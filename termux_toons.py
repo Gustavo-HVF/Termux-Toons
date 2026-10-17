@@ -16,7 +16,8 @@ Reúne em um único menu:
   10. Linux de verdade com proot-distro (Debian, Ubuntu, Arch...)
   11. Servidor de arquivos e backup (rclone, Syncthing, Samba, HTTP)
   12. "Spotify" no terminal: yt-dlp para baixar e mpv para tocar
-  13. Atualização do Termux e dos repositórios
+  13. Vídeos do TikTok, YouTube e outros sites com yt-dlp
+  14. Atualização do Termux e dos repositórios
 
 Uso:
     python termux_toons.py            # menu interativo
@@ -740,6 +741,7 @@ PADRAO_CFG = {
     "alerta_telegram": True,
     "tts_idioma": "",
     "pasta_musicas": "~/storage/downloads",
+    "pasta_videos": "~/storage/downloads",
     "llama_porta": 8080,
     "llama_modelo": "",
     "llama_threads": 4,
@@ -4114,9 +4116,10 @@ def comando_ytdlp(alvo: str) -> list:
             "-o", str(pasta_musicas() / "%(title)s.%(ext)s"), alvo]
 
 
-def garantir_deps_musica() -> bool:
-    faltando = [pkg for cmd, pkg in (("yt-dlp", "python-yt-dlp"), ("ffmpeg", "ffmpeg"), ("mpv", "mpv"))
-                if not tem(cmd)]
+def garantir_deps_musica(com_player: bool = True) -> bool:
+    """yt-dlp + ffmpeg (e, para música, mpv e mutagen)."""
+    necessarios = [("yt-dlp", "python-yt-dlp"), ("ffmpeg", "ffmpeg")] + ([("mpv", "mpv")] if com_player else [])
+    faltando = [pkg for cmd, pkg in necessarios if not tem(cmd)]
     if faltando:
         aviso("Faltam: " + ", ".join(faltando))
         if confirmar("Instalar agora?", True):
@@ -4127,6 +4130,8 @@ def garantir_deps_musica() -> bool:
                           "use a opção '--js-runtimes node' no yt-dlp.")
             elif "python-yt-dlp" in faltando:
                 instalar_pip("yt-dlp")
+    if not com_player:
+        return tem("yt-dlp") and tem("ffmpeg")
     if not modulo_existe("mutagen"):
         info("O yt-dlp precisa do módulo 'mutagen' para embutir a capa em arquivos .opus.")
         if confirmar("Instalar mutagen?", True):
@@ -4350,7 +4355,90 @@ def menu_musica():
 
 
 # ════════════════════════════════════════════════════════════════════
-#  13. Atualização
+#  13. Vídeos: TikTok, YouTube e outros sites suportados pelo yt-dlp
+# ════════════════════════════════════════════════════════════════════
+
+EXTENSOES_VIDEO = {".mp4", ".webm", ".mkv", ".mov", ".m4v"}
+
+
+def pasta_videos() -> Path:
+    return Path(os.path.expanduser(cfg()["pasta_videos"]))
+
+
+def comando_video(alvo: str) -> list:
+    """O comando pedido: melhor vídeo + melhor áudio (ou o melhor arquivo único).
+    --trim-filenames evita o erro de nome longo demais com legendas do TikTok."""
+    return ["yt-dlp", "-f", "bv*+ba/best", "--trim-filenames", "150",
+            "-o", str(pasta_videos() / "%(title)s.%(ext)s"), alvo]
+
+
+def baixar_video(alvo: str) -> bool:
+    """Baixa um link (TikTok, YouTube, Shorts, playlist...) ou o 1º resultado de uma busca."""
+    if not garantir_deps_musica(com_player=False):
+        return False
+    garantir_storage()
+    pasta_videos().mkdir(parents=True, exist_ok=True)
+    if not alvo.startswith(("http://", "https://")):
+        alvo = f"ytsearch1:{alvo}"
+    return rodar(comando_video(alvo)).returncode == 0
+
+
+def videos_locais() -> list:
+    pasta = pasta_videos()
+    if not pasta.exists():
+        return []
+    return sorted((p for p in pasta.rglob("*") if p.suffix.lower() in EXTENSOES_VIDEO),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+@submenu
+def menu_videos():
+    c = cfg()
+
+    def por_link():
+        info("Cole um ou mais links separados por espaço (TikTok, YouTube, Shorts, playlist...).")
+        links = perguntar("Link(s)").split()
+        baixados = sum(baixar_video(link) for link in links)
+        if links:
+            (ok if baixados == len(links) else aviso)(f"{baixados} de {len(links)} vídeo(s) baixado(s) em {pasta_videos()}")
+
+    def buscar_baixar():
+        termo = perguntar("Buscar no YouTube")
+        if not termo or not garantir_deps_musica(com_player=False):
+            return
+        r = escolher_resultado(termo)
+        if r and baixar_video(r["url"]):
+            ok(f"Salvo em {pasta_videos()}")
+
+    def abrir():
+        videos = videos_locais()
+        if not videos:
+            info(f"Nenhum vídeo em {pasta_videos()}.")
+            return
+        i = escolher("Qual vídeo?", [f"{v.name} ({bytes_humanos(v.stat().st_size)})" for v in videos])
+        if i is None:
+            return
+        if tem("termux-open"):
+            rodar(["termux-open", videos[i]])  # abre no player de vídeo do Android
+        else:
+            info(f"Arquivo: {videos[i]}")
+
+    def mudar_pasta():
+        c["pasta_videos"] = perguntar("Pasta dos vídeos", c["pasta_videos"])
+        salvar_cfg()
+        ok(f"Vídeos em {pasta_videos()}")
+
+    menu("🎬 Vídeos (TikTok, YouTube...)", [
+        ("Baixar por link (TikTok, YouTube, Shorts, playlist...)", por_link),
+        ("Buscar no YouTube e baixar", buscar_baixar),
+        ("Abrir vídeo baixado no player do Android", abrir),
+        (lambda: f"Pasta dos vídeos ({c['pasta_videos']})", mudar_pasta),
+        ("Instalar dependências (yt-dlp, ffmpeg)", lambda: garantir_deps_musica(com_player=False)),
+    ])
+
+
+# ════════════════════════════════════════════════════════════════════
+#  14. Atualização
 # ════════════════════════════════════════════════════════════════════
 
 REPO_TOONS = "https://github.com/Gustavo-HVF/Termux-Toons"
@@ -4571,6 +4659,7 @@ def menu_principal() -> None:
         ("🐧 Linux de verdade (proot-distro)", menu_proot),
         ("🗄️ Arquivos e backup", menu_arquivos),
         ("🎵 Música (yt-dlp + mpv)", menu_musica),
+        ("🎬 Vídeos (TikTok, YouTube)", menu_videos),
         ("🔄 Atualização", menu_atualizar),
         ("⚙️ Configurações", menu_config),
         ("🩺 Diagnóstico", diagnostico),
@@ -4597,6 +4686,8 @@ def main(argv=None) -> int:
     p = sub.add_parser("basic", help="interpretador BASIC")
     p.add_argument("arquivo", nargs="?", help="programa .bas para rodar")
     p = sub.add_parser("baixar", help="baixa áudio (link do YouTube/Spotify ou termo de busca)")
+    p.add_argument("alvos", nargs="+")
+    p = sub.add_parser("video", help="baixa vídeos (links do TikTok/YouTube ou termo de busca)")
     p.add_argument("alvos", nargs="+")
     p = sub.add_parser("tocar", help="toca a biblioteca (sem argumentos) ou um mix por busca")
     p.add_argument("busca", nargs="*")
@@ -4631,6 +4722,10 @@ def main(argv=None) -> int:
         elif args.comando == "baixar":
             for alvo in args.alvos:
                 baixar_alvo(alvo)
+        elif args.comando == "video":
+            falhas = sum(not baixar_video(alvo) for alvo in args.alvos)
+            if falhas:
+                raise ToonsError(f"{falhas} download(s) falharam.")
         elif args.comando == "tocar":
             if args.busca:
                 tocar_mpv([f"ytdl://ytsearch15:{' '.join(args.busca)}"], stream=True, perguntar_fundo=False)

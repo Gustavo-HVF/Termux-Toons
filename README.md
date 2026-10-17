@@ -60,7 +60,8 @@ quando não há um terminal interativo, por exemplo em scripts).
 | 10 | 🐧 **Linux com proot-distro** | Instala Debian, Ubuntu, Arch, Alpine, Fedora..., entra na distro, roda comandos, atualiza, cria usuário com sudo, faz backup, reseta e remove. |
 | 11 | 🗄️ **Arquivos e backup** | Compartilhamento HTTP rápido, **rclone** (Drive, Dropbox, OneDrive... copiar/sincronizar e servir via WebDAV com senha), **Syncthing**, **Samba** (porta 4450, experimental) e backup/restauração do Termux em `.tar.gz`. |
 | 12 | 🎵 **Música (yt-dlp + mpv)** | Busca e toca por streaming, baixa no melhor áudio, baixa por link (YouTube, SoundCloud, playlists) e por **link do Spotify** (procura a música no YouTube), mix/rádio por busca, biblioteca local, playlists `.m3u` e player em segundo plano. |
-| 13 | 🔄 **Atualização** | `pkg upgrade`, troca de espelho (`termux-change-repo`), repositórios extras (x11/root/tur), pacotes pip, recompilar llama.cpp, atualizar distros, `git pull` em vários repositórios e no próprio Termux-Toons, limpeza de cache. |
+| 13 | 🎬 **Vídeos (TikTok, YouTube)** | Baixa vídeos por link (TikTok, YouTube, Shorts, playlists e outros sites que o yt-dlp aceita), busca no YouTube e baixa, e abre os vídeos baixados no player do Android. |
+| 14 | 🔄 **Atualização** | `pkg upgrade`, troca de espelho (`termux-change-repo`), repositórios extras (x11/root/tur), pacotes pip, recompilar llama.cpp, atualizar distros, `git pull` em vários repositórios e no próprio Termux-Toons, limpeza de cache. |
 
 Os downloads de música usam exatamente:
 
@@ -69,7 +70,14 @@ yt-dlp -f bestaudio --extract-audio --audio-format opus --embed-thumbnail --add-
        -o "~/storage/downloads/%(title)s.%(ext)s" "<link>"
 ```
 
-(a pasta pode ser trocada no menu de música).
+(a pasta pode ser trocada no menu de música). Os vídeos usam:
+
+```bash
+yt-dlp -f "bv*+ba/best" --trim-filenames 150 -o "~/storage/downloads/%(title)s.%(ext)s" "<link>"
+```
+
+(`--trim-filenames` encurta nomes enormes, como os de legendas do TikTok; a pasta pode ser
+trocada no menu de vídeos).
 
 ## Linha de comando
 
@@ -83,6 +91,7 @@ python termux_toons.py monitor [--uma-vez]
 python termux_toons.py dashboard | tarefas | snake | doctor
 python termux_toons.py basic [programa.bas]
 python termux_toons.py baixar "https://youtu.be/..." "artista - música" "https://open.spotify.com/track/..."
+python termux_toons.py video "https://www.tiktok.com/@user/video/..." "https://youtu.be/..."
 python termux_toons.py tocar                # biblioteca no aleatório
 python termux_toons.py tocar lofi hip hop   # mix por busca
 python termux_toons.py atualizar
