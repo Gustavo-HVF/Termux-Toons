@@ -18,6 +18,7 @@ Reúne em um único menu:
   12. "Spotify" no terminal: yt-dlp para baixar e mpv para tocar
   13. Vídeos do TikTok, YouTube e outros sites com yt-dlp
   14. Atualização do Termux e dos repositórios
+  15. Otimização e limpeza (caches, arquivos grandes/duplicados, processos)
 
 Uso:
     python termux_toons.py            # menu interativo
@@ -3015,8 +3016,7 @@ def menu_rede():
             print(f"  {r.get('rssi', '?'):>4} dBm  {r.get('frequency_mhz', '?'):>5} MHz  {r.get('ssid') or '(oculta)'}")
 
     def trafego():
-        tem_root = tem("su") and saida(["su", "-c", "id -u"], timeout=15) == "0"
-        if tem_root:
+        if tem_root():
             if not garantir_cmd("tcpdump", repo="root-repo"):
                 return
             interface = perguntar("Interface", "wlan0")
@@ -4524,6 +4524,431 @@ def menu_atualizar():
 
 
 # ════════════════════════════════════════════════════════════════════
+#  15. Otimização e limpeza
+# ════════════════════════════════════════════════════════════════════
+
+_ROOT: bool | None = None
+
+
+def tem_root() -> bool:
+    """True se o 'su' existe e devolve uid 0 (pergunta ao Magisk/KernelSU só uma vez)."""
+    global _ROOT
+    if _ROOT is None:
+        _ROOT = tem("su") and saida(["su", "-c", "id -u"], timeout=20) == "0"
+    return _ROOT
+
+
+def tamanho(caminho: Path) -> int:
+    """Tamanho em bytes; pastas são somadas sem seguir links simbólicos."""
+    try:
+        if caminho.is_symlink() or caminho.is_file():
+            return caminho.lstat().st_size
+        if not caminho.is_dir():
+            return 0
+    except OSError:
+        return 0
+    total = 0
+    for raiz, _, arquivos in os.walk(caminho, onerror=lambda e: None):
+        for nome in arquivos:
+            with contextlib.suppress(OSError):
+                total += os.lstat(os.path.join(raiz, nome)).st_size
+    return total
+
+
+def apagar(caminho: Path) -> int:
+    """Apaga arquivo ou pasta e devolve quantos bytes foram liberados."""
+    liberado = tamanho(caminho)
+    try:
+        if caminho.is_symlink() or caminho.is_file():
+            caminho.unlink()
+        elif caminho.is_dir():
+            shutil.rmtree(caminho, ignore_errors=True)
+    except OSError as e:
+        aviso(f"Não consegui apagar {caminho}: {e}")
+        return 0
+    return liberado
+
+
+def _arquivos_tmp_antigos() -> list:
+    """Arquivos em $PREFIX/tmp com mais de 2 dias (sem mexer nos sockets do tmux)."""
+    tmp = Path(PREFIX) / "tmp"
+    if not PREFIX or not tmp.is_dir():
+        return []
+    limite, achados = time.time() - 2 * 86400, []
+    for raiz, pastas, arquivos in os.walk(tmp):
+        pastas[:] = [p for p in pastas if not p.startswith("tmux")]
+        for nome in arquivos:
+            arq = Path(raiz) / nome
+            with contextlib.suppress(OSError):
+                if arq.is_file() and not arq.is_symlink() and arq.stat().st_mtime < limite:
+                    achados.append(arq)
+    return achados
+
+
+def _pycaches() -> list:
+    achados = []
+    for raiz, pastas, _ in os.walk(HOME):
+        pastas[:] = [p for p in pastas if p not in ("storage", ".git", "node_modules")]
+        if "__pycache__" in pastas:
+            achados.append(Path(raiz) / "__pycache__")
+            pastas.remove("__pycache__")
+    return achados
+
+
+def _sobras_toons() -> list:
+    """Logs antigos, logs de serviços parados e fotos temporárias do Termux-Toons."""
+    ativos = set(servicos_ativos())
+    itens = list(LOG_DIR.glob("*.log.old")) if LOG_DIR.exists() else []
+    if LOG_DIR.exists():
+        itens += [p for p in LOG_DIR.glob("*.log") if p.stem not in ativos]
+    itens += list(DATA_DIR.glob("foto_*.jpg"))
+    if (DATA_DIR / "teste_dev").exists():
+        itens.append(DATA_DIR / "teste_dev")
+    return itens
+
+
+def _downloads_incompletos() -> list:
+    if not DOWNLOADS.exists():
+        return []
+    return [p for p in DOWNLOADS.rglob("*") if p.suffix in (".part", ".ytdl", ".temp") and p.is_file()]
+
+
+def _miniaturas() -> list:
+    base = HOME / "storage" / "shared"
+    return [base / sub / ".thumbnails" for sub in ("DCIM", "Pictures", "Movies")
+            if (base / sub / ".thumbnails").is_dir()]
+
+
+def _limpador_lista(obter) -> dict:
+    """Limpador a partir de uma função que devolve a lista de caminhos a apagar."""
+    return {"estimar": lambda: sum(tamanho(p) for p in obter()),
+            "limpar": lambda: sum(apagar(p) for p in obter())}
+
+
+def _limpador_apt() -> dict:
+    cache = Path(PREFIX) / "var" / "cache" / "apt"
+
+    def limpar():
+        antes = tamanho(cache)
+        rodar(["apt", "clean"], capturar=True)
+        return max(0, antes - tamanho(cache))
+
+    return {"estimar": lambda: tamanho(cache) if IS_TERMUX else None, "limpar": limpar}
+
+
+LIMPADORES = [
+    # (rótulo, fábrica do limpador, entra na limpeza rápida?)
+    ("Cache de pacotes do Termux (apt)", _limpador_apt, True),
+    ("Cache geral ~/.cache (pip, yt-dlp, go...)",
+     lambda: _limpador_lista(lambda: list((HOME / ".cache").iterdir()) if (HOME / ".cache").is_dir() else []), True),
+    ("Cache do npm (~/.npm/_cacache)",
+     lambda: _limpador_lista(lambda: [HOME / ".npm" / "_cacache"] if (HOME / ".npm" / "_cacache").exists() else []),
+     True),
+    ("Arquivos temporários antigos ($PREFIX/tmp)", lambda: _limpador_lista(_arquivos_tmp_antigos), True),
+    ("Pastas __pycache__ na home", lambda: _limpador_lista(_pycaches), True),
+    ("Logs antigos e fotos temporárias do Termux-Toons", lambda: _limpador_lista(_sobras_toons), True),
+    ("Miniaturas da galeria (.thumbnails, o Android recria)", lambda: _limpador_lista(_miniaturas), True),
+    ("Downloads incompletos (.part, .ytdl) em Downloads", lambda: _limpador_lista(_downloads_incompletos), False),
+    ("Build do llama.cpp (precisa recompilar depois)",
+     lambda: _limpador_lista(lambda: [LLAMA_DIR / "build"] if (LLAMA_DIR / "build").exists() else []), False),
+]
+
+
+def _estimar_limpadores(so_rapidos: bool = False) -> list:
+    """[(rótulo, limpador, bytes)] dos limpadores que se aplicam a este aparelho."""
+    resultado = []
+    for rotulo, fabrica, rapido in LIMPADORES:
+        if so_rapidos and not rapido:
+            continue
+        limpador = fabrica()
+        estimado = limpador["estimar"]()
+        if estimado is not None:
+            resultado.append((rotulo, limpador, estimado))
+    return resultado
+
+
+def limpar_cache_apps_root() -> int:
+    """Pede ao Android para limpar o cache de todos os apps (pm trim-caches, precisa de root)."""
+    antes = shutil.disk_usage(HOME).free
+    rodar(["su", "-c", "pm trim-caches 999G"])
+    return max(0, shutil.disk_usage(HOME).free - antes)
+
+
+def otimizacao_rapida(interativo: bool = True) -> None:
+    info("Analisando o que dá para limpar com segurança...")
+    total = 0
+    for rotulo, limpador, estimado in _estimar_limpadores(so_rapidos=True):
+        if not estimado:
+            continue
+        liberado = limpador["limpar"]()
+        total += liberado
+        ok(f"{rotulo}: {bytes_humanos(liberado)}")
+    if tem_root():
+        if not interativo or confirmar("Limpar também o cache de TODOS os apps (root)?", True):
+            liberado = limpar_cache_apps_root()
+            total += liberado
+            ok(f"Cache de todos os apps: {bytes_humanos(liberado)}")
+    elif interativo:
+        info("Sem root, o cache dos outros apps só pode ser limpo pela tela de armazenamento do Android "
+             "(opção 'Limpar cache de todos os apps' neste menu).")
+    print(f"\n{NEG}Total liberado: {bytes_humanos(total)}{RST} · "
+          f"livre agora: {bytes_humanos(shutil.disk_usage(HOME).free)}")
+
+
+def _abrir_tela_android(acao: str, dado: str | None = None) -> bool:
+    """Abre uma tela de configurações do Android (o 'am' do Termux funciona sem root)."""
+    if not tem("am"):
+        aviso("Comando 'am' não encontrado (só existe dentro do Termux).")
+        return False
+    cmd = ["am", "start", "-a", acao] + (["-d", dado] if dado else [])
+    return rodar(cmd, capturar=True, timeout=20).returncode == 0
+
+
+TELAS_ANDROID = [
+    ("Liberar espaço (limpeza do próprio Android)", "android.os.storage.action.MANAGE_STORAGE"),
+    ("Armazenamento (cache e dados por categoria)", "android.settings.INTERNAL_STORAGE_SETTINGS"),
+    ("Lista de apps (limpar cache app por app)", "android.settings.MANAGE_APPLICATIONS_SETTINGS"),
+    ("Otimização de bateria (deixe o Termux sem restrição)", "android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS"),
+    ("Economia de bateria", "android.settings.BATTERY_SAVER_SETTINGS"),
+    ("Uso de bateria por app", "android.intent.action.POWER_USAGE_SUMMARY"),
+]
+
+
+def _escolher_pasta(msg: str = "Onde procurar?"):
+    opcoes = [("Downloads", DOWNLOADS), ("Armazenamento interno (tudo)", HOME / "storage" / "shared"),
+              ("Home do Termux", HOME), ("Outra pasta...", None)]
+    disponiveis = [(nome, p) for nome, p in opcoes if p is None or p.exists()]
+    i = escolher(msg, [nome for nome, _ in disponiveis])
+    if i is None:
+        return None
+    pasta = disponiveis[i][1]
+    if pasta is None:
+        pasta = Path(os.path.expanduser(perguntar("Caminho da pasta", str(HOME))))
+    if not pasta.is_dir():
+        raise ToonsError(f"Pasta não encontrada: {pasta}")
+    return pasta
+
+
+def _arquivos(pasta: Path):
+    """Todos os arquivos comuns abaixo de `pasta`, ignorando o que não dá para ler."""
+    for raiz, _, nomes in os.walk(pasta, onerror=lambda e: None):
+        for nome in nomes:
+            caminho = Path(raiz) / nome
+            with contextlib.suppress(OSError):
+                if caminho.is_file() and not caminho.is_symlink():
+                    yield caminho, caminho.stat()
+
+
+def _hash_arquivo(caminho: Path, limite: int | None = None) -> str:
+    h = hashlib.sha1()
+    lido = 0
+    with open(caminho, "rb") as arq:
+        while bloco := arq.read(1 << 20):
+            h.update(bloco)
+            lido += len(bloco)
+            if limite and lido >= limite:
+                break
+    return h.hexdigest()
+
+
+@submenu
+def menu_otimizacao():
+    def rapida():
+        otimizacao_rapida()
+
+    def escolher_limpeza():
+        info("Calculando o tamanho de cada item...")
+        candidatos = [c for c in _estimar_limpadores() if c[2] > 0]
+        if not candidatos:
+            ok("Nada para limpar. 🎉")
+            return
+        sel = escolher_varios("O que limpar?", [f"{r} — {bytes_humanos(t)}" for r, _, t in candidatos])
+        total = 0
+        for i in sel:
+            rotulo, limpador, _ = candidatos[i]
+            liberado = limpador["limpar"]()
+            total += liberado
+            ok(f"{rotulo}: {bytes_humanos(liberado)}")
+        if sel:
+            print(f"\n{NEG}Total liberado: {bytes_humanos(total)}{RST}")
+
+    def cache_todos_apps():
+        if tem_root():
+            info("Pedindo ao Android para limpar o cache de todos os apps...")
+            ok(f"Liberado: {bytes_humanos(limpar_cache_apps_root())}")
+            return
+        aviso("Sem root, o Android não permite que o Termux limpe o cache de outros apps.")
+        info("Vou abrir a tela de armazenamento do Android: lá você limpa o cache (ou use 'Liberar espaço').")
+        if not _abrir_tela_android("android.os.storage.action.MANAGE_STORAGE"):
+            _abrir_tela_android("android.settings.INTERNAL_STORAGE_SETTINGS")
+
+    def otimizar_apps_root():
+        if not tem_root():
+            raise ToonsError("Precisa de root. Sem root, o Android faz isso sozinho quando o aparelho "
+                             "fica carregando e parado.")
+        info("Compilando os apps em segundo plano (pode levar vários minutos, deixe carregando)...")
+        rodar(["su", "-c", "cmd package bg-dexopt-job"])
+        ok("Otimização dos apps concluída.")
+
+    def trim_root():
+        if not tem_root():
+            raise ToonsError("Precisa de root. Sem root, o Android roda o TRIM sozinho durante a "
+                             "manutenção noturna (carregando e com a tela desligada).")
+        rodar(["su", "-c", "sm fstrim"])
+        ok("TRIM solicitado ao armazenamento.")
+
+    def espaco():
+        pasta = _escolher_pasta("Analisar qual pasta?")
+        if not pasta:
+            return
+        info(f"Somando {pasta} ...")
+        try:
+            filhos = list(pasta.iterdir())
+        except OSError as e:
+            raise ToonsError(f"Sem acesso a {pasta}: {e}") from None
+        tamanhos = sorted(((tamanho(f), f) for f in filhos), reverse=True)
+        total = sum(t for t, _ in tamanhos) or 1
+        print(f"\n{NEG}{pasta}{RST} — {bytes_humanos(total)}")
+        for t, f in tamanhos[:20]:
+            nome = f.name + ("/" if f.is_dir() and not f.is_symlink() else "")
+            print(f"  {_barra(t / total, 12)} {bytes_humanos(t):>9}  {nome}")
+        livre = shutil.disk_usage(pasta)
+        print(f"\nDisco: {bytes_humanos(livre.free)} livres de {bytes_humanos(livre.total)}")
+
+    def grandes():
+        pasta = _escolher_pasta()
+        if not pasta:
+            return
+        minimo = perguntar_int("Tamanho mínimo (MB)", 100, 1)
+        info("Procurando...")
+        achados = sorted(((st.st_size, p) for p, st in _arquivos(pasta) if st.st_size >= minimo * 1024 * 1024),
+                         reverse=True)[:40]
+        if not achados:
+            ok(f"Nenhum arquivo com mais de {minimo} MB.")
+            return
+        sel = escolher_varios("Marque os que quer APAGAR",
+                              [f"{bytes_humanos(t):>9}  {p.relative_to(pasta)}" for t, p in achados])
+        escolhidos = [achados[i] for i in sel]
+        if escolhidos and confirmar(f"Apagar {len(escolhidos)} arquivo(s) "
+                                    f"({bytes_humanos(sum(t for t, _ in escolhidos))})?"):
+            ok(f"Liberado: {bytes_humanos(sum(apagar(p) for _, p in escolhidos))}")
+
+    def duplicados():
+        pasta = _escolher_pasta()
+        if not pasta:
+            return
+        info("Procurando arquivos com o mesmo conteúdo...")
+        por_tamanho = {}
+        for p, st in _arquivos(pasta):
+            if st.st_size >= 1024:
+                por_tamanho.setdefault(st.st_size, []).append((st.st_mtime, p))
+        grupos = []
+        for t, lista in por_tamanho.items():
+            if len(lista) < 2:
+                continue
+            por_hash = {}
+            for mtime, p in lista:
+                with contextlib.suppress(OSError):
+                    chave = (_hash_arquivo(p, 65536), _hash_arquivo(p) if t > 65536 else "")
+                    por_hash.setdefault(chave, []).append((mtime, p))
+            grupos += [(t, sorted(g)) for g in por_hash.values() if len(g) > 1]
+        if not grupos:
+            ok("Nenhum arquivo duplicado encontrado.")
+            return
+        sobras = [(t, p) for t, g in grupos for _, p in g[1:]]  # mantém o mais antigo de cada grupo
+        for t, g in sorted(grupos, reverse=True)[:15]:
+            print(f"{NEG}{bytes_humanos(t)}{RST} × {len(g)}")
+            for i, (_, p) in enumerate(g):
+                print(f"   {'mantém' if i == 0 else 'cópia '}  {p.relative_to(pasta)}")
+        if len(grupos) > 15:
+            print(f"{DIM}... e mais {len(grupos) - 15} grupo(s){RST}")
+        espaco_dup = sum(t for t, _ in sobras)
+        if confirmar(f"Apagar {len(sobras)} cópia(s) e liberar {bytes_humanos(espaco_dup)}? "
+                     "(fica o arquivo mais antigo de cada grupo)"):
+            ok(f"Liberado: {bytes_humanos(sum(apagar(p) for _, p in sobras))}")
+
+    def pastas_vazias():
+        pasta = _escolher_pasta()
+        if not pasta:
+            return
+        vazias = set()
+        # De baixo para cima: uma pasta é vazia se não tem arquivos e só tem subpastas vazias.
+        for raiz, pastas, arquivos in os.walk(pasta, topdown=False, onerror=lambda e: None):
+            atual = Path(raiz)
+            if atual != pasta and not arquivos and all(atual / d in vazias for d in pastas):
+                vazias.add(atual)
+        if not vazias:
+            ok("Nenhuma pasta vazia.")
+            return
+        for p in sorted(vazias)[:20]:
+            print(f"   {p.relative_to(pasta)}")
+        if confirmar(f"Remover {len(vazias)} pasta(s) vazia(s)?"):
+            removidas = 0
+            for p in sorted(vazias, key=lambda x: len(x.parts), reverse=True):
+                with contextlib.suppress(OSError):
+                    p.rmdir()
+                    removidas += 1
+            ok(f"{removidas} pasta(s) removida(s).")
+
+    def processos():
+        lista = []
+        for pid_dir in Path("/proc").iterdir():
+            if not pid_dir.name.isdigit() or int(pid_dir.name) == os.getpid():
+                continue
+            with contextlib.suppress(OSError, ValueError, IndexError):
+                campos = dict(linha.split(":", 1) for linha in (pid_dir / "status").read_text().splitlines()
+                              if ":" in linha)
+                rss = int(campos.get("VmRSS", "0 kB").split()[0]) * 1024
+                if rss:
+                    cmdline = (pid_dir / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+                    lista.append((rss, int(pid_dir.name), cmdline.strip() or campos["Name"].strip()))
+        if not lista:
+            info("Nenhum processo visível (o Android só mostra os do próprio Termux).")
+            return
+        lista.sort(reverse=True)
+        print(f"{DIM}O Android só deixa ver os processos do próprio Termux.{RST}")
+        i = escolher("Escolha um para encerrar (Esc para só olhar)",
+                     [f"{bytes_humanos(rss):>9}  {pid:<6} {cmd[:60]}" for rss, pid, cmd in lista[:25]])
+        if i is not None:
+            rss, pid, cmd = lista[i]
+            if confirmar(f"Encerrar o processo {pid} ({cmd[:40]})?"):
+                try:
+                    os.kill(pid, 15)
+                    ok("Sinal de encerramento enviado.")
+                except OSError as e:
+                    erro(f"Não consegui encerrar: {e}")
+
+    def parar_tudo():
+        ativos = servicos_ativos()
+        if not ativos:
+            info("Nenhum serviço do Termux-Toons rodando.")
+            return
+        if confirmar(f"Parar {', '.join(ativos)}?", True):
+            for nome in ativos:
+                parar_servico(nome)
+
+    def telas():
+        i = escolher("Abrir qual tela do Android?", [nome for nome, _ in TELAS_ANDROID])
+        if i is not None and _abrir_tela_android(TELAS_ANDROID[i][1]):
+            ok("Tela aberta no Android.")
+
+    menu("🧹 Otimização e limpeza", [
+        ("⚡ Otimização rápida (limpa tudo que é seguro)", rapida),
+        ("Escolher o que limpar (mostra o tamanho de cada item)", escolher_limpeza),
+        ("Limpar cache de TODOS os apps", cache_todos_apps),
+        ("Ver o que ocupa espaço", espaco),
+        ("Arquivos grandes", grandes),
+        ("Arquivos duplicados", duplicados),
+        ("Pastas vazias", pastas_vazias),
+        ("Processos do Termux que mais usam RAM", processos),
+        ("Parar todos os serviços do Termux-Toons", parar_tudo),
+        ("Otimizar apps — compilação em segundo plano (root)", otimizar_apps_root),
+        ("TRIM do armazenamento (root)", trim_root),
+        ("Atalhos para telas do Android (armazenamento, bateria...)", telas),
+    ])
+
+
+# ════════════════════════════════════════════════════════════════════
 #  Configurações e diagnóstico
 # ════════════════════════════════════════════════════════════════════
 
@@ -4661,6 +5086,7 @@ def menu_principal() -> None:
         ("🎵 Música (yt-dlp + mpv)", menu_musica),
         ("🎬 Vídeos (TikTok, YouTube)", menu_videos),
         ("🔄 Atualização", menu_atualizar),
+        ("🧹 Otimização e limpeza", menu_otimizacao),
         ("⚙️ Configurações", menu_config),
         ("🩺 Diagnóstico", diagnostico),
         ("📦 Instalar essenciais (python, tmux, termux-api, git)", instalar_essenciais),
@@ -4692,6 +5118,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("tocar", help="toca a biblioteca (sem argumentos) ou um mix por busca")
     p.add_argument("busca", nargs="*")
     sub.add_parser("atualizar", help="atualiza Termux, pacotes Python, distros e o Termux-Toons")
+    sub.add_parser("limpar", help="otimização rápida: limpa caches e temporários com segurança")
     sub.add_parser("doctor", help="diagnóstico do ambiente")
     args = parser.parse_args(argv)
 
@@ -4731,6 +5158,8 @@ def main(argv=None) -> int:
                 tocar_mpv([f"ytdl://ytsearch15:{' '.join(args.busca)}"], stream=True, perguntar_fundo=False)
             else:
                 tocar_mpv(musicas_locais(), aleatorio=True, perguntar_fundo=False)
+        elif args.comando == "limpar":
+            otimizacao_rapida(interativo=False)
         elif args.comando == "atualizar":
             atualizar_tudo()
         elif args.comando == "doctor":
