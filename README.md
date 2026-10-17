@@ -63,6 +63,7 @@ quando não há um terminal interativo, por exemplo em scripts).
 | 13 | 🎬 **Vídeos (TikTok, YouTube)** | Baixa vídeos por link (TikTok, YouTube, Shorts, playlists e outros sites que o yt-dlp aceita), busca no YouTube e baixa, e abre os vídeos baixados no player do Android. |
 | 14 | 🔄 **Atualização** | `pkg upgrade`, troca de espelho (`termux-change-repo`), repositórios extras (x11/root/tur), pacotes pip, recompilar llama.cpp, atualizar distros, `git pull` em vários repositórios e no próprio Termux-Toons, limpeza de cache. |
 | 15 | 🧹 **Otimização e limpeza** | **Otimização rápida** (cache do apt, `~/.cache` com pip/yt-dlp/go, npm, temporários antigos, `__pycache__`, logs velhos e miniaturas da galeria) mostrando quanto liberou; escolher item a item; **limpar o cache de todos os apps** (`pm trim-caches` com root; sem root abre a tela de armazenamento do Android); ver o que ocupa espaço; achar **arquivos grandes**, **duplicados** e pastas vazias; processos do Termux que mais usam RAM; parar todos os serviços; compilação dos apps e TRIM (root); atalhos para as telas de armazenamento e bateria. |
+| 16 | 📺 **Compartilhar filme por link** | Servidor de vídeo próprio: escolha um filme, receba um **link secreto** (com prazo opcional) e quem abrir assiste num player no navegador, com **pular para qualquer ponto** e **legenda** (`.srt`/`.vtt` ao lado do vídeo). Avisa se o arquivo não toca em navegadores (MKV, áudio AC3/DTS, H.265...) e **converte para MP4** com o ffmpeg, escolhendo a trilha de áudio (dublado/original) e extraindo a legenda embutida. Copia o link, manda pelo menu de compartilhar do Android (WhatsApp, Telegram...) ou mostra um QR code. **Túnel Cloudflare** para quem está fora do seu Wi-Fi. Apagar um link vale na hora. |
 
 Os downloads de música usam exatamente:
 
@@ -93,11 +94,35 @@ python termux_toons.py dashboard | tarefas | snake | doctor
 python termux_toons.py basic [programa.bas]
 python termux_toons.py baixar "https://youtu.be/..." "artista - música" "https://open.spotify.com/track/..."
 python termux_toons.py video "https://www.tiktok.com/@user/video/..." "https://youtu.be/..."
+python termux_toons.py compartilhar ~/storage/downloads/filme.mp4 --horas 24   # cria o link e liga o servidor
+python termux_toons.py midia                # servidor de vídeo em primeiro plano
 python termux_toons.py tocar                # biblioteca no aleatório
 python termux_toons.py tocar lofi hip hop   # mix por busca
 python termux_toons.py atualizar
 python termux_toons.py limpar                # otimização rápida, sem perguntas
 ```
+
+## Compartilhar um filme por link
+
+1. Menu **📺 Compartilhar filme por link → Compartilhar um filme**, escolha o arquivo, o título e o prazo.
+2. O programa liga o servidor de vídeo (porta 8095) e mostra o link: `http://IP-do-celular:8095/v/<código secreto>`.
+   Quem estiver **no mesmo Wi-Fi** já consegue assistir.
+3. Para quem está **fora da sua rede**, ligue **Túnel para a internet** no mesmo menu (usa o `cloudflared`;
+   o endereço público aparece na tela e vira o link que você envia).
+4. Copie o link ou use **Enviar pelo WhatsApp, Telegram...**. Em **Meus links** dá para apagar um link
+   (quem estiver com ele perde o acesso na hora) ou **Apagar TODOS os links**.
+
+Boas práticas e limites:
+
+- O servidor só entrega os arquivos que você compartilhou, cada um por um código aleatório; não mostra pastas.
+- O filme **sai do seu celular**: quem assiste usa o **upload** da sua internet. Mantenha o celular carregando
+  (o `termux-wake-lock` é ativado sozinho). O túnel gratuito da Cloudflare é pensado para testes e pode ser lento.
+- **Formatos:** MP4 (H.264 + AAC) e WebM tocam em qualquer navegador. MKV, áudio AC3/DTS e H.265 nem sempre; use
+  **Converter filme para MP4 compatível**. O modo *rápido* só troca o áudio (segundos/minutos); o *completo*
+  recodifica o vídeo e, no celular, pode levar mais tempo que o filme.
+- **Legendas:** deixe o `.srt` ao lado do vídeo com o mesmo nome (`Filme.mp4` + `Filme.pt.srt`); ele aparece no player.
+- Compartilhe só o que você pode distribuir: vídeos seus, de domínio público, de licença livre ou com autorização
+  de quem tem os direitos.
 
 ## Serviços 24h (tmux)
 

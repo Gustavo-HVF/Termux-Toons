@@ -19,6 +19,7 @@ Reúne em um único menu:
   13. Vídeos do TikTok, YouTube e outros sites com yt-dlp
   14. Atualização do Termux e dos repositórios
   15. Otimização e limpeza (caches, arquivos grandes/duplicados, processos)
+  16. Compartilhar filmes por link (servidor de vídeo + túnel para a internet)
 
 Uso:
     python termux_toons.py            # menu interativo
@@ -743,6 +744,8 @@ PADRAO_CFG = {
     "tts_idioma": "",
     "pasta_musicas": "~/storage/downloads",
     "pasta_videos": "~/storage/downloads",
+    "midia_porta": 8095,
+    "compartilhamentos": [],
     "llama_porta": 8080,
     "llama_modelo": "",
     "llama_threads": 4,
@@ -1312,12 +1315,35 @@ def garantir_dependencias_web(framework: str) -> bool:
     return all(garantir_modulo(mod, pip, aviso_extra=extra) for mod, pip in DEPENDENCIAS_WEB[framework])
 
 
-def url_tunel():
-    arq = log_de("tunel")
+def url_tunel(nome: str = "tunel"):
+    arq = log_de(nome)
     if not arq.exists():
         return None
     achados = re.findall(r"https://[a-z0-9-]+\.trycloudflare\.com", arq.read_text("utf-8", errors="replace"))
     return achados[-1] if achados else None
+
+
+def abrir_tunel(nome: str, porta: int, aviso_txt: str | None = None) -> None:
+    """Liga um Cloudflare Tunnel rápido para `porta` e mostra o endereço público quando sair."""
+    if not garantir_cmd("cloudflared"):
+        return
+    if servico_ativo(nome):
+        aviso("O túnel já está rodando.")
+        info(f"URL: {url_tunel(nome)}")
+        return
+    log_de(nome).unlink(missing_ok=True)  # para encontrar a URL nova no log
+    if aviso_txt:
+        aviso(aviso_txt)
+    if not iniciar_servico(nome, f"cloudflared tunnel --no-autoupdate --url http://localhost:{porta}"):
+        return
+    info("Aguardando a URL pública...")
+    for _ in range(30):
+        url = url_tunel(nome)
+        if url:
+            ok(f"Acesse de qualquer lugar: {NEG}{url}{RST}")
+            return
+        time.sleep(1)
+    aviso("A URL ainda não apareceu; veja o log do túnel em alguns segundos.")
 
 
 @submenu
@@ -1366,26 +1392,9 @@ def menu_web():
             ok("Novo token gerado. Reinicie o servidor se ele estiver rodando.")
 
     def iniciar_tunel():
-        if not garantir_cmd("cloudflared"):
-            return
-        if servico_ativo("tunel"):
-            aviso("O túnel já está rodando.")
-            info(f"URL: {url_tunel()}")
-            return
         if not servico_ativo("web"):
             aviso("O servidor web não está rodando; o túnel vai apontar para a porta mesmo assim.")
-        log_de("tunel").unlink(missing_ok=True)  # para encontrar a URL nova no log
-        aviso("Com o túnel, a API fica acessível pela internet: guarde bem o token!")
-        if not iniciar_servico("tunel", f"cloudflared tunnel --no-autoupdate --url http://localhost:{c['web_porta']}"):
-            return
-        info("Aguardando a URL pública...")
-        for _ in range(30):
-            url = url_tunel()
-            if url:
-                ok(f"Acesse de qualquer lugar: {NEG}{url}{RST}")
-                return
-            time.sleep(1)
-        aviso("A URL ainda não apareceu; veja o log do túnel em alguns segundos.")
+        abrir_tunel("tunel", c["web_porta"], "Com o túnel, a API fica acessível pela internet: guarde bem o token!")
 
     menu("🌐 Servidor web / API pessoal", [
         *itens_servico("web", "Servidor", iniciar),
@@ -4358,7 +4367,7 @@ def menu_musica():
 #  13. Vídeos: TikTok, YouTube e outros sites suportados pelo yt-dlp
 # ════════════════════════════════════════════════════════════════════
 
-EXTENSOES_VIDEO = {".mp4", ".webm", ".mkv", ".mov", ".m4v"}
+EXTENSOES_VIDEO = {".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi"}
 
 
 def pasta_videos() -> Path:
@@ -4434,6 +4443,617 @@ def menu_videos():
         ("Abrir vídeo baixado no player do Android", abrir),
         (lambda: f"Pasta dos vídeos ({c['pasta_videos']})", mudar_pasta),
         ("Instalar dependências (yt-dlp, ffmpeg)", lambda: garantir_deps_musica(com_player=False)),
+    ])
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Compartilhar filme/vídeo por link (servidor de vídeo)
+# ════════════════════════════════════════════════════════════════════
+# Um servidor próprio, separado da API: só entrega os vídeos que você
+# compartilhou, cada um com um link secreto (e prazo opcional). Suporta
+# "pular para o meio" (HTTP Range) e legendas .srt/.vtt.
+
+TIPOS_VIDEO = {".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm",
+               ".mkv": "video/x-matroska", ".mov": "video/quicktime", ".avi": "video/x-msvideo"}
+FORMATOS_NAVEGADOR = (".mp4", ".m4v", ".webm")
+VIDEO_NAVEGADOR = ("h264", "vp8", "vp9", "av1")
+AUDIO_NAVEGADOR = ("aac", "mp3", "opus", "vorbis")
+CODECS_LEGENDA_TEXTO = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"}
+
+PAGINA_FILME = """<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>@TITULO@</title>
+<style>
+ html,body{height:100%}
+ body{margin:0;background:#000;color:#eee;font-family:system-ui,sans-serif;display:flex;flex-direction:column}
+ header{padding:12px 16px;font-size:1.05em;background:#111}
+ video{width:100%;flex:1;min-height:0;background:#000}
+ #erro{display:none;padding:12px 16px;background:#5a1d1d}
+</style></head><body>
+<header>🎬 @TITULO@</header>
+<video id="v" controls playsinline preload="metadata" src="/v/@TOKEN@/video">@LEGENDA@</video>
+<div id="erro">Seu navegador não conseguiu reproduzir este vídeo. Peça a quem enviou o link para
+converter o filme para MP4 (H.264 + AAC) ou tente abrir em outro navegador.</div>
+<script>
+ var v=document.getElementById('v');
+ v.addEventListener('error',function(){document.getElementById('erro').style.display='block'});
+</script></body></html>
+"""
+
+
+def _srt_para_vtt(dados: bytes) -> bytes:
+    """Converte legenda .srt (UTF-8, Windows-1252 ou Latin-1) em WebVTT UTF-8."""
+    texto = None
+    for codificacao in ("utf-8-sig", "cp1252"):
+        try:
+            texto = dados.decode(codificacao)
+            break
+        except UnicodeDecodeError:
+            continue
+    if texto is None:
+        texto = dados.decode("latin-1")
+    texto = texto.replace("\r\n", "\n").replace("\r", "\n")
+    if not texto.lstrip().startswith("WEBVTT"):
+        texto = "WEBVTT\n\n" + re.sub(r"(\d{2}:\d{2}:\d{2}),(\d{3})", r"\1.\2", texto)
+    return texto.encode("utf-8")
+
+
+def achar_legenda(video: Path):
+    """Legenda ao lado do vídeo (mesmo nome + .srt/.vtt); prefere português e .vtt."""
+    candidatas = []
+    try:
+        for p in video.parent.iterdir():
+            resto = p.name[len(video.stem):]
+            if (p.name.startswith(video.stem) and resto.lower().endswith((".srt", ".vtt"))
+                    and resto[:1] in (".", "_", "-", " ") and p.is_file()):
+                candidatas.append(p)
+    except OSError:
+        return None
+    portugues = re.compile(r"(^|[._\- \[(])(pt|por|pob|br|pt-br|ptbr)([._\- \])]|$)", re.I)
+    candidatas.sort(key=lambda p: (not portugues.search(p.stem), p.suffix.lower() != ".vtt", p.name))
+    return candidatas[0] if candidatas else None
+
+
+def _faixa(cabecalho: str | None, tamanho: int):
+    """Interpreta 'Range: bytes=a-b'. Devolve (início, fim) inclusivos; None se não há faixa
+    (ou se o cabeçalho é ilegível, e então deve ser ignorado); ValueError se for inatingível."""
+    m = re.fullmatch(r"bytes=(\d*)-(\d*)", (cabecalho or "").strip())
+    if not m or not (m.group(1) or m.group(2)):
+        return None
+    if not m.group(1):  # "-N": os últimos N bytes
+        n = int(m.group(2))
+        if n == 0 or tamanho == 0:
+            raise ValueError("faixa inatingível")
+        return max(0, tamanho - n), tamanho - 1
+    inicio = int(m.group(1))
+    if m.group(2) and int(m.group(2)) < inicio:
+        return None
+    if inicio >= tamanho:
+        raise ValueError("faixa inatingível")
+    return inicio, min(int(m.group(2)), tamanho - 1) if m.group(2) else tamanho - 1
+
+
+def _compartilhamentos() -> list:
+    """Lê os links direto do arquivo, a cada pedido: novos links e revogações valem na hora."""
+    return ler_json(CONFIG_FILE, {}).get("compartilhamentos", [])
+
+
+def achar_compartilhamento(token: str):
+    achado = None
+    for item in _compartilhamentos():
+        if hmac.compare_digest(str(item.get("token", "")).encode(), token.encode()):
+            achado = item  # sem 'break': o tempo não revela qual link existe
+    return achado
+
+
+def expirado(item: dict) -> bool:
+    return bool(item.get("expira")) and time.time() > item["expira"]
+
+
+class _HandlerMidia(BaseHTTPRequestHandler):
+    server_version = f"TermuxToons/{VERSION}"
+    timeout = 120  # solta conexões paradas
+
+    def _cabecalhos(self, status: int, tipo: str, comprimento: int, extra: dict | None = None) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", tipo)
+        self.send_header("Content-Length", str(comprimento))
+        self.send_header("Cache-Control", "private, no-cache")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Robots-Tag", "noindex, nofollow")
+        for chave, valor in (extra or {}).items():
+            self.send_header(chave, valor)
+        self.end_headers()
+
+    def _enviar(self, status: int, tipo: str, corpo: bytes, com_corpo: bool, extra: dict | None = None) -> None:
+        self._cabecalhos(status, tipo, len(corpo), extra)
+        if com_corpo and corpo:
+            self.wfile.write(corpo)
+
+    def _aviso(self, status: int, msg: str, com_corpo: bool) -> None:
+        corpo = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,"
+                 "initial-scale=1'><body style='font-family:system-ui;background:#111;color:#eee;"
+                 f"padding:2em'><h2>{msg}</h2>").encode()
+        self._enviar(status, "text/html; charset=utf-8", corpo, com_corpo)
+
+    def _pagina(self, item: dict, arq: Path, com_corpo: bool) -> None:
+        import html as html_mod
+        legenda = ""
+        if achar_legenda(arq):
+            legenda = (f'<track kind="subtitles" srclang="pt" label="Legenda" default '
+                       f'src="/v/{item["token"]}/legenda.vtt">')
+        pagina = (PAGINA_FILME.replace("@TITULO@", html_mod.escape(str(item.get("titulo") or arq.stem)))
+                  .replace("@TOKEN@", item["token"]).replace("@LEGENDA@", legenda))
+        self._enviar(200, "text/html; charset=utf-8", pagina.encode(), com_corpo)
+
+    def _legenda(self, arq: Path, com_corpo: bool) -> None:
+        arq_legenda = achar_legenda(arq)
+        try:
+            dados = arq_legenda.read_bytes() if arq_legenda else None
+        except OSError:
+            dados = None
+        if dados is None:
+            return self._aviso(404, "Sem legenda", com_corpo)
+        self._enviar(200, "text/vtt; charset=utf-8", _srt_para_vtt(dados), com_corpo)
+
+    def _video(self, arq: Path, com_corpo: bool) -> None:
+        try:
+            tamanho = arq.stat().st_size
+            arquivo = open(arq, "rb")
+        except OSError:
+            return self._aviso(404, "O arquivo não está mais disponível.", com_corpo)
+        with arquivo:
+            try:
+                faixa = _faixa(self.headers.get("Range"), tamanho)
+            except ValueError:
+                return self._cabecalhos(416, "text/plain", 0, {"Content-Range": f"bytes */{tamanho}"})
+            inicio, fim = faixa or (0, tamanho - 1)
+            extra = {"Accept-Ranges": "bytes"}
+            if faixa:
+                extra["Content-Range"] = f"bytes {inicio}-{fim}/{tamanho}"
+            tipo = TIPOS_VIDEO.get(arq.suffix.lower(), "application/octet-stream")
+            self._cabecalhos(206 if faixa else 200, tipo, fim - inicio + 1, extra)
+            if not com_corpo:
+                return None
+            arquivo.seek(inicio)
+            restante = fim - inicio + 1
+            try:
+                while restante > 0:
+                    bloco = arquivo.read(min(256 * 1024, restante))
+                    if not bloco:
+                        break
+                    self.wfile.write(bloco)
+                    restante -= len(bloco)
+            except OSError:
+                pass  # a pessoa fechou a aba ou pulou para outro ponto do filme
+        return None
+
+    def _tratar(self, com_corpo: bool) -> None:
+        caminho = urllib.parse.urlsplit(self.path).path
+        m = re.fullmatch(r"/v/([A-Za-z0-9_-]{8,64})(?:/(video|legenda\.vtt)?)?", caminho)
+        item = achar_compartilhamento(m.group(1)) if m else None
+        if item is None:
+            return self._aviso(404, "Link não encontrado.", com_corpo)
+        if expirado(item):
+            return self._aviso(410, "Este link expirou.", com_corpo)
+        arq = Path(item.get("caminho", ""))
+        if not arq.is_file():
+            return self._aviso(404, "O arquivo não está mais disponível.", com_corpo)
+        recurso = m.group(2)
+        if recurso == "video":
+            return self._video(arq, com_corpo)
+        if recurso:
+            return self._legenda(arq, com_corpo)
+        return self._pagina(item, arq, com_corpo)
+
+    def do_GET(self):
+        self._tratar(True)
+
+    def do_HEAD(self):
+        self._tratar(False)
+
+    def log_message(self, fmt, *args):
+        texto = re.sub(r"/v/([A-Za-z0-9_-]{4})[A-Za-z0-9_-]*", r"/v/\1…", fmt % args)  # não grava o link inteiro
+        log(f"{self.client_address[0]} {texto}")
+
+
+def servir_midia(host: str, porta: int) -> None:
+    """Sobe o servidor de vídeo em primeiro plano (é o que roda dentro do tmux)."""
+    with ThreadingHTTPServer((host, porta), _HandlerMidia) as servidor:
+        log(f"Servidor de vídeo em http://{host}:{porta}  (rede local: http://{ip_local()}:{porta})")
+        log("Só entrega os vídeos com link ativo. Ctrl+C para parar.")
+        servidor.serve_forever()
+
+
+# ── Criar, listar e revogar links ────────────────────────────────────
+
+def lista_compartilhamentos() -> list:
+    """Links atuais, relidos do disco (o CLI e o menu podem criar links ao mesmo tempo)."""
+    c = cfg()
+    c["compartilhamentos"] = ler_json(CONFIG_FILE, {}).get("compartilhamentos", [])
+    return c["compartilhamentos"]
+
+
+def titulo_do_arquivo(arq: Path) -> str:
+    """'Filme.Novo.2021.web.mp4' -> 'Filme Novo 2021' (sem o '.web' da versão convertida)."""
+    return re.sub(r"[._]+", " ", re.sub(r"\.web$", "", arq.stem)).strip()
+
+
+def criar_compartilhamento(arq: Path, titulo_filme: str | None = None, horas: float | None = None) -> dict:
+    arq = Path(os.path.expanduser(str(arq)))
+    if not arq.is_file():
+        raise ToonsError(f"Arquivo não encontrado: {arq}")
+    if arq.suffix.lower() not in EXTENSOES_VIDEO:
+        raise ToonsError(f"Só compartilho vídeos ({', '.join(sorted(EXTENSOES_VIDEO))}); este é '{arq.suffix}'.")
+    agora = time.time()
+    item = {"token": secrets.token_urlsafe(16), "caminho": str(arq.resolve()),
+            "titulo": (titulo_filme or titulo_do_arquivo(arq)).strip(),
+            "criado": agora, "expira": agora + horas * 3600 if horas else None}
+    lista_compartilhamentos().append(item)
+    salvar_cfg()
+    return item
+
+
+def revogar_compartilhamentos(tokens: set) -> int:
+    lista = lista_compartilhamentos()
+    restantes = [i for i in lista if i["token"] not in tokens]
+    cfg()["compartilhamentos"] = restantes
+    salvar_cfg()
+    return len(lista) - len(restantes)
+
+
+def descricao_prazo(item: dict) -> str:
+    if not item.get("expira"):
+        return "sem prazo"
+    resta = item["expira"] - time.time()
+    if resta <= 0:
+        return "EXPIROU"
+    horas, minutos = divmod(int(resta // 60), 60)
+    return f"expira em {horas // 24}d {horas % 24}h" if horas >= 24 else f"expira em {horas}h {minutos:02d}min"
+
+
+def links_de(item: dict) -> list:
+    """[(onde funciona, link)] — rede local e, se o túnel estiver ligado, a internet."""
+    porta = cfg()["midia_porta"]
+    links = [("Mesma rede Wi-Fi", f"http://{ip_local()}:{porta}/v/{item['token']}")]
+    if servico_ativo("tunel-midia") and url_tunel("tunel-midia"):
+        links.append(("Internet", f"{url_tunel('tunel-midia')}/v/{item['token']}"))
+    return links
+
+
+def porta_livre(porta: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("0.0.0.0", porta))
+        except OSError:
+            return False
+    return True
+
+
+def garantir_servidor_midia() -> bool:
+    if servico_ativo("midia"):
+        return True
+    porta = cfg()["midia_porta"]
+    if not porta_livre(porta):
+        raise ToonsError(f"A porta {porta} já está em uso por outro programa. Troque em 'Porta do servidor'.")
+    return iniciar_servico("midia", cmd_self("midia", "--porta", str(porta)), reiniciar=True)
+
+
+def mostrar_links(item: dict) -> None:
+    print(f"\n{NEG}🎬 {item['titulo']}{RST}  {DIM}({descricao_prazo(item)}){RST}")
+    for onde, link in links_de(item):
+        print(f"  {CIANO}{onde}:{RST}\n  {NEG}{link}{RST}")
+    if not (servico_ativo("tunel-midia") and url_tunel("tunel-midia")):
+        print(f"\n  {DIM}Para quem está fora da sua rede Wi-Fi, ligue o 'Túnel para a internet' neste menu.{RST}")
+
+
+# ── Compatibilidade com navegadores e conversão (ffmpeg) ─────────────
+
+def sondar_video(arq: Path):
+    """Faixas do arquivo via ffprobe: {'video': [...], 'audio': [...], 'legendas': [...]} ou None."""
+    if not tem("ffprobe"):
+        return None
+    proc = rodar(["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", str(arq)],
+                 capturar=True, timeout=60, mostrar=False)
+    if proc.returncode != 0:
+        return None
+    try:
+        faixas = json.loads(proc.stdout).get("streams", [])
+    except json.JSONDecodeError:
+        return None
+
+    def do_tipo(tipo):
+        return [s for s in faixas if s.get("codec_type") == tipo and not (s.get("disposition") or {}).get("attached_pic")]
+
+    return {"video": do_tipo("video"), "audio": do_tipo("audio"), "legendas": do_tipo("subtitle")}
+
+
+def _video_compativel(faixa: dict) -> bool:
+    codec = faixa.get("codec_name")
+    if codec == "h264":
+        return faixa.get("pix_fmt") in ("yuv420p", "yuvj420p")  # H.264 de 10 bits não toca no navegador
+    return codec in VIDEO_NAVEGADOR
+
+
+def problemas_de_reproducao(arq: Path, sonda) -> list:
+    problemas = []
+    if arq.suffix.lower() not in FORMATOS_NAVEGADOR:
+        problemas.append(f"o formato {arq.suffix} (navegadores tocam bem MP4 e WebM)")
+    if sonda:
+        if sonda["video"] and not _video_compativel(sonda["video"][0]):
+            problemas.append(f"o vídeo está em {str(sonda['video'][0].get('codec_name')).upper()} "
+                             f"({sonda['video'][0].get('pix_fmt', '?')})")
+        if sonda["audio"] and sonda["audio"][0].get("codec_name") not in AUDIO_NAVEGADOR:
+            problemas.append(f"o áudio está em {str(sonda['audio'][0].get('codec_name')).upper()}")
+        if len(sonda["audio"]) > 1:
+            problemas.append(f"há {len(sonda['audio'])} trilhas de áudio e o navegador só toca uma")
+    return problemas
+
+
+def _rotulo_faixa(faixa: dict) -> str:
+    tags = faixa.get("tags") or {}
+    partes = [tags.get("language", "und"), str(faixa.get("codec_name", "?"))]
+    if faixa.get("channels"):
+        partes.append(f"{faixa['channels']} canais")
+    if tags.get("title"):
+        partes.append(tags["title"])
+    return " · ".join(partes)
+
+
+def _indice_portugues(faixas: list) -> int:
+    for i, f in enumerate(faixas):
+        if (f.get("tags") or {}).get("language", "").lower() in ("por", "pt", "pob", "ptb"):
+            return i
+    return 0
+
+
+@contextlib.contextmanager
+def manter_acordado():
+    """Impede o celular de dormir durante tarefas longas (conversão de vídeo)."""
+    usar = tem("termux-wake-lock")
+    if usar:
+        rodar(["termux-wake-lock"], mostrar=False, timeout=10)
+    try:
+        yield
+    finally:
+        if usar and not servicos_ativos():
+            rodar(["termux-wake-unlock"], mostrar=False, timeout=10)
+
+
+def converter_para_mp4(origem: Path):
+    """Gera '<nome>.web.mp4' (H.264 + AAC) que toca em qualquer navegador. Devolve o caminho."""
+    if not garantir_cmd("ffmpeg"):
+        return None
+    sonda = sondar_video(origem)
+    destino = origem.with_name(origem.stem + ".web.mp4")
+    if destino.exists() and destino.stat().st_size > 0:
+        info(f"Já existe uma versão convertida: {destino.name}")
+        if confirmar("Usar a versão que já existe?", True):
+            return destino
+
+    trilha = 0
+    if sonda and len(sonda["audio"]) > 1:
+        info("Este arquivo tem mais de uma trilha de áudio (ex.: dublado e original).")
+        trilha = escolher("Qual áudio manter?", [_rotulo_faixa(f) for f in sonda["audio"]],
+                          str(_indice_portugues(sonda["audio"]) + 1))
+        if trilha is None:
+            return None
+
+    copiar_video = bool(sonda and sonda["video"] and _video_compativel(sonda["video"][0]))
+    if copiar_video:
+        modo = escolher("Como converter?", [
+            "Rápido: mantém o vídeo como está e só troca o áudio (recomendado)",
+            "Completo: recodifica o vídeo (bem mais lento no celular)"])
+        if modo is None:
+            return None
+        copiar_video = modo == 0
+    else:
+        aviso("O vídeo precisa ser recodificado para H.264. No celular isso pode levar mais tempo "
+              "do que a duração do filme; deixe carregando e com a tela ligada.")
+        if not confirmar("Continuar?", False):
+            return None
+
+    legenda = None
+    textos = [(n, f) for n, f in enumerate(sonda["legendas"]) if f.get("codec_name") in CODECS_LEGENDA_TEXTO] \
+        if sonda else []
+    if textos:
+        opcoes = ["Nenhuma"] + [_rotulo_faixa(f) for _, f in textos]
+        padrao = _indice_portugues([f for _, f in textos]) + 2 if any(
+            (f.get("tags") or {}).get("language", "").lower() in ("por", "pt", "pob", "ptb") for _, f in textos) else 1
+        escolha = escolher("Extrair uma legenda embutida para o player?", opcoes, str(padrao))
+        if escolha:
+            legenda = textos[escolha - 1][0]
+
+    parcial = destino.with_name(destino.name + ".part")  # só vira .web.mp4 se terminar sem erro
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-stats", "-y", "-i", str(origem),
+           "-map", "0:v:0", "-map", f"0:a:{trilha}?", "-sn", "-dn"]
+    cmd += ["-c:v", "copy"] if copiar_video else \
+        ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"]
+    cmd += ["-c:a", "aac", "-b:a", "160k", "-ac", "2", "-movflags", "+faststart", "-f", "mp4", str(parcial)]
+    info("Convertendo...")
+    t0 = time.time()
+    with manter_acordado():
+        resultado = rodar(cmd)
+    if resultado.returncode != 0 or not parcial.exists():
+        parcial.unlink(missing_ok=True)
+        raise ToonsError("O ffmpeg não conseguiu converter este arquivo.")
+    parcial.replace(destino)
+    if legenda is not None:
+        rodar(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(origem), "-map", f"0:s:{legenda}",
+               "-c:s", "webvtt", str(destino.with_suffix(".vtt"))], capturar=True, mostrar=False)
+        if destino.with_suffix(".vtt").exists():
+            ok(f"Legenda extraída: {destino.with_suffix('.vtt').name}")
+    ok(f"Pronto em {(time.time() - t0) / 60:.1f} min: {destino.name} ({bytes_humanos(destino.stat().st_size)})")
+    return destino
+
+
+def videos_para_compartilhar() -> list:
+    """[(data, tamanho, caminho)] dos vídeos nas pastas de vídeo/downloads/filmes, os mais novos primeiro."""
+    pastas = [pasta_videos(), DOWNLOADS, HOME / "storage" / "movies", HOME / "storage" / "shared" / "Movies"]
+    vistos, achados = set(), []
+    for pasta in pastas:
+        if not pasta.is_dir():
+            continue
+        for arq, st in _arquivos(pasta):
+            real = arq.resolve()
+            if arq.suffix.lower() in EXTENSOES_VIDEO and real not in vistos:
+                vistos.add(real)
+                achados.append((st.st_mtime, st.st_size, arq))
+    return sorted(achados, reverse=True)
+
+
+def _escolher_video():
+    videos = videos_para_compartilhar()
+    i = escolher("Qual vídeo você quer compartilhar?",
+                 [f"{arq.name} · {bytes_humanos(tam)}" for _, tam, arq in videos] + ["📁 Digitar outro caminho..."])
+    if i is None:
+        return None
+    if i < len(videos):
+        return videos[i][2]
+    caminho = Path(os.path.expanduser(perguntar("Caminho do arquivo")))
+    if not caminho.is_file():
+        raise ToonsError(f"Arquivo não encontrado: {caminho}")
+    return caminho
+
+
+def _pedir_prazo():
+    """(confirmado, horas ou None). Cancelar com Esc devolve confirmado=False."""
+    opcoes = [("Sem prazo (até eu apagar o link)", None), ("6 horas", 6), ("24 horas", 24),
+              ("7 dias", 168), ("Outro prazo (em horas)", -1)]
+    i = escolher("Por quanto tempo o link vai funcionar?", [rotulo for rotulo, _ in opcoes], "3")
+    if i is None:
+        return False, None
+    horas = opcoes[i][1]
+    if horas == -1:
+        horas = perguntar_float("Quantas horas", 12)
+    return True, horas
+
+
+@submenu
+def menu_midia():
+    c = cfg()
+
+    def compartilhar():
+        info("Compartilhe só o que você pode distribuir: vídeos seus, de domínio público, de licença livre "
+             "ou com autorização de quem tem os direitos.")
+        arq = _escolher_video()
+        if arq is None:
+            return
+        problemas = problemas_de_reproducao(arq, sondar_video(arq))
+        if problemas:
+            aviso("Pode não tocar no navegador de quem for assistir:\n  • " + "\n  • ".join(problemas))
+            i = escolher("O que fazer?", ["Converter para MP4 compatível (recomendado)",
+                                          "Compartilhar assim mesmo", "Cancelar"])
+            if i is None or i == 2:
+                return
+            if i == 0:
+                arq = converter_para_mp4(arq)
+                if arq is None:
+                    return
+        titulo_filme = perguntar("Título que aparece na página", titulo_do_arquivo(arq))
+        confirmado, horas = _pedir_prazo()
+        if not confirmado:
+            return
+        item = criar_compartilhamento(arq, titulo_filme, horas)
+        garantir_servidor_midia()
+        mostrar_links(item)
+        oferecer_envio(item)
+
+    def oferecer_envio(item):
+        links = links_de(item)
+        _, link = links[-1]  # o da internet, se existir; senão o da rede local
+        acoes = ["Copiar link", "Enviar pelo WhatsApp, Telegram... (menu do Android)", "Mostrar QR code", "Nada"]
+        i = escolher("O que fazer com o link?", acoes, "4")
+        texto = f"🎬 {item['titulo']}\n{link}"
+        if i == 0:
+            _tapi(["termux-clipboard-set"], 10, entrada=link, json_saida=False)
+            ok("Link copiado.")
+        elif i == 1:
+            _tapi(["termux-share", "-a", "send"], 30, entrada=texto, json_saida=False)
+        elif i == 2 and garantir_cmd("qrencode", "libqrencode"):
+            rodar(["qrencode", "-t", "ansiutf8"], entrada=link, mostrar=False)
+
+    def ver_links():
+        lista = lista_compartilhamentos()
+        if not lista:
+            info("Nenhum link criado ainda.")
+            return
+        i = escolher("Qual link?", [f"{it['titulo']} · {descricao_prazo(it)}" for it in lista])
+        if i is None:
+            return
+        item = lista[i]
+        mostrar_links(item)
+        if not Path(item["caminho"]).is_file():
+            aviso("O arquivo deste link não existe mais.")
+        acao = escolher("O que fazer?", ["Copiar / enviar / QR code", "Apagar este link", "Voltar"], "3")
+        if acao == 0:
+            oferecer_envio(item)
+        elif acao == 1 and confirmar("Apagar o link? Quem estiver com ele deixa de conseguir assistir."):
+            revogar_compartilhamentos({item["token"]})
+            ok("Link apagado.")
+
+    def apagar_todos():
+        lista = lista_compartilhamentos()
+        if not lista:
+            info("Nenhum link criado ainda.")
+        elif confirmar(f"Apagar TODOS os {len(lista)} link(s)? Ninguém mais consegue assistir."):
+            ok(f"{revogar_compartilhamentos({it['token'] for it in lista})} link(s) apagado(s).")
+
+    def apagar_expirados():
+        vencidos = {it["token"] for it in lista_compartilhamentos() if expirado(it)}
+        ok(f"{revogar_compartilhamentos(vencidos)} link(s) expirado(s) removido(s).")
+
+    def converter():
+        arq = _escolher_video()
+        if arq is None:
+            return
+        problemas = problemas_de_reproducao(arq, sondar_video(arq))
+        if problemas:
+            info("Motivos para converter:\n  • " + "\n  • ".join(problemas))
+        else:
+            info("Este arquivo já parece compatível com os navegadores.")
+        destino = converter_para_mp4(arq)
+        if destino and confirmar("Compartilhar o arquivo convertido agora?", True):
+            confirmado, horas = _pedir_prazo()
+            if confirmado:
+                item = criar_compartilhamento(destino, None, horas)
+                garantir_servidor_midia()
+                mostrar_links(item)
+                oferecer_envio(item)
+
+    def iniciar_servidor():
+        garantir_servidor_midia()
+        info("O servidor só entrega vídeos com link criado. Crie um em 'Compartilhar um filme'.")
+
+    def mudar_porta():
+        nova = perguntar_int("Porta do servidor de vídeo", c["midia_porta"], 1024, 65535)
+        c["midia_porta"] = nova
+        salvar_cfg()
+        ok(f"Porta {nova}. Reinicie o servidor e o túnel para valer.")
+
+    def iniciar_tunel():
+        aviso("Pelo túnel, quem tiver o link assiste de qualquer lugar. O filme sai do seu celular, então "
+              "a velocidade depende do upload da sua internet. O túnel gratuito da Cloudflare é pensado "
+              "para testes e pode ficar lento ou cair.")
+        if confirmar("Ligar o túnel para a internet?", True):
+            garantir_servidor_midia()
+            abrir_tunel("tunel-midia", c["midia_porta"])
+
+    menu("📺 Compartilhar filme por link", [
+        ("▶  Compartilhar um filme (criar link)", compartilhar),
+        ("Meus links (copiar, enviar, apagar)", ver_links),
+        ("Converter filme para MP4 compatível", converter),
+        *itens_servico("midia", "Servidor de vídeo", iniciar_servidor),
+        ("Túnel para a internet: ligar", iniciar_tunel),
+        ("Túnel para a internet: desligar", lambda: parar_servico("tunel-midia")),
+        ("Túnel para a internet: mostrar endereço", lambda: info(url_tunel("tunel-midia") or "Túnel desligado.")),
+        ("Apagar links expirados", apagar_expirados),
+        ("Apagar TODOS os links", apagar_todos),
+        (lambda: f"Porta do servidor ({c['midia_porta']})", mudar_porta),
     ])
 
 
@@ -4958,8 +5578,8 @@ def menu_config():
 
     def mostrar():
         for chave, valor in c.items():
-            if chave == "monitores":
-                valor = f"{len(valor)} monitor(es)"
+            if chave in ("monitores", "compartilhamentos"):
+                valor = f"{len(valor)} item(ns)"
             elif chave.endswith("token"):
                 valor = mascarar(valor)
             print(f"  {CIANO}{chave:<24}{RST} {valor}")
@@ -5085,6 +5705,7 @@ def menu_principal() -> None:
         ("🗄️ Arquivos e backup", menu_arquivos),
         ("🎵 Música (yt-dlp + mpv)", menu_musica),
         ("🎬 Vídeos (TikTok, YouTube)", menu_videos),
+        ("📺 Compartilhar filme por link", menu_midia),
         ("🔄 Atualização", menu_atualizar),
         ("🧹 Otimização e limpeza", menu_otimizacao),
         ("⚙️ Configurações", menu_config),
@@ -5115,6 +5736,13 @@ def main(argv=None) -> int:
     p.add_argument("alvos", nargs="+")
     p = sub.add_parser("video", help="baixa vídeos (links do TikTok/YouTube ou termo de busca)")
     p.add_argument("alvos", nargs="+")
+    p = sub.add_parser("midia", help="servidor de vídeo (links de compartilhamento) em primeiro plano")
+    p.add_argument("--host", default="0.0.0.0")
+    p.add_argument("--porta", type=int)
+    p = sub.add_parser("compartilhar", help="cria um link para assistir a um vídeo e liga o servidor")
+    p.add_argument("arquivo")
+    p.add_argument("--titulo")
+    p.add_argument("--horas", type=float, help="validade do link em horas (padrão: sem prazo)")
     p = sub.add_parser("tocar", help="toca a biblioteca (sem argumentos) ou um mix por busca")
     p.add_argument("busca", nargs="*")
     sub.add_parser("atualizar", help="atualiza Termux, pacotes Python, distros e o Termux-Toons")
@@ -5153,6 +5781,12 @@ def main(argv=None) -> int:
             falhas = sum(not baixar_video(alvo) for alvo in args.alvos)
             if falhas:
                 raise ToonsError(f"{falhas} download(s) falharam.")
+        elif args.comando == "midia":
+            servir_midia(args.host, args.porta or cfg()["midia_porta"])
+        elif args.comando == "compartilhar":
+            item = criar_compartilhamento(Path(args.arquivo), args.titulo, args.horas)
+            garantir_servidor_midia()
+            mostrar_links(item)
         elif args.comando == "tocar":
             if args.busca:
                 tocar_mpv([f"ytdl://ytsearch15:{' '.join(args.busca)}"], stream=True, perguntar_fundo=False)
