@@ -27,6 +27,23 @@ bash instalar.sh        # instala tmux/termux-api, pede acesso ao armazenamento 
 toons                   # ou: python termux_toons.py
 ```
 
+## Navegação
+
+Tudo é escolhido com as **setas** (use a barra de teclas extras do Termux):
+
+| Tecla | Ação |
+|-------|------|
+| `↑` `↓` | mover a seleção (dá a volta no fim da lista) |
+| `Enter` ou `→` | abrir / escolher |
+| `Esc`, `←` ou `q` | voltar / cancelar |
+| `Espaço` | marcar itens em listas de seleção múltipla (`a` marca todos) |
+| `←` `→` | alternar entre **Sim** e **Não** nas confirmações (ou aperte `s`/`n`) |
+| `Home` `End` `PgUp` `PgDn` | pular para o início, fim ou página |
+
+Digitar o número da opção também funciona como atalho. Se preferir o modo antigo, de
+digitar números, rode com `TOONS_NUMEROS=1 toons` (ele também é usado automaticamente
+quando não há um terminal interativo, por exemplo em scripts).
+
 ## O que tem no menu
 
 | # | Seção | O que faz |

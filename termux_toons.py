@@ -29,12 +29,15 @@ pacotes do Termux...) é instalado sob demanda, perguntando antes.
 from __future__ import annotations
 
 import argparse
+import atexit
+import contextlib
 import copy
 import getpass
 import hashlib
 import hmac
 import importlib
 import importlib.util
+import io
 import json
 import math
 import os
@@ -42,6 +45,7 @@ import platform
 import random
 import re
 import secrets
+import select
 import shlex
 import shutil
 import socket
@@ -50,6 +54,7 @@ import sys
 import threading
 import time
 import traceback
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -59,7 +64,13 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "1.0.0"
+try:
+    import termios
+    import tty
+except ImportError:  # sem terminal POSIX (ex.: Windows): só o modo numérico
+    termios = tty = None
+
+VERSION = "1.1.0"
 SCRIPT = Path(__file__).resolve()
 HOME = Path.home()
 PREFIX = os.environ.get("PREFIX", "")
@@ -93,7 +104,7 @@ def _c(codigo: int) -> str:
     return f"\033[{codigo}m" if _COR else ""
 
 
-RST, NEG, DIM = _c(0), _c(1), _c(2)
+RST, NEG, DIM, INV = _c(0), _c(1), _c(2), _c(7)
 VERM, VERD, AMAR, AZUL, MAG, CIANO = _c(31), _c(32), _c(33), _c(34), _c(35), _c(36)
 
 
@@ -131,10 +142,15 @@ def largura_tela() -> int:
     return shutil.get_terminal_size((60, 20)).columns
 
 
+def _centralizar(texto: str, largura: int) -> str:
+    sobra = max(0, largura - _largura(texto))
+    return " " * (sobra // 2) + texto + " " * (sobra - sobra // 2)
+
+
 def titulo(texto: str) -> None:
     largura = max(20, min(largura_tela(), 70))
     print(f"{CIANO}{'═' * largura}{RST}")
-    print(f"{NEG}{texto.center(largura)}{RST}")
+    print(f"{NEG}{_centralizar(texto, largura)}{RST}")
     print(f"{CIANO}{'═' * largura}{RST}")
 
 
@@ -174,14 +190,221 @@ def perguntar_float(msg: str, padrao=None) -> float:
             erro("Digite um número (ex.: 199.90).")
 
 
+# ── Navegação com as setas ──────────────────────────────────────────
+# Menus e listas são escolhidos com ↑/↓ e Enter. Sem terminal interativo
+# (saída redirecionada, scripts) ou com TOONS_NUMEROS=1, volta ao modo de
+# digitar o número da opção.
+
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+_SEQUENCIAS = {
+    b"[A": "cima", b"OA": "cima", b"[B": "baixo", b"OB": "baixo",
+    b"[C": "dir", b"OC": "dir", b"[D": "esq", b"OD": "esq",
+    b"[H": "home", b"OH": "home", b"[1~": "home", b"[7~": "home",
+    b"[F": "end", b"OF": "end", b"[4~": "end", b"[8~": "end",
+    b"[5~": "pgup", b"[6~": "pgdn",
+}
+
+
+def setas_ativas() -> bool:
+    return (termios is not None and sys.stdin.isatty() and sys.stdout.isatty()
+            and os.environ.get("TOONS_NUMEROS") != "1")
+
+
+def ler_tecla() -> str:
+    """Lê uma tecla sem esperar Enter: 'cima', 'baixo', 'esq', 'dir', 'enter',
+    'esc', 'home', 'end', 'pgup', 'pgdn', 'backspace' ou o próprio caractere."""
+    fd = sys.stdin.fileno()
+    antigo = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)  # sem eco e sem esperar Enter; Ctrl+C continua funcionando
+        ch = os.read(fd, 1)
+        if not ch:
+            raise SystemExit(0)
+        if ch == b"\x1b":
+            seq, espera = b"", 0.15
+            while select.select([fd], [], [], espera)[0]:
+                seq += os.read(fd, 1)
+                espera = 0.05
+                if len(seq) >= 2 and (seq[-1:].isalpha() or seq.endswith(b"~")):
+                    break
+            return _SEQUENCIAS.get(seq, "" if seq else "esc")
+        if ch in (b"\r", b"\n"):
+            return "enter"
+        if ch in (b"\x7f", b"\x08"):
+            return "backspace"
+        if ch == b"\x04":
+            return "esc"
+        if ch[0] >= 0xC0:  # caractere UTF-8 de vários bytes
+            ch += os.read(fd, 1 if ch[0] < 0xE0 else 2 if ch[0] < 0xF0 else 3)
+        return ch.decode("utf-8", errors="ignore")
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
+
+
+def _cursor(visivel: bool) -> None:
+    if sys.stdout.isatty():
+        sys.stdout.write("\033[?25h" if visivel else "\033[?25l")
+        sys.stdout.flush()
+
+
+atexit.register(_cursor, True)
+
+
+def _sem_ansi(texto: str) -> str:
+    return _ANSI.sub("", texto)
+
+
+def _largura_char(ch: str) -> int:
+    if unicodedata.combining(ch) or unicodedata.category(ch) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def _largura(texto: str) -> int:
+    return sum(_largura_char(c) for c in _sem_ansi(texto))
+
+
+def _cortar(texto: str, largura: int) -> str:
+    """Corta um texto (que pode ter cores) para caber em `largura` colunas."""
+    if _largura(texto) <= largura:
+        return texto
+    partes, usado, pos = [], 0, 0
+    while pos < len(texto):
+        m = _ANSI.match(texto, pos)
+        if m:
+            partes.append(m.group())
+            pos = m.end()
+            continue
+        w = _largura_char(texto[pos])
+        if usado + w > largura - 1:
+            break
+        partes.append(texto[pos])
+        usado += w
+        pos += 1
+    return "".join(partes) + "…" + RST
+
+
+def _linha_opcao(texto: str, selecionada: bool, colunas: int) -> str:
+    if selecionada:
+        return f"{CIANO}❯{RST} {INV}{NEG} {_cortar(_sem_ansi(texto), colunas - 5)} {RST}"
+    return "   " + _cortar(texto, colunas - 4)
+
+
+def _mover(tecla: str, sel: int, total: int, pagina: int) -> int:
+    """Nova posição da seleção para as teclas de movimento (circular em ↑/↓)."""
+    if tecla in ("cima", "k"):
+        return (sel - 1) % total
+    if tecla in ("baixo", "j"):
+        return (sel + 1) % total
+    if tecla == "home":
+        return 0
+    if tecla == "end":
+        return total - 1
+    if tecla == "pgup":
+        return max(0, sel - pagina)
+    if tecla == "pgdn":
+        return min(total - 1, sel + pagina)
+    return sel
+
+
+def _janela(sel: int, topo: int, altura: int, total: int) -> int:
+    """Ajusta o início da parte visível para a seleção ficar na tela."""
+    if sel < topo:
+        topo = sel
+    elif sel >= topo + altura:
+        topo = sel - altura + 1
+    return max(0, min(topo, total - altura))
+
+
+def _lista_inline(msg: str, opcoes: list, sel: int = 0, multipla: bool = False):
+    """Lista escolhida com as setas logo abaixo da pergunta (sem limpar a tela)."""
+    dica = "↑↓ · Espaço marca · a todas · Enter" if multipla else "↑↓ e Enter · Esc cancela"
+    print(f"{AMAR}?{RST} {msg} {DIM}({dica}){RST}")
+    marcadas, topo, desenhadas, resultado = set(), 0, 0, None
+    _cursor(False)
+    try:
+        while True:
+            colunas, linhas_tela = shutil.get_terminal_size((60, 24))
+            altura = max(1, min(len(opcoes), linhas_tela - 3))
+            topo = _janela(sel, topo, altura, len(opcoes))
+            linhas = []
+            for i in range(topo, topo + altura):
+                caixa = ("[x] " if i in marcadas else "[ ] ") if multipla else ""
+                linhas.append(_linha_opcao(caixa + str(opcoes[i]), i == sel, colunas))
+            if len(opcoes) > altura:
+                linhas.append(f"{DIM}   {sel + 1}/{len(opcoes)}{RST}")
+            if desenhadas:
+                sys.stdout.write(f"\033[{desenhadas}A\r")
+            sys.stdout.write("".join(linha + "\033[K\n" for linha in linhas) + "\033[J")
+            sys.stdout.flush()
+            desenhadas = len(linhas)
+
+            tecla = ler_tecla()
+            if tecla in ("enter", "dir"):
+                resultado = (sorted(marcadas) or [sel]) if multipla else sel
+                break
+            if tecla in ("esc", "esq", "q", "backspace"):
+                break
+            if multipla and tecla == " ":
+                marcadas ^= {sel}
+            elif multipla and tecla in ("a", "A"):
+                marcadas = set() if len(marcadas) == len(opcoes) else set(range(len(opcoes)))
+            elif tecla.isdigit() and 1 <= int(tecla) <= len(opcoes):
+                sel = int(tecla) - 1
+            else:
+                sel = _mover(tecla, sel, len(opcoes), altura)
+    finally:
+        if desenhadas:
+            sys.stdout.write(f"\033[{desenhadas}A\r\033[J")  # some com a lista
+        _cursor(True)
+    if resultado is None:
+        print(f"   {DIM}cancelado{RST}")
+    elif multipla:
+        print(f"   {VERD}✔{RST} {len(resultado)} selecionada(s)")
+    else:
+        print(f"   {VERD}✔{RST} {_sem_ansi(str(opcoes[resultado]))}")
+    return resultado
+
+
 def confirmar(msg: str, padrao: bool = False) -> bool:
-    resp = perguntar(f"{msg} ({'S/n' if padrao else 's/N'})").lower()
-    if not resp:
-        return padrao
-    return resp in ("s", "sim", "y", "yes")
+    if not setas_ativas():
+        resp = perguntar(f"{msg} ({'S/n' if padrao else 's/N'})").lower()
+        if not resp:
+            return padrao
+        return resp in ("s", "sim", "y", "yes")
+    sim = padrao
+    print(f"{AMAR}?{RST} {msg}")
+    _cursor(False)
+    try:
+        while True:
+            botoes = (f"{INV}{NEG} Sim {RST}  Não " if sim else f" Sim  {INV}{NEG} Não {RST}") if _COR \
+                else ("[Sim]  Não " if sim else " Sim  [Não]")
+            sys.stdout.write(f"\r   {botoes}  {DIM}(←→ e Enter){RST}\033[K")
+            sys.stdout.flush()
+            tecla = ler_tecla()
+            if tecla in ("esq", "dir", "cima", "baixo", "\t"):
+                sim = not sim
+            elif tecla.lower() in ("s", "y"):
+                sim = True
+                break
+            elif tecla.lower() == "n" or tecla == "esc":
+                sim = False
+                break
+            elif tecla == "enter":
+                break
+    finally:
+        _cursor(True)
+    sys.stdout.write(f"\r   {VERD}✔{RST} {'Sim' if sim else 'Não'}\033[K\n")
+    return sim
 
 
 def pausar() -> None:
+    if setas_ativas():
+        print(f"\n{DIM}Pressione qualquer tecla para continuar...{RST}", end="", flush=True)
+        with contextlib.suppress(KeyboardInterrupt):
+            ler_tecla()
+        print()
+        return
     try:
         input(f"\n{DIM}Pressione Enter para continuar...{RST}")
     except EOFError:
@@ -189,13 +412,44 @@ def pausar() -> None:
 
 
 def escolher(msg: str, opcoes: list, padrao=None):
-    """Lista opções numeradas e devolve o índice escolhido (ou None)."""
+    """Escolhe uma opção (setas ou número) e devolve o índice, ou None se cancelar."""
+    if not opcoes:
+        return None
+    if setas_ativas():
+        inicial = int(padrao) - 1 if str(padrao).isdigit() and 1 <= int(padrao) <= len(opcoes) else 0
+        return _lista_inline(msg, opcoes, inicial)
     for i, op in enumerate(opcoes, 1):
         print(f"  {CIANO}{i:>2}{RST}) {op}")
     resp = perguntar(msg, padrao)
     if resp.isdigit() and 1 <= int(resp) <= len(opcoes):
         return int(resp) - 1
     return None
+
+
+def _parse_selecao(texto: str, total: int) -> list:
+    """'1,3,5-8' -> [0, 2, 4, 5, 6, 7]"""
+    indices = []
+    for parte in texto.replace(" ", "").split(","):
+        if re.fullmatch(r"\d+-\d+", parte):
+            a, b = map(int, parte.split("-"))
+            indices += range(a - 1, b)
+        elif parte.isdigit():
+            indices.append(int(parte) - 1)
+    return [i for i in dict.fromkeys(indices) if 0 <= i < total]
+
+
+def escolher_varios(msg: str, opcoes: list) -> list:
+    """Marca várias opções (Espaço) e devolve os índices; lista vazia se cancelar."""
+    if not opcoes:
+        return []
+    if setas_ativas():
+        return _lista_inline(msg, opcoes, multipla=True) or []
+    for i, op in enumerate(opcoes, 1):
+        print(f"  {CIANO}{i:>3}{RST}) {op}")
+    resp = perguntar(f"{msg} (ex.: 1,4,7-9; 'a' = todas)", "")
+    if resp.lower() in ("a", "todas"):
+        return list(range(len(opcoes)))
+    return _parse_selecao(resp, len(opcoes))
 
 
 def mostrar_dados(dados, recuo: int = 0) -> None:
@@ -248,7 +502,71 @@ def executar(func, rotulo: str = "") -> None:
         pausar()
 
 
+def _menu_setas(titulo_menu: str, itens: list, sair: str, cabecalho, sel: int):
+    """Desenha o menu em tela cheia e devolve o índice escolhido (None = voltar)."""
+    linhas_cab = []
+    if cabecalho:
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            cabecalho()
+        linhas_cab = buffer.getvalue().rstrip("\n").split("\n")
+    topo, digitos, t_digito = 0, "", 0.0
+    limpar()
+    _cursor(False)
+    try:
+        while True:
+            colunas, linhas_tela = shutil.get_terminal_size((60, 24))
+            rotulos = [r() if callable(r) else r for r, _ in itens] + [f"↩  {sair}"]
+            total = len(rotulos)
+            cab = linhas_cab
+            disponivel = linhas_tela - len(cab) - 5
+            if disponivel < min(total, 6):  # tela pequena: esconde o cabeçalho
+                cab, disponivel = [], linhas_tela - 5
+            altura = max(1, min(total, disponivel))
+            topo = _janela(sel, topo, altura, total)
+            largura = max(20, min(colunas, 70))
+            linhas = [*cab, f"{CIANO}{'═' * largura}{RST}", f"{NEG}{_centralizar(titulo_menu, largura)}{RST}",
+                      f"{CIANO}{'═' * largura}{RST}"]
+            linhas += [_linha_opcao(rotulos[i], i == sel, colunas) for i in range(topo, topo + altura)]
+            rodape = "↑↓ mover · Enter abre · Esc volta"
+            if total > altura:
+                rodape += f" · {sel + 1}/{total}"
+            linhas += ["", f"{DIM}{rodape}{RST}"]
+            sys.stdout.write("\033[H" + "\n".join(_cortar(linha, colunas) + "\033[K" for linha in linhas)
+                             + "\033[J")
+            sys.stdout.flush()
+
+            tecla = ler_tecla()
+            if tecla in ("enter", "dir", " "):
+                return None if sel == total - 1 else sel
+            if tecla in ("esc", "esq", "q", "backspace"):
+                return None
+            if tecla.isdigit():  # atalho: digitar o número da opção (0 = voltar)
+                agora = time.time()
+                digitos = digitos + tecla if agora - t_digito < 1.0 else tecla
+                t_digito = agora
+                if not 0 <= int(digitos) < total:
+                    digitos = tecla
+                sel = total - 1 if int(digitos) == 0 else min(int(digitos), total) - 1
+            else:
+                sel = _mover(tecla, sel, total, altura)
+    finally:
+        _cursor(True)
+
+
 def menu(titulo_menu: str, itens: list, sair: str = "Voltar", cabecalho=None) -> None:
+    if setas_ativas():
+        sel = 0
+        while True:
+            try:
+                escolha = _menu_setas(titulo_menu, itens, sair, cabecalho, sel)
+            except KeyboardInterrupt:
+                return
+            if escolha is None:
+                return
+            sel = escolha
+            rotulo, func = itens[escolha]
+            executar(func, rotulo() if callable(rotulo) else rotulo)
     while True:
         limpar()
         if cabecalho:
@@ -1465,8 +1783,8 @@ def menu_termux_api():
         nomes = sensores()
         if not nomes:
             aviso("Nenhum sensor retornado.")
-        for i, nome in enumerate(nomes, 1):
-            print(f"  {i:>2}) {nome}")
+        for nome in nomes:
+            print(f"  • {nome}")
 
     def ler_sensor_menu():
         nomes = sensores()
@@ -2529,11 +2847,11 @@ def menu_monitor():
         if not c["monitores"]:
             info("Nenhum monitor cadastrado.")
             return
-        for i, m in enumerate(c["monitores"], 1):
+        for m in c["monitores"]:
             est = estado.get(m["id"], {})
             situacao = f"{VERM}erro: {est['erro']}{RST}" if est.get("erro") else est.get("resumo", "—")
             ativo = "" if m.get("ativo", True) else f" {DIM}(pausado){RST}"
-            print(f"{CIANO}{i:>2}){RST} {NEG}{m['nome']}{RST}{ativo} [{m['tipo']}] a cada "
+            print(f"{CIANO}•{RST} {NEG}{m['nome']}{RST}{ativo} [{m['tipo']}] a cada "
                   f"{int(m.get('intervalo', 300)) // 60} min")
             if m.get("url"):
                 print(f"     {DIM}{m['url'][:70]}{RST}")
@@ -3940,18 +4258,6 @@ def baixar_alvo(alvo: str) -> None:
         baixar_musica(f"ytsearch1:{alvo}")
 
 
-def _parse_selecao(texto: str, total: int) -> list:
-    """'1,3,5-8' -> [0, 2, 4, 5, 6, 7]"""
-    indices = []
-    for parte in texto.replace(" ", "").split(","):
-        if re.fullmatch(r"\d+-\d+", parte):
-            a, b = map(int, parte.split("-"))
-            indices += range(a - 1, b)
-        elif parte.isdigit():
-            indices.append(int(parte) - 1)
-    return [i for i in dict.fromkeys(indices) if 0 <= i < total]
-
-
 @submenu
 def menu_musica():
     c = cfg()
@@ -3986,10 +4292,9 @@ def menu_musica():
         if not musicas:
             info(f"Nenhuma música em {pasta_musicas()}. Baixe algumas primeiro!")
             return
-        for i, m in enumerate(musicas, 1):
-            print(f"  {CIANO}{i:>3}{RST}) {m.stem}")
-        sel = _parse_selecao(perguntar("Tocar quais? (ex.: 1  ou 1,4,7-9; Enter = todas)", ""), len(musicas))
-        tocar_mpv([musicas[i] for i in sel] if sel else musicas)
+        sel = escolher_varios("Tocar quais?", [m.stem for m in musicas])
+        if sel:
+            tocar_mpv([musicas[i] for i in sel])
 
     def tudo_aleatorio():
         musicas = musicas_locais()
@@ -4003,9 +4308,7 @@ def menu_musica():
         if not musicas:
             info("Biblioteca vazia.")
             return
-        for i, m in enumerate(musicas, 1):
-            print(f"  {CIANO}{i:>3}{RST}) {m.stem}")
-        sel = _parse_selecao(perguntar("Músicas da playlist (ex.: 1,3,5-8)"), len(musicas))
+        sel = escolher_varios("Músicas da playlist", [m.stem for m in musicas])
         if not sel:
             return
         nome = re.sub(r"[^\w\- ]", "_", perguntar("Nome da playlist", "favoritas")).strip() or "playlist"
