@@ -19,8 +19,8 @@ Reúne em um único menu:
   13. Vídeos do TikTok, YouTube e outros sites com yt-dlp
   14. Atualização do Termux e dos repositórios
   15. Otimização e limpeza (caches, arquivos grandes/duplicados, processos)
-  16. Compartilhar filmes por link: arquivo do celular ou link do TorBox, com player
-      próprio, troca de trilha de áudio e conversão na hora (servidor de vídeo + túnel)
+  16. Compartilhar filmes por link: arquivo do celular ou qualquer link de vídeo, com
+      player próprio, troca de trilha de áudio e conversão na hora (servidor de vídeo + túnel)
 
 Uso:
     python termux_toons.py            # menu interativo
@@ -4461,8 +4461,9 @@ def menu_videos():
 # ════════════════════════════════════════════════════════════════════
 # Um servidor próprio, separado da API: só entrega os vídeos que você
 # compartilhou, cada um com um link secreto (e prazo opcional). O vídeo
-# pode ser um arquivo do celular ou um link direto da internet (TorBox,
-# Real-Debrid, servidor seu...), repassado sem baixar o filme inteiro.
+# pode ser um arquivo do celular, um link direto da internet (servidor
+# seu, nuvem, serviços de debrid...) ou uma página de vídeo (YouTube,
+# Vimeo... achada pelo yt-dlp), repassados sem baixar o filme inteiro.
 # O que o navegador toca é entregue como está (HTTP Range: dá para pular
 # para qualquer ponto). O resto (MKV, áudio AC3/DTS, várias trilhas de
 # áudio) o ffmpeg converte na hora, copiando o vídeo e recodificando só o
@@ -5222,8 +5223,59 @@ def eh_link(texto) -> bool:
 
 
 def fonte_de(item: dict) -> str:
-    """O que o servidor lê para um link: o endereço da internet ou o caminho do arquivo."""
-    return item.get("url") or item.get("caminho", "")
+    """O vídeo de um compartilhamento como foi cadastrado: página, link da internet ou caminho do arquivo."""
+    return item.get("pagina") or item.get("url") or item.get("caminho", "")
+
+
+def fontes_de(item: dict, renovar: bool = False) -> list:
+    """O que o ffmpeg e o servidor leem: [arquivo] ou [link]; numa página, [vídeo] ou [vídeo, áudio]
+    (sites como o YouTube separam os dois), achados pelo yt-dlp."""
+    if item.get("pagina"):
+        return info_pagina(item["pagina"], renovar)["enderecos"]
+    return [fonte_de(item)]
+
+
+# Formato pedido ao yt-dlp: até 1080p, de preferência H.264 + AAC (só copiados, sem pesar no celular), por
+# HTTP direto (o ffmpeg não escolhe uma qualidade dentro de um manifesto DASH); senão, o que houver.
+_HTTP_SIMPLES = "[protocol^=http][protocol!*=dash]"
+FORMATO_PAGINA = (f"bv*[height<=1080][vcodec^=avc1]{_HTTP_SIMPLES}+ba[acodec^=mp4a]{_HTTP_SIMPLES}/"
+                  f"bv*[height<=1080]{_HTTP_SIMPLES}+ba{_HTTP_SIMPLES}/b[height<=1080]{_HTTP_SIMPLES}/b")
+_PAGINAS: dict = {}          # página -> (quando, {'enderecos', 'titulo', 'duracao'})
+_PAGINAS_TRAVA = threading.Lock()
+_CABECALHOS_LINK: dict = {}  # endereço achado pelo yt-dlp -> cabeçalhos HTTP que o site exige (Referer...)
+
+
+def info_pagina(pagina: str, renovar: bool = False) -> dict:
+    """Vídeo de uma página (YouTube, Vimeo, Google Drive...) achado pelo yt-dlp, sem baixar:
+    {'enderecos': [vídeo] ou [vídeo, áudio], 'titulo', 'duracao'}. Os sites expiram esses endereços em
+    poucas horas: ficam 1 hora em cache e `renovar` pede outros."""
+    with _PAGINAS_TRAVA:
+        achado = _PAGINAS.get(pagina)
+        if achado and not renovar and time.time() - achado[0] < 3600:
+            return achado[1]
+        if not tem("yt-dlp"):
+            raise ToonsError("Links de página (YouTube, Vimeo...) precisam do yt-dlp: pkg install python-yt-dlp")
+        proc = rodar(["yt-dlp", "-j", "--no-playlist", "--no-warnings", "-f", FORMATO_PAGINA, pagina],
+                     capturar=True, timeout=180, mostrar=False)
+        dados = None
+        with contextlib.suppress(json.JSONDecodeError, IndexError):
+            dados = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 else None
+        formatos = [f for f in ((dados.get("requested_formats") or [dados]) if dados else []) if f.get("url")]
+        if not formatos:
+            raise ToonsError("O yt-dlp não achou um vídeo nessa página. " + (proc.stderr or "").strip()[-300:])
+        for velho in (achado[1]["enderecos"] if achado else []):
+            _CABECALHOS_LINK.pop(velho, None)
+        for f in formatos[:2]:
+            _CABECALHOS_LINK[f["url"]] = {k: v for k, v in (f.get("http_headers") or dados.get("http_headers") or {}).items()
+                                          if isinstance(v, str) and k.lower() != "accept-encoding"}
+        resultado = {"enderecos": [f["url"] for f in formatos[:2]], "titulo": str(dados.get("title") or "Vídeo"),
+                     "duracao": dados.get("duration")}
+        _PAGINAS[pagina] = (time.time(), resultado)
+        return resultado
+
+
+def _cabecalhos_de(url: str) -> dict:
+    return {"User-Agent": USER_AGENT, **_CABECALHOS_LINK.get(url, {})}
 
 
 def extensao_de(fonte) -> str:
@@ -5237,7 +5289,10 @@ def _opcoes_entrada(fonte: str, ffprobe: bool = False) -> list:
     no ffmpeg, reconectam sozinhos se a conexão cair no meio do filme."""
     if not eh_link(fonte):
         return ["-i", "file:" + fonte]
-    opcoes = ["-user_agent", USER_AGENT, "-rw_timeout", "30000000"]
+    cabecalhos = _cabecalhos_de(fonte)
+    opcoes = ["-user_agent", cabecalhos.pop("User-Agent"), "-rw_timeout", "30000000"]
+    if cabecalhos:
+        opcoes += ["-headers", "".join(f"{chave}: {valor}\r\n" for chave, valor in cabecalhos.items())]
     if not ffprobe:
         opcoes += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1",
                    "-reconnect_delay_max", "10"]
@@ -5326,7 +5381,18 @@ _SONDAS: dict = {}
 _SONDAS_TRAVA = threading.Lock()
 
 
-def sonda_em_cache(fonte: str):
+def sonda_em_cache(fontes: list):
+    """Faixas de [arquivo], [link] ou [vídeo, áudio] (página), lembrando o resultado de cada fonte."""
+    sondas = [_sonda_unica_em_cache(fonte) for fonte in fontes]
+    if not sondas or None in sondas:
+        return None
+    if len(sondas) == 1:
+        return sondas[0]
+    video, audio = sondas[0], sondas[-1]
+    return {"video": video["video"], "audio": audio["audio"], "legendas": video["legendas"], "formato": video["formato"]}
+
+
+def _sonda_unica_em_cache(fonte: str):
     """sondar_video lembrando o resultado: arquivos até mudarem, links por 6 horas."""
     if eh_link(fonte):
         chave, validade = fonte, 6 * 3600
@@ -5367,7 +5433,7 @@ def _inicio(sonda) -> float:
 
 
 def _hms(segundos) -> str:
-    minutos = int(segundos or 0) // 60
+    minutos = round((segundos or 0) / 60)
     return f"{minutos // 60}h {minutos % 60:02d}min" if minutos >= 60 else f"{minutos}min"
 
 
@@ -5435,9 +5501,17 @@ def _codecs_navegador(faixa) -> str:
             "hevc": "hvc1.2.4.L120.90" if dez_bits else "hvc1.1.6.L120.90"}.get(codec, "")
 
 
-def _toca_direto(fonte: str, sonda) -> bool:
+def _arquivo_unico(fontes: list, sonda) -> bool:
+    """A fonte é um arquivo só, que dá para entregar byte a byte (não vídeo + áudio separados nem HLS)?"""
+    formato = sonda["formato"].get("format_name", "") if sonda else ""
+    return len(fontes) == 1 and extensao_de(fontes[0]) != ".m3u8" and "hls" not in formato
+
+
+def _toca_direto(fontes: list, sonda) -> bool:
     """O navegador toca o arquivo original como está, sem o ffmpeg?"""
-    ext = extensao_de(fonte)
+    if not _arquivo_unico(fontes, sonda):
+        return False
+    ext = extensao_de(fontes[0])
     if sonda is None:
         return ext in FORMATOS_NAVEGADOR  # sem ffprobe, só dá para confiar na extensão
     if ext not in FORMATOS_NAVEGADOR and not (ext == "" and "mp4" in sonda["formato"].get("format_name", "")):
@@ -5516,7 +5590,7 @@ def _legenda_padrao(legendas: list, audio_em_portugues: bool) -> int:
 
 def _arquivo_legenda(item: dict, n: int) -> Path:
     """Cache de uma legenda embutida. Num link, vale para o compartilhamento (trocar o endereço expirado
-    do TorBox não obriga a baixar o filme de novo); num arquivo, até ele mudar."""
+    que expirou não obriga a baixar o filme de novo); num arquivo, até ele mudar."""
     fonte = fonte_de(item)
     ident = f"link|{item['token']}"
     if not eh_link(fonte):
@@ -5566,7 +5640,7 @@ def legenda_embutida(item: dict, n: int, todas: list):
                         if not d.exists() and _EXTRACOES.get(d.name, ("",))[0] != "extraindo"}
             for destino in faltando.values():
                 _EXTRACOES[destino.name] = ("extraindo", time.time())
-            threading.Thread(target=_extrair_legendas, args=(fonte_de(item), faltando), daemon=True).start()
+            threading.Thread(target=_extrair_legendas, args=(fontes_de(item)[0], faltando), daemon=True).start()
             estado = ("extraindo", time.time())
     return None, estado[0]
 
@@ -5617,15 +5691,18 @@ def tem_encoder(nome: str) -> bool:
     return _ENCODERS[nome]
 
 
-def comando_transmissao(fonte: str, sonda, audio: int = 0, inicio: float = 0.0,
+def comando_transmissao(fontes: list, sonda, audio: int = 0, inicio: float = 0.0,
                         recodificar: bool = False, audio_codec: str = "aac") -> list:
     """ffmpeg que gera um MP4 fragmentado (toca enquanto chega) a partir de `inicio` segundos, com a trilha
-    de áudio `audio`. A imagem é copiada (leve); só é recodificada se o navegador não toca o formato."""
+    de áudio `audio`. A imagem é copiada (leve); só é recodificada se o navegador não toca o formato.
+    Com [vídeo, áudio] (página do YouTube, por exemplo) junta as duas fontes."""
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
-    if inicio > 0:
-        cmd += ["-ss", f"{inicio + 0.005:.3f}"]  # um pouco depois do quadro-chave: o ffmpeg volta até ele
-    cmd += _opcoes_entrada(fonte)
-    cmd += ["-map", "0:v:0?", "-map", f"0:a:{audio}?", "-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1"]
+    for fonte in fontes:
+        if inicio > 0:
+            cmd += ["-ss", f"{inicio + 0.005:.3f}"]  # um pouco depois do quadro-chave: o ffmpeg volta até ele
+        cmd += _opcoes_entrada(fonte)
+    cmd += ["-map", "0:v:0?", "-map", f"{len(fontes) - 1}:a:{audio}?", "-sn", "-dn", "-map_metadata", "-1",
+            "-map_chapters", "-1"]
     video = sonda["video"][0] if sonda and sonda["video"] else None
     if video and (recodificar or not _video_copiavel(video)):
         cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "24", "-maxrate", "4M", "-bufsize", "8M",
@@ -5653,7 +5730,7 @@ _TRANSMISSOES_TRAVA = threading.Lock()
 def info_link(url: str) -> dict:
     """Confere um link de vídeo pedindo só o primeiro byte: {'status', 'nome', 'tamanho', 'tipo'}.
     Erros de rede viram exceção (OSError)."""
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Range": "bytes=0-0"})
+    req = urllib.request.Request(url, headers={**_cabecalhos_de(url), "Range": "bytes=0-0"})
     try:
         resposta = urllib.request.urlopen(req, timeout=25)
     except urllib.error.HTTPError as e:
@@ -5694,7 +5771,7 @@ def expirado(item: dict) -> bool:
     return bool(item.get("expira")) and time.time() > item["expira"]
 
 
-def config_do_player(item: dict, sonda) -> dict:
+def config_do_player(item: dict, fontes: list, sonda) -> dict:
     """Tudo que o player precisa saber do vídeo (vai embutido na página)."""
     fonte = fonte_de(item)
     audios = sonda["audio"] if sonda else []
@@ -5705,10 +5782,11 @@ def config_do_player(item: dict, sonda) -> dict:
         "token": item["token"],
         "titulo": item.get("titulo") or titulo_do_arquivo(Path(fonte)),
         "duracao": _duracao(sonda),
-        "direto": _toca_direto(fonte, sonda),
+        "direto": _toca_direto(fontes, sonda),
         "transmissao": tem("ffmpeg"),
         "remoto": eh_link(fonte),
-        "mp4": extensao_de(fonte) in (".mp4", ".m4v", ".mov") or "mp4" in (sonda["formato"].get("format_name", "") if sonda else ""),
+        "mp4": _arquivo_unico(fontes, sonda) and (extensao_de(fontes[0]) in (".mp4", ".m4v", ".mov")
+                                                  or "mp4" in (sonda["formato"].get("format_name", "") if sonda else "")),
         "video": {"codecs": _codecs_navegador(video), "copiavel": _video_copiavel(video)} if video else None,
         "audios": [{"rotulo": _rotulo_faixa(f)} for f in audios],
         "audio_padrao": audio_padrao,
@@ -5757,9 +5835,9 @@ class _HandlerMidia(BaseHTTPRequestHandler):
                  f"<h2 style='font-weight:600'>{html_mod.escape(msg)}</h2></div>").encode()
         self._enviar(status, "text/html; charset=utf-8", corpo, com_corpo)
 
-    def _pagina(self, item: dict, sonda, com_corpo: bool) -> None:
+    def _pagina(self, item: dict, fontes: list, sonda, com_corpo: bool) -> None:
         import html as html_mod
-        config = config_do_player(item, sonda)
+        config = config_do_player(item, fontes, sonda)
         dados = json.dumps(config).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
         trocas = {"@TITULO@": html_mod.escape(config["titulo"]), "@CONFIG@": dados}
         pagina = re.sub(r"@TITULO@|@CONFIG@", lambda m: trocas[m.group()], PAGINA_FILME)
@@ -5826,7 +5904,7 @@ class _HandlerMidia(BaseHTTPRequestHandler):
 
     def _repassar(self, url: str, sonda, com_corpo: bool) -> None:
         """Entrega um link da internet como se fosse um arquivo daqui (com Range), sem revelar o endereço."""
-        cabecalhos = {"User-Agent": USER_AGENT}
+        cabecalhos = _cabecalhos_de(url)
         if self.headers.get("Range"):
             cabecalhos["Range"] = self.headers["Range"]
         try:
@@ -5849,7 +5927,7 @@ class _HandlerMidia(BaseHTTPRequestHandler):
                 self._copiar(resposta, None)
         return None
 
-    def _transmitir(self, item: dict, sonda, consulta: dict, com_corpo: bool) -> None:
+    def _transmitir(self, item: dict, fontes: list, sonda, consulta: dict, com_corpo: bool) -> None:
         if not tem("ffmpeg"):
             return self._aviso(503, "O ffmpeg não está instalado no celular que compartilhou o vídeo.", com_corpo)
         if not com_corpo:
@@ -5860,7 +5938,7 @@ class _HandlerMidia(BaseHTTPRequestHandler):
         inicio = max(0.0, _numero(consulta, "t", 0))
         sessao_player = re.sub(r"[^a-z0-9]", "", consulta.get("s", [""])[0])[:16] or "x"
         chave = f"{item['token']}:{sessao_player}"
-        cmd = comando_transmissao(fonte_de(item), sonda, audio, inicio, consulta.get("v", [""])[0] == "h264",
+        cmd = comando_transmissao(fontes, sonda, audio, inicio, consulta.get("v", [""])[0] == "h264",
                                   "opus" if consulta.get("ac", [""])[0] == "opus" else "aac")
         processo = None
         with _TRANSMISSOES_TRAVA:
@@ -5897,6 +5975,11 @@ class _HandlerMidia(BaseHTTPRequestHandler):
     def _estado(self, item: dict, com_corpo: bool) -> None:
         """Por que a transmissão falhou? O player pergunta isso para mostrar uma mensagem útil."""
         fonte = fonte_de(item)
+        if item.get("pagina"):  # pede endereços novos ao yt-dlp: os antigos podem ter expirado
+            try:
+                fonte = fontes_de(item, renovar=True)[0]
+            except ToonsError as e:
+                return self._json(200, {"ok": False, "erro": str(e)}, com_corpo)
         if eh_link(fonte):
             try:
                 status = info_link(fonte)["status"]
@@ -5926,18 +6009,26 @@ class _HandlerMidia(BaseHTTPRequestHandler):
             return self._aviso(404, "O arquivo não está mais disponível.", com_corpo)
         if recurso == "estado":
             return self._estado(item, com_corpo)
-        sonda = sonda_em_cache(fonte)
+        try:
+            fontes = fontes_de(item)
+        except ToonsError as e:
+            return self._aviso(502, str(e), com_corpo)
+        sonda = sonda_em_cache(fontes)
         consulta = urllib.parse.parse_qs(partes.query)
         if recurso == "video":
-            return self._repassar(fonte, sonda, com_corpo) if eh_link(fonte) else self._arquivo(Path(fonte), sonda, com_corpo)
+            if not _arquivo_unico(fontes, sonda):  # vídeo e áudio separados ou HLS: vai convertido, sem pular
+                return self._transmitir(item, fontes, sonda, {"s": [secrets.token_hex(4)]}, com_corpo)
+            if eh_link(fontes[0]):
+                return self._repassar(fontes[0], sonda, com_corpo)
+            return self._arquivo(Path(fontes[0]), sonda, com_corpo)
         if recurso == "stream":
-            return self._transmitir(item, sonda, consulta, com_corpo)
+            return self._transmitir(item, fontes, sonda, consulta, com_corpo)
         if recurso == "ponto":
             t = max(0.0, _numero(consulta, "t", 0))
-            return self._json(200, {"t": round(ponto_de_corte(fonte, sonda, t), 3)}, com_corpo)
+            return self._json(200, {"t": round(ponto_de_corte(fontes[0], sonda, t), 3)}, com_corpo)
         if recurso:
             return self._legenda(item, sonda, int(m.group(3)), com_corpo)
-        return self._pagina(item, sonda, com_corpo)
+        return self._pagina(item, fontes, sonda, com_corpo)
 
     def do_GET(self):
         self._tratar(True)
@@ -5987,12 +6078,13 @@ def titulo_do_link(url: str, nome: str = "") -> str:
 
 
 def criar_compartilhamento(alvo, titulo_filme: str | None = None, horas: float | None = None,
-                           legendas: list | None = None, embutidas: list | None = None) -> dict:
-    """Cria um link secreto para um vídeo do celular ou para um link direto da internet (TorBox...)."""
+                           legendas: list | None = None, embutidas: list | None = None, pagina: bool = False) -> dict:
+    """Cria um link secreto para um vídeo do celular, um link direto da internet ou (`pagina`) uma página de
+    vídeo que o yt-dlp lê na hora de assistir (YouTube, Vimeo...)."""
     item = {"token": secrets.token_urlsafe(16)}
     if eh_link(alvo):
-        item["url"] = str(alvo).strip()
-        padrao = titulo_do_link(item["url"])
+        item["pagina" if pagina else "url"] = str(alvo).strip()
+        padrao = "Vídeo" if pagina else titulo_do_link(str(alvo).strip())
     else:
         arq = Path(os.path.expanduser(str(alvo)))
         if not arq.is_file():
@@ -6014,9 +6106,12 @@ def criar_compartilhamento(alvo, titulo_filme: str | None = None, horas: float |
 
 
 def atualizar_compartilhamento(token: str, **campos) -> dict | None:
+    """Muda campos de um link (None apaga o campo)."""
     for item in lista_compartilhamentos():
         if item["token"] == token:
             item.update(campos)
+            for chave in [k for k, v in campos.items() if v is None]:
+                item.pop(chave, None)
             salvar_cfg()
             return item
     return None
@@ -6086,7 +6181,8 @@ def garantir_servidor_midia() -> bool:
 
 
 def mostrar_links(item: dict) -> None:
-    origem = "🌐 link da internet" if item.get("url") else "📁 arquivo do celular"
+    origem = ("▶ página de vídeo" if item.get("pagina") else "🌐 link da internet" if item.get("url")
+              else "📁 arquivo do celular")
     print(f"\n{NEG}🎬 {item['titulo']}{RST}  {DIM}({origem} · {descricao_prazo(item)}){RST}")
     for onde, link in links_de(item):
         print(f"  {CIANO}{onde}:{RST}\n  {NEG}{link}{RST}")
@@ -6136,7 +6232,7 @@ def endereco_para_assistir(url: str) -> str:
 def assistir_link_no_celular(url: str | None = None) -> None:
     """Toca um link no VLC (ou outro app) do próprio celular, sem baixar o vídeo."""
     if url is None:
-        info("Serve link direto de arquivo (TorBox, Real-Debrid...) e páginas do YouTube, TikTok etc.")
+        info("Serve link direto de arquivo (servidor seu, nuvem, debrid...) e páginas de vídeo (YouTube, TikTok...).")
         url = perguntar("Link do vídeo")
     if not url:
         return
@@ -6274,29 +6370,42 @@ def _pedir_prazo():
     return True, horas
 
 
-def conferir_link(url: str):
-    """Confere se o link responde e lê as faixas do vídeo sem baixá-lo. Devolve (info_link, sonda)."""
+def conferir_link(url: str) -> dict:
+    """Confere um link sem baixar o vídeo e mostra as faixas: {'pagina', 'titulo', 'tamanho', 'sonda'}.
+    Link direto de arquivo passa como está; página (YouTube, Vimeo, Google Drive...) é lida pelo yt-dlp."""
     if not eh_link(url):
         raise ToonsError("O link precisa começar com http:// ou https://")
     info("Conferindo o link (sem baixar o vídeo)...")
     try:
         dados = info_link(url)
     except OSError as e:
-        raise ToonsError(f"Não consegui acessar o link: {e}") from None
-    if dados["status"] >= 400:
-        raise ToonsError(f"O site respondeu HTTP {dados['status']}. O link pode ter expirado (no TorBox, gere o "
-                         "link de download de novo) ou exigir login.")
-    if dados["tipo"].startswith("text/"):
-        raise ToonsError("Esse endereço é de uma página, não do arquivo de vídeo. Copie o link do botão de download "
-                         "(o mesmo que você abre no VLC).")
-    detalhes = [x for x in (dados["nome"], bytes_humanos(dados["tamanho"]) if dados["tamanho"] else "") if x]
-    ok("Link funcionando" + (f": {' · '.join(detalhes)}" if detalhes else "."))
-    sonda = sondar_video(url) if tem("ffprobe") else None
+        dados = {"status": 0, "tipo": "", "nome": "", "tamanho": None, "erro": str(e)}
+    eh_pagina = dados["tipo"].startswith("text/") or not 0 < dados["status"] < 400
+    if not eh_pagina:
+        detalhes = [x for x in (dados["nome"], bytes_humanos(dados["tamanho"]) if dados["tamanho"] else "") if x]
+        ok("Link de arquivo funcionando" + (f": {' · '.join(detalhes)}" if detalhes else "."))
+        titulo, fontes = titulo_do_link(url, dados["nome"]), [url]
+    else:  # página de vídeo, ou um site que só responde a quem parece navegador: o yt-dlp tenta achar o vídeo
+        if not tem("yt-dlp") and not garantir_deps_musica(com_player=False):
+            raise ToonsError("Para links de página (YouTube, Vimeo...) é preciso o yt-dlp.")
+        info("Não é um link direto de arquivo: procurando o vídeo na página com o yt-dlp...")
+        try:
+            achado = info_pagina(url)
+        except ToonsError as e:
+            if dados["status"] >= 400:
+                raise ToonsError(f"O site respondeu HTTP {dados['status']}: o link pode ter expirado ou exigir "
+                                 "login.") from None
+            if dados.get("erro"):
+                raise ToonsError(f"Não consegui acessar o link: {dados['erro']}") from None
+            raise e
+        ok(f"Vídeo encontrado: {achado['titulo']}")
+        titulo, fontes = achado["titulo"], achado["enderecos"]
+    sonda = sonda_em_cache(fontes) if tem("ffprobe") else None
     if sonda:
         mostrar_faixas(sonda)
     elif tem("ffprobe"):
         aviso("O ffmpeg não reconheceu um vídeo nesse link; o player pode não conseguir tocar.")
-    return dados, sonda
+    return {"pagina": eh_pagina, "titulo": titulo, "tamanho": None if eh_pagina else dados["tamanho"], "sonda": sonda}
 
 
 def _pedir_legenda_extra() -> list:
@@ -6388,30 +6497,35 @@ def menu_midia():
 
     def compartilhar_link():
         info(direitos)
-        info("Cole o link direto do arquivo de vídeo, o mesmo que você abre no VLC. No TorBox: abra o item, "
-             "toque em Download e copie o link. Também servem links do Real-Debrid, AllDebrid, Premiumize "
-             "ou de um servidor seu. O filme não é baixado: o celular repassa enquanto a pessoa assiste.")
+        info("Cole qualquer link de vídeo: link direto de um arquivo (o mesmo que você abriria no VLC: servidor "
+             "seu, Google Drive, Dropbox, OneDrive, serviços de debrid...) ou uma página de vídeo (YouTube, Vimeo, "
+             "Dailymotion e os outros sites que o yt-dlp lê). O filme não é baixado: o celular repassa "
+             "enquanto a pessoa assiste.")
         url = perguntar("Link do vídeo").strip()
         if not url:
             return
         if not tem("ffmpeg"):
             aviso("Sem o ffmpeg só links de MP4/WebM com uma trilha de áudio tocam no navegador "
-                  "(MKV, áudio AC3/DTS e troca de trilha precisam dele).")
+                  "(MKV, áudio AC3/DTS, troca de trilha e páginas como o YouTube precisam dele).")
             garantir_cmd("ffmpeg")
-        dados, sonda = conferir_link(url)
-        titulo_filme = perguntar("Título que aparece na página", titulo_do_link(url, dados["nome"]))
+        link = conferir_link(url)
+        titulo_filme = perguntar("Título que aparece na página", link["titulo"])
         confirmado, horas = _pedir_prazo()
         if not confirmado:
             return
         extras = _pedir_legenda_extra()
-        embutidas = _escolher_embutidas(sonda, dados["tamanho"])
-        item = criar_compartilhamento(url, titulo_filme, horas, legendas=extras, embutidas=embutidas)
+        embutidas = [] if link["pagina"] else _escolher_embutidas(link["sonda"], link["tamanho"])
+        item = criar_compartilhamento(url, titulo_filme, horas, legendas=extras, embutidas=embutidas,
+                                      pagina=link["pagina"])
         garantir_servidor_midia()
         if embutidas:
-            _preparar_legendas(item, sonda)
+            _preparar_legendas(item, link["sonda"])
         mostrar_links(item)
-        info("Se o link do TorBox expirar, gere outro e use 'Meus links → Trocar o endereço do vídeo': "
-             "o link que você enviou continua o mesmo.")
+        if link["pagina"]:
+            info("O endereço do vídeo na página é renovado sozinho quando o site o expira.")
+        else:
+            info("Se o link expirar (links de download costumam valer só algumas horas), gere outro e use "
+                 "'Meus links → Trocar o endereço do vídeo': o link que você enviou continua o mesmo.")
         oferecer_envio(item)
 
     def oferecer_envio(item):
@@ -6441,15 +6555,17 @@ def menu_midia():
                 return
             rodar(["termux-open-url", pagina], capturar=True, timeout=20)
         else:
-            abrir_no_android(fonte_de(item), VLC_ANDROID if i == 0 else None)
+            alvo = endereco_para_assistir(item["pagina"]) if item.get("pagina") else fonte_de(item)
+            abrir_no_android(alvo, VLC_ANDROID if i == 0 else None)
 
     def trocar_endereco(item):
         info("Cole o novo link do mesmo vídeo. Quem já tem o link do Termux-Toons não precisa receber outro.")
         url = perguntar("Novo link do vídeo").strip()
         if not url:
             return
-        conferir_link(url)
-        atualizar_compartilhamento(item["token"], url=url)
+        link = conferir_link(url)
+        atualizar_compartilhamento(item["token"], url=None if link["pagina"] else url,
+                                   pagina=url if link["pagina"] else None)
         ok("Endereço atualizado.")
 
     def ver_links():
@@ -6457,17 +6573,18 @@ def menu_midia():
         if not lista:
             info("Nenhum link criado ainda.")
             return
-        i = escolher("Qual link?", [f"{'🌐' if it.get('url') else '📁'} {it['titulo']} · {descricao_prazo(it)}"
+        i = escolher("Qual link?", [f"{'▶' if it.get('pagina') else '🌐' if it.get('url') else '📁'} "
+                                    f"{it['titulo']} · {descricao_prazo(it)}"
                                     for it in lista])
         if i is None:
             return
         item = lista[i]
         mostrar_links(item)
-        if not item.get("url") and not Path(item.get("caminho", "")).is_file():
+        if item.get("caminho") and not Path(item["caminho"]).is_file():
             aviso("O arquivo deste link não existe mais.")
         acoes = [("Copiar / enviar / QR code", oferecer_envio), ("Assistir neste celular", assistir_aqui)]
         if item.get("url"):
-            acoes.append(("Trocar o endereço do vídeo (o link do TorBox expirou)", trocar_endereco))
+            acoes.append(("Trocar o endereço do vídeo (o link expirou)", trocar_endereco))
         acoes.append(("Apagar este link", None))
         acao = escolher("O que fazer?", [rotulo for rotulo, _ in acoes] + ["Voltar"], str(len(acoes) + 1))
         if acao is None or acao >= len(acoes):
@@ -6534,7 +6651,7 @@ def menu_midia():
 
     menu("📺 Compartilhar filme por link", [
         ("▶  Compartilhar um filme do celular (criar link)", compartilhar),
-        ("🌐 Transmitir de um link (TorBox, Real-Debrid...) sem baixar", compartilhar_link),
+        ("🌐 Transmitir de um link da internet (sem baixar)", compartilhar_link),
         ("Meus links (copiar, enviar, assistir, apagar)", ver_links),
         ("Assistir um link neste celular (VLC, MX Player...)", assistir_link_no_celular),
         ("Converter filme para MP4 compatível", converter),
@@ -7235,7 +7352,7 @@ def main(argv=None) -> int:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--porta", type=int)
     p = sub.add_parser("compartilhar", help="cria um link para assistir a um vídeo e liga o servidor")
-    p.add_argument("arquivo", help="vídeo do celular ou link direto (TorBox, Real-Debrid...)")
+    p.add_argument("arquivo", help="vídeo do celular, link direto de arquivo ou página de vídeo (YouTube...)")
     p.add_argument("--titulo")
     p.add_argument("--horas", type=float, help="validade do link em horas (padrão: sem prazo)")
     p.add_argument("--legenda", action="append", help="legenda .srt/.vtt extra (arquivo ou link); pode repetir")
@@ -7283,7 +7400,9 @@ def main(argv=None) -> int:
         elif args.comando == "midia":
             servir_midia(args.host, args.porta or cfg()["midia_porta"])
         elif args.comando == "compartilhar":
-            item = criar_compartilhamento(args.arquivo, args.titulo, args.horas, legendas=args.legenda)
+            link = conferir_link(args.arquivo) if eh_link(args.arquivo) else {"pagina": False, "titulo": None}
+            item = criar_compartilhamento(args.arquivo, args.titulo or link["titulo"], args.horas,
+                                          legendas=args.legenda, pagina=link["pagina"])
             garantir_servidor_midia()
             mostrar_links(item)
         elif args.comando == "assistir":

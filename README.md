@@ -60,10 +60,10 @@ quando não há um terminal interativo, por exemplo em scripts).
 | 10 | 🐧 **Linux com proot-distro** | Instala Debian, Ubuntu, Arch, Alpine, Fedora..., entra na distro, roda comandos, atualiza, cria usuário com sudo, faz backup, reseta e remove. |
 | 11 | 🗄️ **Arquivos e backup** | Compartilhamento HTTP rápido, **rclone** (Drive, Dropbox, OneDrive... copiar/sincronizar e servir via WebDAV com senha), **Syncthing**, **Samba** (porta 4450, experimental) e backup/restauração do Termux em `.tar.gz`. |
 | 12 | 🎵 **Música (yt-dlp + mpv)** | Busca e toca por streaming, baixa no melhor áudio, baixa por link (YouTube, SoundCloud, playlists) e por **link do Spotify** (procura a música no YouTube), mix/rádio por busca, biblioteca local, playlists `.m3u` e player em segundo plano. |
-| 13 | 🎬 **Vídeos (TikTok, YouTube)** | Baixa vídeos por link (TikTok, YouTube, Shorts, playlists e outros sites que o yt-dlp aceita), busca no YouTube e baixa, abre os vídeos baixados no player do Android e **assiste um link sem baixar** no VLC/MX Player (link direto do TorBox ou página do YouTube/TikTok). |
+| 13 | 🎬 **Vídeos (TikTok, YouTube)** | Baixa vídeos por link (TikTok, YouTube, Shorts, playlists e outros sites que o yt-dlp aceita), busca no YouTube e baixa, abre os vídeos baixados no player do Android e **assiste um link sem baixar** no VLC/MX Player (link direto de arquivo ou página do YouTube/TikTok). |
 | 14 | 🔄 **Atualização** | `pkg upgrade`, troca de espelho (`termux-change-repo`), repositórios extras (x11/root/tur), pacotes pip, recompilar llama.cpp, atualizar distros, `git pull` em vários repositórios e no próprio Termux-Toons, limpeza de cache. |
 | 15 | 🧹 **Otimização e limpeza** | **Otimização rápida** (cache do apt, `~/.cache` com pip/yt-dlp/go, npm, temporários antigos, `__pycache__`, logs velhos e miniaturas da galeria) mostrando quanto liberou; escolher item a item; **limpar o cache de todos os apps** (`pm trim-caches` com root; sem root abre a tela de armazenamento do Android); ver o que ocupa espaço; achar **arquivos grandes**, **duplicados** e pastas vazias; processos do Termux que mais usam RAM; parar todos os serviços; compilação dos apps e TRIM (root); atalhos para as telas de armazenamento e bateria. |
-| 16 | 📺 **Compartilhar filme por link** | Servidor de vídeo próprio: escolha um filme do celular **ou cole um link do TorBox/Real-Debrid (sem baixar o filme)**, receba um **link secreto** (com prazo opcional) e quem abrir assiste num **player próprio** no navegador: barra de progresso com prévia do tempo, **troca de trilha de áudio** (dublado/original), legendas (arquivo ao lado, extra ou **embutidas**) com tamanho e sincronia ajustáveis, velocidade, tela cheia, janela flutuante, **toque duplo para pular 10 s**, atalhos de teclado, **continuar de onde parou** e botão **Abrir no VLC**. MKV, áudio AC3/DTS e várias trilhas são **convertidos na hora** pelo ffmpeg (a imagem é só copiada; HEVC é recodificado só se o navegador não tocar). Também **converte para MP4** de vez, se preferir. Copia o link, manda pelo menu de compartilhar do Android (WhatsApp, Telegram...) ou mostra um QR code. **Túnel Cloudflare** para quem está fora do seu Wi-Fi. Apagar um link vale na hora. |
+| 16 | 📺 **Compartilhar filme por link** | Servidor de vídeo próprio: escolha um filme do celular **ou cole qualquer link de vídeo (sem baixar o filme)**: link direto de arquivo (servidor seu, nuvem, debrid...) ou página de vídeo (YouTube, Vimeo... pelo yt-dlp), receba um **link secreto** (com prazo opcional) e quem abrir assiste num **player próprio** no navegador: barra de progresso com prévia do tempo, **troca de trilha de áudio** (dublado/original), legendas (arquivo ao lado, extra ou **embutidas**) com tamanho e sincronia ajustáveis, velocidade, tela cheia, janela flutuante, **toque duplo para pular 10 s**, atalhos de teclado, **continuar de onde parou** e botão **Abrir no VLC**. MKV, áudio AC3/DTS e várias trilhas são **convertidos na hora** pelo ffmpeg (a imagem é só copiada; HEVC é recodificado só se o navegador não tocar). Também **converte para MP4** de vez, se preferir. Copia o link, manda pelo menu de compartilhar do Android (WhatsApp, Telegram...) ou mostra um QR code. **Túnel Cloudflare** para quem está fora do seu Wi-Fi. Apagar um link vale na hora. |
 
 Os downloads de música usam exatamente:
 
@@ -95,8 +95,9 @@ python termux_toons.py basic [programa.bas]
 python termux_toons.py baixar "https://youtu.be/..." "artista - música" "https://open.spotify.com/track/..."
 python termux_toons.py video "https://www.tiktok.com/@user/video/..." "https://youtu.be/..."
 python termux_toons.py compartilhar ~/storage/downloads/filme.mp4 --horas 24   # cria o link e liga o servidor
-python termux_toons.py compartilhar "https://link-direto-do-torbox/Filme.mkv" --legenda filme.pt.srt
-python termux_toons.py assistir "https://link-direto-do-torbox/Filme.mkv"      # abre no VLC do celular
+python termux_toons.py compartilhar "https://seu-servidor/Filme.mkv" --legenda filme.pt.srt
+python termux_toons.py compartilhar "https://www.youtube.com/watch?v=..."      # página de vídeo também vale
+python termux_toons.py assistir "https://seu-servidor/Filme.mkv"              # abre no VLC do celular
 python termux_toons.py midia                # servidor de vídeo em primeiro plano
 python termux_toons.py tocar                # biblioteca no aleatório
 python termux_toons.py tocar lofi hip hop   # mix por busca
@@ -114,17 +115,22 @@ python termux_toons.py limpar                # otimização rápida, sem pergunt
 4. Copie o link ou use **Enviar pelo WhatsApp, Telegram...**. Em **Meus links** dá para assistir no próprio
    celular, apagar um link (quem estiver com ele perde o acesso na hora) ou **Apagar TODOS os links**.
 
-### Transmitir de um link (TorBox, Real-Debrid...) sem baixar
+### Transmitir de um link da internet, sem baixar
 
-Se o filme está no **TorBox** (ou Real-Debrid, AllDebrid, Premiumize, um servidor seu...), não precisa baixar:
+O filme não precisa estar no celular. Serve qualquer link de vídeo:
 
-1. No TorBox, abra o item, toque em **Download** e copie o link (o mesmo que você abre no VLC).
-2. Menu **📺 → 🌐 Transmitir de um link**, cole o link. O programa confere o link (sem baixar), mostra a duração,
-   as trilhas de áudio e as legendas, e cria o link secreto como no passo a passo acima.
-3. Enquanto a pessoa assiste, o celular busca só o pedaço do filme que está passando e repassa para ela. O
-   endereço do TorBox nunca aparece para quem recebe o link.
-4. O link do TorBox expirou? Gere outro e use **Meus links → Trocar o endereço do vídeo**: o link que você já
-   enviou continua o mesmo.
+- **Link direto de um arquivo** — o mesmo tipo de link que você abriria no VLC: um servidor seu, Google Drive,
+  Dropbox, OneDrive, serviços de debrid (TorBox, Real-Debrid, AllDebrid...), etc.
+- **Página de vídeo** — YouTube, Vimeo, Dailymotion e os outros sites que o yt-dlp lê. O endereço do vídeo é
+  achado na hora de assistir e renovado sozinho quando o site o expira. Quando o site entrega imagem e som
+  separados (como o YouTube), o servidor junta os dois.
+
+1. Menu **📺 → 🌐 Transmitir de um link da internet**, cole o link. O programa confere o link (sem baixar),
+   mostra a duração, as trilhas de áudio e as legendas, e cria o link secreto como no passo a passo acima.
+2. Enquanto a pessoa assiste, o celular busca só o pedaço do filme que está passando e repassa para ela. O
+   endereço de origem nunca aparece para quem recebe o link.
+3. Link direto que expirou (links de download costumam valer só algumas horas)? Gere outro e use **Meus links →
+   Trocar o endereço do vídeo**: o link que você já enviou continua o mesmo.
 
 Para só assistir no seu celular, use **Assistir um link neste celular** (no menu 📺 ou no 🎬 Vídeos): abre direto
 no VLC ou em outro app de vídeo. Também aceita páginas do YouTube, TikTok etc. (o yt-dlp acha o vídeo).
@@ -145,7 +151,7 @@ no VLC ou em outro app de vídeo. Também aceita páginas do YouTube, TikTok etc
 Boas práticas e limites:
 
 - O servidor só entrega os arquivos que você compartilhou, cada um por um código aleatório; não mostra pastas.
-- O filme **sai do seu celular**: quem assiste usa o **upload** da sua internet (num link do TorBox, também o
+- O filme **sai do seu celular**: quem assiste usa o **upload** da sua internet (num link da internet, também o
   download). Mantenha o celular carregando (o `termux-wake-lock` é ativado sozinho). O túnel gratuito da
   Cloudflare é pensado para testes e pode ser lento.
 - **Formatos:** MP4 (H.264 + AAC) e WebM tocam direto, com o arquivo original. MKV, áudio AC3/DTS/E-AC3 e
