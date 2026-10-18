@@ -1,4 +1,4 @@
-# Termux-Toons 📱🧰
+# Termux-Toons
 
 Um canivete suíço em **um único arquivo Python** para transformar o celular Android
 (com [Termux](https://termux.dev)) em servidor, estação de desenvolvimento, central de
