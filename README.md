@@ -58,7 +58,7 @@ quando não há um terminal interativo, por exemplo em scripts).
 | 8 | 🛡️ **Rede e segurança** *(só em equipamentos seus!)* | Info de rede, descoberta de dispositivos e varredura de portas com **nmap**, DNS/ping/traceroute, teste de velocidade, redes Wi-Fi próximas, captura com tcpdump (root) ou leitura de `.pcap`, **servidor SSH** (porta 8022) e geração de config **WireGuard** + QR code para o app. |
 | 9 | 👾 **Retro** | Snake em curses, adivinhe o número, **interpretador BASIC** (PRINT, INPUT, IF/THEN, GOTO, GOSUB, FOR/NEXT, matrizes, SAVE/LOAD...) e gerador de **template para criar seu próprio jogo**. |
 | 10 | 🐧 **Linux com proot-distro** | Instala Debian, Ubuntu, Arch, Alpine, Fedora..., entra na distro, roda comandos, atualiza, cria usuário com sudo, faz backup, reseta e remove. |
-| 11 | 🗄️ **Arquivos e backup** | Compartilhamento HTTP rápido, **rclone** (Drive, Dropbox, OneDrive... copiar/sincronizar e servir via WebDAV com senha), **Syncthing**, **Samba** (porta 4450, experimental) e backup/restauração do Termux em `.tar.gz`. |
+| 11 | 🗄️ **Arquivos e backup** | **Publicar uma página/site HTML num link** (rede local ou internet, pelo túnel da Cloudflare; não lista pastas nem mostra arquivos ocultos), Compartilhamento HTTP rápido, **rclone** (Drive, Dropbox, OneDrive... copiar/sincronizar e servir via WebDAV com senha), **Syncthing**, **Samba** (porta 4450, experimental) e backup/restauração do Termux em `.tar.gz`. |
 | 12 | 🎵 **Música (yt-dlp + mpv)** | Busca e toca por streaming, baixa no melhor áudio, baixa por link (YouTube, SoundCloud, playlists) e por **link do Spotify** (procura a música no YouTube), mix/rádio por busca, biblioteca local, playlists `.m3u` e player em segundo plano. |
 | 13 | 🎬 **Vídeos (TikTok, YouTube)** | Baixa vídeos por link (TikTok, YouTube, Shorts, playlists e outros sites que o yt-dlp aceita), busca no YouTube e baixa, abre os vídeos baixados no player do Android e **assiste um link sem baixar** no VLC/MX Player (link direto de arquivo ou página do YouTube/TikTok). |
 | 14 | 🔄 **Atualização** | `pkg upgrade`, troca de espelho (`termux-change-repo`), repositórios extras (x11/root/tur), pacotes pip, recompilar llama.cpp, atualizar distros, `git pull` em vários repositórios e no próprio Termux-Toons, limpeza de cache. |
@@ -99,6 +99,7 @@ python termux_toons.py compartilhar "https://seu-servidor/Filme.mkv" --legenda f
 python termux_toons.py compartilhar "https://www.youtube.com/watch?v=..."      # página de vídeo também vale
 python termux_toons.py assistir "https://seu-servidor/Filme.mkv"              # abre no VLC do celular
 python termux_toons.py midia                # servidor de vídeo em primeiro plano
+python termux_toons.py site ~/storage/downloads/meu-site --porta 8097   # publica uma pasta como site
 python termux_toons.py tocar                # biblioteca no aleatório
 python termux_toons.py tocar lofi hip hop   # mix por busca
 python termux_toons.py atualizar
