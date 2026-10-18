@@ -60,10 +60,10 @@ quando não há um terminal interativo, por exemplo em scripts).
 | 10 | 🐧 **Linux com proot-distro** | Instala Debian, Ubuntu, Arch, Alpine, Fedora..., entra na distro, roda comandos, atualiza, cria usuário com sudo, faz backup, reseta e remove. |
 | 11 | 🗄️ **Arquivos e backup** | Compartilhamento HTTP rápido, **rclone** (Drive, Dropbox, OneDrive... copiar/sincronizar e servir via WebDAV com senha), **Syncthing**, **Samba** (porta 4450, experimental) e backup/restauração do Termux em `.tar.gz`. |
 | 12 | 🎵 **Música (yt-dlp + mpv)** | Busca e toca por streaming, baixa no melhor áudio, baixa por link (YouTube, SoundCloud, playlists) e por **link do Spotify** (procura a música no YouTube), mix/rádio por busca, biblioteca local, playlists `.m3u` e player em segundo plano. |
-| 13 | 🎬 **Vídeos (TikTok, YouTube)** | Baixa vídeos por link (TikTok, YouTube, Shorts, playlists e outros sites que o yt-dlp aceita), busca no YouTube e baixa, e abre os vídeos baixados no player do Android. |
+| 13 | 🎬 **Vídeos (TikTok, YouTube)** | Baixa vídeos por link (TikTok, YouTube, Shorts, playlists e outros sites que o yt-dlp aceita), busca no YouTube e baixa, abre os vídeos baixados no player do Android e **assiste um link sem baixar** no VLC/MX Player (link direto do TorBox ou página do YouTube/TikTok). |
 | 14 | 🔄 **Atualização** | `pkg upgrade`, troca de espelho (`termux-change-repo`), repositórios extras (x11/root/tur), pacotes pip, recompilar llama.cpp, atualizar distros, `git pull` em vários repositórios e no próprio Termux-Toons, limpeza de cache. |
 | 15 | 🧹 **Otimização e limpeza** | **Otimização rápida** (cache do apt, `~/.cache` com pip/yt-dlp/go, npm, temporários antigos, `__pycache__`, logs velhos e miniaturas da galeria) mostrando quanto liberou; escolher item a item; **limpar o cache de todos os apps** (`pm trim-caches` com root; sem root abre a tela de armazenamento do Android); ver o que ocupa espaço; achar **arquivos grandes**, **duplicados** e pastas vazias; processos do Termux que mais usam RAM; parar todos os serviços; compilação dos apps e TRIM (root); atalhos para as telas de armazenamento e bateria. |
-| 16 | 📺 **Compartilhar filme por link** | Servidor de vídeo próprio: escolha um filme, receba um **link secreto** (com prazo opcional) e quem abrir assiste num player no navegador, com **pular para qualquer ponto** e **legenda** (`.srt`/`.vtt` ao lado do vídeo). Avisa se o arquivo não toca em navegadores (MKV, áudio AC3/DTS, H.265...) e **converte para MP4** com o ffmpeg, escolhendo a trilha de áudio (dublado/original) e extraindo a legenda embutida. Copia o link, manda pelo menu de compartilhar do Android (WhatsApp, Telegram...) ou mostra um QR code. **Túnel Cloudflare** para quem está fora do seu Wi-Fi. Apagar um link vale na hora. |
+| 16 | 📺 **Compartilhar filme por link** | Servidor de vídeo próprio: escolha um filme do celular **ou cole um link do TorBox/Real-Debrid (sem baixar o filme)**, receba um **link secreto** (com prazo opcional) e quem abrir assiste num **player próprio** no navegador: barra de progresso com prévia do tempo, **troca de trilha de áudio** (dublado/original), legendas (arquivo ao lado, extra ou **embutidas**) com tamanho e sincronia ajustáveis, velocidade, tela cheia, janela flutuante, **toque duplo para pular 10 s**, atalhos de teclado, **continuar de onde parou** e botão **Abrir no VLC**. MKV, áudio AC3/DTS e várias trilhas são **convertidos na hora** pelo ffmpeg (a imagem é só copiada; HEVC é recodificado só se o navegador não tocar). Também **converte para MP4** de vez, se preferir. Copia o link, manda pelo menu de compartilhar do Android (WhatsApp, Telegram...) ou mostra um QR code. **Túnel Cloudflare** para quem está fora do seu Wi-Fi. Apagar um link vale na hora. |
 
 Os downloads de música usam exatamente:
 
@@ -95,6 +95,8 @@ python termux_toons.py basic [programa.bas]
 python termux_toons.py baixar "https://youtu.be/..." "artista - música" "https://open.spotify.com/track/..."
 python termux_toons.py video "https://www.tiktok.com/@user/video/..." "https://youtu.be/..."
 python termux_toons.py compartilhar ~/storage/downloads/filme.mp4 --horas 24   # cria o link e liga o servidor
+python termux_toons.py compartilhar "https://link-direto-do-torbox/Filme.mkv" --legenda filme.pt.srt
+python termux_toons.py assistir "https://link-direto-do-torbox/Filme.mkv"      # abre no VLC do celular
 python termux_toons.py midia                # servidor de vídeo em primeiro plano
 python termux_toons.py tocar                # biblioteca no aleatório
 python termux_toons.py tocar lofi hip hop   # mix por busca
@@ -104,23 +106,59 @@ python termux_toons.py limpar                # otimização rápida, sem pergunt
 
 ## Compartilhar um filme por link
 
-1. Menu **📺 Compartilhar filme por link → Compartilhar um filme**, escolha o arquivo, o título e o prazo.
+1. Menu **📺 Compartilhar filme por link → Compartilhar um filme do celular**, escolha o arquivo, o título e o prazo.
 2. O programa liga o servidor de vídeo (porta 8095) e mostra o link: `http://IP-do-celular:8095/v/<código secreto>`.
    Quem estiver **no mesmo Wi-Fi** já consegue assistir.
 3. Para quem está **fora da sua rede**, ligue **Túnel para a internet** no mesmo menu (usa o `cloudflared`;
    o endereço público aparece na tela e vira o link que você envia).
-4. Copie o link ou use **Enviar pelo WhatsApp, Telegram...**. Em **Meus links** dá para apagar um link
-   (quem estiver com ele perde o acesso na hora) ou **Apagar TODOS os links**.
+4. Copie o link ou use **Enviar pelo WhatsApp, Telegram...**. Em **Meus links** dá para assistir no próprio
+   celular, apagar um link (quem estiver com ele perde o acesso na hora) ou **Apagar TODOS os links**.
+
+### Transmitir de um link (TorBox, Real-Debrid...) sem baixar
+
+Se o filme está no **TorBox** (ou Real-Debrid, AllDebrid, Premiumize, um servidor seu...), não precisa baixar:
+
+1. No TorBox, abra o item, toque em **Download** e copie o link (o mesmo que você abre no VLC).
+2. Menu **📺 → 🌐 Transmitir de um link**, cole o link. O programa confere o link (sem baixar), mostra a duração,
+   as trilhas de áudio e as legendas, e cria o link secreto como no passo a passo acima.
+3. Enquanto a pessoa assiste, o celular busca só o pedaço do filme que está passando e repassa para ela. O
+   endereço do TorBox nunca aparece para quem recebe o link.
+4. O link do TorBox expirou? Gere outro e use **Meus links → Trocar o endereço do vídeo**: o link que você já
+   enviou continua o mesmo.
+
+Para só assistir no seu celular, use **Assistir um link neste celular** (no menu 📺 ou no 🎬 Vídeos): abre direto
+no VLC ou em outro app de vídeo. Também aceita páginas do YouTube, TikTok etc. (o yt-dlp acha o vídeo).
+
+### O player
+
+- **Trilha de áudio** (🎧): quando o filme tem mais de uma (dublado e original, por exemplo), quem assiste escolhe.
+  Começa no áudio em português, se houver, e lembra a última escolha.
+- **Legendas** (CC): `.srt`/`.vtt` ao lado do vídeo com o mesmo nome (`Filme.mkv` + `Filme.pt-BR.srt`), uma legenda
+  extra que você indica ao criar o link (arquivo ou link) e as **embutidas** no MKV. Tamanho e sincronia
+  (adiantar/atrasar) ajustáveis. Com áudio em português, liga sozinha só a legenda forçada.
+- Barra de progresso com prévia do tempo, ±10 s (botões, setas ou **toque duplo** nas laterais da tela),
+  velocidade, tela cheia (gira o celular sozinho), janela flutuante, atalhos (`espaço`, `←` `→`, `↑` `↓`, `F`,
+  `M`, `C`, `A`, `0`–`9`) e **continuar de onde parou**.
+- **Abrir no VLC** (em ⚙ Ajustes): abre o arquivo original no VLC, com todas as trilhas e legendas. O mesmo link
+  terminado em `/video` serve para colar no VLC, Kodi ou numa TV.
 
 Boas práticas e limites:
 
 - O servidor só entrega os arquivos que você compartilhou, cada um por um código aleatório; não mostra pastas.
-- O filme **sai do seu celular**: quem assiste usa o **upload** da sua internet. Mantenha o celular carregando
-  (o `termux-wake-lock` é ativado sozinho). O túnel gratuito da Cloudflare é pensado para testes e pode ser lento.
-- **Formatos:** MP4 (H.264 + AAC) e WebM tocam em qualquer navegador. MKV, áudio AC3/DTS e H.265 nem sempre; use
-  **Converter filme para MP4 compatível**. O modo *rápido* só troca o áudio (segundos/minutos); o *completo*
-  recodifica o vídeo e, no celular, pode levar mais tempo que o filme.
-- **Legendas:** deixe o `.srt` ao lado do vídeo com o mesmo nome (`Filme.mp4` + `Filme.pt.srt`); ele aparece no player.
+- O filme **sai do seu celular**: quem assiste usa o **upload** da sua internet (num link do TorBox, também o
+  download). Mantenha o celular carregando (o `termux-wake-lock` é ativado sozinho). O túnel gratuito da
+  Cloudflare é pensado para testes e pode ser lento.
+- **Formatos:** MP4 (H.264 + AAC) e WebM tocam direto, com o arquivo original. MKV, áudio AC3/DTS/E-AC3 e
+  arquivos com várias trilhas de áudio são **convertidos na hora** pelo ffmpeg: a imagem é copiada e só o áudio
+  é recodificado, o que pesa pouco. HEVC/H.265 é copiado quando o navegador toca (Chrome, Edge e Safari
+  recentes); nos outros, a imagem é recodificada em 720p, o que exige bastante do celular. Cada pessoa vendo um
+  vídeo convertido usa um ffmpeg; o limite (3) fica em **Conversões ao mesmo tempo**.
+- **iPhone/iPad (Safari):** toca MP4 direto (e troca a trilha de áudio do próprio MP4), mas não aceita a
+  conversão na hora; para MKV, o player oferece **Abrir no VLC**. Ou use **Converter filme para MP4 compatível**:
+  o modo *rápido* só troca o áudio (segundos/minutos); o *completo* recodifica o vídeo e, no celular, pode levar
+  mais tempo que o filme.
+- **Legendas embutidas num link:** para extraí-las o celular precisa ler o arquivo inteiro uma vez (fica em cache),
+  por isso o programa pergunta antes quais preparar. Prefira o Wi-Fi.
 - Compartilhe só o que você pode distribuir: vídeos seus, de domínio público, de licença livre ou com autorização
   de quem tem os direitos.
 
@@ -154,6 +192,7 @@ Android.
 ├── logs/                  # um log por serviço
 ├── tarefas.json           # gerenciador de tarefas
 ├── monitores_estado.json  # último resultado de cada monitor
+├── cache/legendas/        # legendas embutidas já extraídas
 ├── playlists/             # playlists .m3u
 ├── basic/                 # programas BASIC salvos
 └── recordes.json
