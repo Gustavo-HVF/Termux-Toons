@@ -19,7 +19,8 @@ Reúne em um único menu:
   13. Vídeos do TikTok, YouTube e outros sites com yt-dlp
   14. Atualização do Termux e dos repositórios
   15. Otimização e limpeza (caches, arquivos grandes/duplicados, processos)
-  16. Compartilhar filmes por link (servidor de vídeo + túnel para a internet)
+  16. Compartilhar filmes por link: arquivo do celular ou qualquer link de vídeo, com
+      player próprio, troca de trilha de áudio e conversão na hora (servidor de vídeo + túnel)
 
 Uso:
     python termux_toons.py            # menu interativo
@@ -73,7 +74,7 @@ try:
 except ImportError:  # sem terminal POSIX (ex.: Windows): só o modo numérico
     termios = tty = None
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 SCRIPT = Path(__file__).resolve()
 HOME = Path.home()
 PREFIX = os.environ.get("PREFIX", "")
@@ -745,6 +746,7 @@ PADRAO_CFG = {
     "pasta_musicas": "~/storage/downloads",
     "pasta_videos": "~/storage/downloads",
     "midia_porta": 8095,
+    "midia_transmissoes": 3,
     "compartilhamentos": [],
     "llama_porta": 8080,
     "llama_modelo": "",
@@ -4202,12 +4204,20 @@ def tocar_mpv(alvos: list, aleatorio: bool = False, playlist: Path | None = None
     rodar(cmd, mostrar=False)
 
 
+def _mais_novos_primeiro(arquivos) -> list:
+    """Ordena por data de modificação; ignora o que sumiu ou não dá para ler no meio do caminho."""
+    datas = {}
+    for p in arquivos:
+        with contextlib.suppress(OSError):
+            datas[p] = p.stat().st_mtime
+    return sorted(datas, key=datas.get, reverse=True)
+
+
 def musicas_locais() -> list:
     pasta = pasta_musicas()
     if not pasta.exists():
         return []
-    return sorted((p for p in pasta.rglob("*") if p.suffix.lower() in EXTENSOES_AUDIO),
-                  key=lambda p: p.stat().st_mtime, reverse=True)
+    return _mais_novos_primeiro(p for p in pasta.rglob("*") if p.suffix.lower() in EXTENSOES_AUDIO)
 
 
 def _meta(pagina: str, nome: str) -> str:
@@ -4396,8 +4406,7 @@ def videos_locais() -> list:
     pasta = pasta_videos()
     if not pasta.exists():
         return []
-    return sorted((p for p in pasta.rglob("*") if p.suffix.lower() in EXTENSOES_VIDEO),
-                  key=lambda p: p.stat().st_mtime, reverse=True)
+    return _mais_novos_primeiro(p for p in pasta.rglob("*") if p.suffix.lower() in EXTENSOES_VIDEO)
 
 
 @submenu
@@ -4424,11 +4433,11 @@ def menu_videos():
         if not videos:
             info(f"Nenhum vídeo em {pasta_videos()}.")
             return
-        i = escolher("Qual vídeo?", [f"{v.name} ({bytes_humanos(v.stat().st_size)})" for v in videos])
+        i = escolher("Qual vídeo?", [f"{v.name} ({bytes_humanos(tamanho(v))})" for v in videos])
         if i is None:
             return
         if tem("termux-open"):
-            rodar(["termux-open", videos[i]])  # abre no player de vídeo do Android
+            abrir_no_android(str(videos[i]))  # abre no player de vídeo do Android
         else:
             info(f"Arquivo: {videos[i]}")
 
@@ -4441,6 +4450,7 @@ def menu_videos():
         ("Baixar por link (TikTok, YouTube, Shorts, playlist...)", por_link),
         ("Buscar no YouTube e baixar", buscar_baixar),
         ("Abrir vídeo baixado no player do Android", abrir),
+        ("Assistir um link sem baixar (VLC, MX Player...)", assistir_link_no_celular),
         (lambda: f"Pasta dos vídeos ({c['pasta_videos']})", mudar_pasta),
         ("Instalar dependências (yt-dlp, ffmpeg)", lambda: garantir_deps_musica(com_player=False)),
     ])
@@ -4450,8 +4460,14 @@ def menu_videos():
 #  Compartilhar filme/vídeo por link (servidor de vídeo)
 # ════════════════════════════════════════════════════════════════════
 # Um servidor próprio, separado da API: só entrega os vídeos que você
-# compartilhou, cada um com um link secreto (e prazo opcional). Suporta
-# "pular para o meio" (HTTP Range) e legendas .srt/.vtt.
+# compartilhou, cada um com um link secreto (e prazo opcional). O vídeo
+# pode ser um arquivo do celular, um link direto da internet (servidor
+# seu, nuvem, serviços de debrid...) ou uma página de vídeo (YouTube,
+# Vimeo... achada pelo yt-dlp), repassados sem baixar o filme inteiro.
+# O que o navegador toca é entregue como está (HTTP Range: dá para pular
+# para qualquer ponto). O resto (MKV, áudio AC3/DTS, várias trilhas de
+# áudio) o ffmpeg converte na hora, copiando o vídeo e recodificando só o
+# áudio; o player troca de trilha pedindo uma nova conversão.
 
 TIPOS_VIDEO = {".mp4": "video/mp4", ".m4v": "video/mp4", ".webm": "video/webm",
                ".mkv": "video/x-matroska", ".mov": "video/quicktime", ".avi": "video/x-msvideo"}
@@ -4459,28 +4475,828 @@ FORMATOS_NAVEGADOR = (".mp4", ".m4v", ".webm")
 VIDEO_NAVEGADOR = ("h264", "vp8", "vp9", "av1")
 AUDIO_NAVEGADOR = ("aac", "mp3", "opus", "vorbis")
 CODECS_LEGENDA_TEXTO = {"subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"}
+LINGUAS_PT = ("por", "pt", "pob", "ptb", "pt-br")
+LEGENDAS_CACHE = DATA_DIR / "cache" / "legendas"
+VLC_ANDROID = "org.videolan.vlc"
 
-PAGINA_FILME = """<!doctype html>
+IDIOMAS = {
+    "por": "Português", "pt": "Português", "pob": "Português (BR)", "ptb": "Português (BR)", "pt-br": "Português (BR)",
+    "eng": "Inglês", "en": "Inglês", "spa": "Espanhol", "es": "Espanhol", "fre": "Francês", "fra": "Francês",
+    "fr": "Francês", "ger": "Alemão", "deu": "Alemão", "de": "Alemão", "ita": "Italiano", "it": "Italiano",
+    "jpn": "Japonês", "ja": "Japonês", "kor": "Coreano", "ko": "Coreano", "chi": "Chinês", "zho": "Chinês",
+    "zh": "Chinês", "rus": "Russo", "ru": "Russo", "hin": "Hindi", "ara": "Árabe", "tur": "Turco", "pol": "Polonês",
+}
+CANAIS = {1: "mono", 2: "estéreo", 6: "5.1", 8: "7.1"}
+
+
+PAGINA_FILME = r"""<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="robots" content="noindex,nofollow">
+<meta name="theme-color" content="#000000">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8E%AC%3C/text%3E%3C/svg%3E">
 <title>@TITULO@</title>
 <style>
- html,body{height:100%}
- body{margin:0;background:#000;color:#eee;font-family:system-ui,sans-serif;display:flex;flex-direction:column}
- header{padding:12px 16px;font-size:1.05em;background:#111}
- video{width:100%;flex:1;min-height:0;background:#000}
- #erro{display:none;padding:12px 16px;background:#5a1d1d}
+ :root{--acc:#8b5cf6;--acc2:#a78bfa;--txt:#f4f4f5;--sub:#a1a1aa;--painel:rgba(24,24,27,.95);--borda:rgba(255,255,255,.1)}
+ *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+ html,body{margin:0;height:100%;background:#000;color:var(--txt);overflow:hidden;
+  font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:pointer}
+ button:focus-visible{outline:2px solid var(--acc2);outline-offset:2px}
+ #player{position:fixed;inset:0;background:#000;user-select:none;-webkit-user-select:none;touch-action:manipulation}
+ #player.ocioso{cursor:none}
+ video{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000}
+ .camada{position:absolute;left:0;right:0;transition:opacity .25s;pointer-events:none}
+ .camada>*{pointer-events:auto}
+ #player.ocioso .camada{opacity:0}
+ #player.ocioso .camada *{pointer-events:none}
+ #topo{top:0;padding:max(14px,env(safe-area-inset-top)) 18px 48px;background:linear-gradient(rgba(0,0,0,.8),transparent)}
+ #topo h1{margin:0;font-size:1.05em;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  text-shadow:0 1px 3px #000;pointer-events:none}
+ #baixo{bottom:0;padding:56px max(12px,env(safe-area-inset-right)) max(8px,env(safe-area-inset-bottom)) max(12px,env(safe-area-inset-left));
+  background:linear-gradient(transparent,rgba(0,0,0,.88))}
+ #barra{position:relative;height:24px;display:flex;align-items:center;cursor:pointer;touch-action:none;margin:0 6px}
+ #trilho{position:relative;width:100%;height:4px;border-radius:4px;background:rgba(255,255,255,.22);transition:height .15s}
+ #barra:hover #trilho,#barra.arrastando #trilho{height:6px}
+ #buf,#prog{position:absolute;left:0;top:0;bottom:0;border-radius:inherit}
+ #buf{background:rgba(255,255,255,.35)}
+ #prog{background:var(--acc)}
+ #bola{position:absolute;top:50%;left:0;width:14px;height:14px;margin:-7px 0 0 -7px;border-radius:50%;background:#fff;
+  box-shadow:0 0 0 4px rgba(139,92,246,.45);transform:scale(0);transition:transform .15s}
+ #barra:hover #bola,#barra.arrastando #bola,#player.toque #bola{transform:scale(1)}
+ #dica{position:absolute;bottom:28px;left:0;transform:translateX(-50%);background:var(--painel);border:1px solid var(--borda);
+  padding:3px 8px;border-radius:6px;font-size:.8em;font-variant-numeric:tabular-nums;display:none;pointer-events:none}
+ #barra:hover #dica,#barra.arrastando #dica{display:block}
+ #linha{display:flex;align-items:center;gap:2px}
+ .bt{position:relative;width:44px;height:44px;display:grid;place-items:center;border-radius:50%;transition:background .15s,color .15s}
+ .bt:hover{background:rgba(255,255,255,.12)}
+ .bt svg{width:26px;height:26px;fill:currentColor}
+ .bt.ativo{color:var(--acc2)}
+ .bt.ativo::after{content:"";position:absolute;bottom:6px;left:14px;right:14px;height:2px;border-radius:2px;background:var(--acc2)}
+ .bt[hidden]{display:none}
+ #vol{width:84px;accent-color:var(--acc);margin:0 6px}
+ #tempo{font-variant-numeric:tabular-nums;font-size:.88em;color:#e4e4e7;padding:0 8px;white-space:nowrap}
+ .esp{flex:1}
+ #centro{position:absolute;inset:0;display:grid;place-items:center;pointer-events:none}
+ #grande{width:78px;height:78px;border-radius:50%;background:rgba(139,92,246,.92);display:grid;place-items:center;
+  pointer-events:auto;box-shadow:0 10px 34px rgba(0,0,0,.55);transition:transform .15s,opacity .2s}
+ #grande:hover{transform:scale(1.07)}
+ #grande svg{width:42px;height:42px;fill:#fff}
+ #girando{display:none;width:58px;height:58px;border-radius:50%;border:4px solid rgba(255,255,255,.18);
+  border-top-color:var(--acc2);animation:gira .8s linear infinite}
+ @keyframes gira{to{transform:rotate(360deg)}}
+ #player.carregando #girando{display:block}
+ #player.carregando #grande,#player.tocando #grande{display:none}
+ #legenda{position:absolute;left:4%;right:4%;bottom:7%;text-align:center;pointer-events:none;transition:bottom .25s;
+  font-size:calc(var(--tam,1) * clamp(17px,3.8vmin,36px));line-height:1.45}
+ #player:not(.ocioso) #legenda{bottom:calc(7% + 76px)}
+ #legenda span{background:rgba(0,0,0,.7);padding:.06em .38em;border-radius:5px;text-shadow:0 1px 2px #000;
+  -webkit-box-decoration-break:clone;box-decoration-break:clone}
+ #aviso{position:absolute;top:max(64px,calc(env(safe-area-inset-top) + 50px));left:50%;transform:translateX(-50%);
+  max-width:min(92%,520px);text-align:center;background:var(--painel);border:1px solid var(--borda);padding:9px 16px;
+  border-radius:12px;font-size:.9em;opacity:0;transition:opacity .2s;pointer-events:none}
+ #aviso.ver{opacity:1}
+ .pulo{position:absolute;top:50%;transform:translateY(-50%);padding:14px 20px;border-radius:40px;background:rgba(0,0,0,.6);
+  font-weight:700;opacity:0;transition:opacity .35s;pointer-events:none;font-variant-numeric:tabular-nums}
+ #puloE{left:10%}
+ #puloD{right:10%}
+ .pulo.ver{opacity:1;transition:none}
+ #painel{position:absolute;right:12px;bottom:92px;width:320px;max-width:calc(100% - 24px);max-height:min(62%,460px);overflow:auto;
+  background:var(--painel);border:1px solid var(--borda);border-radius:16px;padding:6px;display:none;
+  -webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);box-shadow:0 14px 44px rgba(0,0,0,.6)}
+ #painel.ver{display:block}
+ #painel h3{display:flex;align-items:center;gap:6px;margin:4px 6px 4px;font-size:.78em;text-transform:uppercase;
+  letter-spacing:.07em;color:var(--sub);font-weight:600;min-height:32px}
+ #painel h3 button{display:grid;place-items:center;width:30px;height:30px;border-radius:50%}
+ #painel h3 svg{width:20px;height:20px;fill:currentColor}
+ .item{display:flex;align-items:center;gap:10px;width:100%;text-align:left;padding:10px 12px;border-radius:10px}
+ .item:hover{background:rgba(255,255,255,.08)}
+ .item .marca{width:20px;height:20px;flex:none;fill:var(--acc2);visibility:hidden}
+ .item.sel .marca{visibility:visible}
+ .item.sel{color:#fff;font-weight:600}
+ .item .dir{margin-left:auto;color:var(--sub);font-size:.86em;white-space:nowrap;font-weight:400}
+ .item small{display:block;color:var(--sub);font-size:.8em;font-weight:400}
+ #cartao{position:absolute;inset:0;display:none;place-items:center;padding:20px;background:rgba(0,0,0,.62)}
+ #cartao.ver{display:grid}
+ #cartao .caixa{width:100%;max-width:440px;text-align:center;background:var(--painel);border:1px solid var(--borda);
+  border-radius:18px;padding:22px 20px;box-shadow:0 14px 44px rgba(0,0,0,.6)}
+ #cartao h2{margin:0 0 8px;font-size:1.15em}
+ #cartao p{margin:0 0 18px;color:var(--sub)}
+ .botoes{display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
+ .botao{padding:11px 20px;border-radius:99px;background:rgba(255,255,255,.1);font-weight:600}
+ .botao:hover{background:rgba(255,255,255,.18)}
+ .botao.pri{background:var(--acc)}
+ .botao.pri:hover{background:#7c3aed}
+ @media (max-width:640px){
+  #vol{display:none}
+  .bt{width:40px;height:40px}
+  .bt svg{width:24px;height:24px}
+  #tempo{padding:0 4px;font-size:.82em}
+  #painel{left:8px;right:8px;width:auto;max-width:none;bottom:84px}
+ }
+ @media (max-width:400px){.opcional{display:none}}
+ @media (pointer:coarse){#vol{display:none}}
 </style></head><body>
-<header>🎬 @TITULO@</header>
-<video id="v" controls playsinline preload="metadata" src="/v/@TOKEN@/video">@LEGENDA@</video>
-<div id="erro">Seu navegador não conseguiu reproduzir este vídeo. Peça a quem enviou o link para
-converter o filme para MP4 (H.264 + AAC) ou tente abrir em outro navegador.</div>
+<div id="player" class="carregando">
+ <video id="v" playsinline preload="metadata"></video>
+ <div id="legenda"></div>
+ <div id="centro"><button id="grande" aria-label="Assistir"></button><div id="girando"></div></div>
+ <div class="pulo" id="puloE"></div><div class="pulo" id="puloD"></div>
+ <div id="topo" class="camada"><h1>@TITULO@</h1></div>
+ <div id="baixo" class="camada">
+  <div id="barra" role="slider" aria-label="Posição no vídeo">
+   <div id="trilho"><div id="buf"></div><div id="prog"></div></div><div id="bola"></div><div id="dica">0:00</div>
+  </div>
+  <div id="linha">
+   <button class="bt" id="btPlay" title="Assistir / pausar (espaço)"></button>
+   <button class="bt" id="btVolta" title="Voltar 10 s (←)"></button>
+   <button class="bt" id="btAvanca" title="Avançar 10 s (→)"></button>
+   <button class="bt opcional" id="btSom" title="Som (M)"></button>
+   <input type="range" id="vol" min="0" max="1" step="0.05" value="1" aria-label="Volume">
+   <span id="tempo">0:00</span>
+   <span class="esp"></span>
+   <button class="bt" id="btAudio" title="Trilha de áudio (A)" hidden></button>
+   <button class="bt" id="btLegenda" title="Legendas (C)" hidden></button>
+   <button class="bt" id="btAjustes" title="Ajustes"></button>
+   <button class="bt opcional" id="btPip" title="Janela flutuante" hidden></button>
+   <button class="bt" id="btTela" title="Tela cheia (F)"></button>
+  </div>
+ </div>
+ <div id="painel" role="menu"></div>
+ <div id="aviso" role="status"></div>
+ <div id="cartao"><div class="caixa"><h2 id="cTit"></h2><p id="cTxt"></p><div class="botoes" id="cBot"></div></div></div>
+</div>
+<script id="cfg" type="application/json">@CONFIG@</script>
 <script>
- var v=document.getElementById('v');
- v.addEventListener('error',function(){document.getElementById('erro').style.display='block'});
+(function () {
+ 'use strict';
+ var C = JSON.parse(document.getElementById('cfg').textContent);
+ function $(id) { return document.getElementById(id); }
+ var v = $('v'), P = $('player'), BASE = '/v/' + C.token, CHAVE = 'toons:' + C.token;
+ var ICONE = {
+  play: 'M8 5v14l11-7z', pausa: 'M6 19h4V5H6v14zm8-14v14h4V5h-4z',
+  som: 'M3 9v6h4l5 5V4L7 9H3zm13.5 3c0-1.77-1.02-3.29-2.5-4.03v8.05c1.48-.73 2.5-2.25 2.5-4.02zM14 3.23v2.06c2.89.86 5 3.54 5 6.71s-2.11 5.85-5 6.71v2.06c4.01-.91 7-4.49 7-8.77s-2.99-7.86-7-8.77z',
+  mudo: 'M16.5 12c0-1.77-1.02-3.29-2.5-4.03v2.21l2.45 2.45c.03-.2.05-.41.05-.63zm2.5 0c0 .94-.2 1.82-.54 2.64l1.51 1.51C20.63 14.91 21 13.5 21 12c0-4.28-2.99-7.86-7-8.77v2.06c2.89.86 5 3.54 5 6.71zM4.27 3L3 4.27 7.73 9H3v6h4l5 5v-6.73l4.25 4.25c-.67.52-1.42.93-2.25 1.18v2.06c1.38-.31 2.63-.95 3.69-1.81L19.73 21 21 19.73l-9-9L4.27 3zM12 4L9.91 6.09 12 8.18V4z',
+  audio: 'M12 1c-4.97 0-9 4.03-9 9v7c0 1.66 1.34 3 3 3h3v-8H5v-2c0-3.87 3.13-7 7-7s7 3.13 7 7v2h-4v8h3c1.66 0 3-1.34 3-3v-7c0-4.97-4.03-9-9-9z',
+  legenda: 'M19 4H5c-1.11 0-2 .9-2 2v12c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm-8 7H9.5v-.5h-2v3h2V13H11v1c0 .55-.45 1-1 1H7c-.55 0-1-.45-1-1v-4c0-.55.45-1 1-1h3c.55 0 1 .45 1 1v1zm7 0h-1.5v-.5h-2v3h2V13H18v1c0 .55-.45 1-1 1h-3c-.55 0-1-.45-1-1v-4c0-.55.45-1 1-1h3c.55 0 1 .45 1 1v1z',
+  ajustes: 'M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z',
+  pip: 'M19 7h-8v6h8V7zm2-4H3c-1.1 0-2 .9-2 2v14c0 1.1.9 1.98 2 1.98h18c1.1 0 2-.88 2-1.98V5c0-1.1-.9-2-2-2zm0 16.01H3V4.98h18v14.03z',
+  tela: 'M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z',
+  sairTela: 'M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z',
+  marca: 'M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z',
+  voltar: 'M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z',
+  denovo: 'M12 5V1L7 6l5 5V7c3.31 0 6 2.69 6 6s-2.69 6-6 6-6-2.69-6-6H4c0 4.42 3.58 8 8 8s8-3.58 8-8-3.58-8-8-8z'
+ };
+ function svg(nome) { return '<svg viewBox="0 0 24 24"><path d="' + ICONE[nome] + '"/></svg>'; }
+ function svgPulo(frente) {  // seta circular com "10" dentro (espelhada para avançar)
+  return '<svg viewBox="0 0 24 24"><g' + (frente ? ' transform="matrix(-1 0 0 1 24 0)"' : '') + '>' +
+   '<path d="M12 5A8 8 0 1 0 18.93 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>' +
+   '<path d="M12.6 1.4L7.4 5l5.2 3.6z"/></g><text x="12" y="15.9" text-anchor="middle" font-size="7.4" ' +
+   'font-weight="700" font-family="system-ui,sans-serif">10</text></svg>';
+ }
+
+ // ── Ambiente ──
+ var ua = navigator.userAgent;
+ var ehIOS = /iP(hone|ad|od)/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+ var ehSafari = ehIOS || (/Safari\//.test(ua) && !/Chrome|Chromium|CriOS|FxiOS|Edg|OPR|Android/.test(ua));
+ var ehAndroid = /Android/.test(ua);
+ function toca(tipo) { try { return !!v.canPlayType(tipo); } catch (e) { return false; } }
+ var podeH264 = toca('video/mp4; codecs="avc1.640028"');
+ var acodec = !toca('audio/mp4; codecs="mp4a.40.2"') && toca('audio/mp4; codecs="opus"') ? 'opus' : 'aac';
+
+ // ── Estado ──
+ var E = {
+  audio: C.audio_padrao || 0, legenda: C.legenda_padrao, modo: '', base: 0, iniciado: false, geracao: 0,
+  falhas: 0, forcar: false, alvo: null, arrasto: null, tam: 1, atraso: 0, vel: 1, ultimaLegenda: -1, reconexao: null,
+  recod: !!(C.video && podeH264 && (!C.video.copiavel || (C.video.codecs && !toca('video/mp4; codecs="' + C.video.codecs + '"'))))
+ };
+ var sessao = Math.random().toString(36).slice(2, 10);
+ function lerSalvo() { try { return JSON.parse(localStorage.getItem(CHAVE)) || {}; } catch (e) { return {}; } }
+ function salvar(fim) {
+  try {
+   localStorage.setItem(CHAVE, JSON.stringify({t: fim ? 0 : agora(), a: E.audio, l: E.legenda, tam: E.tam, at: E.atraso}));
+   localStorage.setItem('toons:vol', JSON.stringify({v: v.volume, m: v.muted}));
+  } catch (e) {}
+ }
+ var salvo = lerSalvo();
+ if (typeof salvo.a === 'number' && salvo.a < C.audios.length) E.audio = salvo.a;
+ if (typeof salvo.l === 'number' && salvo.l < C.legendas.length) E.legenda = salvo.l;
+ if (salvo.tam) E.tam = salvo.tam;
+ if (salvo.at) E.atraso = salvo.at;
+ try { var vol = JSON.parse(localStorage.getItem('toons:vol')); if (vol) { v.volume = vol.v; v.muted = vol.m; } } catch (e) {}
+
+ // Arquivo original (com HTTP Range) quando o navegador o toca; senão, conversão na hora. Sem ffmpeg no
+ // celular, ou no Safari com MP4 (ele toca AC3 e HEVC e troca a trilha sozinho), tenta o original mesmo assim.
+ function direto() { return !E.forcar && ((C.direto && C.audios.length <= 1) || !C.transmissao || (ehSafari && C.mp4)); }
+ function trilhasNativas() { return E.modo === 'direto' && v.audioTracks && v.audioTracks.length > 1; }
+ function podeTrocarAudio() { return C.audios.length > 1 && (C.transmissao || (ehSafari && C.mp4)); }
+ function agora() { return (E.modo === 'transmissao' ? E.base : 0) + (v.currentTime || 0); }
+ function duracao() { return C.duracao || (isFinite(v.duration) ? v.duration : 0); }
+ function fmt(s) {
+  s = Math.max(0, Math.floor(s || 0));
+  var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), x = s % 60;
+  return (h ? h + ':' + (m < 10 ? '0' : '') : '') + m + ':' + (x < 10 ? '0' : '') + x;
+ }
+
+ // ── Carregar e pular ──
+ function carregar(t, tocar) {
+  E.iniciado = true;
+  esconderCartao();
+  var d = duracao(), minha = ++E.geracao;
+  t = Math.max(0, d ? Math.min(t || 0, d - 1) : (t || 0));
+  P.classList.add('carregando');
+  if (direto()) {
+   E.modo = 'direto';
+   var url = BASE + '/video';
+   var ir = function () { if (minha !== E.geracao) return; if (t) v.currentTime = t; if (tocar) tocarVideo(); };
+   if (v.getAttribute('src') !== url) { v.src = url; v.addEventListener('loadedmetadata', ir, {once: true}); }
+   else ir();
+   return;
+  }
+  if (!C.transmissao) return falhar('Este vídeo não toca no navegador e o celular que o compartilhou não tem o ffmpeg para convertê-lo.');
+  if (ehSafari) return falhar('Este vídeo é convertido na hora, e o Safari (iPhone, iPad e Mac) não aceita esse tipo de transmissão. No VLC ele abre com todas as trilhas de áudio e legendas.');
+  E.modo = 'transmissao';
+  var abrir = function (k) {
+   if (minha !== E.geracao) return;
+   E.base = k;
+   v.src = BASE + '/stream?a=' + E.audio + '&t=' + k.toFixed(3) + '&ac=' + acodec + '&s=' + sessao + (E.recod ? '&v=h264' : '');
+   v.defaultPlaybackRate = v.playbackRate = E.vel;
+   atualizarTempo();
+   if (tocar) tocarVideo();
+  };
+  if (t < 1) return abrir(0);
+  fetch(BASE + '/ponto?t=' + t.toFixed(3)).then(function (r) { return r.ok ? r.json() : null; })
+   .then(function (j) { abrir(j && typeof j.t === 'number' ? j.t : t); }, function () { abrir(t); });
+ }
+ function tocarVideo() {
+  var p = v.play();
+  if (p && p.catch) p.catch(function (e) {
+   if (e && e.name === 'NotAllowedError') { P.classList.remove('carregando'); mostrarControles(); }
+  });
+ }
+ function pular(t) {
+  if (!E.iniciado) return carregar(t, true);
+  var d = duracao();
+  t = Math.max(0, d ? Math.min(t, d - 0.5) : t);
+  if (E.modo === 'direto') { v.currentTime = t; return; }
+  var rel = t - E.base, s = v.seekable;
+  for (var i = 0; i < s.length; i++) if (rel >= s.start(i) && rel <= s.end(i) - 0.5) { v.currentTime = rel; return; }
+  carregar(t, !v.paused || P.classList.contains('carregando'));
+ }
+ var tAlvo, tPulo = {};
+ function pularRel(dt) {
+  if (!E.iniciado) return;
+  var d = duracao();
+  E.alvo = Math.max(0, (E.alvo != null ? E.alvo : agora()) + dt);
+  if (d) E.alvo = Math.min(E.alvo, d - 0.5);
+  var lado = dt < 0 ? 'puloE' : 'puloD', el = $(lado);
+  el.dataset.soma = (+(el.dataset.soma || 0) + Math.abs(dt));
+  el.textContent = (dt < 0 ? '« ' : '') + el.dataset.soma + ' s' + (dt > 0 ? ' »' : '');
+  el.classList.add('ver');
+  clearTimeout(tPulo[lado]);
+  tPulo[lado] = setTimeout(function () { el.classList.remove('ver'); el.dataset.soma = 0; }, 700);
+  clearTimeout(tAlvo);
+  if (E.modo === 'direto') { var alvo = E.alvo; E.alvo = null; pular(alvo); return; }
+  E.arrasto = E.alvo; atualizarTempo();
+  tAlvo = setTimeout(function () { var alvo = E.alvo; E.alvo = null; E.arrasto = null; pular(alvo); }, 450);
+ }
+ function alternar() {
+  if (!E.iniciado) return carregar(retomar || 0, true);
+  if (v.ended) { pular(0); return tocarVideo(); }
+  if (v.paused) tocarVideo(); else v.pause();
+ }
+
+ // ── Eventos do vídeo ──
+ v.addEventListener('playing', function () {
+  P.classList.remove('carregando'); P.classList.add('tocando'); E.falhas = 0; atualizarPlay(); agendarOcioso();
+ });
+ v.addEventListener('play', atualizarPlay);
+ v.addEventListener('pause', function () { P.classList.remove('tocando'); atualizarPlay(); mostrarControles(); if (E.iniciado) salvar(); });
+ v.addEventListener('waiting', function () { if (E.iniciado) P.classList.add('carregando'); });
+ v.addEventListener('seeking', function () { P.classList.add('carregando'); });
+ v.addEventListener('seeked', function () { P.classList.remove('carregando'); desenharLegenda(); });
+ v.addEventListener('canplay', function () { if (v.paused || !E.iniciado) P.classList.remove('carregando'); });
+ v.addEventListener('loadeddata', function () {
+  if (v.paused) P.classList.remove('carregando');
+  if (!E.iniciado || !C.video || v.videoWidth) return;
+  // o navegador abriu só o som: não reconhece o formato da imagem
+  if (E.modo === 'transmissao' && !E.recod && podeH264) {
+   E.recod = true; aviso('Recodificando o vídeo para o seu navegador…', 3500);
+   return carregar(agora(), true);
+  }
+  if (E.modo === 'direto' && C.transmissao && !ehSafari && !E.forcar) { E.forcar = true; return carregar(agora(), true); }
+  falhar('Seu navegador tocou só o som: ele não reconhece o formato da imagem deste vídeo.');
+ });
+ v.addEventListener('loadedmetadata', function () { if (!E.iniciado) P.classList.remove('carregando'); aplicarTrilhaNativa(); atualizarTempo(); });
+ v.addEventListener('timeupdate', function () { atualizarTempo(); desenharLegenda(); });
+ v.addEventListener('progress', atualizarBuffer);
+ v.addEventListener('durationchange', atualizarTempo);
+ v.addEventListener('volumechange', atualizarSom);
+ v.addEventListener('ended', function () {
+  var d = duracao(), t = agora();
+  if (E.modo === 'transmissao' && d && t < d - 5) {  // a conexão caiu antes do fim do filme
+   var r = E.reconexao;
+   if (!r || t - r > 5) { E.reconexao = t; aviso('Reconectando…'); return carregar(t, true); }
+  }
+  P.classList.remove('tocando', 'carregando'); atualizarPlay(true); mostrarControles(); salvar(true);
+ });
+ v.addEventListener('error', function () {
+  if (!v.error || !v.getAttribute('src')) return;
+  var t = agora();
+  if (E.modo === 'direto') {
+   if (C.transmissao && !ehSafari) {  // o navegador não toca o arquivo original: passa a converter na hora
+    E.forcar = true;
+    if (!E.iniciado) { E.modo = ''; P.classList.remove('carregando'); return; }
+    aviso('Convertendo na hora para o seu navegador…');
+    return carregar(t, true);
+   }
+   return E.iniciado ? falhar('Seu navegador não conseguiu reproduzir este vídeo.') : P.classList.remove('carregando');
+  }
+  if (!E.iniciado) return;
+  fetch(BASE + '/estado').then(function (r) {
+   if (r.status === 410) return {ok: false, erro: 'Este link expirou.'};
+   if (r.status === 404) return {ok: false, erro: 'Este link foi apagado ou o vídeo não está mais disponível.'};
+   return r.json();
+  }).then(function (j) {
+   if (!j.ok) return falhar(j.erro);
+   E.falhas++;
+   if (E.falhas <= 2) { aviso('Reconectando…'); return setTimeout(function () { carregar(t, true); }, 1200); }
+   if (!E.recod && podeH264 && C.video) {
+    E.recod = true; E.falhas = 0;
+    aviso('Recodificando o vídeo para o seu navegador…', 3500);
+    return carregar(t, true);
+   }
+   falhar('Seu navegador não conseguiu reproduzir este vídeo.');
+  }, function () { falhar('Sem conexão com o celular que está transmitindo.'); });
+ });
+
+ // ── Tempo, barra e botões ──
+ function atualizarTempo() {
+  var d = duracao(), t = E.arrasto != null ? E.arrasto : E.iniciado ? agora() : (retomar || 0);
+  $('tempo').textContent = fmt(t) + (d ? ' / ' + fmt(d) : '');
+  var f = d ? Math.min(1, t / d) : 0;
+  $('prog').style.width = (f * 100) + '%';
+  $('bola').style.left = (f * 100) + '%';
+  $('barra').setAttribute('aria-valuenow', Math.floor(t));
+  atualizarBuffer();
+ }
+ function atualizarBuffer() {
+  var d = duracao(), b = v.buffered, ini = 0, fim = 0, base = E.modo === 'transmissao' ? E.base : 0;
+  for (var i = 0; i < b.length; i++) if (b.start(i) <= v.currentTime + 1 && b.end(i) >= v.currentTime) { ini = b.start(i); fim = b.end(i); }
+  $('buf').style.left = d ? ((base + ini) / d * 100) + '%' : '0';
+  $('buf').style.width = d && fim ? (Math.min(fim - ini, d) / d * 100) + '%' : '0';
+ }
+ function atualizarPlay(fim) {
+  var tocando = !v.paused && !v.ended;
+  $('btPlay').innerHTML = svg(tocando ? 'pausa' : 'play');
+  $('grande').innerHTML = svg(fim === true ? 'denovo' : 'play');
+ }
+ function atualizarSom() { $('btSom').innerHTML = svg(v.muted || v.volume === 0 ? 'mudo' : 'som'); $('vol').value = v.muted ? 0 : v.volume; }
+ function atualizarBotoes() {
+  $('btAudio').hidden = !podeTrocarAudio();
+  $('btLegenda').hidden = !C.legendas.length;
+  $('btLegenda').classList.toggle('ativo', E.legenda >= 0);
+  $('legenda').style.setProperty('--tam', E.tam);
+ }
+ function emTela() { return document.fullscreenElement || document.webkitFullscreenElement; }
+ function atualizarTela() { $('btTela').innerHTML = svg(emTela() ? 'sairTela' : 'tela'); }
+ function alternarTela() {
+  if (emTela()) return (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+  var pedir = P.requestFullscreen || P.webkitRequestFullscreen;
+  if (!pedir) { if (v.webkitEnterFullscreen) { trilhaNativa(); v.webkitEnterFullscreen(); } return; }
+  var r = pedir.call(P);
+  var girar = function () {
+   if (v.videoWidth > v.videoHeight && screen.orientation && screen.orientation.lock) screen.orientation.lock('landscape').catch(function () {});
+  };
+  if (r && r.then) r.then(girar, function () {}); else girar();
+ }
+ function trilhaNativa() {  // tela cheia do iPhone usa o player do sistema, que só mostra legendas de <track>
+  var velha = v.querySelector('track');
+  if (velha) velha.remove();
+  if (E.legenda < 0 || E.modo !== 'direto') return;
+  var tr = document.createElement('track');
+  tr.kind = 'subtitles'; tr.srclang = 'pt'; tr.label = C.legendas[E.legenda].rotulo; tr.default = true;
+  tr.src = BASE + '/legenda/' + E.legenda + '.vtt';
+  v.appendChild(tr);
+ }
+ v.addEventListener('webkitendfullscreen', function () { var tr = v.querySelector('track'); if (tr) tr.remove(); });
+ document.addEventListener('fullscreenchange', atualizarTela);
+ document.addEventListener('webkitfullscreenchange', atualizarTela);
+
+ function ao(id, fn) { $(id).addEventListener('click', function (ev) { ev.stopPropagation(); this.blur(); fn(ev); mostrarControles(); }); }
+ ao('btPlay', alternar);
+ ao('grande', alternar);
+ ao('btVolta', function () { pularRel(-10); });
+ ao('btAvanca', function () { pularRel(10); });
+ ao('btSom', function () { v.muted = !v.muted; if (!v.muted && v.volume === 0) v.volume = 1; });
+ ao('btTela', alternarTela);
+ ao('btAudio', function () { abrirPainel('audio'); });
+ ao('btLegenda', function () { abrirPainel('legenda'); });
+ ao('btAjustes', function () { abrirPainel('ajustes'); });
+ ao('btPip', function () {
+  if (document.pictureInPictureElement) document.exitPictureInPicture();
+  else v.requestPictureInPicture().catch(function () { aviso('Janela flutuante indisponível.'); });
+ });
+ $('vol').addEventListener('input', function () { v.volume = +this.value; v.muted = v.volume === 0; });
+ $('vol').addEventListener('change', function () { this.blur(); salvar(); });
+
+ var barra = $('barra');
+ function fracao(ev) { var r = $('trilho').getBoundingClientRect(); return Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width)); }
+ function dica(ev) { var f = fracao(ev); $('dica').textContent = fmt(f * duracao()); $('dica').style.left = (f * 100) + '%'; }
+ barra.addEventListener('pointerdown', function (ev) {
+  if (!duracao() || !E.iniciado) return;
+  ev.preventDefault(); ev.stopPropagation();
+  barra.setPointerCapture(ev.pointerId); barra.classList.add('arrastando');
+  E.arrasto = fracao(ev) * duracao(); dica(ev); atualizarTempo(); mostrarControles();
+ });
+ barra.addEventListener('pointermove', function (ev) {
+  if (!duracao()) return;
+  dica(ev);
+  if (E.arrasto != null && barra.classList.contains('arrastando')) { E.arrasto = fracao(ev) * duracao(); atualizarTempo(); mostrarControles(); }
+ });
+ function soltar(ev, pularPara) {
+  if (!barra.classList.contains('arrastando')) return;
+  barra.classList.remove('arrastando');
+  var t = E.arrasto; E.arrasto = null;
+  if (pularPara && t != null) pular(t); else atualizarTempo();
+ }
+ barra.addEventListener('pointerup', function (ev) { soltar(ev, true); });
+ barra.addEventListener('pointercancel', function (ev) { soltar(ev, false); });
+ barra.addEventListener('click', function (ev) { ev.stopPropagation(); });
+
+ // ── Controles somem sozinhos; toque duplo pula 10 s ──
+ var tOcioso;
+ function mostrarControles() { P.classList.remove('ocioso'); agendarOcioso(); }
+ function agendarOcioso() {
+  clearTimeout(tOcioso);
+  tOcioso = setTimeout(function () { if (!v.paused && !painelAberto() && E.arrasto == null) P.classList.add('ocioso'); }, 3000);
+ }
+ var ponteiro = 'mouse', ultimoToque = 0, tToque, ladoPulo = null, ladoAte = 0;
+ P.addEventListener('pointerdown', function (ev) { ponteiro = ev.pointerType; P.classList.toggle('toque', ponteiro !== 'mouse'); }, true);
+ P.addEventListener('pointermove', function (ev) { if (ev.pointerType === 'mouse') mostrarControles(); });
+ P.addEventListener('click', function (ev) {
+  if (ev.target.closest('button, input, #painel, #barra, #linha, #cartao')) return;
+  if (painelAberto()) return fecharPainel();
+  if (!E.iniciado) return alternar();
+  if (ponteiro === 'mouse') return alternar();
+  var x = ev.clientX / P.clientWidth, lado = x < 0.4 ? -10 : x > 0.6 ? 10 : 0, t = Date.now();
+  if (lado && ladoPulo === lado && t < ladoAte) { ladoAte = t + 700; return pularRel(lado); }  // toques seguidos somam
+  if (t - ultimoToque < 300) {
+   clearTimeout(tToque); ultimoToque = 0;
+   if (lado) { ladoPulo = lado; ladoAte = t + 700; pularRel(lado); } else alternarTela();
+   return;
+  }
+  ultimoToque = t;
+  tToque = setTimeout(function () {
+   if (P.classList.contains('ocioso')) mostrarControles();
+   else if (!v.paused) { clearTimeout(tOcioso); P.classList.add('ocioso'); }
+  }, 260);
+ });
+ P.addEventListener('dblclick', function (ev) { if (ponteiro === 'mouse' && !ev.target.closest('button, input, #painel, #barra, #cartao')) alternarTela(); });
+
+ document.addEventListener('keydown', function (ev) {
+  if (ev.ctrlKey || ev.metaKey || ev.altKey || ev.target.tagName === 'INPUT') return;
+  var k = ev.key, feito = true;
+  if (k === ' ' || k === 'k' || k === 'K' || k === 'MediaPlayPause') alternar();
+  else if (k === 'ArrowLeft' || k === 'j' || k === 'J') pularRel(-10);
+  else if (k === 'ArrowRight' || k === 'l' || k === 'L') pularRel(10);
+  else if (k === 'ArrowUp' || k === 'ArrowDown') {
+   v.muted = false; v.volume = Math.round(Math.max(0, Math.min(1, v.volume + (k === 'ArrowUp' ? 0.1 : -0.1))) * 10) / 10;
+   aviso('Volume ' + Math.round(v.volume * 100) + '%', 900);
+  }
+  else if (k === 'f' || k === 'F') alternarTela();
+  else if (k === 'm' || k === 'M') v.muted = !v.muted;
+  else if (k === 'c' || k === 'C') alternarLegenda();
+  else if (k === 'a' || k === 'A') { if (podeTrocarAudio()) trocarAudio((E.audio + 1) % C.audios.length); }
+  else if (k === 'Escape' && painelAberto()) fecharPainel();
+  else if (/^[0-9]$/.test(k) && duracao() && E.iniciado) pular(duracao() * (+k) / 10);
+  else feito = false;
+  if (feito) { ev.preventDefault(); mostrarControles(); }
+ });
+
+ // ── Menus: áudio, legendas e ajustes ──
+ var painel = $('painel'), painelAtual = '';
+ function painelAberto() { return painel.classList.contains('ver'); }
+ function fecharPainel() { painel.classList.remove('ver'); painelAtual = ''; agendarOcioso(); }
+ function abrirPainel(nome) { if (painelAtual === nome) return fecharPainel(); mostrarPainel(nome); }
+ function rotuloAtraso() { return (E.atraso > 0 ? '+' : '') + E.atraso.toFixed(1).replace('.', ',') + ' s'; }
+ var PAINEIS = {
+  audio: function () {
+   return {titulo: 'Trilha de áudio', itens: C.audios.map(function (a, i) {
+    return {rotulo: a.rotulo, sel: i === E.audio, acao: function () { fecharPainel(); trocarAudio(i); }};
+   })};
+  },
+  legenda: function () {
+   var itens = [{rotulo: 'Desligada', sel: E.legenda < 0, acao: function () { fecharPainel(); trocarLegenda(-1); }}];
+   C.legendas.forEach(function (l, i) {
+    itens.push({rotulo: l.rotulo, sel: i === E.legenda, acao: function () { fecharPainel(); trocarLegenda(i); }});
+   });
+   itens.push({rotulo: 'Tamanho', dir: Math.round(E.tam * 100) + '%', acao: function () { mostrarPainel('tamanho'); }});
+   itens.push({rotulo: 'Sincronia', dir: rotuloAtraso(), acao: function () { mostrarPainel('sincronia'); }});
+   return {titulo: 'Legendas', itens: itens};
+  },
+  tamanho: function () {
+   return {titulo: 'Tamanho da legenda', voltar: 'legenda', itens: [0.75, 1, 1.25, 1.5, 2].map(function (x) {
+    return {rotulo: Math.round(x * 100) + '%', sel: x === E.tam, acao: function () { E.tam = x; atualizarBotoes(); salvar(); mostrarPainel('tamanho'); }};
+   })};
+  },
+  sincronia: function () {
+   var mudar = function (d) { return function () { E.atraso = Math.round((E.atraso + d) * 10) / 10; salvar(); desenharLegenda(); mostrarPainel('sincronia'); }; };
+   return {titulo: 'Sincronia: ' + rotuloAtraso(), voltar: 'legenda', itens: [
+    {rotulo: 'Legenda aparece cedo demais', sub: 'atrasar 0,5 s', acao: mudar(0.5)},
+    {rotulo: 'Legenda aparece tarde demais', sub: 'adiantar 0,5 s', acao: mudar(-0.5)},
+    {rotulo: 'Zerar', acao: function () { E.atraso = 0; salvar(); desenharLegenda(); mostrarPainel('sincronia'); }}
+   ]};
+  },
+  velocidade: function () {
+   return {titulo: 'Velocidade', voltar: 'ajustes', itens: [0.5, 0.75, 1, 1.25, 1.5, 2].map(function (x) {
+    return {rotulo: x === 1 ? 'Normal' : String(x).replace('.', ',') + 'x', sel: x === E.vel,
+            acao: function () { E.vel = x; v.defaultPlaybackRate = v.playbackRate = x; mostrarPainel('velocidade'); }};
+   })};
+  },
+  ajustes: function () {
+   var itens = [{rotulo: 'Velocidade', dir: E.vel === 1 ? 'Normal' : String(E.vel).replace('.', ',') + 'x', acao: function () { mostrarPainel('velocidade'); }}];
+   if (C.transmissao && C.video && C.video.copiavel && podeH264 && !direto() && !ehSafari) {
+    itens.push({rotulo: 'Imagem', sub: E.recod ? 'recodificada: toca em mais aparelhos, mas pesa no celular que transmite'
+                                              : 'original: melhor qualidade', dir: E.recod ? 'Compatível' : 'Original',
+     acao: function () { E.recod = !E.recod; fecharPainel(); aviso(E.recod ? 'Imagem compatível' : 'Imagem original'); if (E.iniciado) carregar(agora(), !v.paused); }});
+   }
+   itens.push({rotulo: 'Abrir no VLC', sub: 'todas as trilhas de áudio e legendas', acao: function () { fecharPainel(); abrirFora(true); }});
+   if (ehAndroid) itens.push({rotulo: 'Abrir em outro app', sub: 'MX Player, Just Player…', acao: function () { fecharPainel(); abrirFora(false); }});
+   itens.push({rotulo: 'Copiar link do vídeo', sub: 'para colar no VLC, Kodi, TV…', acao: function () { fecharPainel(); copiar(linkArquivo(), 'Link copiado.'); }});
+   if (matchMedia('(pointer: fine)').matches) itens.push({rotulo: 'Atalhos do teclado', sub: 'espaço · ← → 10 s · ↑ ↓ volume · F tela cheia · M mudo · C legenda · A áudio · 0–9 posição', acao: function () {}});
+   return {titulo: 'Ajustes', itens: itens};
+  }
+ };
+ function mostrarPainel(nome) {
+  var spec = PAINEIS[nome]();
+  painelAtual = nome; painel.innerHTML = '';
+  var h = document.createElement('h3');
+  if (spec.voltar) {
+   var b = document.createElement('button'); b.innerHTML = svg('voltar'); b.setAttribute('aria-label', 'Voltar');
+   b.onclick = function (ev) { ev.stopPropagation(); mostrarPainel(spec.voltar); };
+   h.appendChild(b);
+  }
+  h.appendChild(document.createTextNode(spec.titulo));
+  painel.appendChild(h);
+  spec.itens.forEach(function (it) {
+   var el = document.createElement('button');
+   el.className = 'item' + (it.sel ? ' sel' : ''); el.setAttribute('role', 'menuitem');
+   el.innerHTML = '<svg class="marca" viewBox="0 0 24 24"><path d="' + ICONE.marca + '"/></svg><span></span>';
+   var texto = el.querySelector('span'); texto.textContent = it.rotulo;
+   if (it.sub) { var s = document.createElement('small'); s.textContent = it.sub; texto.appendChild(s); }
+   if (it.dir) { var d = document.createElement('span'); d.className = 'dir'; d.textContent = it.dir; el.appendChild(d); }
+   el.onclick = function (ev) { ev.stopPropagation(); it.acao(); };
+   painel.appendChild(el);
+  });
+  painel.classList.add('ver'); mostrarControles();
+ }
+
+ function trocarAudio(i) {
+  if (i === E.audio) return;
+  E.audio = i; salvar();
+  aviso('Áudio: ' + C.audios[i].rotulo);
+  if (trilhasNativas()) aplicarTrilhaNativa();
+  else if (E.iniciado && E.modo === 'transmissao') carregar(agora(), !v.paused || P.classList.contains('carregando'));
+ }
+ function aplicarTrilhaNativa() {  // Safari: troca a trilha do próprio arquivo, sem conversão
+  if (!trilhasNativas()) return;
+  for (var i = 0; i < v.audioTracks.length; i++) v.audioTracks[i].enabled = i === E.audio;
+ }
+
+ // ── Legendas (desenhadas pelo player: funcionam também na transmissão convertida) ──
+ var cues = [], cacheLeg = {}, legHtml = null;
+ function alternarLegenda() {
+  if (!C.legendas.length) return;
+  if (E.legenda >= 0) { E.ultimaLegenda = E.legenda; trocarLegenda(-1); }
+  else trocarLegenda(E.ultimaLegenda >= 0 ? E.ultimaLegenda : Math.max(0, C.legenda_padrao));
+ }
+ function trocarLegenda(i, calado) {
+  E.legenda = i; cues = []; salvar(); atualizarBotoes(); desenharLegenda();
+  if (!calado) aviso(i < 0 ? 'Legenda desligada' : 'Legenda: ' + C.legendas[i].rotulo);
+  if (i < 0) return;
+  if (cacheLeg[i]) { cues = cacheLeg[i]; desenharLegenda(); return; }
+  baixarLegenda(i, 0);
+ }
+ function baixarLegenda(i, tentativa) {
+  fetch(BASE + '/legenda/' + i + '.vtt').then(function (r) {
+   if (r.status === 202) {
+    if (E.legenda !== i) return null;
+    if (tentativa % 10 === 0) aviso(C.remoto ? 'Preparando a legenda: o celular que transmite precisa ler o vídeo inteiro uma vez. Pode levar alguns minutos.' : 'Preparando a legenda…', 4000);
+    setTimeout(function () { if (E.legenda === i) baixarLegenda(i, tentativa + 1); }, 3000);
+    return null;
+   }
+   if (!r.ok) throw new Error('HTTP ' + r.status);
+   return r.text();
+  }).then(function (txt) {
+   if (txt == null) return;
+   cacheLeg[i] = lerVTT(txt);
+   if (E.legenda === i) { cues = cacheLeg[i]; desenharLegenda(); if (tentativa) aviso('Legenda pronta.'); }
+  }).catch(function () { if (E.legenda === i) aviso('Não consegui carregar essa legenda.'); });
+ }
+ function segundos(s) { var t = 0; s.replace(',', '.').split(':').forEach(function (x) { t = t * 60 + parseFloat(x); }); return t; }
+ function limparTexto(t) {
+  t = t.replace(/\{\\[^}]*\}/g, '').replace(/<(?!\/?[ibu]>)[^>]*>/gi, '')
+   .replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  var div = document.createElement('div'); div.textContent = t;
+  return div.innerHTML.replace(/&lt;(\/?)([ibu])&gt;/gi, '<$1$2>').replace(/\n/g, '<br>');
+ }
+ function lerVTT(txt) {
+  var lista = [];
+  txt.replace(/\r/g, '').split(/\n{2,}/).forEach(function (bloco) {
+   var linhas = bloco.split('\n'), i = 0;
+   while (i < linhas.length && linhas[i].indexOf('-->') < 0) i++;
+   if (i >= linhas.length) return;
+   var m = linhas[i].match(/((?:\d+:)?\d{1,2}:\d{2}[.,]\d{1,3})\s*-->\s*((?:\d+:)?\d{1,2}:\d{2}[.,]\d{1,3})/);
+   var texto = linhas.slice(i + 1).join('\n').trim();
+   if (m && texto) lista.push({i: segundos(m[1]), f: segundos(m[2]), html: limparTexto(texto)});
+  });
+  return lista.sort(function (a, b) { return a.i - b.i; });
+ }
+ function desenharLegenda() {
+  var t = agora() - E.atraso, html = '';
+  if (E.legenda >= 0) {
+   for (var i = 0; i < cues.length && cues[i].i <= t; i++) {
+    if (t < cues[i].f) html += (html ? '<br>' : '') + '<span>' + cues[i].html + '</span>';
+   }
+  }
+  if (html !== legHtml) { legHtml = html; $('legenda').innerHTML = html; }
+ }
+ var ultimoQuadro = 0;
+ (function quadro(ms) {
+  if (!v.paused && ms - ultimoQuadro > 100) { ultimoQuadro = ms; desenharLegenda(); atualizarTempo(); }
+  requestAnimationFrame(quadro);
+ })(0);
+
+ // ── Abrir fora do navegador (VLC...) ──
+ function linkArquivo() { return location.origin + BASE + '/video'; }
+ function abrirFora(vlc) {
+  var url = linkArquivo();
+  v.pause();
+  if (ehAndroid) {
+   location.href = 'intent://' + url.replace(/^https?:\/\//, '') + '#Intent;scheme=' + location.protocol.replace(':', '') +
+    ';action=android.intent.action.VIEW;type=video/*' + (vlc ? ';package=org.videolan.vlc' : '') +
+    ';S.title=' + encodeURIComponent(C.titulo) + ';end';
+  } else if (ehIOS && vlc) {
+   location.href = 'vlc-x-callback://x-callback-url/stream?url=' + encodeURIComponent(url);
+  } else {
+   copiar(url, 'Link copiado. No VLC: Mídia → Abrir fluxo de rede (Ctrl+N) e cole o link.');
+  }
+ }
+ function copiar(texto, msg) {
+  var feito = function () { aviso(msg, 4000); };
+  var velho = function () {
+   var t = document.createElement('textarea'); t.value = texto; t.style.position = 'fixed'; t.style.opacity = '0';
+   document.body.appendChild(t); t.select(); var r = false;
+   try { r = document.execCommand('copy'); } catch (e) {}
+   t.remove();
+   if (r) feito(); else window.prompt('Copie o link:', texto);
+  };
+  if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(texto).then(feito, velho);
+  else velho();
+ }
+
+ // ── Avisos e cartões ──
+ var tAviso;
+ function aviso(msg, ms) {
+  var a = $('aviso'); a.textContent = msg; a.classList.add('ver');
+  clearTimeout(tAviso); tAviso = setTimeout(function () { a.classList.remove('ver'); }, ms || 2200);
+ }
+ function cartao(titulo, texto, botoes) {
+  $('cTit').textContent = titulo; $('cTxt').textContent = texto;
+  var cb = $('cBot'); cb.innerHTML = '';
+  botoes.forEach(function (b) {
+   var el = document.createElement('button'); el.className = 'botao' + (b[2] ? ' pri' : ''); el.textContent = b[0];
+   el.onclick = function (ev) { ev.stopPropagation(); esconderCartao(); b[1](); };
+   cb.appendChild(el);
+  });
+  $('cartao').classList.add('ver');
+  P.classList.remove('ocioso');
+ }
+ function esconderCartao() { $('cartao').classList.remove('ver'); }
+ function falhar(msg) {
+  ++E.geracao;
+  if (!v.paused) v.pause();
+  P.classList.remove('carregando', 'tocando'); atualizarPlay();
+  var botoes = [['Abrir no VLC', function () { abrirFora(true); }, true]];
+  if (ehAndroid) botoes.push(['Outro app', function () { abrirFora(false); }]);
+  botoes.push(['Tentar de novo', function () { E.falhas = 0; E.forcar = false; carregar(agora(), true); }]);
+  cartao('Não deu para reproduzir aqui', msg, botoes);
+ }
+
+ // ── Começo ──
+ if ('mediaSession' in navigator) {
+  try {
+   navigator.mediaSession.metadata = new MediaMetadata({title: C.titulo, artist: 'Termux-Toons'});
+   navigator.mediaSession.setActionHandler('play', function () { tocarVideo(); });
+   navigator.mediaSession.setActionHandler('pause', function () { v.pause(); });
+   navigator.mediaSession.setActionHandler('seekbackward', function () { pularRel(-10); });
+   navigator.mediaSession.setActionHandler('seekforward', function () { pularRel(10); });
+  } catch (e) {}
+ }
+ if (document.pictureInPictureEnabled && !v.disablePictureInPicture) $('btPip').hidden = false;
+ $('btVolta').innerHTML = svgPulo(false);
+ $('btAvanca').innerHTML = svgPulo(true);
+ $('btAudio').innerHTML = svg('audio');
+ $('btLegenda').innerHTML = svg('legenda');
+ $('btAjustes').innerHTML = svg('ajustes');
+ $('btPip').innerHTML = svg('pip');
+ atualizarPlay(); atualizarSom(); atualizarTela(); atualizarBotoes(); atualizarTempo();
+ window.addEventListener('pagehide', function () { if (E.iniciado) salvar(); });
+ setInterval(function () { if (!v.paused) salvar(); }, 5000);
+ if (E.legenda >= 0) trocarLegenda(E.legenda, true);
+ if (direto()) { E.modo = 'direto'; v.src = BASE + '/video'; } else P.classList.remove('carregando');
+ var retomar = salvo.t > 30 && (!duracao() || salvo.t < duracao() - 60) ? salvo.t : 0;
+ if (retomar) {
+  cartao('Continuar assistindo?', 'Você parou em ' + fmt(retomar) + '.', [
+   ['Continuar', function () { carregar(retomar, true); }, true],
+   ['Do início', function () { retomar = 0; carregar(0, true); }]
+  ]);
+ }
+})();
 </script></body></html>
 """
+
+
+def eh_link(texto) -> bool:
+    return str(texto).strip().lower().startswith(("http://", "https://"))
+
+
+def fonte_de(item: dict) -> str:
+    """O vídeo de um compartilhamento como foi cadastrado: página, link da internet ou caminho do arquivo."""
+    return item.get("pagina") or item.get("url") or item.get("caminho", "")
+
+
+def fontes_de(item: dict, renovar: bool = False) -> list:
+    """O que o ffmpeg e o servidor leem: [arquivo] ou [link]; numa página, [vídeo] ou [vídeo, áudio]
+    (sites como o YouTube separam os dois), achados pelo yt-dlp."""
+    if item.get("pagina"):
+        return info_pagina(item["pagina"], renovar)["enderecos"]
+    return [fonte_de(item)]
+
+
+# Formato pedido ao yt-dlp: até 1080p, de preferência H.264 + AAC (só copiados, sem pesar no celular), por
+# HTTP direto (o ffmpeg não escolhe uma qualidade dentro de um manifesto DASH); senão, o que houver.
+_HTTP_SIMPLES = "[protocol^=http][protocol!*=dash]"
+FORMATO_PAGINA = (f"bv*[height<=1080][vcodec^=avc1]{_HTTP_SIMPLES}+ba[acodec^=mp4a]{_HTTP_SIMPLES}/"
+                  f"bv*[height<=1080]{_HTTP_SIMPLES}+ba{_HTTP_SIMPLES}/b[height<=1080]{_HTTP_SIMPLES}/b")
+_PAGINAS: dict = {}          # página -> (quando, {'enderecos', 'titulo', 'duracao'})
+_PAGINAS_TRAVA = threading.Lock()
+_CABECALHOS_LINK: dict = {}  # endereço achado pelo yt-dlp -> cabeçalhos HTTP que o site exige (Referer...)
+
+
+def info_pagina(pagina: str, renovar: bool = False) -> dict:
+    """Vídeo de uma página (YouTube, Vimeo, Google Drive...) achado pelo yt-dlp, sem baixar:
+    {'enderecos': [vídeo] ou [vídeo, áudio], 'titulo', 'duracao'}. Os sites expiram esses endereços em
+    poucas horas: ficam 1 hora em cache e `renovar` pede outros."""
+    with _PAGINAS_TRAVA:
+        achado = _PAGINAS.get(pagina)
+        if achado and not renovar and time.time() - achado[0] < 3600:
+            return achado[1]
+        if not tem("yt-dlp"):
+            raise ToonsError("Links de página (YouTube, Vimeo...) precisam do yt-dlp: pkg install python-yt-dlp")
+        proc = rodar(["yt-dlp", "-j", "--no-playlist", "--no-warnings", "-f", FORMATO_PAGINA, pagina],
+                     capturar=True, timeout=180, mostrar=False)
+        dados = None
+        with contextlib.suppress(json.JSONDecodeError, IndexError):
+            dados = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 else None
+        formatos = [f for f in ((dados.get("requested_formats") or [dados]) if dados else []) if f.get("url")]
+        if not formatos:
+            raise ToonsError("O yt-dlp não achou um vídeo nessa página. " + (proc.stderr or "").strip()[-300:])
+        for velho in (achado[1]["enderecos"] if achado else []):
+            _CABECALHOS_LINK.pop(velho, None)
+        for f in formatos[:2]:
+            _CABECALHOS_LINK[f["url"]] = {k: v for k, v in (f.get("http_headers") or dados.get("http_headers") or {}).items()
+                                          if isinstance(v, str) and k.lower() != "accept-encoding"}
+        resultado = {"enderecos": [f["url"] for f in formatos[:2]], "titulo": str(dados.get("title") or "Vídeo"),
+                     "duracao": dados.get("duration")}
+        _PAGINAS[pagina] = (time.time(), resultado)
+        return resultado
+
+
+def _cabecalhos_de(url: str) -> dict:
+    return {"User-Agent": USER_AGENT, **_CABECALHOS_LINK.get(url, {})}
+
+
+def extensao_de(fonte) -> str:
+    fonte = str(fonte)
+    caminho = urllib.parse.urlsplit(fonte).path if eh_link(fonte) else fonte
+    return os.path.splitext(caminho)[1].lower()
+
+
+def _opcoes_entrada(fonte: str, ffprobe: bool = False) -> list:
+    """Opções do ffmpeg/ffprobe para ler `fonte`. Links usam a identificação de um navegador e,
+    no ffmpeg, reconectam sozinhos se a conexão cair no meio do filme."""
+    if not eh_link(fonte):
+        return ["-i", "file:" + fonte]
+    cabecalhos = _cabecalhos_de(fonte)
+    opcoes = ["-user_agent", cabecalhos.pop("User-Agent"), "-rw_timeout", "30000000"]
+    if cabecalhos:
+        opcoes += ["-headers", "".join(f"{chave}: {valor}\r\n" for chave, valor in cabecalhos.items())]
+    if not ffprobe:
+        opcoes += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_on_network_error", "1",
+                   "-reconnect_delay_max", "10"]
+    return opcoes + ["-i", fonte]
 
 
 def _srt_para_vtt(dados: bytes) -> bytes:
@@ -4500,8 +5316,11 @@ def _srt_para_vtt(dados: bytes) -> bytes:
     return texto.encode("utf-8")
 
 
-def achar_legenda(video: Path):
-    """Legenda ao lado do vídeo (mesmo nome + .srt/.vtt); prefere português e .vtt."""
+_PORTUGUES = re.compile(r"(^|[._\- \[(])(pt|por|pob|br|pt-br|ptbr)([._\- \])]|$)", re.I)
+
+
+def legendas_ao_lado(video: Path) -> list:
+    """Legendas ao lado do vídeo (mesmo nome + .srt/.vtt), português e .vtt primeiro."""
     candidatas = []
     try:
         for p in video.parent.iterdir():
@@ -4510,10 +5329,8 @@ def achar_legenda(video: Path):
                     and resto[:1] in (".", "_", "-", " ") and p.is_file()):
                 candidatas.append(p)
     except OSError:
-        return None
-    portugues = re.compile(r"(^|[._\- \[(])(pt|por|pob|br|pt-br|ptbr)([._\- \])]|$)", re.I)
-    candidatas.sort(key=lambda p: (not portugues.search(p.stem), p.suffix.lower() != ".vtt", p.name))
-    return candidatas[0] if candidatas else None
+        return []
+    return sorted(candidatas, key=lambda p: (not _PORTUGUES.search(p.stem), p.suffix.lower() != ".vtt", p.name))
 
 
 def _faixa(cabecalho: str | None, tamanho: int):
@@ -4535,6 +5352,408 @@ def _faixa(cabecalho: str | None, tamanho: int):
     return inicio, min(int(m.group(2)), tamanho - 1) if m.group(2) else tamanho - 1
 
 
+# ── Faixas do vídeo (ffprobe) ────────────────────────────────────────
+
+def sondar_video(fonte):
+    """Faixas do vídeo (arquivo ou link) via ffprobe:
+    {'video': [...], 'audio': [...], 'legendas': [...], 'formato': {...}} ou None."""
+    if not tem("ffprobe"):
+        return None
+    fonte = str(fonte)
+    proc = rodar(["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams",
+                  *_opcoes_entrada(fonte, ffprobe=True)], capturar=True, timeout=90, mostrar=False)
+    if proc.returncode != 0:
+        return None
+    try:
+        dados = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    faixas = dados.get("streams", [])
+
+    def do_tipo(tipo):
+        return [s for s in faixas if s.get("codec_type") == tipo and not (s.get("disposition") or {}).get("attached_pic")]
+
+    return {"video": do_tipo("video"), "audio": do_tipo("audio"), "legendas": do_tipo("subtitle"),
+            "formato": dados.get("format") or {}}
+
+
+_SONDAS: dict = {}
+_SONDAS_TRAVA = threading.Lock()
+
+
+def sonda_em_cache(fontes: list):
+    """Faixas de [arquivo], [link] ou [vídeo, áudio] (página), lembrando o resultado de cada fonte."""
+    sondas = [_sonda_unica_em_cache(fonte) for fonte in fontes]
+    if not sondas or None in sondas:
+        return None
+    if len(sondas) == 1:
+        return sondas[0]
+    video, audio = sondas[0], sondas[-1]
+    return {"video": video["video"], "audio": audio["audio"], "legendas": video["legendas"], "formato": video["formato"]}
+
+
+def _sonda_unica_em_cache(fonte: str):
+    """sondar_video lembrando o resultado: arquivos até mudarem, links por 6 horas."""
+    if eh_link(fonte):
+        chave, validade = fonte, 6 * 3600
+    else:
+        try:
+            st = os.stat(fonte)
+        except OSError:
+            return None
+        chave, validade = (fonte, st.st_size, st.st_mtime), None
+    with _SONDAS_TRAVA:
+        achado = _SONDAS.get(chave)
+    if achado and (validade is None or time.time() - achado[0] < validade):
+        return achado[1]
+    sonda = sondar_video(fonte)
+    if sonda is not None:  # falha (link fora do ar, por exemplo) não fica guardada
+        with _SONDAS_TRAVA:
+            _SONDAS[chave] = (time.time(), sonda)
+    return sonda
+
+
+def _duracao(sonda):
+    for origem in ([sonda["formato"]] + sonda["video"]) if sonda else []:
+        try:
+            duracao = float(origem.get("duration") or 0)
+        except (TypeError, ValueError):
+            continue
+        if duracao > 0:
+            return round(duracao, 3)
+    return None
+
+
+def _inicio(sonda) -> float:
+    """start_time do arquivo: o ffmpeg conta o -ss a partir dele; o ffprobe mostra tempos absolutos."""
+    try:
+        return float(sonda["formato"].get("start_time") or 0) if sonda else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _hms(segundos) -> str:
+    minutos = round((segundos or 0) / 60)
+    return f"{minutos // 60}h {minutos % 60:02d}min" if minutos >= 60 else f"{minutos}min"
+
+
+def _eh_portugues(faixa: dict) -> bool:
+    return str((faixa.get("tags") or {}).get("language", "")).lower() in LINGUAS_PT
+
+
+def _indice_portugues(faixas: list) -> int:
+    return next((i for i, f in enumerate(faixas) if _eh_portugues(f)), 0)
+
+
+def _rotulo_faixa(faixa: dict) -> str:
+    """'Português · Dublado · AC3 5.1' para mostrar no menu e no player."""
+    tags = faixa.get("tags") or {}
+    lingua = str(tags.get("language", "")).lower()
+    partes = [IDIOMAS.get(lingua, lingua if lingua not in ("", "und") else "Idioma não informado")]
+    nome = str(tags.get("title") or "").strip()
+    if nome and nome.lower() not in partes[0].lower():
+        partes.append(nome)
+    if faixa.get("codec_type") == "audio":
+        canais = faixa.get("channels")
+        partes.append(str(faixa.get("codec_name", "?")).upper()
+                      + (f" {CANAIS.get(canais, f'{canais} canais')}" if canais else ""))
+    if (faixa.get("disposition") or {}).get("forced") and "forç" not in nome.lower() and "forced" not in nome.lower():
+        partes.append("forçada")
+    return " · ".join(partes)
+
+
+def mostrar_faixas(sonda) -> None:
+    """Resumo do vídeo: duração, imagem, trilhas de áudio e legendas."""
+    resumo = []
+    if _duracao(sonda):
+        resumo.append(_hms(_duracao(sonda)))
+    if sonda["video"]:
+        v = sonda["video"][0]
+        resumo.append(f"{str(v.get('codec_name', '?')).upper()} {v.get('width', '?')}x{v.get('height', '?')}")
+    if resumo:
+        print(f"  🎬 {' · '.join(resumo)}")
+    for faixa in sonda["audio"]:
+        print(f"  🔊 {_rotulo_faixa(faixa)}")
+    for faixa in sonda["legendas"]:
+        texto = faixa.get("codec_name") in CODECS_LEGENDA_TEXTO
+        print(f"  💬 {_rotulo_faixa(faixa)}{'' if texto else f' {DIM}(em imagem: não aparece no navegador){RST}'}")
+
+
+# ── O navegador consegue tocar? ──────────────────────────────────────
+
+def _video_compativel(faixa: dict) -> bool:
+    codec = faixa.get("codec_name")
+    if codec == "h264":
+        return faixa.get("pix_fmt") in ("yuv420p", "yuvj420p")  # H.264 de 10 bits não toca no navegador
+    return codec in VIDEO_NAVEGADOR
+
+
+def _video_copiavel(faixa) -> bool:
+    """Dá para transmitir sem recodificar a imagem? (HEVC só toca em parte dos navegadores; o player confere.)"""
+    return bool(faixa) and (_video_compativel(faixa) or faixa.get("codec_name") == "hevc")
+
+
+def _codecs_navegador(faixa) -> str:
+    """Código do formato de vídeo para o player perguntar ao navegador se consegue tocar (canPlayType)."""
+    codec, dez_bits = faixa.get("codec_name"), "10" in str(faixa.get("pix_fmt", ""))
+    return {"h264": "avc1.640028", "vp8": "vp8", "vp9": "vp09.02.40.10" if dez_bits else "vp09.00.40.08",
+            "av1": "av01.0.08M.10" if dez_bits else "av01.0.08M.08",
+            "hevc": "hvc1.2.4.L120.90" if dez_bits else "hvc1.1.6.L120.90"}.get(codec, "")
+
+
+def _arquivo_unico(fontes: list, sonda) -> bool:
+    """A fonte é um arquivo só, que dá para entregar byte a byte (não vídeo + áudio separados nem HLS)?"""
+    formato = sonda["formato"].get("format_name", "") if sonda else ""
+    return len(fontes) == 1 and extensao_de(fontes[0]) != ".m3u8" and "hls" not in formato
+
+
+def _toca_direto(fontes: list, sonda) -> bool:
+    """O navegador toca o arquivo original como está, sem o ffmpeg?"""
+    if not _arquivo_unico(fontes, sonda):
+        return False
+    ext = extensao_de(fontes[0])
+    if sonda is None:
+        return ext in FORMATOS_NAVEGADOR  # sem ffprobe, só dá para confiar na extensão
+    if ext not in FORMATOS_NAVEGADOR and not (ext == "" and "mp4" in sonda["formato"].get("format_name", "")):
+        return False
+    if sonda["video"] and not _video_compativel(sonda["video"][0]):
+        return False
+    return len(sonda["audio"]) == 0 or (len(sonda["audio"]) == 1 and sonda["audio"][0].get("codec_name") in AUDIO_NAVEGADOR)
+
+
+def _tipo_mime(fonte: str, sonda) -> str:
+    ext = extensao_de(fonte)
+    if ext in TIPOS_VIDEO:
+        return TIPOS_VIDEO[ext]
+    formato = sonda["formato"].get("format_name", "") if sonda else ""
+    if "mp4" in formato:
+        return "video/mp4"
+    if "matroska" in formato:
+        return "video/x-matroska"
+    return "application/octet-stream"
+
+
+def problemas_de_reproducao(fonte, sonda) -> list:
+    """O que impede o navegador de tocar o arquivo como está (o ffmpeg resolve convertendo na hora)."""
+    problemas = []
+    ext = extensao_de(fonte)
+    if ext and ext not in FORMATOS_NAVEGADOR:
+        problemas.append(f"o formato {ext} (navegadores tocam bem MP4 e WebM)")
+    if sonda:
+        if sonda["video"] and not _video_compativel(sonda["video"][0]):
+            problemas.append(f"o vídeo está em {str(sonda['video'][0].get('codec_name')).upper()} "
+                             f"({sonda['video'][0].get('pix_fmt', '?')})")
+        codecs = {str(f.get("codec_name")) for f in sonda["audio"]} - set(AUDIO_NAVEGADOR)
+        if codecs:
+            problemas.append(f"o áudio está em {', '.join(sorted(c.upper() for c in codecs))}")
+        if len(sonda["audio"]) > 1:
+            problemas.append(f"há {len(sonda['audio'])} trilhas de áudio e o navegador sozinho só toca uma")
+    return problemas
+
+
+def _precisa_recodificar(sonda) -> bool:
+    return bool(sonda and sonda["video"] and not _video_copiavel(sonda["video"][0]))
+
+
+# ── Legendas: arquivos ao lado, extras e embutidas ───────────────────
+
+def legendas_do_item(item: dict, sonda) -> list:
+    """Legendas oferecidas no player, na ordem do menu: [{'tipo', 'ref', 'rotulo', 'pt', 'forcada'}].
+    Num link da internet, as embutidas só entram se você escolheu prepará-las (é preciso ler o filme todo)."""
+    lista, fonte = [], fonte_de(item)
+    if not eh_link(fonte):
+        video = Path(fonte)
+        for p in legendas_ao_lado(video):
+            nome = p.name[len(video.stem):-len(p.suffix)].strip("._- ")
+            lista.append({"tipo": "arquivo", "ref": str(p), "rotulo": f"{IDIOMAS.get(nome.lower(), nome or 'Legenda')} · arquivo",
+                          "pt": bool(_PORTUGUES.search(p.stem)), "forcada": False})
+    for extra in item.get("legendas") or []:
+        nome = urllib.parse.unquote(Path(urllib.parse.urlsplit(extra).path if eh_link(extra) else extra).stem)
+        lista.append({"tipo": "link" if eh_link(extra) else "arquivo", "ref": extra, "rotulo": f"{nome} · extra",
+                      "pt": bool(_PORTUGUES.search(nome)), "forcada": False})
+    if sonda:
+        permitidas = set(item.get("legendas_embutidas") or []) if eh_link(fonte) else None
+        for n, faixa in enumerate(sonda["legendas"]):
+            if faixa.get("codec_name") in CODECS_LEGENDA_TEXTO and (permitidas is None or n in permitidas):
+                lista.append({"tipo": "embutida", "ref": n, "rotulo": _rotulo_faixa(faixa), "pt": _eh_portugues(faixa),
+                              "forcada": bool((faixa.get("disposition") or {}).get("forced"))})
+    return lista
+
+
+def _legenda_padrao(legendas: list, audio_em_portugues: bool) -> int:
+    """Áudio em português: só a legenda forçada (placas, falas em outra língua). Senão, legenda em português."""
+    if audio_em_portugues:
+        return next((i for i, l in enumerate(legendas) if l["pt"] and l["forcada"]), -1)
+    return next((i for i, l in enumerate(legendas) if l["pt"] and not l["forcada"]),
+                next((i for i, l in enumerate(legendas) if l["pt"]), -1))
+
+
+def _arquivo_legenda(item: dict, n: int) -> Path:
+    """Cache de uma legenda embutida. Num link, vale para o compartilhamento (trocar o endereço expirado
+    que expirou não obriga a baixar o filme de novo); num arquivo, até ele mudar."""
+    fonte = fonte_de(item)
+    ident = f"link|{item['token']}"
+    if not eh_link(fonte):
+        st = os.stat(fonte)
+        ident = f"{fonte}|{st.st_size}|{st.st_mtime}"
+    return LEGENDAS_CACHE / (hashlib.sha1(f"{ident}|{n}".encode()).hexdigest()[:24] + ".vtt")
+
+
+_EXTRACOES: dict = {}  # nome do arquivo em cache -> ("extraindo" | "erro", quando)
+_EXTRACOES_TRAVA = threading.Lock()
+
+
+def _extrair_legendas(fonte: str, destinos: dict) -> None:
+    """Extrai várias legendas embutidas numa passada só do ffmpeg (num link, o filme é lido uma vez)."""
+    LEGENDAS_CACHE.mkdir(parents=True, exist_ok=True)
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", *_opcoes_entrada(fonte)]
+    for n, destino in destinos.items():
+        cmd += ["-map", f"0:s:{n}", "-c:s", "webvtt", "-f", "webvtt", str(destino) + ".part"]
+    log(f"Extraindo {len(destinos)} legenda(s) embutida(s)...")
+    proc = rodar(cmd, capturar=True, timeout=4 * 3600, mostrar=False)
+    with _EXTRACOES_TRAVA:
+        for destino in destinos.values():
+            parcial = Path(str(destino) + ".part")
+            if proc.returncode == 0 and parcial.exists():
+                parcial.replace(destino)
+                _EXTRACOES.pop(destino.name, None)
+            else:
+                parcial.unlink(missing_ok=True)
+                _EXTRACOES[destino.name] = ("erro", time.time())
+    if proc.returncode != 0:
+        log(f"Falha ao extrair legendas: {(proc.stderr or '').strip()[-300:]}")
+
+
+def legenda_embutida(item: dict, n: int, todas: list):
+    """(bytes do .vtt, None) se já extraída; senão (None, 'extraindo' | 'erro'). Na primeira vez dispara a
+    extração, em segundo plano, de todas as legendas embutidas do item (`todas`), que ficam em cache."""
+    try:
+        destinos = {m: _arquivo_legenda(item, m) for m in dict.fromkeys([n, *todas])}
+    except OSError:
+        return None, "erro"
+    with contextlib.suppress(OSError):
+        return destinos[n].read_bytes(), None
+    with _EXTRACOES_TRAVA:
+        estado = _EXTRACOES.get(destinos[n].name)
+        if estado is None or (estado[0] == "erro" and time.time() - estado[1] > 300):
+            faltando = {m: d for m, d in destinos.items()
+                        if not d.exists() and _EXTRACOES.get(d.name, ("",))[0] != "extraindo"}
+            for destino in faltando.values():
+                _EXTRACOES[destino.name] = ("extraindo", time.time())
+            threading.Thread(target=_extrair_legendas, args=(fontes_de(item)[0], faltando), daemon=True).start()
+            estado = ("extraindo", time.time())
+    return None, estado[0]
+
+
+_LEGENDAS_LINK: dict = {}  # endereço -> (quando, bytes)
+
+
+def _baixar_legenda_link(url: str):
+    achado = _LEGENDAS_LINK.get(url)
+    if achado and time.time() - achado[0] < 3600:
+        return achado[1]
+    try:
+        status, dados, _ = baixar_url(url, timeout=30)
+    except OSError:
+        return None
+    if status >= 400 or not dados:
+        return None
+    _LEGENDAS_LINK[url] = (time.time(), dados)
+    return dados
+
+
+# ── Transmissão convertida na hora (ffmpeg) ──────────────────────────
+
+def ponto_de_corte(fonte: str, sonda, t: float) -> float:
+    """Início do quadro-chave em `t` ou logo antes. O ffmpeg só consegue copiar o vídeo a partir de um
+    quadro-chave; começando exatamente nele, o player sabe a que minuto do filme cada imagem pertence."""
+    if t <= 0 or not sonda or not sonda["video"]:
+        return max(t, 0.0)
+    base = _inicio(sonda)
+    proc = rodar(["ffprobe", "-v", "error", "-select_streams", "v:0", "-read_intervals", f"{t + base:.3f}%+5",
+                  "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", *_opcoes_entrada(fonte, ffprobe=True)],
+                 capturar=True, timeout=60, mostrar=False)
+    for linha in (proc.stdout or "").splitlines():
+        pts, _, marcas = linha.partition(",")
+        if "K" in marcas:
+            with contextlib.suppress(ValueError):
+                return max(0.0, float(pts) - base)
+    return t
+
+
+_ENCODERS: dict = {}
+
+
+def tem_encoder(nome: str) -> bool:
+    if nome not in _ENCODERS:
+        _ENCODERS[nome] = bool(re.search(rf"^\s*\S+\s+{re.escape(nome)}\s", saida(
+            ["ffmpeg", "-hide_banner", "-encoders"], timeout=20), re.M))
+    return _ENCODERS[nome]
+
+
+def comando_transmissao(fontes: list, sonda, audio: int = 0, inicio: float = 0.0,
+                        recodificar: bool = False, audio_codec: str = "aac") -> list:
+    """ffmpeg que gera um MP4 fragmentado (toca enquanto chega) a partir de `inicio` segundos, com a trilha
+    de áudio `audio`. A imagem é copiada (leve); só é recodificada se o navegador não toca o formato.
+    Com [vídeo, áudio] (página do YouTube, por exemplo) junta as duas fontes."""
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
+    for fonte in fontes:
+        if inicio > 0:
+            cmd += ["-ss", f"{inicio + 0.005:.3f}"]  # um pouco depois do quadro-chave: o ffmpeg volta até ele
+        cmd += _opcoes_entrada(fonte)
+    cmd += ["-map", "0:v:0?", "-map", f"{len(fontes) - 1}:a:{audio}?", "-sn", "-dn", "-map_metadata", "-1",
+            "-map_chapters", "-1"]
+    video = sonda["video"][0] if sonda and sonda["video"] else None
+    if video and (recodificar or not _video_copiavel(video)):
+        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "24", "-maxrate", "4M", "-bufsize", "8M",
+                "-vf", "scale=-2:'min(720,ih)'", "-pix_fmt", "yuv420p", "-g", "48"]
+    else:
+        cmd += ["-c:v", "copy"]
+        if video and video.get("codec_name") == "hevc":
+            cmd += ["-tag:v", "hvc1"]  # é assim que Safari e Chrome reconhecem HEVC dentro do MP4
+    faixas = sonda["audio"] if sonda else []
+    origem = faixas[audio].get("codec_name") if audio < len(faixas) else None
+    if (audio_codec == "aac" and origem in ("aac", "mp3")) or (audio_codec == "opus" and origem == "opus"):
+        cmd += ["-c:a", "copy"]
+    elif audio_codec == "opus" and tem_encoder("libopus"):
+        cmd += ["-c:a", "libopus", "-b:a", "160k", "-ac", "2"]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]
+    return cmd + ["-max_muxing_queue_size", "4096", "-movflags", "frag_keyframe+empty_moov+default_base_moof",
+                  "-frag_duration", "2000000", "-f", "mp4", "pipe:1"]
+
+
+_TRANSMISSOES: dict = {}  # "token:sessão do player" -> processo do ffmpeg
+_TRANSMISSOES_TRAVA = threading.Lock()
+
+
+def info_link(url: str) -> dict:
+    """Confere um link de vídeo pedindo só o primeiro byte: {'status', 'nome', 'tamanho', 'tipo'}.
+    Erros de rede viram exceção (OSError)."""
+    req = urllib.request.Request(url, headers={**_cabecalhos_de(url), "Range": "bytes=0-0"})
+    try:
+        resposta = urllib.request.urlopen(req, timeout=25)
+    except urllib.error.HTTPError as e:
+        return {"status": e.code, "nome": "", "tamanho": None, "tipo": ""}
+    with resposta:
+        cab, status, final = resposta.headers, resposta.status, resposta.geturl()
+    tamanho = None
+    m = re.search(r"/(\d+)\s*$", cab.get("Content-Range", ""))
+    if m:
+        tamanho = int(m.group(1))
+    elif status == 200 and str(cab.get("Content-Length", "")).isdigit():
+        tamanho = int(cab["Content-Length"])
+    disposicao = cab.get("Content-Disposition", "")
+    m = (re.search(r"filename\*\s*=\s*(?:UTF-8'')?\"?([^\";]+)", disposicao, re.I)
+         or re.search(r"filename\s*=\s*\"?([^\";]+)", disposicao, re.I))
+    nome = urllib.parse.unquote(m.group(1)).strip() if m else ""
+    if not nome:
+        nome = urllib.parse.unquote(os.path.basename(urllib.parse.urlsplit(final).path))
+    return {"status": status, "nome": nome, "tamanho": tamanho, "tipo": cab.get_content_type()}
+
+
+# ── O servidor ───────────────────────────────────────────────────────
+
 def _compartilhamentos() -> list:
     """Lê os links direto do arquivo, a cada pedido: novos links e revogações valem na hora."""
     return ler_json(CONFIG_FILE, {}).get("compartilhamentos", [])
@@ -4552,19 +5771,50 @@ def expirado(item: dict) -> bool:
     return bool(item.get("expira")) and time.time() > item["expira"]
 
 
+def config_do_player(item: dict, fontes: list, sonda) -> dict:
+    """Tudo que o player precisa saber do vídeo (vai embutido na página)."""
+    fonte = fonte_de(item)
+    audios = sonda["audio"] if sonda else []
+    video = sonda["video"][0] if sonda and sonda["video"] else None
+    audio_padrao = _indice_portugues(audios)
+    legendas = legendas_do_item(item, sonda)
+    return {
+        "token": item["token"],
+        "titulo": item.get("titulo") or titulo_do_arquivo(Path(fonte)),
+        "duracao": _duracao(sonda),
+        "direto": _toca_direto(fontes, sonda),
+        "transmissao": tem("ffmpeg"),
+        "remoto": eh_link(fonte),
+        "mp4": _arquivo_unico(fontes, sonda) and (extensao_de(fontes[0]) in (".mp4", ".m4v", ".mov")
+                                                  or "mp4" in (sonda["formato"].get("format_name", "") if sonda else "")),
+        "video": {"codecs": _codecs_navegador(video), "copiavel": _video_copiavel(video)} if video else None,
+        "audios": [{"rotulo": _rotulo_faixa(f)} for f in audios],
+        "audio_padrao": audio_padrao,
+        "legendas": [{"rotulo": l["rotulo"]} for l in legendas],
+        "legenda_padrao": _legenda_padrao(legendas, bool(audios) and _eh_portugues(audios[audio_padrao])),
+    }
+
+
+def _numero(consulta: dict, chave: str, padrao: float) -> float:
+    try:
+        valor = float(consulta.get(chave, [padrao])[0])
+    except (TypeError, ValueError):
+        return padrao
+    return valor if math.isfinite(valor) else padrao
+
+
 class _HandlerMidia(BaseHTTPRequestHandler):
     server_version = f"TermuxToons/{VERSION}"
     timeout = 120  # solta conexões paradas
+    maximo_transmissoes = 3
 
-    def _cabecalhos(self, status: int, tipo: str, comprimento: int, extra: dict | None = None) -> None:
+    def _cabecalhos(self, status: int, tipo: str, comprimento: int | None, extra: dict | None = None) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", tipo)
-        self.send_header("Content-Length", str(comprimento))
-        self.send_header("Cache-Control", "private, no-cache")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("X-Robots-Tag", "noindex, nofollow")
-        for chave, valor in (extra or {}).items():
+        cabecalhos = {"Content-Type": tipo, "Cache-Control": "private, no-cache", "X-Content-Type-Options": "nosniff",
+                      "Referrer-Policy": "no-referrer", "X-Robots-Tag": "noindex, nofollow", **(extra or {})}
+        if comprimento is not None:
+            cabecalhos["Content-Length"] = str(comprimento)
+        for chave, valor in cabecalhos.items():
             self.send_header(chave, valor)
         self.end_headers()
 
@@ -4573,33 +5823,65 @@ class _HandlerMidia(BaseHTTPRequestHandler):
         if com_corpo and corpo:
             self.wfile.write(corpo)
 
+    def _json(self, status: int, dados: dict, com_corpo: bool) -> None:
+        self._enviar(status, "application/json; charset=utf-8", json.dumps(dados).encode(), com_corpo)
+
     def _aviso(self, status: int, msg: str, com_corpo: bool) -> None:
+        import html as html_mod
         corpo = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,"
-                 "initial-scale=1'><body style='font-family:system-ui;background:#111;color:#eee;"
-                 f"padding:2em'><h2>{msg}</h2>").encode()
+                 "initial-scale=1'><title>Termux-Toons</title><body style='margin:0;min-height:100vh;display:grid;"
+                 "place-items:center;font-family:system-ui,sans-serif;background:#09090b;color:#f4f4f5'>"
+                 "<div style='text-align:center;padding:24px'><div style='font-size:48px'>🎬</div>"
+                 f"<h2 style='font-weight:600'>{html_mod.escape(msg)}</h2></div>").encode()
         self._enviar(status, "text/html; charset=utf-8", corpo, com_corpo)
 
-    def _pagina(self, item: dict, arq: Path, com_corpo: bool) -> None:
+    def _pagina(self, item: dict, fontes: list, sonda, com_corpo: bool) -> None:
         import html as html_mod
-        legenda = ""
-        if achar_legenda(arq):
-            legenda = (f'<track kind="subtitles" srclang="pt" label="Legenda" default '
-                       f'src="/v/{item["token"]}/legenda.vtt">')
-        pagina = (PAGINA_FILME.replace("@TITULO@", html_mod.escape(str(item.get("titulo") or arq.stem)))
-                  .replace("@TOKEN@", item["token"]).replace("@LEGENDA@", legenda))
-        self._enviar(200, "text/html; charset=utf-8", pagina.encode(), com_corpo)
+        config = config_do_player(item, fontes, sonda)
+        dados = json.dumps(config).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+        trocas = {"@TITULO@": html_mod.escape(config["titulo"]), "@CONFIG@": dados}
+        pagina = re.sub(r"@TITULO@|@CONFIG@", lambda m: trocas[m.group()], PAGINA_FILME)
+        self._enviar(200, "text/html; charset=utf-8", pagina.encode(), com_corpo,
+                     {"Content-Security-Policy": "default-src 'self'; script-src 'unsafe-inline'; "
+                      "style-src 'unsafe-inline'; img-src 'self' data:; media-src 'self'; frame-ancestors 'none'"})
 
-    def _legenda(self, arq: Path, com_corpo: bool) -> None:
-        arq_legenda = achar_legenda(arq)
-        try:
-            dados = arq_legenda.read_bytes() if arq_legenda else None
-        except OSError:
-            dados = None
+    def _legenda(self, item: dict, sonda, n: int, com_corpo: bool) -> None:
+        legendas = legendas_do_item(item, sonda)
+        if not 0 <= n < len(legendas):
+            return self._json(404, {"erro": "Legenda não encontrada."}, com_corpo)
+        legenda = legendas[n]
+        if legenda["tipo"] == "embutida":
+            todas = [l["ref"] for l in legendas if l["tipo"] == "embutida"]
+            dados, estado = legenda_embutida(item, legenda["ref"], todas)
+            if dados is None:
+                if estado == "extraindo":
+                    return self._json(202, {"status": "extraindo"}, com_corpo)
+                return self._json(500, {"erro": "Não consegui extrair essa legenda."}, com_corpo)
+        elif legenda["tipo"] == "link":
+            dados = _baixar_legenda_link(legenda["ref"])
+        else:
+            try:
+                dados = Path(legenda["ref"]).read_bytes()
+            except OSError:
+                dados = None
         if dados is None:
-            return self._aviso(404, "Sem legenda", com_corpo)
+            return self._json(404, {"erro": "Legenda indisponível."}, com_corpo)
         self._enviar(200, "text/vtt; charset=utf-8", _srt_para_vtt(dados), com_corpo)
 
-    def _video(self, arq: Path, com_corpo: bool) -> None:
+    def _copiar(self, origem, restante: int | None) -> None:
+        """Copia bytes de `origem` para quem pediu até o fim (ou `restante` bytes)."""
+        try:
+            while restante is None or restante > 0:
+                bloco = origem.read(256 * 1024 if restante is None else min(256 * 1024, restante))
+                if not bloco:
+                    break
+                self.wfile.write(bloco)
+                if restante is not None:
+                    restante -= len(bloco)
+        except OSError:
+            pass  # a pessoa fechou a aba ou pulou para outro ponto do filme
+
+    def _arquivo(self, arq: Path, sonda, com_corpo: bool) -> None:
         try:
             tamanho = arq.stat().st_size
             arquivo = open(arq, "rb")
@@ -4614,40 +5896,139 @@ class _HandlerMidia(BaseHTTPRequestHandler):
             extra = {"Accept-Ranges": "bytes"}
             if faixa:
                 extra["Content-Range"] = f"bytes {inicio}-{fim}/{tamanho}"
-            tipo = TIPOS_VIDEO.get(arq.suffix.lower(), "application/octet-stream")
-            self._cabecalhos(206 if faixa else 200, tipo, fim - inicio + 1, extra)
-            if not com_corpo:
-                return None
-            arquivo.seek(inicio)
-            restante = fim - inicio + 1
-            try:
-                while restante > 0:
-                    bloco = arquivo.read(min(256 * 1024, restante))
-                    if not bloco:
-                        break
-                    self.wfile.write(bloco)
-                    restante -= len(bloco)
-            except OSError:
-                pass  # a pessoa fechou a aba ou pulou para outro ponto do filme
+            self._cabecalhos(206 if faixa else 200, _tipo_mime(str(arq), sonda), fim - inicio + 1, extra)
+            if com_corpo:
+                arquivo.seek(inicio)
+                self._copiar(arquivo, fim - inicio + 1)
         return None
 
+    def _repassar(self, url: str, sonda, com_corpo: bool) -> None:
+        """Entrega um link da internet como se fosse um arquivo daqui (com Range), sem revelar o endereço."""
+        cabecalhos = _cabecalhos_de(url)
+        if self.headers.get("Range"):
+            cabecalhos["Range"] = self.headers["Range"]
+        try:
+            resposta = urllib.request.urlopen(urllib.request.Request(url, headers=cabecalhos), timeout=30)
+        except urllib.error.HTTPError as e:
+            if e.code == 416:
+                return self._cabecalhos(416, "text/plain", 0, {"Content-Range": e.headers.get("Content-Range", "bytes */0")})
+            return self._aviso(502, f"O site de origem respondeu HTTP {e.code} (o link pode ter expirado).", com_corpo)
+        except OSError:
+            return self._aviso(502, "Não consegui acessar o link de origem do vídeo.", com_corpo)
+        with resposta:
+            extra = {}
+            if resposta.headers.get("Content-Range"):
+                extra["Content-Range"] = resposta.headers["Content-Range"]
+            if resposta.status == 206 or resposta.headers.get("Accept-Ranges", "").lower() == "bytes":
+                extra["Accept-Ranges"] = "bytes"
+            comprimento = str(resposta.headers.get("Content-Length", ""))
+            self._cabecalhos(resposta.status, _tipo_mime(url, sonda), int(comprimento) if comprimento.isdigit() else None, extra)
+            if com_corpo:
+                self._copiar(resposta, None)
+        return None
+
+    def _transmitir(self, item: dict, fontes: list, sonda, consulta: dict, com_corpo: bool) -> None:
+        if not tem("ffmpeg"):
+            return self._aviso(503, "O ffmpeg não está instalado no celular que compartilhou o vídeo.", com_corpo)
+        if not com_corpo:
+            return self._cabecalhos(200, "video/mp4", None, {"Cache-Control": "no-store"})
+        faixas = len(sonda["audio"]) if sonda else 1
+        audio = int(_numero(consulta, "a", 0))
+        audio = audio if 0 <= audio < max(faixas, 1) else 0
+        inicio = max(0.0, _numero(consulta, "t", 0))
+        sessao_player = re.sub(r"[^a-z0-9]", "", consulta.get("s", [""])[0])[:16] or "x"
+        chave = f"{item['token']}:{sessao_player}"
+        cmd = comando_transmissao(fontes, sonda, audio, inicio, consulta.get("v", [""])[0] == "h264",
+                                  "opus" if consulta.get("ac", [""])[0] == "opus" else "aac")
+        processo = None
+        with _TRANSMISSOES_TRAVA:
+            antigo = _TRANSMISSOES.pop(chave, None)
+            if antigo:  # o mesmo player pulou para outro ponto ou trocou o áudio: a conversão anterior acaba
+                antigo.kill()
+            if len(_TRANSMISSOES) < self.maximo_transmissoes:
+                processo = subprocess.Popen(cmd, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+                _TRANSMISSOES[chave] = processo
+        if processo is None:
+            return self._aviso(503, "Muita gente assistindo ao mesmo tempo. Tente de novo daqui a pouco.", com_corpo)
+        try:
+            primeiro = processo.stdout.read1(64 * 1024)
+            if not primeiro:
+                return self._aviso(502, "Não consegui abrir o vídeo (o link de origem pode ter expirado).", com_corpo)
+            self.connection.settimeout(900)  # o player pode passar um bom tempo pausado sem ler nada
+            self._cabecalhos(200, "video/mp4", None, {"Cache-Control": "no-store"})
+            bloco = primeiro
+            while bloco:
+                self.wfile.write(bloco)
+                bloco = processo.stdout.read1(256 * 1024)
+        except OSError:
+            pass  # a pessoa fechou a aba, pulou para outro ponto ou ficou tempo demais pausada
+        finally:
+            if processo.poll() is None:
+                processo.kill()
+            processo.wait()
+            processo.stdout.close()
+            with _TRANSMISSOES_TRAVA:
+                if _TRANSMISSOES.get(chave) is processo:
+                    del _TRANSMISSOES[chave]
+        return None
+
+    def _estado(self, item: dict, com_corpo: bool) -> None:
+        """Por que a transmissão falhou? O player pergunta isso para mostrar uma mensagem útil."""
+        fonte = fonte_de(item)
+        if item.get("pagina"):  # pede endereços novos ao yt-dlp: os antigos podem ter expirado
+            try:
+                fonte = fontes_de(item, renovar=True)[0]
+            except ToonsError as e:
+                return self._json(200, {"ok": False, "erro": str(e)}, com_corpo)
+        if eh_link(fonte):
+            try:
+                status = info_link(fonte)["status"]
+            except OSError:
+                return self._json(200, {"ok": False, "erro": "O celular não conseguiu acessar o link de origem do vídeo."}, com_corpo)
+            if status >= 400:
+                return self._json(200, {"ok": False, "erro": f"O link de origem respondeu HTTP {status}: "
+                                        "ele pode ter expirado. Peça a quem enviou para atualizar o link."}, com_corpo)
+        elif not Path(fonte).is_file():
+            return self._json(200, {"ok": False, "erro": "O arquivo não está mais disponível."}, com_corpo)
+        with _TRANSMISSOES_TRAVA:
+            lotado = len(_TRANSMISSOES) >= self.maximo_transmissoes
+        if lotado:
+            return self._json(200, {"ok": False, "erro": "Muita gente assistindo ao mesmo tempo. Tente de novo daqui a pouco."}, com_corpo)
+        return self._json(200, {"ok": True}, com_corpo)
+
     def _tratar(self, com_corpo: bool) -> None:
-        caminho = urllib.parse.urlsplit(self.path).path
-        m = re.fullmatch(r"/v/([A-Za-z0-9_-]{8,64})(?:/(video|legenda\.vtt)?)?", caminho)
+        partes = urllib.parse.urlsplit(self.path)
+        m = re.fullmatch(r"/v/([A-Za-z0-9_-]{8,64})(?:/(video|stream|ponto|estado|legenda/(\d{1,3})\.vtt))?/?", partes.path)
         item = achar_compartilhamento(m.group(1)) if m else None
         if item is None:
             return self._aviso(404, "Link não encontrado.", com_corpo)
         if expirado(item):
             return self._aviso(410, "Este link expirou.", com_corpo)
-        arq = Path(item.get("caminho", ""))
-        if not arq.is_file():
+        fonte, recurso = fonte_de(item), m.group(2)
+        if not eh_link(fonte) and not Path(fonte).is_file():
             return self._aviso(404, "O arquivo não está mais disponível.", com_corpo)
-        recurso = m.group(2)
+        if recurso == "estado":
+            return self._estado(item, com_corpo)
+        try:
+            fontes = fontes_de(item)
+        except ToonsError as e:
+            return self._aviso(502, str(e), com_corpo)
+        sonda = sonda_em_cache(fontes)
+        consulta = urllib.parse.parse_qs(partes.query)
         if recurso == "video":
-            return self._video(arq, com_corpo)
+            if not _arquivo_unico(fontes, sonda):  # vídeo e áudio separados ou HLS: vai convertido, sem pular
+                return self._transmitir(item, fontes, sonda, {"s": [secrets.token_hex(4)]}, com_corpo)
+            if eh_link(fontes[0]):
+                return self._repassar(fontes[0], sonda, com_corpo)
+            return self._arquivo(Path(fontes[0]), sonda, com_corpo)
+        if recurso == "stream":
+            return self._transmitir(item, fontes, sonda, consulta, com_corpo)
+        if recurso == "ponto":
+            t = max(0.0, _numero(consulta, "t", 0))
+            return self._json(200, {"t": round(ponto_de_corte(fontes[0], sonda, t), 3)}, com_corpo)
         if recurso:
-            return self._legenda(arq, com_corpo)
-        return self._pagina(item, arq, com_corpo)
+            return self._legenda(item, sonda, int(m.group(3)), com_corpo)
+        return self._pagina(item, fontes, sonda, com_corpo)
 
     def do_GET(self):
         self._tratar(True)
@@ -4662,10 +6043,18 @@ class _HandlerMidia(BaseHTTPRequestHandler):
 
 def servir_midia(host: str, porta: int) -> None:
     """Sobe o servidor de vídeo em primeiro plano (é o que roda dentro do tmux)."""
+    _HandlerMidia.maximo_transmissoes = max(1, int(cfg().get("midia_transmissoes", 3)))
+    if not tem("ffmpeg"):
+        log("Aviso: sem o ffmpeg, só vídeos que o navegador já toca (MP4/WebM com uma trilha de áudio) funcionam.")
     with ThreadingHTTPServer((host, porta), _HandlerMidia) as servidor:
         log(f"Servidor de vídeo em http://{host}:{porta}  (rede local: http://{ip_local()}:{porta})")
         log("Só entrega os vídeos com link ativo. Ctrl+C para parar.")
-        servidor.serve_forever()
+        try:
+            servidor.serve_forever()
+        finally:
+            with _TRANSMISSOES_TRAVA:
+                for processo in _TRANSMISSOES.values():
+                    processo.kill()
 
 
 # ── Criar, listar e revogar links ────────────────────────────────────
@@ -4682,19 +6071,50 @@ def titulo_do_arquivo(arq: Path) -> str:
     return re.sub(r"[._]+", " ", re.sub(r"\.web$", "", arq.stem)).strip()
 
 
-def criar_compartilhamento(arq: Path, titulo_filme: str | None = None, horas: float | None = None) -> dict:
-    arq = Path(os.path.expanduser(str(arq)))
-    if not arq.is_file():
-        raise ToonsError(f"Arquivo não encontrado: {arq}")
-    if arq.suffix.lower() not in EXTENSOES_VIDEO:
-        raise ToonsError(f"Só compartilho vídeos ({', '.join(sorted(EXTENSOES_VIDEO))}); este é '{arq.suffix}'.")
+def titulo_do_link(url: str, nome: str = "") -> str:
+    """Título a partir do nome do arquivo (do servidor ou do próprio link); 'Vídeo' se não houver."""
+    nome = nome or urllib.parse.unquote(os.path.basename(urllib.parse.urlsplit(url).path))
+    return titulo_do_arquivo(Path(nome)) if Path(nome).suffix.lower() in EXTENSOES_VIDEO else "Vídeo"
+
+
+def criar_compartilhamento(alvo, titulo_filme: str | None = None, horas: float | None = None,
+                           legendas: list | None = None, embutidas: list | None = None, pagina: bool = False) -> dict:
+    """Cria um link secreto para um vídeo do celular, um link direto da internet ou (`pagina`) uma página de
+    vídeo que o yt-dlp lê na hora de assistir (YouTube, Vimeo...)."""
+    item = {"token": secrets.token_urlsafe(16)}
+    if eh_link(alvo):
+        item["pagina" if pagina else "url"] = str(alvo).strip()
+        padrao = "Vídeo" if pagina else titulo_do_link(str(alvo).strip())
+    else:
+        arq = Path(os.path.expanduser(str(alvo)))
+        if not arq.is_file():
+            raise ToonsError(f"Arquivo não encontrado: {arq}")
+        if arq.suffix.lower() not in EXTENSOES_VIDEO:
+            raise ToonsError(f"Só compartilho vídeos ({', '.join(sorted(EXTENSOES_VIDEO))}); este é '{arq.suffix}'.")
+        item["caminho"] = str(arq.resolve())
+        padrao = titulo_do_arquivo(arq)
     agora = time.time()
-    item = {"token": secrets.token_urlsafe(16), "caminho": str(arq.resolve()),
-            "titulo": (titulo_filme or titulo_do_arquivo(arq)).strip(),
-            "criado": agora, "expira": agora + horas * 3600 if horas else None}
+    item.update({"titulo": (titulo_filme or "").strip() or padrao, "criado": agora,
+                 "expira": agora + horas * 3600 if horas else None})
+    if legendas:
+        item["legendas"] = list(legendas)
+    if embutidas:
+        item["legendas_embutidas"] = sorted(embutidas)
     lista_compartilhamentos().append(item)
     salvar_cfg()
     return item
+
+
+def atualizar_compartilhamento(token: str, **campos) -> dict | None:
+    """Muda campos de um link (None apaga o campo)."""
+    for item in lista_compartilhamentos():
+        if item["token"] == token:
+            item.update(campos)
+            for chave in [k for k, v in campos.items() if v is None]:
+                item.pop(chave, None)
+            salvar_cfg()
+            return item
+    return None
 
 
 def revogar_compartilhamentos(tokens: set) -> int:
@@ -4734,82 +6154,97 @@ def porta_livre(porta: int) -> bool:
     return True
 
 
+def _versao_servidor_midia(porta: int) -> str:
+    """Cabeçalho 'Server' do servidor de vídeo que está no ar ('' se não respondeu)."""
+    req = urllib.request.Request(f"http://127.0.0.1:{porta}/", method="HEAD")
+    try:
+        with _SEM_PROXY.open(req, timeout=3) as r:
+            return r.headers.get("Server", "")
+    except urllib.error.HTTPError as e:
+        return e.headers.get("Server", "")
+    except OSError:
+        return ""
+
+
 def garantir_servidor_midia() -> bool:
-    if servico_ativo("midia"):
-        return True
     porta = cfg()["midia_porta"]
+    if servico_ativo("midia"):
+        versao = _versao_servidor_midia(porta)
+        if not versao or f"TermuxToons/{VERSION}" in versao:
+            return True
+        info("O servidor de vídeo é de uma versão anterior do Termux-Toons; reiniciando...")
+        parar_servico("midia")
+        time.sleep(1)
     if not porta_livre(porta):
         raise ToonsError(f"A porta {porta} já está em uso por outro programa. Troque em 'Porta do servidor'.")
     return iniciar_servico("midia", cmd_self("midia", "--porta", str(porta)), reiniciar=True)
 
 
 def mostrar_links(item: dict) -> None:
-    print(f"\n{NEG}🎬 {item['titulo']}{RST}  {DIM}({descricao_prazo(item)}){RST}")
+    origem = ("▶ página de vídeo" if item.get("pagina") else "🌐 link da internet" if item.get("url")
+              else "📁 arquivo do celular")
+    print(f"\n{NEG}🎬 {item['titulo']}{RST}  {DIM}({origem} · {descricao_prazo(item)}){RST}")
     for onde, link in links_de(item):
         print(f"  {CIANO}{onde}:{RST}\n  {NEG}{link}{RST}")
+    print(f"\n  {DIM}No VLC (todas as trilhas de áudio e legendas): use o mesmo link terminado em /video.{RST}")
     if not (servico_ativo("tunel-midia") and url_tunel("tunel-midia")):
-        print(f"\n  {DIM}Para quem está fora da sua rede Wi-Fi, ligue o 'Túnel para a internet' neste menu.{RST}")
+        print(f"  {DIM}Para quem está fora da sua rede Wi-Fi, ligue o 'Túnel para a internet' neste menu.{RST}")
 
 
-# ── Compatibilidade com navegadores e conversão (ffmpeg) ─────────────
+def abrir_no_android(alvo: str, pacote: str | None = None) -> None:
+    """Abre um vídeo (link ou arquivo) num app do Android, como o VLC: o app toca direto, sem baixar."""
+    if not eh_link(alvo):
+        if not tem("termux-open"):
+            raise ToonsError("'termux-open' não encontrado (só existe dentro do Termux).")
+        rodar(["termux-open", "--content-type", "video/*", alvo], capturar=True, timeout=20)
+        return
+    if not tem("am"):
+        raise ToonsError("Comando 'am' não encontrado (só existe dentro do Termux).")
+    cmd = ["am", "start", "-a", "android.intent.action.VIEW", "-t", "video/*", "-d", alvo]
+    if pacote:
+        cmd += ["-p", pacote]
+    proc = rodar(cmd, capturar=True, timeout=20)
+    texto = f"{proc.stdout or ''}{proc.stderr or ''}"
+    if proc.returncode != 0 or re.search(r"\bError\b", texto):
+        dica_vlc = "O VLC está instalado? " if pacote == VLC_ANDROID else ""
+        raise ToonsError(f"{dica_vlc}O Android não abriu o vídeo: {texto.strip()[-200:]}")
+    ok("Abrindo no app de vídeo...")
 
-def sondar_video(arq: Path):
-    """Faixas do arquivo via ffprobe: {'video': [...], 'audio': [...], 'legendas': [...]} ou None."""
-    if not tem("ffprobe"):
-        return None
-    proc = rodar(["ffprobe", "-v", "error", "-print_format", "json", "-show_streams", str(arq)],
-                 capturar=True, timeout=60, mostrar=False)
-    if proc.returncode != 0:
-        return None
+
+def endereco_para_assistir(url: str) -> str:
+    """Link de arquivo passa direto; página (YouTube, TikTok...) vira o endereço do vídeo pelo yt-dlp."""
     try:
-        faixas = json.loads(proc.stdout).get("streams", [])
-    except json.JSONDecodeError:
-        return None
-
-    def do_tipo(tipo):
-        return [s for s in faixas if s.get("codec_type") == tipo and not (s.get("disposition") or {}).get("attached_pic")]
-
-    return {"video": do_tipo("video"), "audio": do_tipo("audio"), "legendas": do_tipo("subtitle")}
-
-
-def _video_compativel(faixa: dict) -> bool:
-    codec = faixa.get("codec_name")
-    if codec == "h264":
-        return faixa.get("pix_fmt") in ("yuv420p", "yuvj420p")  # H.264 de 10 bits não toca no navegador
-    return codec in VIDEO_NAVEGADOR
+        dados = info_link(url)
+    except OSError:
+        dados = {"status": 0, "tipo": ""}
+    if dados["status"] and dados["status"] < 400 and not dados["tipo"].startswith("text/"):
+        return url
+    if not garantir_deps_musica(com_player=False):
+        raise ToonsError("Sem o yt-dlp não consigo achar o vídeo dessa página.")
+    info("É uma página: procurando o endereço do vídeo com o yt-dlp...")
+    proc = rodar(["yt-dlp", "-g", "-f", "b", "--no-warnings", "--no-playlist", url], capturar=True, timeout=120)
+    enderecos = (proc.stdout or "").split()
+    if proc.returncode != 0 or not enderecos:
+        raise ToonsError("O yt-dlp não achou um vídeo nesse link. " + (proc.stderr or "").strip()[-300:])
+    return enderecos[0]
 
 
-def problemas_de_reproducao(arq: Path, sonda) -> list:
-    problemas = []
-    if arq.suffix.lower() not in FORMATOS_NAVEGADOR:
-        problemas.append(f"o formato {arq.suffix} (navegadores tocam bem MP4 e WebM)")
-    if sonda:
-        if sonda["video"] and not _video_compativel(sonda["video"][0]):
-            problemas.append(f"o vídeo está em {str(sonda['video'][0].get('codec_name')).upper()} "
-                             f"({sonda['video'][0].get('pix_fmt', '?')})")
-        if sonda["audio"] and sonda["audio"][0].get("codec_name") not in AUDIO_NAVEGADOR:
-            problemas.append(f"o áudio está em {str(sonda['audio'][0].get('codec_name')).upper()}")
-        if len(sonda["audio"]) > 1:
-            problemas.append(f"há {len(sonda['audio'])} trilhas de áudio e o navegador só toca uma")
-    return problemas
+def assistir_link_no_celular(url: str | None = None) -> None:
+    """Toca um link no VLC (ou outro app) do próprio celular, sem baixar o vídeo."""
+    if url is None:
+        info("Serve link direto de arquivo (servidor seu, nuvem, debrid...) e páginas de vídeo (YouTube, TikTok...).")
+        url = perguntar("Link do vídeo")
+    if not url:
+        return
+    if not eh_link(url):
+        raise ToonsError("O link precisa começar com http:// ou https://")
+    alvo = endereco_para_assistir(url)
+    i = escolher("Abrir em qual app?", ["VLC", "Escolher o app (MX Player, Just Player...)"])
+    if i is not None:
+        abrir_no_android(alvo, VLC_ANDROID if i == 0 else None)
 
 
-def _rotulo_faixa(faixa: dict) -> str:
-    tags = faixa.get("tags") or {}
-    partes = [tags.get("language", "und"), str(faixa.get("codec_name", "?"))]
-    if faixa.get("channels"):
-        partes.append(f"{faixa['channels']} canais")
-    if tags.get("title"):
-        partes.append(tags["title"])
-    return " · ".join(partes)
-
-
-def _indice_portugues(faixas: list) -> int:
-    for i, f in enumerate(faixas):
-        if (f.get("tags") or {}).get("language", "").lower() in ("por", "pt", "pob", "ptb"):
-            return i
-    return 0
-
+# ── Conversão para MP4 (ffmpeg) ──────────────────────────────────────
 
 @contextlib.contextmanager
 def manter_acordado():
@@ -4837,7 +6272,8 @@ def converter_para_mp4(origem: Path):
 
     trilha = 0
     if sonda and len(sonda["audio"]) > 1:
-        info("Este arquivo tem mais de uma trilha de áudio (ex.: dublado e original).")
+        info("Este arquivo tem mais de uma trilha de áudio (ex.: dublado e original). O MP4 convertido fica com "
+             "uma só; para trocar de trilha no player, compartilhe o arquivo original (o servidor converte na hora).")
         trilha = escolher("Qual áudio manter?", [_rotulo_faixa(f) for f in sonda["audio"]],
                           str(_indice_portugues(sonda["audio"]) + 1))
         if trilha is None:
@@ -4862,8 +6298,7 @@ def converter_para_mp4(origem: Path):
         if sonda else []
     if textos:
         opcoes = ["Nenhuma"] + [_rotulo_faixa(f) for _, f in textos]
-        padrao = _indice_portugues([f for _, f in textos]) + 2 if any(
-            (f.get("tags") or {}).get("language", "").lower() in ("por", "pt", "pob", "ptb") for _, f in textos) else 1
+        padrao = _indice_portugues([f for _, f in textos]) + 2 if any(_eh_portugues(f) for _, f in textos) else 1
         escolha = escolher("Extrair uma legenda embutida para o player?", opcoes, str(padrao))
         if escolha:
             legenda = textos[escolha - 1][0]
@@ -4891,6 +6326,8 @@ def converter_para_mp4(origem: Path):
     return destino
 
 
+# ── Menu ─────────────────────────────────────────────────────────────
+
 def videos_para_compartilhar() -> list:
     """[(data, tamanho, caminho)] dos vídeos nas pastas de vídeo/downloads/filmes, os mais novos primeiro."""
     pastas = [pasta_videos(), DOWNLOADS, HOME / "storage" / "movies", HOME / "storage" / "shared" / "Movies"]
@@ -4900,7 +6337,7 @@ def videos_para_compartilhar() -> list:
             continue
         for arq, st in _arquivos(pasta):
             real = arq.resolve()
-            if arq.suffix.lower() in EXTENSOES_VIDEO and real not in vistos:
+            if arq.suffix.lower() in EXTENSOES_VIDEO and not arq.name.endswith(".part") and real not in vistos:
                 vistos.add(real)
                 achados.append((st.st_mtime, st.st_size, arq))
     return sorted(achados, reverse=True)
@@ -4933,24 +6370,119 @@ def _pedir_prazo():
     return True, horas
 
 
+def conferir_link(url: str) -> dict:
+    """Confere um link sem baixar o vídeo e mostra as faixas: {'pagina', 'titulo', 'tamanho', 'sonda'}.
+    Link direto de arquivo passa como está; página (YouTube, Vimeo, Google Drive...) é lida pelo yt-dlp."""
+    if not eh_link(url):
+        raise ToonsError("O link precisa começar com http:// ou https://")
+    info("Conferindo o link (sem baixar o vídeo)...")
+    try:
+        dados = info_link(url)
+    except OSError as e:
+        dados = {"status": 0, "tipo": "", "nome": "", "tamanho": None, "erro": str(e)}
+    eh_pagina = dados["tipo"].startswith("text/") or not 0 < dados["status"] < 400
+    if not eh_pagina:
+        detalhes = [x for x in (dados["nome"], bytes_humanos(dados["tamanho"]) if dados["tamanho"] else "") if x]
+        ok("Link de arquivo funcionando" + (f": {' · '.join(detalhes)}" if detalhes else "."))
+        titulo, fontes = titulo_do_link(url, dados["nome"]), [url]
+    else:  # página de vídeo, ou um site que só responde a quem parece navegador: o yt-dlp tenta achar o vídeo
+        if not tem("yt-dlp") and not garantir_deps_musica(com_player=False):
+            raise ToonsError("Para links de página (YouTube, Vimeo...) é preciso o yt-dlp.")
+        info("Não é um link direto de arquivo: procurando o vídeo na página com o yt-dlp...")
+        try:
+            achado = info_pagina(url)
+        except ToonsError as e:
+            if dados["status"] >= 400:
+                raise ToonsError(f"O site respondeu HTTP {dados['status']}: o link pode ter expirado ou exigir "
+                                 "login.") from None
+            if dados.get("erro"):
+                raise ToonsError(f"Não consegui acessar o link: {dados['erro']}") from None
+            raise e
+        ok(f"Vídeo encontrado: {achado['titulo']}")
+        titulo, fontes = achado["titulo"], achado["enderecos"]
+    sonda = sonda_em_cache(fontes) if tem("ffprobe") else None
+    if sonda:
+        mostrar_faixas(sonda)
+    elif tem("ffprobe"):
+        aviso("O ffmpeg não reconheceu um vídeo nesse link; o player pode não conseguir tocar.")
+    return {"pagina": eh_pagina, "titulo": titulo, "tamanho": None if eh_pagina else dados["tamanho"], "sonda": sonda}
+
+
+def _pedir_legenda_extra() -> list:
+    alvo = perguntar("Legenda .srt/.vtt extra: caminho no celular ou link (Enter pula)", "")
+    if not alvo:
+        return []
+    if eh_link(alvo):
+        return [alvo]
+    arq = Path(os.path.expanduser(alvo))
+    if not arq.is_file() or arq.suffix.lower() not in (".srt", ".vtt"):
+        aviso(f"Legenda ignorada: {arq} não é um arquivo .srt ou .vtt.")
+        return []
+    return [str(arq.resolve())]
+
+
+def _escolher_embutidas(sonda, tamanho) -> list:
+    """Num link, legenda embutida exige ler o filme inteiro: só prepara as que você escolher."""
+    textos = [(n, f) for n, f in enumerate(sonda["legendas"]) if f.get("codec_name") in CODECS_LEGENDA_TEXTO] \
+        if sonda else []
+    if not textos:
+        return []
+    peso = f" ({bytes_humanos(tamanho)})" if tamanho else ""
+    info(f"O vídeo tem {len(textos)} legenda(s) embutida(s). Para usá-las no player, o celular baixa o arquivo "
+         f"inteiro uma vez{peso} e guarda só as legendas. Prefira fazer isso no Wi-Fi.")
+    if not confirmar("Preparar legendas embutidas?", False):
+        return []
+    sel = escolher_varios("Quais legendas?", [_rotulo_faixa(f) for _, f in textos])
+    return [textos[i][0] for i in sel]
+
+
+def _preparar_legendas(item: dict, sonda) -> None:
+    """Pede ao servidor a primeira legenda embutida do link: ele extrai todas de uma vez, em segundo plano."""
+    indice = next((i for i, l in enumerate(legendas_do_item(item, sonda)) if l["tipo"] == "embutida"), None)
+    if indice is None:
+        return
+    url = f"http://127.0.0.1:{cfg()['midia_porta']}/v/{item['token']}/legenda/{indice}.vtt"
+    for _ in range(10):
+        try:
+            _SEM_PROXY.open(url, timeout=10).close()
+        except OSError:
+            time.sleep(1)
+            continue
+        ok("Legendas sendo preparadas em segundo plano; aparecem no player quando ficarem prontas.")
+        return
+    aviso("Não consegui pedir as legendas ao servidor agora; elas serão preparadas quando alguém escolher no player.")
+
+
 @submenu
 def menu_midia():
     c = cfg()
+    direitos = ("Compartilhe só o que você pode distribuir: vídeos seus, de domínio público, de licença livre "
+                "ou com autorização de quem tem os direitos.")
 
     def compartilhar():
-        info("Compartilhe só o que você pode distribuir: vídeos seus, de domínio público, de licença livre "
-             "ou com autorização de quem tem os direitos.")
+        info(direitos)
         arq = _escolher_video()
         if arq is None:
             return
-        problemas = problemas_de_reproducao(arq, sondar_video(arq))
+        sonda = sondar_video(arq)
+        if sonda:
+            mostrar_faixas(sonda)
+        problemas = problemas_de_reproducao(arq, sonda)
         if problemas:
-            aviso("Pode não tocar no navegador de quem for assistir:\n  • " + "\n  • ".join(problemas))
-            i = escolher("O que fazer?", ["Converter para MP4 compatível (recomendado)",
-                                          "Compartilhar assim mesmo", "Cancelar"])
+            print()
+            aviso("Do jeito que está, o navegador não toca este arquivo:\n  • " + "\n  • ".join(problemas))
+            if tem("ffmpeg"):
+                info("O servidor converte na hora enquanto a pessoa assiste e o player deixa trocar a trilha de áudio. "
+                     + ("A imagem também precisa ser recodificada, o que pesa no celular; se travar, converta antes."
+                        if _precisa_recodificar(sonda) else "A imagem é só copiada, então pesa pouco no celular."))
+                opcoes = ["Criar o link e converter na hora (recomendado)",
+                          "Converter para MP4 antes (arquivo novo; toca até no Safari do iPhone)", "Cancelar"]
+            else:
+                opcoes = ["Criar o link assim mesmo", "Converter para MP4 antes (instala o ffmpeg)", "Cancelar"]
+            i = escolher("O que fazer?", opcoes)
             if i is None or i == 2:
                 return
-            if i == 0:
+            if i == 1:
                 arq = converter_para_mp4(arq)
                 if arq is None:
                     return
@@ -4961,6 +6493,39 @@ def menu_midia():
         item = criar_compartilhamento(arq, titulo_filme, horas)
         garantir_servidor_midia()
         mostrar_links(item)
+        oferecer_envio(item)
+
+    def compartilhar_link():
+        info(direitos)
+        info("Cole qualquer link de vídeo: link direto de um arquivo (o mesmo que você abriria no VLC: servidor "
+             "seu, Google Drive, Dropbox, OneDrive, serviços de debrid...) ou uma página de vídeo (YouTube, Vimeo, "
+             "Dailymotion e os outros sites que o yt-dlp lê). O filme não é baixado: o celular repassa "
+             "enquanto a pessoa assiste.")
+        url = perguntar("Link do vídeo").strip()
+        if not url:
+            return
+        if not tem("ffmpeg"):
+            aviso("Sem o ffmpeg só links de MP4/WebM com uma trilha de áudio tocam no navegador "
+                  "(MKV, áudio AC3/DTS, troca de trilha e páginas como o YouTube precisam dele).")
+            garantir_cmd("ffmpeg")
+        link = conferir_link(url)
+        titulo_filme = perguntar("Título que aparece na página", link["titulo"])
+        confirmado, horas = _pedir_prazo()
+        if not confirmado:
+            return
+        extras = _pedir_legenda_extra()
+        embutidas = [] if link["pagina"] else _escolher_embutidas(link["sonda"], link["tamanho"])
+        item = criar_compartilhamento(url, titulo_filme, horas, legendas=extras, embutidas=embutidas,
+                                      pagina=link["pagina"])
+        garantir_servidor_midia()
+        if embutidas:
+            _preparar_legendas(item, link["sonda"])
+        mostrar_links(item)
+        if link["pagina"]:
+            info("O endereço do vídeo na página é renovado sozinho quando o site o expira.")
+        else:
+            info("Se o link expirar (links de download costumam valer só algumas horas), gere outro e use "
+                 "'Meus links → Trocar o endereço do vídeo': o link que você enviou continua o mesmo.")
         oferecer_envio(item)
 
     def oferecer_envio(item):
@@ -4977,22 +6542,57 @@ def menu_midia():
         elif i == 2 and garantir_cmd("qrencode", "libqrencode"):
             rodar(["qrencode", "-t", "ansiutf8"], entrada=link, mostrar=False)
 
+    def assistir_aqui(item):
+        i = escolher("Abrir onde?", ["VLC", "Outro app (MX Player, Just Player...)",
+                                     "Navegador (o mesmo player de quem recebe o link)"])
+        if i is None:
+            return
+        if i == 2:
+            garantir_servidor_midia()
+            pagina = f"http://127.0.0.1:{c['midia_porta']}/v/{item['token']}"
+            if not tem("termux-open-url"):
+                info(f"Abra no navegador: {pagina}")
+                return
+            rodar(["termux-open-url", pagina], capturar=True, timeout=20)
+        else:
+            alvo = endereco_para_assistir(item["pagina"]) if item.get("pagina") else fonte_de(item)
+            abrir_no_android(alvo, VLC_ANDROID if i == 0 else None)
+
+    def trocar_endereco(item):
+        info("Cole o novo link do mesmo vídeo. Quem já tem o link do Termux-Toons não precisa receber outro.")
+        url = perguntar("Novo link do vídeo").strip()
+        if not url:
+            return
+        link = conferir_link(url)
+        atualizar_compartilhamento(item["token"], url=None if link["pagina"] else url,
+                                   pagina=url if link["pagina"] else None)
+        ok("Endereço atualizado.")
+
     def ver_links():
         lista = lista_compartilhamentos()
         if not lista:
             info("Nenhum link criado ainda.")
             return
-        i = escolher("Qual link?", [f"{it['titulo']} · {descricao_prazo(it)}" for it in lista])
+        i = escolher("Qual link?", [f"{'▶' if it.get('pagina') else '🌐' if it.get('url') else '📁'} "
+                                    f"{it['titulo']} · {descricao_prazo(it)}"
+                                    for it in lista])
         if i is None:
             return
         item = lista[i]
         mostrar_links(item)
-        if not Path(item["caminho"]).is_file():
+        if item.get("caminho") and not Path(item["caminho"]).is_file():
             aviso("O arquivo deste link não existe mais.")
-        acao = escolher("O que fazer?", ["Copiar / enviar / QR code", "Apagar este link", "Voltar"], "3")
-        if acao == 0:
-            oferecer_envio(item)
-        elif acao == 1 and confirmar("Apagar o link? Quem estiver com ele deixa de conseguir assistir."):
+        acoes = [("Copiar / enviar / QR code", oferecer_envio), ("Assistir neste celular", assistir_aqui)]
+        if item.get("url"):
+            acoes.append(("Trocar o endereço do vídeo (o link expirou)", trocar_endereco))
+        acoes.append(("Apagar este link", None))
+        acao = escolher("O que fazer?", [rotulo for rotulo, _ in acoes] + ["Voltar"], str(len(acoes) + 1))
+        if acao is None or acao >= len(acoes):
+            return
+        _, func = acoes[acao]
+        if func:
+            func(item)
+        elif confirmar("Apagar o link? Quem estiver com ele deixa de conseguir assistir."):
             revogar_compartilhamentos({item["token"]})
             ok("Link apagado.")
 
@@ -5035,6 +6635,12 @@ def menu_midia():
         salvar_cfg()
         ok(f"Porta {nova}. Reinicie o servidor e o túnel para valer.")
 
+    def mudar_transmissoes():
+        info("Cada pessoa assistindo um vídeo convertido na hora usa um ffmpeg no celular.")
+        c["midia_transmissoes"] = perguntar_int("Quantas conversões ao mesmo tempo", c["midia_transmissoes"], 1, 10)
+        salvar_cfg()
+        ok("Reinicie o servidor de vídeo para valer.")
+
     def iniciar_tunel():
         aviso("Pelo túnel, quem tiver o link assiste de qualquer lugar. O filme sai do seu celular, então "
               "a velocidade depende do upload da sua internet. O túnel gratuito da Cloudflare é pensado "
@@ -5044,8 +6650,10 @@ def menu_midia():
             abrir_tunel("tunel-midia", c["midia_porta"])
 
     menu("📺 Compartilhar filme por link", [
-        ("▶  Compartilhar um filme (criar link)", compartilhar),
-        ("Meus links (copiar, enviar, apagar)", ver_links),
+        ("▶  Compartilhar um filme do celular (criar link)", compartilhar),
+        ("🌐 Transmitir de um link da internet (sem baixar)", compartilhar_link),
+        ("Meus links (copiar, enviar, assistir, apagar)", ver_links),
+        ("Assistir um link neste celular (VLC, MX Player...)", assistir_link_no_celular),
         ("Converter filme para MP4 compatível", converter),
         *itens_servico("midia", "Servidor de vídeo", iniciar_servidor),
         ("Túnel para a internet: ligar", iniciar_tunel),
@@ -5054,6 +6662,7 @@ def menu_midia():
         ("Apagar links expirados", apagar_expirados),
         ("Apagar TODOS os links", apagar_todos),
         (lambda: f"Porta do servidor ({c['midia_porta']})", mudar_porta),
+        (lambda: f"Conversões ao mesmo tempo ({c['midia_transmissoes']})", mudar_transmissoes),
     ])
 
 
@@ -5216,7 +6825,7 @@ def _pycaches() -> list:
 
 
 def _sobras_toons() -> list:
-    """Logs antigos, logs de serviços parados e fotos temporárias do Termux-Toons."""
+    """Logs antigos, logs de serviços parados, fotos temporárias e legendas extraídas (refeitas quando preciso)."""
     ativos = set(servicos_ativos())
     itens = list(LOG_DIR.glob("*.log.old")) if LOG_DIR.exists() else []
     if LOG_DIR.exists():
@@ -5224,6 +6833,8 @@ def _sobras_toons() -> list:
     itens += list(DATA_DIR.glob("foto_*.jpg"))
     if (DATA_DIR / "teste_dev").exists():
         itens.append(DATA_DIR / "teste_dev")
+    if LEGENDAS_CACHE.exists() and "midia" not in ativos:
+        itens += list(LEGENDAS_CACHE.glob("*.vtt*"))
     return itens
 
 
@@ -5266,7 +6877,7 @@ LIMPADORES = [
      True),
     ("Arquivos temporários antigos ($PREFIX/tmp)", lambda: _limpador_lista(_arquivos_tmp_antigos), True),
     ("Pastas __pycache__ na home", lambda: _limpador_lista(_pycaches), True),
-    ("Logs antigos e fotos temporárias do Termux-Toons", lambda: _limpador_lista(_sobras_toons), True),
+    ("Logs antigos, fotos temporárias e legendas extraídas do Termux-Toons", lambda: _limpador_lista(_sobras_toons), True),
     ("Miniaturas da galeria (.thumbnails, o Android recria)", lambda: _limpador_lista(_miniaturas), True),
     ("Downloads incompletos (.part, .ytdl) em Downloads", lambda: _limpador_lista(_downloads_incompletos), False),
     ("Build do llama.cpp (precisa recompilar depois)",
@@ -5628,7 +7239,8 @@ FERRAMENTAS = [
     ("tmux", "tmux", "serviços 24h"), ("termux-wake-lock", "termux-tools", "manter acordado"),
     ("termux-battery-status", "termux-api", "Termux:API"), ("git", "git", "dev / atualização"),
     ("nvim", "neovim", "editor"), ("clang", "clang", "C/C++ e llama.cpp"), ("cmake", "cmake", "llama.cpp"),
-    ("yt-dlp", "python-yt-dlp", "música"), ("ffmpeg", "ffmpeg", "música"), ("mpv", "mpv", "música"),
+    ("yt-dlp", "python-yt-dlp", "música e vídeos"), ("ffmpeg", "ffmpeg", "música e transmissão de filmes"),
+    ("mpv", "mpv", "música"),
     ("nmap", "nmap", "rede"), ("sshd", "openssh", "SSH"), ("wg", "wireguard-tools", "WireGuard"),
     ("cloudflared", "cloudflared", "túnel"), ("proot-distro", "proot-distro", "Linux"),
     ("rclone", "rclone", "nuvem"), ("syncthing", "syncthing", "sincronização"),
@@ -5740,9 +7352,13 @@ def main(argv=None) -> int:
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--porta", type=int)
     p = sub.add_parser("compartilhar", help="cria um link para assistir a um vídeo e liga o servidor")
-    p.add_argument("arquivo")
+    p.add_argument("arquivo", help="vídeo do celular, link direto de arquivo ou página de vídeo (YouTube...)")
     p.add_argument("--titulo")
     p.add_argument("--horas", type=float, help="validade do link em horas (padrão: sem prazo)")
+    p.add_argument("--legenda", action="append", help="legenda .srt/.vtt extra (arquivo ou link); pode repetir")
+    p = sub.add_parser("assistir", help="toca um link no VLC do celular, sem baixar")
+    p.add_argument("link")
+    p.add_argument("--escolher", action="store_true", help="mostra a lista de apps em vez de abrir o VLC")
     p = sub.add_parser("tocar", help="toca a biblioteca (sem argumentos) ou um mix por busca")
     p.add_argument("busca", nargs="*")
     sub.add_parser("atualizar", help="atualiza Termux, pacotes Python, distros e o Termux-Toons")
@@ -5784,9 +7400,13 @@ def main(argv=None) -> int:
         elif args.comando == "midia":
             servir_midia(args.host, args.porta or cfg()["midia_porta"])
         elif args.comando == "compartilhar":
-            item = criar_compartilhamento(Path(args.arquivo), args.titulo, args.horas)
+            link = conferir_link(args.arquivo) if eh_link(args.arquivo) else {"pagina": False, "titulo": None}
+            item = criar_compartilhamento(args.arquivo, args.titulo or link["titulo"], args.horas,
+                                          legendas=args.legenda, pagina=link["pagina"])
             garantir_servidor_midia()
             mostrar_links(item)
+        elif args.comando == "assistir":
+            abrir_no_android(endereco_para_assistir(args.link), None if args.escolher else VLC_ANDROID)
         elif args.comando == "tocar":
             if args.busca:
                 tocar_mpv([f"ytdl://ytsearch15:{' '.join(args.busca)}"], stream=True, perguntar_fundo=False)
