@@ -14,7 +14,7 @@ Reúne em um único menu:
    8. Rede e segurança em equipamentos seus (nmap, SSH, WireGuard, velocidade)
    9. Retro: jogos ASCII, interpretador BASIC e template para criar seu jogo
   10. Linux de verdade com proot-distro (Debian, Ubuntu, Arch...)
-  11. Servidor de arquivos e backup (rclone, Syncthing, Samba, HTTP)
+  11. Servidor de arquivos e backup (rclone, Syncthing, Samba, HTTP) e página HTML num link
   12. "Spotify" no terminal: yt-dlp para baixar e mpv para tocar
   13. Vídeos do TikTok, YouTube e outros sites com yt-dlp
   14. Atualização do Termux e dos repositórios
@@ -65,7 +65,7 @@ import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 try:
@@ -747,6 +747,8 @@ PADRAO_CFG = {
     "pasta_videos": "~/storage/downloads",
     "midia_porta": 8095,
     "midia_transmissoes": 3,
+    "site_porta": 8097,
+    "site_pagina": "",
     "compartilhamentos": [],
     "llama_porta": 8080,
     "llama_modelo": "",
@@ -3971,6 +3973,123 @@ def _caminho_termux() -> Path:
     return HOME.parent
 
 
+# ── Publicar página/site HTML num link ───────────────────────────────
+
+SITE_DIR = DATA_DIR / "site"  # cópia do arquivo quando você publica só uma página
+
+
+class _HandlerSite(SimpleHTTPRequestHandler):
+    """Entrega os arquivos de uma pasta como site: abre o index.html, mas não lista pastas
+    nem mostra arquivos ocultos (.git, .env...)."""
+    server_version = f"TermuxToons/{VERSION}"
+
+    def list_directory(self, path):
+        self.send_error(404, "Página não encontrada")
+        return None
+
+    def send_head(self):
+        partes = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path).split("/")
+        if any(p.startswith(".") for p in partes if p):
+            self.send_error(404, "Página não encontrada")
+            return None
+        return super().send_head()
+
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-cache")  # quem abre o link vê sempre a versão mais nova
+        super().end_headers()
+
+    def log_message(self, fmt, *args):
+        log(f"{self.client_address[0]} {fmt % args}")
+
+
+def servir_site(pasta: str, porta: int) -> None:
+    """Sobe o site em primeiro plano (é o que roda dentro do tmux)."""
+    pasta = str(Path(os.path.expanduser(pasta)).resolve())
+    if not Path(pasta).is_dir():
+        raise ToonsError(f"Pasta não encontrada: {pasta}")
+    with ThreadingHTTPServer(("0.0.0.0", porta), lambda *a, **k: _HandlerSite(*a, directory=pasta, **k)) as servidor:
+        log(f"Site de {pasta} em http://{ip_local()}:{porta}  (Ctrl+C para parar)")
+        servidor.serve_forever()
+
+
+def links_do_site() -> list:
+    """[(onde funciona, link)] da página publicada: rede local e, com o túnel ligado, a internet."""
+    c = cfg()
+    caminho = "/" + urllib.parse.quote(c["site_pagina"])
+    links = [("Mesma rede Wi-Fi", f"http://{ip_local()}:{c['site_porta']}{caminho}")]
+    if servico_ativo("tunel-site") and url_tunel("tunel-site"):
+        links.append(("Internet", f"{url_tunel('tunel-site')}{caminho}"))
+    return links
+
+
+def mostrar_links_do_site() -> None:
+    if not servico_ativo("site"):
+        info("Nenhuma página publicada agora.")
+        return
+    for onde, link in links_do_site():
+        print(f"  {CIANO}{onde}:{RST}\n  {NEG}{link}{RST}")
+    if not servico_ativo("tunel-site"):
+        print(f"  {DIM}Para quem está fora da sua rede Wi-Fi, use 'Página publicada: liberar para a internet'.{RST}")
+
+
+def publicar_site() -> None:
+    """Escolhe um .html (ou a pasta de um site), sobe o servidor e, se quiser, o túnel para a internet."""
+    info("Publica uma página HTML (ou um site com imagens, CSS e JS) num link. Na mesma rede Wi-Fi funciona "
+         "na hora; para quem está longe, o túnel da Cloudflare cria um endereço na internet.")
+    alvo = Path(os.path.expanduser(perguntar("Arquivo .html ou pasta do site", str(DOWNLOADS))))
+    if alvo.is_dir():
+        pasta, pagina = alvo, ""
+        if not (alvo / "index.html").is_file():
+            paginas = sorted(p.name for p in alvo.iterdir() if p.suffix.lower() in (".html", ".htm"))
+            i = escolher("Qual página abre primeiro?", paginas)
+            if i is None:
+                return
+            pagina = paginas[i]
+        aviso(f"Todos os arquivos de {alvo} ficam acessíveis para quem tiver o link.")
+    elif alvo.is_file() and alvo.suffix.lower() in (".html", ".htm"):
+        i = escolher("O que publicar?", [
+            "Só este arquivo",
+            f"A pasta inteira ({alvo.parent.name}/) — use se a página carrega imagens, CSS ou JS dessa pasta"])
+        if i is None:
+            return
+        if i == 0:
+            shutil.rmtree(SITE_DIR, ignore_errors=True)
+            SITE_DIR.mkdir(parents=True)
+            shutil.copy2(alvo, SITE_DIR / "index.html")
+            pasta, pagina = SITE_DIR, ""
+        else:
+            aviso(f"Todos os arquivos de {alvo.parent} ficam acessíveis para quem tiver o link.")
+            if not confirmar("Continuar?", True):
+                return
+            pasta, pagina = alvo.parent, "" if alvo.name == "index.html" else alvo.name
+    else:
+        raise ToonsError(f"Escolha um arquivo .html ou uma pasta: {alvo}")
+    c = cfg()
+    c["site_pagina"] = pagina
+    salvar_cfg()
+    if servico_ativo("site"):
+        parar_servico("site")
+    if not porta_livre(c["site_porta"]):
+        raise ToonsError(f"A porta {c['site_porta']} já está em uso. Troque 'site_porta' em Configurações.")
+    if not iniciar_servico("site", cmd_self("site", str(pasta), "--porta", str(c["site_porta"])), reiniciar=True):
+        return
+    if not servico_ativo("tunel-site") and confirmar("Liberar para a internet (pessoas fora do seu Wi-Fi)?", True):
+        abrir_tunel("tunel-site", c["site_porta"])
+    print()
+    mostrar_links_do_site()
+    _, link = links_do_site()[-1]
+    if tem("termux-clipboard-set") and confirmar("Copiar o link?", True):
+        _tapi(["termux-clipboard-set"], 10, entrada=link, json_saida=False)
+        ok("Link copiado.")
+    info("O link funciona enquanto o celular estiver ligado com o Termux aberto. O endereço do túnel muda "
+         "toda vez que ele é religado.")
+
+
+def parar_site() -> None:
+    parar_servico("tunel-site")
+    parar_servico("site")
+
+
 @submenu
 def menu_arquivos():
     def http_iniciar():
@@ -4092,6 +4211,11 @@ def menu_arquivos():
             ok("Restaurado. Reinicie o Termux.")
 
     menu("🗄️ Servidor de arquivos e backup", [
+        ("🌍 Publicar página/site HTML num link", publicar_site),
+        ("Página publicada: ver o link", mostrar_links_do_site),
+        ("Página publicada: liberar para a internet (túnel)",
+         lambda: abrir_tunel("tunel-site", cfg()["site_porta"]) if servico_ativo("site") else info("Publique uma página primeiro.")),
+        ("Página publicada: tirar do ar", parar_site),
         *itens_servico("http-arquivos", "Compartilhar pasta via HTTP", http_iniciar),
         ("rclone: instalar e configurar nuvem (Drive, Dropbox, OneDrive...)", rclone_config),
         ("rclone: copiar/sincronizar pasta com a nuvem", rclone_copiar),
@@ -7351,6 +7475,9 @@ def main(argv=None) -> int:
     p = sub.add_parser("midia", help="servidor de vídeo (links de compartilhamento) em primeiro plano")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--porta", type=int)
+    p = sub.add_parser("site", help="publica uma pasta como site (página HTML) em primeiro plano")
+    p.add_argument("pasta")
+    p.add_argument("--porta", type=int)
     p = sub.add_parser("compartilhar", help="cria um link para assistir a um vídeo e liga o servidor")
     p.add_argument("arquivo", help="vídeo do celular, link direto de arquivo ou página de vídeo (YouTube...)")
     p.add_argument("--titulo")
@@ -7399,6 +7526,8 @@ def main(argv=None) -> int:
                 raise ToonsError(f"{falhas} download(s) falharam.")
         elif args.comando == "midia":
             servir_midia(args.host, args.porta or cfg()["midia_porta"])
+        elif args.comando == "site":
+            servir_site(args.pasta, args.porta or cfg()["site_porta"])
         elif args.comando == "compartilhar":
             link = conferir_link(args.arquivo) if eh_link(args.arquivo) else {"pagina": False, "titulo": None}
             item = criar_compartilhamento(args.arquivo, args.titulo or link["titulo"], args.horas,
