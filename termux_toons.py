@@ -22,6 +22,7 @@ Reúne em um único menu:
   16. Compartilhar filmes por link: arquivo do celular ou qualquer link de vídeo, com
       player próprio, troca de trilha de áudio e conversão na hora (servidor de vídeo + túnel)
   17. Depuração sem fio (ADB pelo Wi-Fi) do próprio celular, sem PC e sem root
+  18. Gerenciador de arquivos: copiar, mover, renomear, compactar e ver Android/data (ADB ou root)
 
 Uso:
     python termux_toons.py            # menu interativo
@@ -37,6 +38,7 @@ import argparse
 import atexit
 import contextlib
 import copy
+import fnmatch
 import getpass
 import hashlib
 import hmac
@@ -54,8 +56,10 @@ import select
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import traceback
@@ -65,6 +69,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -4213,6 +4218,7 @@ def menu_arquivos():
             ok("Restaurado. Reinicie o Termux.")
 
     menu("🗄️ Servidor de arquivos e backup", [
+        ("📂 Gerenciador de arquivos (copiar, mover, renomear, Android/data...)", gerenciador_arquivos),
         ("🌍 Publicar página/site HTML num link", publicar_site),
         ("Página publicada: ver o link", mostrar_links_do_site),
         ("Página publicada: liberar para a internet (túnel)",
@@ -7590,6 +7596,613 @@ def menu_adb():
 
 
 # ════════════════════════════════════════════════════════════════════
+#  18. Gerenciador de arquivos (estilo ZArchiver)
+# ════════════════════════════════════════════════════════════════════
+# Navega, copia, move, renomeia, apaga, mostra os dados, compacta e
+# extrai. Três níveis de acesso, do mais fraco ao mais forte:
+#   • Termux: o armazenamento interno e a pasta do próprio Termux;
+#   • ADB (depuração sem fio): o usuário "shell" do Android, que abre
+#     Android/data e Android/obb (escondidas dos apps desde o Android 11),
+#     /data/local/tmp e partes do sistema, sem root;
+#   • Root: tudo, inclusive /data/data com os dados de cada app.
+
+ARMAZENAMENTO = "/storage/emulated/0"
+ICONES_ARQUIVO = [
+    (EXTENSOES_VIDEO, "🎬"), (EXTENSOES_AUDIO, "🎵"),
+    ({".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".bmp", ".svg"}, "🖼"),
+    ({".zip", ".rar", ".7z", ".tar", ".gz", ".tgz", ".xz", ".bz2", ".zst"}, "📦"),
+    ({".apk", ".apks", ".xapk"}, "📱"), ({".pdf"}, "📕"),
+    ({".txt", ".md", ".json", ".xml", ".html", ".htm", ".py", ".sh", ".log", ".csv", ".srt", ".vtt", ".ini",
+      ".conf", ".js", ".css", ".lua", ".c", ".rs", ".go"}, "📝"),
+]
+COMPACTADOS = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2", ".7z", ".rar")
+
+
+def _privado_do_termux(caminho: str) -> bool:
+    """Pastas que só o Termux enxerga (a home dele): o ADB não lê nem grava ali."""
+    return os.path.realpath(caminho).startswith(str(HOME.parent))
+
+
+class AcessoTermux:
+    """Arquivos com a permissão do próprio Termux (Python puro)."""
+    nome, rotulo = "termux", "Termux (normal)"
+
+    def listar(self, pasta: str) -> list:
+        itens = []
+        try:
+            with os.scandir(pasta) as entradas:
+                for e in entradas:
+                    try:
+                        st = e.stat()  # segue links: /sdcard e ~/storage/* abrem como pastas
+                        eh_pasta = stat.S_ISDIR(st.st_mode)
+                    except OSError:
+                        st, eh_pasta = None, False
+                    itens.append({"nome": e.name, "caminho": e.path, "pasta": eh_pasta,
+                                  "tamanho": None if eh_pasta or st is None else st.st_size,
+                                  "data": st.st_mtime if st else 0})
+        except PermissionError:
+            raise ToonsError("Sem permissão para abrir esta pasta com o acesso do Termux.") from None
+        except OSError as e:
+            raise ToonsError(f"Não consegui abrir a pasta: {e.strerror or e}") from None
+        return itens
+
+    def dados(self, caminho: str) -> dict:
+        st = os.stat(caminho)
+        dados = {"Tipo": "pasta" if stat.S_ISDIR(st.st_mode) else "arquivo",
+                 "Tamanho": f"{bytes_humanos(st.st_size)} ({st.st_size:,} bytes)".replace(",", ".")
+                 if not stat.S_ISDIR(st.st_mode) else "(use 'Calcular tamanho')",
+                 "Modificado": f"{datetime.fromtimestamp(st.st_mtime):%d/%m/%Y %H:%M:%S}",
+                 "Permissões": stat.filemode(st.st_mode), "Dono (uid:gid)": f"{st.st_uid}:{st.st_gid}"}
+        if os.path.islink(caminho):
+            dados["Link para"] = os.path.realpath(caminho)
+        return dados
+
+    def tamanho_total(self, caminho: str) -> int:
+        return tamanho(Path(caminho))
+
+    def existe(self, caminho: str) -> bool:
+        return os.path.lexists(caminho)
+
+    def copiar(self, origem: str, pasta: str, nome: str) -> None:
+        destino = os.path.join(pasta, nome)
+        if os.path.isdir(origem) and not os.path.islink(origem):
+            shutil.copytree(origem, destino, symlinks=True)
+        else:
+            shutil.copy2(origem, destino)
+
+    def mover(self, origem: str, pasta: str, nome: str) -> None:
+        shutil.move(origem, os.path.join(pasta, nome))
+
+    def renomear(self, caminho: str, novo: str) -> None:
+        os.rename(caminho, os.path.join(os.path.dirname(caminho), novo))
+
+    def apagar(self, caminho: str) -> None:
+        if os.path.isdir(caminho) and not os.path.islink(caminho):
+            shutil.rmtree(caminho)
+        else:
+            os.remove(caminho)
+
+    def criar_pasta(self, caminho: str) -> None:
+        os.makedirs(caminho)
+
+    def ler(self, caminho: str, limite: int) -> bytes:
+        with open(caminho, "rb") as arq:
+            return arq.read(limite)
+
+    def buscar(self, pasta: str, termo: str, limite: int = 200) -> list:
+        padrao, achados = f"*{termo.lower()}*", []
+        for raiz, pastas, nomes in os.walk(pasta, onerror=lambda e: None):
+            for nome in pastas + nomes:
+                if fnmatch.fnmatch(nome.lower(), padrao):
+                    achados.append(os.path.join(raiz, nome))
+                    if len(achados) >= limite:
+                        return achados
+        return achados
+
+
+class AcessoShell(AcessoTermux):
+    """Arquivos pelo shell do Android: via ADB (usuário 'shell', sem root) ou via su (root)."""
+
+    def __init__(self, nome: str):
+        self.nome = nome
+        self.rotulo = "Root (vê tudo)" if nome == "root" else "ADB / depuração sem fio (Android/data, obb...)"
+        self.serial = adb_alvo() if nome == "adb" else None
+
+    def sh(self, comando: str, timeout: float | None = 120) -> subprocess.CompletedProcess:
+        cmd = ["su", "-c", comando] if self.nome == "root" else ["adb", "-s", self.serial, "shell", comando]
+        return rodar(cmd, capturar=True, timeout=timeout, mostrar=False)
+
+    def _ok(self, comando: str, timeout: float | None = None) -> str:
+        """Saída do comando; erro (com a mensagem do Android) se ele falhar."""
+        proc = self.sh(comando, timeout)
+        if proc.returncode != 0:
+            texto = f"{proc.stderr or ''}{proc.stdout or ''}".strip()
+            raise ToonsError(texto[-300:] or f"O comando falhou (código {proc.returncode}).")
+        return (proc.stdout or "").strip()
+
+    def listar(self, pasta: str) -> list:
+        base = pasta.rstrip("/")
+        q = shlex.quote(base) if base else ""
+        globs = " ".join(f"{q}/{g}" for g in ("*", ".[!.]*", "..?*"))
+        proc = self.sh(f"cd {shlex.quote(pasta)} && stat -L -c '%F|%s|%Y|%n' -- {globs} 2>/dev/null; "
+                       f"[ -d {shlex.quote(pasta)} ] || echo NAO_EXISTE; [ -r {shlex.quote(pasta)} ] || echo SEM_PERMISSAO")
+        saida_sh = proc.stdout or ""
+        if "NAO_EXISTE" in saida_sh:
+            raise ToonsError(f"A pasta não existe (ou não aparece com o acesso {self.rotulo}).")
+        if "SEM_PERMISSAO" in saida_sh or (proc.returncode != 0 and not saida_sh.strip()
+                                           and "Permission denied" in (proc.stderr or "")):
+            raise ToonsError(f"Sem permissão para abrir esta pasta com o acesso {self.rotulo}.")
+        itens = []
+        for linha in saida_sh.splitlines():
+            partes = linha.split("|", 3)
+            if len(partes) != 4:
+                continue
+            tipo, tam, data, caminho = partes
+            eh_pasta = tipo == "directory"
+            itens.append({"nome": caminho.rsplit("/", 1)[-1], "caminho": caminho, "pasta": eh_pasta,
+                          "tamanho": None if eh_pasta else int(tam or 0), "data": int(data or 0)})
+        return itens
+
+    def dados(self, caminho: str) -> dict:
+        tipo, tam, data, perm, dono = (self._ok(
+            f"stat -L -c '%F|%s|%Y|%A|%U:%G' -- {shlex.quote(caminho)}").splitlines()[-1].split("|") + [""] * 5)[:5]
+        contexto = (self.sh(f"stat -L -c %C -- {shlex.quote(caminho)} 2>/dev/null").stdout or "").strip()
+        dados = {"Tipo": "pasta" if tipo == "directory" else "arquivo",
+                 "Tamanho": "(use 'Calcular tamanho')" if tipo == "directory"
+                 else f"{bytes_humanos(int(tam or 0))} ({int(tam or 0):,} bytes)".replace(",", "."),
+                 "Modificado": f"{datetime.fromtimestamp(int(data or 0)):%d/%m/%Y %H:%M:%S}",
+                 "Permissões": perm, "Dono": dono}
+        if contexto and contexto != "?":
+            dados["Contexto SELinux"] = contexto
+        return dados
+
+    def tamanho_total(self, caminho: str) -> int:
+        texto = self._ok(f"du -sk -- {shlex.quote(caminho)} 2>/dev/null | tail -n 1")
+        return int(texto.split()[0]) * 1024 if texto.split() and texto.split()[0].isdigit() else 0
+
+    def existe(self, caminho: str) -> bool:
+        return "sim" in (self.sh(f"[ -e {shlex.quote(caminho)} ] && echo sim").stdout or "")
+
+    def copiar(self, origem: str, pasta: str, nome: str) -> None:
+        self._ok(f"cp -rp -- {shlex.quote(origem)} {shlex.quote(os.path.join(pasta, nome))}")
+
+    def mover(self, origem: str, pasta: str, nome: str) -> None:
+        self._ok(f"mv -- {shlex.quote(origem)} {shlex.quote(os.path.join(pasta, nome))}")
+
+    def renomear(self, caminho: str, novo: str) -> None:
+        self.mover(caminho, os.path.dirname(caminho), novo)
+
+    def apagar(self, caminho: str) -> None:
+        self._ok(f"rm -rf -- {shlex.quote(caminho)}")
+
+    def criar_pasta(self, caminho: str) -> None:
+        self._ok(f"mkdir -p -- {shlex.quote(caminho)}")
+
+    def ler(self, caminho: str, limite: int) -> bytes:
+        return self._ok(f"head -c {limite} -- {shlex.quote(caminho)}", timeout=60).encode("utf-8", "replace")
+
+    def buscar(self, pasta: str, termo: str, limite: int = 200) -> list:
+        padrao = shlex.quote(f"*{termo}*")
+        saida_sh = self.sh(f"find {shlex.quote(pasta)} -iname {padrao} 2>/dev/null | head -n {limite}", 300).stdout
+        return [l for l in (saida_sh or "").splitlines() if l.strip()]
+
+
+def criar_acesso(nome: str):
+    """Abre o nível de acesso pedido, conectando a depuração sem fio se precisar."""
+    if nome == "termux":
+        return AcessoTermux()
+    if nome == "root":
+        if not tem_root():
+            raise ToonsError("Este celular não tem root (o comando su não respondeu).")
+        return AcessoShell("root")
+    if not garantir_adb():
+        raise ToonsError("Sem o adb (pacote android-tools).")
+    if not adb_aparelhos():
+        info("A depuração sem fio não está conectada. Ligue a 'Depuração por Wi-Fi' nas Opções do desenvolvedor.")
+        if not adb_conectar():
+            raise ToonsError("Não conectou. Na primeira vez, use 'Depuração sem fio → Parear este celular'.")
+    return AcessoShell("adb")
+
+
+def _icone(item: dict) -> str:
+    if item["pasta"]:
+        return "📁"
+    nome = item["nome"].lower()
+    return next((icone for extensoes, icone in ICONES_ARQUIVO if os.path.splitext(nome)[1] in extensoes), "📄")
+
+
+def _eh_compactado(nome: str) -> bool:
+    return nome.lower().endswith(COMPACTADOS)
+
+
+def _nome_livre(acesso, pasta: str, nome: str) -> str:
+    """'foto.jpg' -> 'foto (2).jpg' se já existe na pasta."""
+    base, ext = os.path.splitext(nome)
+    if base.endswith(".tar"):
+        base, ext = base[:-4], ".tar" + ext
+    n = 2
+    while acesso.existe(os.path.join(pasta, nome)):
+        nome, n = f"{base} ({n}){ext}", n + 1
+    return nome
+
+
+def _resolver_conflito(acesso, pasta: str, nome: str):
+    """Nome final para colar em `pasta`, ou None para pular. Pergunta se já existir."""
+    if not acesso.existe(os.path.join(pasta, nome)):
+        return nome
+    i = escolher(f"'{nome}' já existe aqui. O que fazer?", ["Manter os dois (renomear o novo)", "Substituir", "Pular"])
+    if i == 0:
+        return _nome_livre(acesso, pasta, nome)
+    if i == 1:
+        acesso.apagar(os.path.join(pasta, nome))
+        return nome
+    return None
+
+
+def transferir(origem, caminhos: list, destino, pasta: str, mover: bool) -> int:
+    """Copia/move `caminhos` (lidos com o acesso `origem`) para `pasta` (com o acesso `destino`).
+    Root alcança tudo; entre Termux e ADB, o que está na pasta privada do Termux passa por adb push/pull."""
+    feitos = 0
+    for caminho in caminhos:
+        nome = os.path.basename(caminho.rstrip("/"))
+        if os.path.realpath(pasta).startswith(os.path.realpath(caminho).rstrip("/") + "/") and origem.nome == destino.nome:
+            erro(f"Não dá para colocar '{nome}' dentro dele mesmo.")
+            continue
+        try:
+            if origem.nome == destino.nome or "root" in (origem.nome, destino.nome):
+                acesso = destino if destino.nome == "root" or origem.nome == destino.nome else origem
+                final = _resolver_conflito(acesso, pasta, nome)
+                if final is None:
+                    continue
+                (acesso.mover if mover else acesso.copiar)(caminho, pasta, final)
+                if acesso.nome == "root" and _privado_do_termux(pasta):  # devolve os arquivos ao Termux
+                    acesso.sh(f"chown -R {os.getuid()}:{os.getgid()} -- {shlex.quote(os.path.join(pasta, final))}")
+            else:
+                adb_acesso = origem if origem.nome == "adb" else destino
+                final = _resolver_conflito(destino, pasta, nome)
+                if final is None:
+                    continue
+                alvo = os.path.join(pasta, final)
+                if origem.nome == "termux" and _privado_do_termux(caminho):  # Termux privado -> ADB
+                    proc = adb("push", caminho, alvo, serial=adb_acesso.serial, timeout=None)
+                    if proc.returncode != 0:
+                        raise ToonsError((proc.stderr or proc.stdout or "").strip()[-300:])
+                    if mover:
+                        origem.apagar(caminho)
+                elif destino.nome == "termux" and _privado_do_termux(pasta):  # ADB -> Termux privado
+                    proc = adb("pull", "-a", caminho, alvo, serial=adb_acesso.serial, timeout=None)
+                    if proc.returncode != 0:
+                        raise ToonsError((proc.stderr or proc.stdout or "").strip()[-300:])
+                    if mover:
+                        adb_acesso.apagar(caminho)
+                else:  # os dois lados no armazenamento: o shell do ADB faz direto
+                    (adb_acesso.mover if mover else adb_acesso.copiar)(os.path.realpath(caminho), os.path.realpath(pasta), final)
+            feitos += 1
+            ok(f"{'Movido' if mover else 'Copiado'}: {nome}" + (f" → {final}" if final != nome else ""))
+        except (OSError, shutil.Error, ToonsError) as e:
+            erro(f"{nome}: {e}")
+    return feitos
+
+
+def extrair(arquivo: str, pasta: str) -> str:
+    """Extrai .zip/.tar.* com o Python e .7z/.rar com o 7z, numa pasta com o nome do arquivo."""
+    nome = os.path.basename(arquivo)
+    base = re.sub(r"\.(tar\.(gz|xz|bz2)|tgz|txz|tbz2|zip|tar|7z|rar)$", "", nome, flags=re.I) or nome
+    destino = os.path.join(pasta, _nome_livre(AcessoTermux(), pasta, base))
+    baixo = nome.lower()
+    if baixo.endswith(".zip"):
+        with zipfile.ZipFile(arquivo) as z:
+            raiz = os.path.realpath(destino)
+            for membro in z.namelist():  # nada de '../' saindo da pasta
+                if not os.path.realpath(os.path.join(raiz, membro)).startswith(raiz + os.sep) and membro.strip("/"):
+                    raise ToonsError(f"Arquivo suspeito dentro do zip: {membro}")
+            z.extractall(destino)
+    elif baixo.endswith((".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2")):
+        with tarfile.open(arquivo) as t:
+            if hasattr(tarfile, "data_filter"):
+                t.extractall(destino, filter="data")
+            else:
+                raiz = os.path.realpath(destino)
+                if any(not os.path.realpath(os.path.join(raiz, m.name)).startswith(raiz) or m.issym() or m.islnk()
+                       for m in t.getmembers()):
+                    raise ToonsError("O arquivo tem caminhos ou links suspeitos; não extraí.")
+                t.extractall(destino)
+    else:
+        if not garantir_cmd("7z", "p7zip"):
+            raise ToonsError("Para .7z e .rar é preciso o 7z (pkg install p7zip).")
+        if rodar(["7z", "x", f"-o{destino}", "-y", arquivo]).returncode != 0:
+            raise ToonsError("O 7z não conseguiu extrair (senha errada ou arquivo corrompido?).")
+    return destino
+
+
+def compactar(caminhos: list, destino: str) -> None:
+    """Junta arquivos e pastas num .zip."""
+    with zipfile.ZipFile(destino, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as z:
+        for caminho in caminhos:
+            pai = os.path.dirname(caminho.rstrip("/"))
+            if os.path.isdir(caminho):
+                for raiz, _, nomes in os.walk(caminho):
+                    z.write(raiz, os.path.relpath(raiz, pai))
+                    for nome in nomes:
+                        completo = os.path.join(raiz, nome)
+                        z.write(completo, os.path.relpath(completo, pai))
+            else:
+                z.write(caminho, os.path.relpath(caminho, pai))
+
+
+def _atalhos_de_pasta(acesso) -> list:
+    """[(rótulo, caminho)] para 'Ir para...'."""
+    atalhos = [("📱 Armazenamento interno", ARMAZENAMENTO)]
+    atalhos += [(f"   {nome}", f"{ARMAZENAMENTO}/{nome}") for nome in
+                ("Download", "DCIM", "Pictures", "Movies", "Music", "Documents", "WhatsApp/Media", "Android/media")]
+    atalhos += [("🔒 Android/data (ADB ou root)", f"{ARMAZENAMENTO}/Android/data"),
+                ("🔒 Android/obb (ADB ou root)", f"{ARMAZENAMENTO}/Android/obb")]
+    with contextlib.suppress(OSError):
+        for nome in sorted(os.listdir("/storage")):
+            if nome not in ("emulated", "self") and re.fullmatch(r"[0-9A-F]{4}-[0-9A-F]{4}", nome):
+                atalhos.append((f"💾 Cartão SD / pendrive ({nome})", f"/storage/{nome}"))
+    atalhos += [("🐧 Home do Termux", str(HOME)), ("⚙ Raiz do sistema (/)", "/"),
+                ("🔒 /data/local/tmp (ADB)", "/data/local/tmp"), ("🔒 /data/data — dados dos apps (root)", "/data/data")]
+    return atalhos
+
+
+@submenu
+def gerenciador_arquivos(inicio: str | None = None) -> None:
+    """Navegador de arquivos com setas: Enter abre pasta ou mostra as ações do arquivo; Esc sobe uma pasta."""
+    acesso = AcessoTermux()
+    if inicio is None:
+        garantir_storage()
+        inicio = ARMAZENAMENTO if os.path.isdir(ARMAZENAMENTO) else str(HOME)
+    pasta = os.path.abspath(os.path.expanduser(inicio))
+    estado = {"ocultos": False, "ordem": "nome", "clip": None}  # clip: (acesso, [caminhos], mover?)
+    ordens = {"nome": "nome", "data": "data (mais novos)", "tamanho": "tamanho (maiores)"}
+
+    def colar():
+        origem, caminhos, mover = estado["clip"]
+        feitos = transferir(origem, caminhos, acesso, pasta, mover)
+        if mover and feitos:
+            estado["clip"] = None
+        pausar()
+
+    def acoes_item(item: dict):
+        caminho, nome = item["caminho"], item["nome"]
+        opcoes = [("📋 Ver dados (tamanho, data, permissões...)", "dados"), ("📂 Abrir com um app", "abrir"),
+                  ("👁 Ver conteúdo (texto)", "ver"), ("✏ Renomear", "renomear"), ("📄 Copiar", "copiar"),
+                  ("✂ Recortar (mover)", "mover"), ("⬇ Copiar para Download", "download")]
+        if acesso.nome == "termux":
+            if _eh_compactado(nome):
+                opcoes.append(("📦 Extrair aqui", "extrair"))
+            opcoes += [("🗜 Compactar em .zip", "zip"), ("📝 Editar texto (nano)", "editar"),
+                       ("📤 Compartilhar (WhatsApp, Telegram...)", "enviar")]
+        opcoes += [("🗑 Apagar", "apagar")]
+        i = escolher(f"{_icone(item)} {nome}", [r for r, _ in opcoes])
+        if i is None:
+            return
+        acao = opcoes[i][1]
+        if acao == "dados":
+            mostrar_dados({"Nome": nome, "Caminho": caminho, **acesso.dados(caminho)})
+            if item["pasta"] and confirmar("Calcular o tamanho da pasta?", False):
+                info("Somando...")
+                print(f"Tamanho total: {bytes_humanos(acesso.tamanho_total(caminho))}")
+        elif acao == "abrir":
+            if acesso.nome != "termux" and not os.access(caminho, os.R_OK):
+                aviso("O Termux não enxerga este arquivo direto. Use 'Copiar para Download' e abra de lá.")
+            elif not tem("termux-open"):
+                raise ToonsError("'termux-open' não encontrado (só existe dentro do Termux).")
+            else:
+                rodar(["termux-open", "--chooser", caminho], capturar=True, timeout=20)
+        elif acao == "ver":
+            dados = acesso.ler(caminho, 6000)
+            if b"\0" in dados[:2000]:
+                aviso("Parece um arquivo binário (não é texto).")
+            else:
+                print(dados.decode("utf-8", "replace"))
+                if len(dados) >= 6000:
+                    print(f"{DIM}… (mostrando só o começo){RST}")
+        elif acao == "renomear":
+            novo = perguntar("Novo nome", nome).strip()
+            if novo and novo != nome:
+                if "/" in novo:
+                    raise ToonsError("O nome não pode ter '/'.")
+                if acesso.existe(os.path.join(os.path.dirname(caminho), novo)):
+                    raise ToonsError(f"Já existe '{novo}' nesta pasta.")
+                acesso.renomear(caminho, novo)
+                ok(f"Renomeado para {novo}")
+        elif acao in ("copiar", "mover"):
+            estado["clip"] = (acesso, [caminho], acao == "mover")
+            ok(f"{'Recortado' if acao == 'mover' else 'Copiado'}. Vá até a pasta de destino e use ⚙ → Colar aqui.")
+        elif acao == "download":
+            transferir(acesso, [caminho], AcessoTermux() if acesso.nome == "termux" else acesso,
+                       f"{ARMAZENAMENTO}/Download", False)
+        elif acao == "extrair":
+            info("Extraindo...")
+            ok(f"Extraído em {extrair(caminho, pasta)}")
+        elif acao == "zip":
+            destino = os.path.join(pasta, _nome_livre(acesso, pasta, os.path.splitext(nome)[0] + ".zip"))
+            compactar([caminho], destino)
+            ok(f"Criado {os.path.basename(destino)}")
+        elif acao == "editar":
+            editor = os.environ.get("EDITOR") or next((e for e in ("nano", "nvim", "vi") if tem(e)), None)
+            if not editor:
+                raise ToonsError("Nenhum editor encontrado (pkg install nano).")
+            rodar([editor, caminho])
+            return
+        elif acao == "enviar":
+            if not tem("termux-share"):
+                raise ToonsError("Precisa do Termux:API (pkg install termux-api).")
+            rodar(["termux-share", "-a", "send", caminho], capturar=True, timeout=30)
+        elif acao == "apagar":
+            tipo = "a pasta e TUDO dentro dela" if item["pasta"] else "o arquivo"
+            if confirmar(f"Apagar {tipo} '{nome}'? Não dá para desfazer.", False):
+                acesso.apagar(caminho)
+                ok("Apagado.")
+        pausar()
+
+    def acoes_varios(itens: list):
+        sel = escolher_varios("Marque os itens (Espaço marca, a = todos)",
+                              [f"{_icone(it)} {it['nome']}" for it in itens])
+        if not sel:
+            return
+        escolhidos = [itens[i] for i in sel]
+        caminhos = [it["caminho"] for it in escolhidos]
+        opcoes = ["📄 Copiar", "✂ Recortar (mover)", "🗑 Apagar", "📋 Tamanho total"]
+        if len(escolhidos) == 1:
+            opcoes += ["✏ Renomear", "📋 Ver dados"]
+        if acesso.nome == "termux":
+            opcoes.append("🗜 Compactar em .zip")
+        i = escolher(f"{len(escolhidos)} item(ns) marcado(s)", opcoes)
+        if i is None:
+            return
+        acao = opcoes[i]
+        if "Copiar" in acao or "Recortar" in acao:
+            estado["clip"] = (acesso, caminhos, "Recortar" in acao)
+            ok("Pronto. Vá até a pasta de destino e use ⚙ → Colar aqui.")
+        elif "Apagar" in acao:
+            if confirmar(f"Apagar {len(caminhos)} item(ns), com tudo o que tiver dentro? Não dá para desfazer.", False):
+                for c in caminhos:
+                    try:
+                        acesso.apagar(c)
+                        ok(f"Apagado: {os.path.basename(c)}")
+                    except (OSError, ToonsError) as e:
+                        erro(f"{os.path.basename(c)}: {e}")
+        elif "Tamanho" in acao:
+            info("Somando...")
+            print(f"Tamanho total: {bytes_humanos(sum(acesso.tamanho_total(c) for c in caminhos))}")
+        elif "Renomear" in acao or "Ver dados" in acao:
+            return acoes_item(escolhidos[0])
+        elif "Compactar" in acao:
+            nome_zip = perguntar("Nome do .zip", (escolhidos[0]["nome"] if len(escolhidos) == 1 else "arquivos") + ".zip")
+            destino = os.path.join(pasta, _nome_livre(acesso, pasta, nome_zip if nome_zip.endswith(".zip") else nome_zip + ".zip"))
+            info("Compactando...")
+            compactar(caminhos, destino)
+            ok(f"Criado {os.path.basename(destino)} ({bytes_humanos(os.path.getsize(destino))})")
+        pausar()
+
+    def acoes_pasta(itens: list):
+        nonlocal pasta, acesso
+        clip = estado["clip"]
+        opcoes = []
+        if clip:
+            opcoes.append((f"📋 Colar aqui ({len(clip[1])} item(ns), {'mover' if clip[2] else 'copiar'})", "colar"))
+        opcoes += [("☑ Marcar itens (copiar, mover, apagar, renomear pastas...)", "marcar"),
+                   ("➕ Nova pasta", "nova"), ("🧭 Ir para... (Download, Android/data, cartão SD, raiz...)", "ir"),
+                   ("🔎 Buscar por nome a partir daqui", "buscar"),
+                   (f"🔑 Nível de acesso: {acesso.rotulo}", "acesso"),
+                   (f"👁 Arquivos ocultos: {'mostrando' if estado['ocultos'] else 'escondidos'}", "ocultos"),
+                   (f"↕ Ordenar por: {ordens[estado['ordem']]}", "ordem"), ("📋 Dados desta pasta", "dados")]
+        if clip:
+            opcoes.append(("✖ Esvaziar a área de transferência", "limpar"))
+        i = escolher("Ações nesta pasta", [r for r, _ in opcoes])
+        if i is None:
+            return
+        acao = opcoes[i][1]
+        if acao == "colar":
+            colar()
+        elif acao == "marcar":
+            if itens:
+                acoes_varios(itens)
+            else:
+                info("Pasta vazia.")
+                pausar()
+        elif acao == "nova":
+            nome = perguntar("Nome da nova pasta").strip()
+            if nome:
+                acesso.criar_pasta(os.path.join(pasta, nome))
+                ok(f"Pasta '{nome}' criada.")
+        elif acao == "ir":
+            atalhos = _atalhos_de_pasta(acesso)
+            j = escolher("Ir para", [r for r, _ in atalhos] + ["⌨ Digitar um caminho"])
+            if j is not None:
+                pasta = atalhos[j][1] if j < len(atalhos) else os.path.expanduser(perguntar("Caminho", pasta))
+        elif acao == "buscar":
+            termo = perguntar("Parte do nome (ex.: .apk, foto, relatorio)").strip()
+            if termo:
+                info("Buscando...")
+                achados = acesso.buscar(pasta, termo)
+                if not achados:
+                    info("Nada encontrado.")
+                    pausar()
+                    return
+                j = escolher(f"{len(achados)} resultado(s)", [a.replace(pasta.rstrip('/') + "/", "", 1) for a in achados])
+                if j is not None:
+                    pasta = os.path.dirname(achados[j].rstrip("/")) or "/"
+        elif acao == "acesso":
+            niveis = [("Termux (normal)", "termux"),
+                      ("ADB / depuração sem fio — abre Android/data, Android/obb e mais, sem root", "adb"),
+                      ("Root — tudo, inclusive os dados dos apps", "root")]
+            j = escolher("Nível de acesso", [r for r, _ in niveis])
+            if j is not None:
+                try:
+                    acesso = criar_acesso(niveis[j][1])
+                    ok(f"Acesso: {acesso.rotulo}")
+                except ToonsError as e:
+                    erro(str(e))
+                pausar()
+        elif acao == "ocultos":
+            estado["ocultos"] = not estado["ocultos"]
+        elif acao == "ordem":
+            chaves = list(ordens)
+            estado["ordem"] = chaves[(chaves.index(estado["ordem"]) + 1) % len(chaves)]
+        elif acao == "dados":
+            mostrar_dados({"Caminho": pasta, "Itens": len(itens), **acesso.dados(pasta)})
+            if confirmar("Calcular o tamanho total?", False):
+                print(f"Tamanho total: {bytes_humanos(acesso.tamanho_total(pasta))}")
+            pausar()
+        elif acao == "limpar":
+            estado["clip"] = None
+
+    while True:
+        limpar()
+        try:
+            itens, problema = acesso.listar(pasta), ""
+        except ToonsError as e:
+            itens, problema = [], str(e)
+        if not estado["ocultos"]:
+            itens = [it for it in itens if not it["nome"].startswith(".")]
+        chave = {"nome": lambda it: it["nome"].lower(), "data": lambda it: -it["data"],
+                 "tamanho": lambda it: -(it["tamanho"] or 0)}[estado["ordem"]]
+        itens.sort(key=lambda it: (not it["pasta"], chave(it)))
+        clip = estado["clip"]
+        print(f"{NEG}📂 {pasta}{RST}")
+        print(f"{DIM}🔑 {acesso.rotulo} · {len(itens)} item(ns)"
+              + (f" · 📋 {len(clip[1])} para {'mover' if clip[2] else 'copiar'}" if clip else "") + RST)
+        if problema:
+            aviso(problema)
+            if acesso.nome == "termux":
+                info("Pastas como Android/data precisam do acesso ADB (depuração sem fio) ou root: ⚙ → Nível de acesso.")
+        linhas = ["✖ Sair do gerenciador", "⚙ Ações nesta pasta (colar, marcar, nova pasta, ir para, acesso...)",
+                  "⬆ .. (pasta de cima)"]
+        for it in itens:
+            if it["pasta"]:
+                linhas.append(f"📁 {it['nome']}/")
+            else:
+                data = f"{datetime.fromtimestamp(it['data']):%d/%m/%y %H:%M}" if it["data"] else ""
+                linhas.append(f"{_icone(it)} {it['nome']}  {DIM}{bytes_humanos(it['tamanho'] or 0)} · {data}{RST}")
+        i = escolher("Enter abre · Esc sobe uma pasta", linhas, "4" if itens else "2")
+        if i == 0:
+            return
+        if i is None or i == 2:
+            if pasta == "/":
+                if i is None:
+                    return
+                continue
+            pasta = os.path.dirname(pasta.rstrip("/")) or "/"
+            continue
+        try:
+            if i == 1:
+                acoes_pasta(itens)
+                continue
+            item = itens[i - 3]
+            if item["pasta"]:
+                pasta = item["caminho"]
+            else:
+                acoes_item(item)
+        except (OSError, shutil.Error, zipfile.BadZipFile, tarfile.TarError, ToonsError) as e:
+            erro(str(e) if isinstance(e, ToonsError) else f"Falhou: {e}")
+            pausar()
+
+
+# ════════════════════════════════════════════════════════════════════
 #  Configurações e diagnóstico
 # ════════════════════════════════════════════════════════════════════
 
@@ -7652,7 +8265,8 @@ FERRAMENTAS = [
     ("yt-dlp", "python-yt-dlp", "música e vídeos"), ("ffmpeg", "ffmpeg", "música e transmissão de filmes"),
     ("mpv", "mpv", "música"),
     ("nmap", "nmap", "rede"), ("sshd", "openssh", "SSH"), ("wg", "wireguard-tools", "WireGuard"),
-    ("cloudflared", "cloudflared", "túnel"), ("adb", "android-tools", "depuração sem fio"), ("proot-distro", "proot-distro", "Linux"),
+    ("cloudflared", "cloudflared", "túnel"), ("adb", "android-tools", "depuração sem fio e Android/data"),
+    ("7z", "p7zip", "extrair .7z e .rar"), ("proot-distro", "proot-distro", "Linux"),
     ("rclone", "rclone", "nuvem"), ("syncthing", "syncthing", "sincronização"),
 ]
 MODULOS_OPCIONAIS = [("rich", "dashboard"), ("flask", "servidor web"), ("fastapi", "servidor web"),
@@ -7731,6 +8345,7 @@ def menu_principal() -> None:
         ("🔄 Atualização", menu_atualizar),
         ("🧹 Otimização e limpeza", menu_otimizacao),
         ("🔌 Depuração sem fio (ADB pelo Wi-Fi)", menu_adb),
+        ("📂 Gerenciador de arquivos (copiar, mover, renomear, Android/data...)", gerenciador_arquivos),
         ("⚙️ Configurações", menu_config),
         ("🩺 Diagnóstico", diagnostico),
         ("📦 Instalar essenciais (python, tmux, termux-api, git)", instalar_essenciais),
@@ -7762,6 +8377,8 @@ def main(argv=None) -> int:
     p = sub.add_parser("midia", help="servidor de vídeo (links de compartilhamento) em primeiro plano")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--porta", type=int)
+    p = sub.add_parser("arquivos", help="gerenciador de arquivos (copiar, mover, renomear, Android/data...)")
+    p.add_argument("pasta", nargs="?")
     p = sub.add_parser("site", help="publica uma pasta como site (página HTML) em primeiro plano")
     p.add_argument("pasta")
     p.add_argument("--porta", type=int)
@@ -7813,6 +8430,8 @@ def main(argv=None) -> int:
                 raise ToonsError(f"{falhas} download(s) falharam.")
         elif args.comando == "midia":
             servir_midia(args.host, args.porta or cfg()["midia_porta"])
+        elif args.comando == "arquivos":
+            gerenciador_arquivos(args.pasta)
         elif args.comando == "site":
             servir_site(args.pasta, args.porta or cfg()["site_porta"])
         elif args.comando == "compartilhar":
