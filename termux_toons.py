@@ -7391,6 +7391,16 @@ def adb_shell(comando: str, serial: str | None = None, timeout: float = 60) -> s
     return ((proc.stdout or "") + (proc.stderr or "")).strip()
 
 
+def pedir_endereco_adb(msg: str) -> tuple:
+    """(ip, porta) digitados como o Android mostra ('192.168.0.10:41235') ou só a porta ('41235')."""
+    while True:
+        texto = perguntar(msg).strip().replace(" ", "")
+        m = re.fullmatch(r"(?:(\d{1,3}(?:\.\d{1,3}){3}|\[?[0-9a-fA-F:]+\]?)[:])?(\d{1,5})", texto)
+        if m and 1 <= int(m.group(2)) <= 65535:
+            return (m.group(1) or ip_local()).strip("[]"), int(m.group(2))
+        erro("Digite o endereço como aparece no celular (ex.: 192.168.0.10:41235) ou só a porta (41235).")
+
+
 def adb_conectar(endereco: str | None = None) -> bool:
     """Conecta o adb à Depuração por Wi-Fi (a porta muda toda vez que ela é ligada)."""
     if not garantir_adb():
@@ -7402,8 +7412,8 @@ def adb_conectar(endereco: str | None = None) -> bool:
             info(f"Depuração por Wi-Fi encontrada em {ip}:{porta}.")
         else:
             info("Na tela 'Depuração por Wi-Fi', veja 'Endereço IP e porta' (ex.: 192.168.0.10:41235).")
-            ip, porta = ip_local(), perguntar_int("Porta (o número depois dos dois-pontos)", None, 1, 65535)
-        endereco = f"{ip}:{porta}"
+            ip, porta = pedir_endereco_adb("Endereço IP e porta (ex.: 192.168.0.10:41235) ou só a porta")
+        endereco = f"[{ip}]:{porta}" if ":" in ip else f"{ip}:{porta}"
     saida_adb = adb("connect", endereco, timeout=30)
     texto = f"{saida_adb.stdout or ''}{saida_adb.stderr or ''}".strip()
     if re.search(r"\bconnected to", texto) and not re.search(r"fail|cannot|unable", texto, re.I):
@@ -7439,12 +7449,11 @@ def menu_adb():
         if achados:
             info(f"Tela de pareamento encontrada em {ip}:{porta}.")
         else:
-            porta = perguntar_int("Porta de pareamento (o número depois dos dois-pontos, junto do código)",
-                                  None, 1, 65535)
+            ip, porta = pedir_endereco_adb("Endereço IP e porta do pareamento (o que aparece junto do código)")
         codigo = perguntar("Código de pareamento (6 dígitos)").replace(" ", "")
         if not codigo:
             return
-        proc = adb("pair", f"{ip}:{porta}", codigo, timeout=30)
+        proc = adb("pair", f"[{ip}]:{porta}" if ":" in ip else f"{ip}:{porta}", codigo, timeout=30)
         texto = f"{proc.stdout or ''}{proc.stderr or ''}".strip()
         if "Successfully paired" not in texto:
             raise ToonsError(f"O pareamento falhou: {texto or 'sem resposta'}. O código expira rápido: gere outro "
