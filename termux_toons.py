@@ -7999,7 +7999,8 @@ def gerenciador_arquivos(inicio: str | None = None) -> None:
         garantir_storage()
         inicio = ARMAZENAMENTO if os.path.isdir(ARMAZENAMENTO) else str(HOME)
     pasta = os.path.abspath(os.path.expanduser(inicio))
-    estado = {"ocultos": False, "ordem": "nome", "clip": None}  # clip: (acesso, [caminhos], mover?)
+    estado = {"ocultos": False, "ordem": "nome", "clip": None,  # clip: (acesso, [caminhos], mover?)
+              "oferecido": None}  # pasta protegida em que já oferecemos trocar o acesso
     ordens = {"nome": "nome", "data": "data (mais novos)", "tamanho": "tamanho (maiores)"}
 
     def colar():
@@ -8202,6 +8203,26 @@ def gerenciador_arquivos(inicio: str | None = None) -> None:
             itens, problema = acesso.listar(pasta), ""
         except ToonsError as e:
             itens, problema = [], str(e)
+        # No Android 11+ o Termux vê Android/data e Android/obb vazias (ou só com a pasta dele), sem erro:
+        # oferece abrir com o acesso ADB (ou root), que enxerga as pastas dos outros apps.
+        protegida = re.search(r"/Android/(data|obb)/?$", pasta) or problema
+        if acesso.nome == "termux" and protegida and estado["oferecido"] != pasta:
+            estado["oferecido"] = pasta
+            print(f"{NEG}📂 {pasta}{RST}")
+            aviso(problema or "No Android 11+ o acesso normal do Termux vê esta pasta vazia (só com a pasta do "
+                  "próprio Termux): os arquivos dos outros apps ficam escondidos.")
+            niveis = (["root"] if tem_root() else []) + ["adb"]
+            rotulos = {"root": "Abrir com root", "adb": "Abrir com o acesso ADB (depuração sem fio, sem root)"}
+            j = escolher("Como abrir?", [rotulos[n] for n in niveis] + ["Continuar com o acesso normal"])
+            if j is not None and j < len(niveis):
+                try:
+                    acesso = criar_acesso(niveis[j])
+                    ok(f"Acesso: {acesso.rotulo}")
+                    continue
+                except ToonsError as e:
+                    erro(str(e))
+                    pausar()
+            limpar()
         if not estado["ocultos"]:
             itens = [it for it in itens if not it["nome"].startswith(".")]
         chave = {"nome": lambda it: it["nome"].lower(), "data": lambda it: -it["data"],
