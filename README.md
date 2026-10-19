@@ -62,8 +62,9 @@ quando não há um terminal interativo, por exemplo em scripts).
 | 12 | 🎵 **Música (yt-dlp + mpv)** | Busca e toca por streaming, baixa no melhor áudio, baixa por link (YouTube, SoundCloud, playlists) e por **link do Spotify** (procura a música no YouTube), mix/rádio por busca, biblioteca local, playlists `.m3u` e player em segundo plano. |
 | 13 | 🎬 **Vídeos (TikTok, YouTube)** | Baixa vídeos por link (TikTok, YouTube, Shorts, playlists e outros sites que o yt-dlp aceita), busca no YouTube e baixa, abre os vídeos baixados no player do Android e **assiste um link sem baixar** no VLC/MX Player (link direto de arquivo ou página do YouTube/TikTok). |
 | 14 | 🔄 **Atualização** | `pkg upgrade`, troca de espelho (`termux-change-repo`), repositórios extras (x11/root/tur), pacotes pip, recompilar llama.cpp, atualizar distros, `git pull` em vários repositórios e no próprio Termux-Toons, limpeza de cache. |
-| 15 | 🧹 **Otimização e limpeza** | **Otimização rápida** (cache do apt, `~/.cache` com pip/yt-dlp/go, npm, temporários antigos, `__pycache__`, logs velhos e miniaturas da galeria) mostrando quanto liberou; escolher item a item; **limpar o cache de todos os apps** (`pm trim-caches` com root; sem root abre a tela de armazenamento do Android); ver o que ocupa espaço; achar **arquivos grandes**, **duplicados** e pastas vazias; processos do Termux que mais usam RAM; parar todos os serviços; compilação dos apps e TRIM (root); atalhos para as telas de armazenamento e bateria. |
+| 15 | 🧹 **Otimização e limpeza** | **Otimização rápida** (cache do apt, `~/.cache` com pip/yt-dlp/go, npm, temporários antigos, `__pycache__`, logs velhos e miniaturas da galeria) mostrando quanto liberou; escolher item a item; **limpar o cache de todos os apps** (`pm trim-caches` com root ou, **sem root, pela depuração sem fio** do menu 🔌; se nenhum dos dois estiver disponível, abre a tela de armazenamento do Android); ver o que ocupa espaço; achar **arquivos grandes**, **duplicados** e pastas vazias; processos do Termux que mais usam RAM; parar todos os serviços; compilação dos apps e TRIM (root); atalhos para as telas de armazenamento e bateria. |
 | 16 | 📺 **Compartilhar filme por link** | Servidor de vídeo próprio: escolha um filme do celular **ou cole qualquer link de vídeo (sem baixar o filme)**: link direto de arquivo (servidor seu, nuvem, debrid...) ou página de vídeo (YouTube, Vimeo... pelo yt-dlp), receba um **link secreto** (com prazo opcional) e quem abrir assiste num **player próprio** no navegador: barra de progresso com prévia do tempo, **troca de trilha de áudio** (dublado/original), legendas (arquivo ao lado, extra ou **embutidas**) com tamanho e sincronia ajustáveis, velocidade, tela cheia, janela flutuante, **toque duplo para pular 10 s**, atalhos de teclado, **continuar de onde parou** e botão **Abrir no VLC**. MKV, áudio AC3/DTS e várias trilhas são **convertidos na hora** pelo ffmpeg (a imagem é só copiada; HEVC é recodificado só se o navegador não tocar). Também **converte para MP4** de vez, se preferir. Copia o link, manda pelo menu de compartilhar do Android (WhatsApp, Telegram...) ou mostra um QR code. **Túnel Cloudflare** para quem está fora do seu Wi-Fi. Apagar um link vale na hora. |
+| 17 | 🔌 **Depuração sem fio (ADB pelo Wi-Fi)** | Conecta o `adb` do Termux ao **próprio celular** pela Depuração por Wi-Fi (Android 11+), **sem PC e sem root**: pareamento guiado (acha a porta sozinho), status, shell e comandos do Android, **impedir que o Android mate o Termux** (o erro *signal 9* dos processos fantasmas, Android 12+), print e gravação de tela, **limpar o cache de todos os apps**, instalar APK, logcat, `pm grant` e liberar a porta 5555 para um computador. |
 
 Os downloads de música usam exatamente:
 
@@ -168,6 +169,19 @@ Boas práticas e limites:
   por isso o programa pergunta antes quais preparar. Prefira o Wi-Fi.
 - Compartilhe só o que você pode distribuir: vídeos seus, de domínio público, de licença livre ou com autorização
   de quem tem os direitos.
+
+## Depuração sem fio (ADB pelo Wi-Fi)
+
+1. Ative as **Opções do desenvolvedor** (Configurações → Sobre o telefone → toque 7 vezes em *Número da versão*).
+2. Menu **🔌 Depuração sem fio → Parear este celular**: ligue a *Depuração por Wi-Fi*, toque em *Parear dispositivo
+   com código de pareamento* e digite o código no Termux. O Android fecha o código se você sair da tela, então use
+   **tela dividida** (ou o Termux em janela flutuante). O pareamento é feito uma vez só.
+3. Nas próximas vezes, só **Conectar** (a porta muda sempre que a depuração é religada; o programa tenta achá-la
+   sozinho).
+4. Use **Impedir que o Android mate o Termux** para acabar com o *Process completed (signal 9)* em serviços 24h.
+
+Desligue a Depuração por Wi-Fi quando não estiver usando: enquanto ela está ligada, um aparelho pareado tem
+acesso de "shell" ao celular.
 
 ## Serviços 24h (tmux)
 
