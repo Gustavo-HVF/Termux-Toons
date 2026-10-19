@@ -7024,10 +7024,23 @@ def _estimar_limpadores(so_rapidos: bool = False) -> list:
     return resultado
 
 
-def limpar_cache_apps_root() -> int:
-    """Pede ao Android para limpar o cache de todos os apps (pm trim-caches, precisa de root)."""
+def modo_cache_apps() -> str | None:
+    """Como limpar o cache de todos os apps: 'root', 'adb' (depuração sem fio conectada) ou None."""
+    if tem_root():
+        return "root"
+    if tem("adb") and adb_aparelhos():
+        return "adb"
+    return None
+
+
+def limpar_cache_apps(modo: str) -> int:
+    """Pede ao Android para limpar o cache de todos os apps (pm trim-caches). Precisa de root ou da
+    permissão de 'shell' que a depuração sem fio dá. Devolve quantos bytes foram liberados."""
     antes = shutil.disk_usage(HOME).free
-    rodar(["su", "-c", "pm trim-caches 999G"])
+    if modo == "root":
+        rodar(["su", "-c", "pm trim-caches 999G"])
+    else:
+        adb("shell", "pm trim-caches 999G", serial=adb_alvo(), timeout=600)
     return max(0, shutil.disk_usage(HOME).free - antes)
 
 
@@ -7040,14 +7053,16 @@ def otimizacao_rapida(interativo: bool = True) -> None:
         liberado = limpador["limpar"]()
         total += liberado
         ok(f"{rotulo}: {bytes_humanos(liberado)}")
-    if tem_root():
-        if not interativo or confirmar("Limpar também o cache de TODOS os apps (root)?", True):
-            liberado = limpar_cache_apps_root()
+    modo = modo_cache_apps()
+    if modo:
+        origem = "root" if modo == "root" else "depuração sem fio"
+        if not interativo or confirmar(f"Limpar também o cache de TODOS os apps ({origem})?", True):
+            liberado = limpar_cache_apps(modo)
             total += liberado
             ok(f"Cache de todos os apps: {bytes_humanos(liberado)}")
     elif interativo:
-        info("Sem root, o cache dos outros apps só pode ser limpo pela tela de armazenamento do Android "
-             "(opção 'Limpar cache de todos os apps' neste menu).")
+        info("Para limpar o cache dos outros apps sem root, conecte a depuração sem fio (menu 🔌) e use "
+             "'Limpar cache de TODOS os apps' neste menu.")
     print(f"\n{NEG}Total liberado: {bytes_humanos(total)}{RST} · "
           f"livre agora: {bytes_humanos(shutil.disk_usage(HOME).free)}")
 
@@ -7130,14 +7145,26 @@ def menu_otimizacao():
             print(f"\n{NEG}Total liberado: {bytes_humanos(total)}{RST}")
 
     def cache_todos_apps():
-        if tem_root():
-            info("Pedindo ao Android para limpar o cache de todos os apps...")
-            ok(f"Liberado: {bytes_humanos(limpar_cache_apps_root())}")
-            return
-        aviso("Sem root, o Android não permite que o Termux limpe o cache de outros apps.")
-        info("Vou abrir a tela de armazenamento do Android: lá você limpa o cache (ou use 'Liberar espaço').")
-        if not _abrir_tela_android("android.os.storage.action.MANAGE_STORAGE"):
-            _abrir_tela_android("android.settings.INTERNAL_STORAGE_SETTINGS")
+        modo = modo_cache_apps()
+        if not modo:
+            info("Sem root, dá para limpar pela depuração sem fio (ADB pelo Wi-Fi): o Termux se conecta ao "
+                 "próprio celular e pede a limpeza com a permissão de 'shell'.")
+            i = escolher("Como fazer?", [
+                "Conectar pela depuração sem fio e limpar (precisa ter pareado uma vez no menu 🔌)",
+                "Abrir a tela de armazenamento do Android e limpar por lá"])
+            if i is None:
+                return
+            if i == 1:
+                if not _abrir_tela_android("android.os.storage.action.MANAGE_STORAGE"):
+                    _abrir_tela_android("android.settings.INTERNAL_STORAGE_SETTINGS")
+                return
+            info("Ligue a 'Depuração por Wi-Fi' nas Opções do desenvolvedor, se estiver desligada.")
+            if not adb_conectar():
+                info("Primeira vez? Use 'Depuração sem fio → Parear este celular' e volte aqui.")
+                return
+            modo = "adb"
+        info("Pedindo ao Android para limpar o cache de todos os apps...")
+        ok(f"Liberado: {bytes_humanos(limpar_cache_apps(modo))}")
 
     def otimizar_apps_root():
         if not tem_root():
@@ -7292,7 +7319,7 @@ def menu_otimizacao():
     menu("🧹 Otimização e limpeza", [
         ("⚡ Otimização rápida (limpa tudo que é seguro)", rapida),
         ("Escolher o que limpar (mostra o tamanho de cada item)", escolher_limpeza),
-        ("Limpar cache de TODOS os apps", cache_todos_apps),
+        ("Limpar cache de TODOS os apps (root ou depuração sem fio)", cache_todos_apps),
         ("Ver o que ocupa espaço", espaco),
         ("Arquivos grandes", grandes),
         ("Arquivos duplicados", duplicados),
@@ -7554,6 +7581,7 @@ def menu_adb():
         ("Instalar APK", instalar_apk),
         ("Logcat (erros ou filtro)", logcat),
         ("Conceder permissão a um app (pm grant)", permissao),
+        ("Limpar o cache de todos os apps", lambda: ok(f"Liberado: {bytes_humanos(limpar_cache_apps('adb'))}")),
         ("Liberar ADB na porta 5555 para um computador", porta_5555),
         ("Desconectar", desconectar),
         ("Desligar a Depuração por Wi-Fi", desligar_depuracao),
