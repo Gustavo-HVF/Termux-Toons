@@ -21,6 +21,7 @@ Reúne em um único menu:
   15. Otimização e limpeza (caches, arquivos grandes/duplicados, processos)
   16. Compartilhar filmes por link: arquivo do celular ou qualquer link de vídeo, com
       player próprio, troca de trilha de áudio e conversão na hora (servidor de vídeo + túnel)
+  17. Depuração sem fio (ADB pelo Wi-Fi) do próprio celular, sem PC e sem root
 
 Uso:
     python termux_toons.py            # menu interativo
@@ -749,6 +750,7 @@ PADRAO_CFG = {
     "midia_transmissoes": 3,
     "site_porta": 8097,
     "site_pagina": "",
+    "adb_endereco": "",
     "compartilhamentos": [],
     "llama_porta": 8080,
     "llama_modelo": "",
@@ -7304,6 +7306,262 @@ def menu_otimizacao():
 
 
 # ════════════════════════════════════════════════════════════════════
+#  17. Depuração sem fio (ADB pelo Wi-Fi) direto do Termux
+# ════════════════════════════════════════════════════════════════════
+# No Android 11+ a "Depuração por Wi-Fi" deixa o adb do próprio Termux se
+# conectar ao celular, sem PC e sem root. Com isso dá para rodar comandos
+# com permissão de "shell": impedir que o Android mate o Termux, liberar
+# permissões, instalar APKs, gravar a tela, ler o logcat...
+
+TELA_DEPURACAO = "android.settings.APPLICATION_DEVELOPMENT_SETTINGS"
+DICA_TELA_DIVIDIDA = ("O Android fecha o código de pareamento se você sair da tela. Abra o Termux e as "
+                      "Configurações em tela dividida (ou o Termux em janela flutuante) para ver os dois juntos.")
+
+
+def garantir_adb() -> bool:
+    return garantir_cmd("adb", "android-tools")
+
+
+def adb(*args: str, serial: str | None = None, timeout: float = 60) -> subprocess.CompletedProcess:
+    """Roda o adb capturando a saída (`serial` escolhe o aparelho quando há mais de um)."""
+    return rodar(["adb", *(["-s", serial] if serial else []), *args], capturar=True, timeout=timeout)
+
+
+def adb_mdns() -> dict:
+    """Endereços anunciados pela tela 'Depuração por Wi-Fi': {'pairing': [(ip, porta)], 'connect': [...]}."""
+    achados = {"pairing": [], "connect": []}
+    for tipo, ip, porta in re.findall(r"_adb-tls-(pairing|connect)\._tcp\.?\s+(\d+\.\d+\.\d+\.\d+):(\d+)",
+                                      adb("mdns", "services", timeout=10).stdout or ""):
+        achados[tipo].append((ip, int(porta)))
+    return achados
+
+
+def adb_aparelhos() -> list:
+    """Seriais dos aparelhos conectados e prontos ('device' no adb devices)."""
+    linhas = (adb("devices", timeout=15).stdout or "").splitlines()[1:]
+    return [partes[0] for partes in (l.split() for l in linhas) if len(partes) >= 2 and partes[1] == "device"]
+
+
+def adb_alvo() -> str:
+    """O aparelho conectado (o último que o Termux-Toons conectou, se houver vários)."""
+    if not garantir_adb():
+        raise ToonsError("Sem o adb (pacote android-tools).")
+    aparelhos = adb_aparelhos()
+    if not aparelhos:
+        raise ToonsError("Nenhum aparelho conectado. Use 'Conectar' (ou 'Parear', na primeira vez).")
+    preferido = cfg().get("adb_endereco")
+    return preferido if preferido in aparelhos else aparelhos[0]
+
+
+def adb_shell(comando: str, serial: str | None = None, timeout: float = 60) -> str:
+    proc = adb("shell", comando, serial=serial or adb_alvo(), timeout=timeout)
+    return ((proc.stdout or "") + (proc.stderr or "")).strip()
+
+
+def adb_conectar(endereco: str | None = None) -> bool:
+    """Conecta o adb à Depuração por Wi-Fi (a porta muda toda vez que ela é ligada)."""
+    if not garantir_adb():
+        return False
+    if not endereco:
+        achados = adb_mdns()["connect"]
+        if achados:
+            ip, porta = achados[0]
+            info(f"Depuração por Wi-Fi encontrada em {ip}:{porta}.")
+        else:
+            info("Na tela 'Depuração por Wi-Fi', veja 'Endereço IP e porta' (ex.: 192.168.0.10:41235).")
+            ip, porta = ip_local(), perguntar_int("Porta (o número depois dos dois-pontos)", None, 1, 65535)
+        endereco = f"{ip}:{porta}"
+    saida_adb = adb("connect", endereco, timeout=30)
+    texto = f"{saida_adb.stdout or ''}{saida_adb.stderr or ''}".strip()
+    if re.search(r"\bconnected to", texto) and not re.search(r"fail|cannot|unable", texto, re.I):
+        cfg()["adb_endereco"] = endereco
+        salvar_cfg()
+        ok(f"Conectado a {endereco}.")
+        return True
+    erro(f"Não conectou: {texto or 'sem resposta'}")
+    info("Confira se a Depuração por Wi-Fi está ligada e se o celular já foi pareado ('Parear', uma vez só).")
+    return False
+
+
+@submenu
+def menu_adb():
+    c = cfg()
+
+    def abrir_opcoes():
+        info("Se as 'Opções do desenvolvedor' não aparecem: Configurações → Sobre o telefone → toque 7 vezes "
+             "em 'Número da versão'.")
+        _abrir_tela_android(TELA_DEPURACAO)
+
+    def parear():
+        if not garantir_adb():
+            return
+        info("1. Opções do desenvolvedor → Depuração por Wi-Fi → ligue (precisa estar num Wi-Fi).\n"
+             "  2. Toque em 'Parear dispositivo com código de pareamento'.\n"
+             "  3. Volte aqui e digite a porta e o código que aparecem lá. É preciso parear uma vez só.")
+        info(DICA_TELA_DIVIDIDA)
+        if confirmar("Abrir as Opções do desenvolvedor agora?", True):
+            _abrir_tela_android(TELA_DEPURACAO)
+        achados = adb_mdns()["pairing"]
+        ip, porta = achados[0] if achados else (ip_local(), None)
+        if achados:
+            info(f"Tela de pareamento encontrada em {ip}:{porta}.")
+        else:
+            porta = perguntar_int("Porta de pareamento (o número depois dos dois-pontos, junto do código)",
+                                  None, 1, 65535)
+        codigo = perguntar("Código de pareamento (6 dígitos)").replace(" ", "")
+        if not codigo:
+            return
+        proc = adb("pair", f"{ip}:{porta}", codigo, timeout=30)
+        texto = f"{proc.stdout or ''}{proc.stderr or ''}".strip()
+        if "Successfully paired" not in texto:
+            raise ToonsError(f"O pareamento falhou: {texto or 'sem resposta'}. O código expira rápido: gere outro "
+                             "e tente de novo.")
+        ok("Pareado! Agora conectando...")
+        adb_conectar()
+
+    def status():
+        if not garantir_adb():
+            return
+        print(adb("devices", "-l", timeout=15).stdout)
+        if not adb_aparelhos():
+            return
+        serial = adb_alvo()
+        dados = {"Aparelho": adb_shell("getprop ro.product.model", serial),
+                 "Android": adb_shell("getprop ro.build.version.release", serial),
+                 "SDK": adb_shell("getprop ro.build.version.sdk", serial)}
+        mostrar_dados(dados)
+
+    def shell():
+        serial = adb_alvo()
+        info("Shell do Android com permissão de 'shell' (exit para sair).")
+        rodar(["adb", "-s", serial, "shell"])
+
+    def comando():
+        cmd = perguntar("Comando (ex.: pm list packages -3, dumpsys battery, wm size)")
+        if cmd:
+            print(adb_shell(cmd, timeout=120))
+
+    def impedir_morte():
+        serial = adb_alvo()
+        sdk = int(adb_shell("getprop ro.build.version.sdk", serial) or 0)
+        info("O Android 12+ encerra processos 'fantasmas' (filhos do Termux) quando passam de 32 — é o erro "
+             "'Process completed (signal 9)'. Isso desliga esse limite.")
+        if sdk < 31:
+            ok("Este Android é anterior ao 12: não tem esse limite.")
+            return
+        comandos = ["device_config set_sync_disabled_for_tests persistent",
+                    "device_config put activity_manager max_phantom_processes 2147483647",
+                    "settings put global settings_enable_monitor_phantom_procs false"]
+        for cmd in comandos:
+            resposta = adb_shell(cmd, serial)
+            print(f"  {DIM}$ {cmd}{RST}" + (f"\n  {resposta}" if resposta else ""))
+        limite = adb_shell("device_config get activity_manager max_phantom_processes", serial)
+        ok(f"Feito. Limite de processos fantasmas agora: {limite}. Vale até você desfazer (sobrevive a reinícios).")
+        info("Desative também a otimização de bateria do Termux (Configurações → Apps → Termux → Bateria).")
+
+    def desfazer_morte():
+        serial = adb_alvo()
+        for cmd in ("device_config set_sync_disabled_for_tests none",
+                    "device_config delete activity_manager max_phantom_processes",
+                    "settings put global settings_enable_monitor_phantom_procs true"):
+            adb_shell(cmd, serial)
+        ok("Comportamento padrão do Android restaurado.")
+
+    def print_tela():
+        destino = f"/sdcard/Download/tela_{datetime.now():%Y%m%d_%H%M%S}.png"
+        print(adb_shell(f"screencap -p {destino}") or "")
+        ok(f"Print salvo em {destino.replace('/sdcard/', 'Armazenamento interno/')}")
+
+    def gravar_tela():
+        segundos = perguntar_int("Duração em segundos (até 180)", 30, 1, 180)
+        destino = f"/sdcard/Download/gravacao_{datetime.now():%Y%m%d_%H%M%S}.mp4"
+        info("Gravando... (Ctrl+C para parar antes)")
+        try:
+            adb_shell(f"screenrecord --time-limit {segundos} {destino}", timeout=segundos + 30)
+        except KeyboardInterrupt:
+            time.sleep(1)
+        ok(f"Vídeo salvo em {destino.replace('/sdcard/', 'Armazenamento interno/')}")
+
+    def instalar_apk():
+        serial = adb_alvo()
+        apks = _mais_novos_primeiro(DOWNLOADS.glob("*.apk")) if DOWNLOADS.exists() else []
+        i = escolher("Qual APK?", [p.name for p in apks] + ["📁 Digitar outro caminho..."])
+        if i is None:
+            return
+        apk = apks[i] if i < len(apks) else Path(os.path.expanduser(perguntar("Caminho do APK")))
+        if not apk.is_file():
+            raise ToonsError(f"Arquivo não encontrado: {apk}")
+        info(f"Instalando {apk.name}...")
+        proc = adb("install", "-r", str(apk), serial=serial, timeout=600)
+        texto = f"{proc.stdout or ''}{proc.stderr or ''}".strip()
+        (ok if "Success" in texto else erro)(texto[-400:] or "sem resposta")
+
+    def logcat():
+        serial = adb_alvo()
+        filtro = perguntar("Filtrar por texto (Enter = só erros)", "")
+        args = ["logcat", "-d", "-t", "2000"] + ([] if filtro else ["*:E"])
+        linhas = (adb(*args, serial=serial, timeout=60).stdout or "").splitlines()
+        if filtro:
+            linhas = [l for l in linhas if filtro.lower() in l.lower()]
+        arquivo = DOWNLOADS / f"logcat_{datetime.now():%Y%m%d_%H%M%S}.txt"
+        if garantir_storage():
+            arquivo.write_text("\n".join(linhas), "utf-8")
+        print("\n".join(linhas[-40:]) or "(nada encontrado)")
+        if arquivo.exists():
+            ok(f"{len(linhas)} linha(s) salvas em {arquivo}")
+
+    def permissao():
+        info("Exemplos: com.joaomgcd.taskerm android.permission.WRITE_SECURE_SETTINGS · "
+             "com.termux android.permission.DUMP")
+        pacote = perguntar("Pacote do app (ex.: com.termux)")
+        perm = perguntar("Permissão", "android.permission.WRITE_SECURE_SETTINGS")
+        if pacote and perm:
+            resposta = adb_shell(f"pm grant {shlex.quote(pacote)} {shlex.quote(perm)}")
+            (erro if resposta else ok)(resposta or f"Permissão concedida a {pacote}.")
+
+    def porta_5555():
+        serial = adb_alvo()
+        aviso("Com isso, qualquer computador na mesma rede pode pedir para depurar o celular (o Android ainda "
+              "pergunta antes de liberar um computador novo). Volta ao normal quando o celular reinicia.")
+        if not confirmar("Abrir o ADB na porta 5555?", False):
+            return
+        print(adb("tcpip", "5555", serial=serial, timeout=30).stdout or "")
+        time.sleep(2)
+        endereco = f"{ip_local()}:5555"
+        adb_conectar(endereco)
+        info(f"No computador: adb connect {endereco}")
+
+    def desconectar():
+        if garantir_adb():
+            print(adb("disconnect", timeout=15).stdout or "")
+            ok("Desconectado.")
+
+    def desligar_depuracao():
+        adb_shell("settings put global adb_wifi_enabled 0")
+        ok("Depuração por Wi-Fi desligada (para usar de novo: ligue nas Opções do desenvolvedor e use 'Conectar').")
+
+    menu("🔌 Depuração sem fio (ADB pelo Wi-Fi)", [
+        ("Abrir as Opções do desenvolvedor", abrir_opcoes),
+        ("Parear este celular (primeira vez)", parear),
+        (lambda: f"Conectar{' (' + c['adb_endereco'] + ')' if c.get('adb_endereco') else ''}", adb_conectar),
+        ("Status: aparelhos conectados", status),
+        ("Impedir que o Android mate o Termux (signal 9, Android 12+)", impedir_morte),
+        ("Desfazer: limite padrão de processos", desfazer_morte),
+        ("Shell do Android (adb shell)", shell),
+        ("Rodar um comando", comando),
+        ("Tirar print da tela", print_tela),
+        ("Gravar a tela", gravar_tela),
+        ("Instalar APK", instalar_apk),
+        ("Logcat (erros ou filtro)", logcat),
+        ("Conceder permissão a um app (pm grant)", permissao),
+        ("Liberar ADB na porta 5555 para um computador", porta_5555),
+        ("Desconectar", desconectar),
+        ("Desligar a Depuração por Wi-Fi", desligar_depuracao),
+        ("Instalar o adb (android-tools)", garantir_adb),
+    ])
+
+
+# ════════════════════════════════════════════════════════════════════
 #  Configurações e diagnóstico
 # ════════════════════════════════════════════════════════════════════
 
@@ -7366,7 +7624,7 @@ FERRAMENTAS = [
     ("yt-dlp", "python-yt-dlp", "música e vídeos"), ("ffmpeg", "ffmpeg", "música e transmissão de filmes"),
     ("mpv", "mpv", "música"),
     ("nmap", "nmap", "rede"), ("sshd", "openssh", "SSH"), ("wg", "wireguard-tools", "WireGuard"),
-    ("cloudflared", "cloudflared", "túnel"), ("proot-distro", "proot-distro", "Linux"),
+    ("cloudflared", "cloudflared", "túnel"), ("adb", "android-tools", "depuração sem fio"), ("proot-distro", "proot-distro", "Linux"),
     ("rclone", "rclone", "nuvem"), ("syncthing", "syncthing", "sincronização"),
 ]
 MODULOS_OPCIONAIS = [("rich", "dashboard"), ("flask", "servidor web"), ("fastapi", "servidor web"),
@@ -7444,6 +7702,7 @@ def menu_principal() -> None:
         ("📺 Compartilhar filme por link", menu_midia),
         ("🔄 Atualização", menu_atualizar),
         ("🧹 Otimização e limpeza", menu_otimizacao),
+        ("🔌 Depuração sem fio (ADB pelo Wi-Fi)", menu_adb),
         ("⚙️ Configurações", menu_config),
         ("🩺 Diagnóstico", diagnostico),
         ("📦 Instalar essenciais (python, tmux, termux-api, git)", instalar_essenciais),
