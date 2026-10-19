@@ -182,6 +182,10 @@ Boas práticas e limites:
    sozinho).
 4. Use **Impedir que o Android mate o Termux** para acabar com o *Process completed (signal 9)* em serviços 24h.
 
+Erro `CANNOT LINK EXECUTABLE "adb": cannot locate symbol ...`? O `adb` foi atualizado e as bibliotecas dele não
+(atualização pela metade). O menu oferece consertar sozinho; à mão: `pkg update && pkg upgrade` (se continuar,
+`pkg install --reinstall android-tools abseil-cpp`).
+
 Desligue a Depuração por Wi-Fi quando não estiver usando: enquanto ela está ligada, um aparelho pareado tem
 acesso de "shell" ao celular.
 

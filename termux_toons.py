@@ -7351,8 +7351,44 @@ DICA_TELA_DIVIDIDA = ("O Android fecha o código de pareamento se você sair da 
                       "Configurações em tela dividida (ou o Termux em janela flutuante) para ver os dois juntos.")
 
 
+_ADB_OK = False
+
+
+def _adb_funciona() -> str:
+    """'' se o adb abre; senão a mensagem de erro dele."""
+    proc = rodar(["adb", "version"], capturar=True, timeout=20, mostrar=False)
+    texto = f"{proc.stdout or ''}{proc.stderr or ''}".strip()
+    return "" if proc.returncode == 0 and "CANNOT LINK" not in texto else (texto or f"código {proc.returncode}")
+
+
 def garantir_adb() -> bool:
-    return garantir_cmd("adb", "android-tools")
+    """adb instalado e abrindo. 'CANNOT LINK EXECUTABLE' quer dizer que o android-tools foi atualizado e as
+    bibliotecas dele não (atualização pela metade): oferece atualizar o Termux e reinstalar o adb."""
+    global _ADB_OK
+    if _ADB_OK:
+        return True
+    if not garantir_cmd("adb", "android-tools"):
+        return False
+    problema = _adb_funciona()
+    if problema:
+        erro(f"O adb está instalado, mas não abre: {problema.splitlines()[0][:220]}")
+        info("Isso acontece quando um pacote foi atualizado e as bibliotecas de que ele depende não "
+             "(atualização pela metade). Resolve atualizando o Termux inteiro: pkg update && pkg upgrade")
+        if not IS_TERMUX or not confirmar("Atualizar o Termux e reinstalar o adb agora?", True):
+            return False
+        rodar(["pkg", "update", "-y"])
+        rodar(["pkg", "upgrade", "-y"])
+        problema = _adb_funciona()
+        if problema:
+            rodar(["pkg", "install", "--reinstall", "-y", "android-tools", "abseil-cpp"])
+            problema = _adb_funciona()
+        if problema:
+            erro(f"O adb continua sem abrir: {problema.splitlines()[0][:220]}")
+            info("Tente trocar o espelho de pacotes (termux-change-repo) e rodar 'pkg upgrade' de novo.")
+            return False
+        ok("adb consertado.")
+    _ADB_OK = True
+    return True
 
 
 def adb(*args: str, serial: str | None = None, timeout: float = 60) -> subprocess.CompletedProcess:
