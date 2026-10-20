@@ -755,6 +755,9 @@ PADRAO_CFG = {
     "tts_idioma": "",
     "pasta_musicas": "~/storage/downloads",
     "pasta_videos": "~/storage/downloads",
+    "formato_musica": "opus",
+    "formato_video": "mp4",
+    "qualidade_video": "melhor",
     "midia_porta": 8095,
     "midia_transmissoes": 3,
     "site_porta": 8097,
@@ -4492,15 +4495,43 @@ def pasta_musicas() -> Path:
     return Path(os.path.expanduser(cfg()["pasta_musicas"]))
 
 
-def comando_ytdlp(alvo: str) -> list:
-    """O comando pedido: melhor áudio, convertido para opus, com capa e metadados."""
-    return ["yt-dlp", "-f", "bestaudio", "--extract-audio", "--audio-format", "opus",
-            "--embed-thumbnail", "--add-metadata",
-            "-o", str(pasta_musicas() / "%(title)s.%(ext)s"), alvo]
+# formato: (descrição no menu, opções do yt-dlp, leva a capa embutida?)
+FORMATOS_MUSICA = {
+    "opus": ("Opus — arquivo menor com ótima qualidade", ["--audio-format", "opus"], True),
+    "mp3": ("MP3 320 kbps — toca em qualquer aparelho, som do carro, pendrive",
+            ["--audio-format", "mp3", "--audio-quality", "320K"], True),
+    "m4a": ("M4A (AAC) — bom para iPhone e aparelhos da Apple", ["--audio-format", "m4a"], True),
+    "flac": ("FLAC — sem perdas (bem maior; a origem já vem comprimida)", ["--audio-format", "flac"], True),
+    "wav": ("WAV — sem compressão, para editar (não leva capa)", ["--audio-format", "wav"], False),
+    "original": ("Original do site, sem converter (mais rápido)", [], False),
+}
 
 
-def garantir_deps_musica(com_player: bool = True) -> bool:
-    """yt-dlp + ffmpeg (e, para música, mpv e mutagen)."""
+def comando_ytdlp(alvo: str, formato: str | None = None) -> list:
+    """Melhor áudio, convertido para o formato escolhido, com capa (quando o formato aceita) e metadados."""
+    formato = formato if formato in FORMATOS_MUSICA else cfg().get("formato_musica", "opus")
+    _, opcoes, capa = FORMATOS_MUSICA.get(formato, FORMATOS_MUSICA["opus"])
+    selecao = "bestaudio[ext=m4a]/bestaudio/best" if formato == "m4a" else "bestaudio/best"
+    return ["yt-dlp", "-f", selecao, "--extract-audio", *opcoes, *(["--embed-thumbnail"] if capa else []),
+            "--add-metadata", "-o", str(pasta_musicas() / "%(title)s.%(ext)s"), alvo]
+
+
+def escolher_formato_musica() -> str | None:
+    """Pergunta o formato do áudio (começa no último usado) e o guarda como padrão."""
+    c = cfg()
+    chaves = list(FORMATOS_MUSICA)
+    atual = c.get("formato_musica", "opus")
+    i = escolher("Em qual formato baixar?", [FORMATOS_MUSICA[k][0] for k in chaves],
+                 str(chaves.index(atual) + 1 if atual in chaves else 1))
+    if i is None:
+        return None
+    c["formato_musica"] = chaves[i]
+    salvar_cfg()
+    return chaves[i]
+
+
+def garantir_deps_musica(com_player: bool = True, capa: bool | None = None) -> bool:
+    """yt-dlp + ffmpeg; mpv só para tocar (com_player) e mutagen para embutir capas (capa; padrão: com_player)."""
     necessarios = [("yt-dlp", "python-yt-dlp"), ("ffmpeg", "ffmpeg")] + ([("mpv", "mpv")] if com_player else [])
     faltando = [pkg for cmd, pkg in necessarios if not tem(cmd)]
     if faltando:
@@ -4513,21 +4544,19 @@ def garantir_deps_musica(com_player: bool = True) -> bool:
                           "use a opção '--js-runtimes node' no yt-dlp.")
             elif "python-yt-dlp" in faltando:
                 instalar_pip("yt-dlp")
-    if not com_player:
-        return tem("yt-dlp") and tem("ffmpeg")
-    if not modulo_existe("mutagen"):
+    if (com_player if capa is None else capa) and not modulo_existe("mutagen"):
         info("O yt-dlp precisa do módulo 'mutagen' para embutir a capa em arquivos .opus.")
         if confirmar("Instalar mutagen?", True):
             instalar_pip("mutagen")
-    return tem("yt-dlp") and tem("mpv")
+    return tem("yt-dlp") and tem("ffmpeg") and (not com_player or tem("mpv"))
 
 
-def baixar_musica(alvo: str) -> bool:
-    if not garantir_deps_musica():
+def baixar_musica(alvo: str, formato: str | None = None) -> bool:
+    if not garantir_deps_musica(com_player=False, capa=True):  # baixar não precisa do player
         return False
     garantir_storage()
     pasta_musicas().mkdir(parents=True, exist_ok=True)
-    return rodar(comando_ytdlp(alvo)).returncode == 0
+    return rodar(comando_ytdlp(alvo, formato)).returncode == 0
 
 
 def buscar_youtube(termo: str, n: int = 10) -> list:
@@ -4640,18 +4669,18 @@ def spotify_para_buscas(url: str) -> list:
     return buscas
 
 
-def baixar_alvo(alvo: str) -> None:
+def baixar_alvo(alvo: str, formato: str | None = None) -> None:
     """Baixa link do YouTube/SoundCloud/etc., link do Spotify ou termo de busca."""
     if "open.spotify.com/" in alvo:
         buscas = spotify_para_buscas(alvo)
         ok(f"{len(buscas)} música(s) encontrada(s). Procurando no YouTube...")
         for busca in buscas:
             info(busca)
-            baixar_musica(f"ytsearch1:{busca} audio")
+            baixar_musica(f"ytsearch1:{busca} audio", formato)
     elif alvo.startswith(("http://", "https://")):
-        baixar_musica(alvo)
+        baixar_musica(alvo, formato)
     else:
-        baixar_musica(f"ytsearch1:{alvo}")
+        baixar_musica(f"ytsearch1:{alvo}", formato)
 
 
 @submenu
@@ -4665,18 +4694,21 @@ def menu_musica():
 
     def buscar_baixar():
         r = escolher_resultado(perguntar("Música ou artista"))
-        if r and baixar_musica(r["url"]):
+        formato = escolher_formato_musica() if r else None
+        if formato and baixar_musica(r["url"], formato):
             ok(f"Salvo em {pasta_musicas()}")
 
     def baixar_link():
         alvo = perguntar("Link (YouTube, YT Music, SoundCloud, playlist...)")
-        if alvo:
-            baixar_alvo(alvo)
+        formato = escolher_formato_musica() if alvo else None
+        if formato:
+            baixar_alvo(alvo, formato)
 
     def baixar_spotify():
         url = perguntar("Link do Spotify (música, álbum ou playlist pública)")
-        if url:
-            baixar_alvo(url)
+        formato = escolher_formato_musica() if url else None
+        if formato:
+            baixar_alvo(url, formato)
 
     def mix():
         termo = perguntar("Tocar mix de (artista, gênero, 'lofi'...)")
@@ -4730,7 +4762,7 @@ def menu_musica():
 
     menu("🎵 Música (yt-dlp + mpv)", [
         ("Buscar e tocar (streaming)", buscar_tocar),
-        ("Buscar e baixar (melhor áudio, .opus com capa)", buscar_baixar),
+        ("Buscar e baixar (escolhe o formato: MP3, Opus, M4A, FLAC...)", buscar_baixar),
         ("Baixar por link (YouTube, SoundCloud, playlist...)", baixar_link),
         ("Baixar do Spotify (link → busca no YouTube)", baixar_spotify),
         ("Tocar mix/rádio por busca", mix),
@@ -4756,14 +4788,57 @@ def pasta_videos() -> Path:
     return Path(os.path.expanduser(cfg()["pasta_videos"]))
 
 
-def comando_video(alvo: str) -> list:
-    """O comando pedido: melhor vídeo + melhor áudio (ou o melhor arquivo único).
+# formato: (descrição no menu, preferência de codecs para o -S do yt-dlp, opções do contêiner)
+FORMATOS_VIDEO = {
+    "mp4": ("MP4 — toca em qualquer celular, TV e computador (recomendado)",
+            ["vcodec:h264", "ext:mp4:m4a"], ["--merge-output-format", "mp4", "--remux-video", "mp4"]),
+    "mkv": ("MKV — a melhor qualidade do site, sem converter (alguns players não abrem)",
+            [], ["--merge-output-format", "mkv", "--remux-video", "mkv"]),
+    "webm": ("WebM — formato aberto (VP9/AV1), arquivos menores", ["ext:webm:webm"], ["--merge-output-format", "webm/mkv"]),
+    "mp3": ("Só o áudio, em MP3", [], []),
+}
+QUALIDADES_VIDEO = {"melhor": "Melhor disponível", "1080": "1080p (Full HD)", "720": "720p (HD) — bom equilíbrio",
+                    "480": "480p — economiza espaço e dados", "360": "360p — o menor"}
+
+
+def comando_video(alvo: str, formato: str | None = None, qualidade: str | None = None) -> list:
+    """Melhor vídeo + melhor áudio no formato e na qualidade escolhidos (o yt-dlp junta os dois).
     --trim-filenames evita o erro de nome longo demais com legendas do TikTok."""
-    return ["yt-dlp", "-f", "bv*+ba/best", "--trim-filenames", "150",
-            "-o", str(pasta_videos() / "%(title)s.%(ext)s"), alvo]
+    c = cfg()
+    formato = formato if formato in FORMATOS_VIDEO else c.get("formato_video", "mp4")
+    qualidade = qualidade if qualidade in QUALIDADES_VIDEO else c.get("qualidade_video", "melhor")
+    saida_arq = ["--trim-filenames", "150", "-o", str(pasta_videos() / "%(title)s.%(ext)s"), alvo]
+    if formato == "mp3":
+        return ["yt-dlp", "-f", "bestaudio/best", "--extract-audio", "--audio-format", "mp3", "--audio-quality", "320K",
+                "--embed-thumbnail", "--add-metadata", *saida_arq]
+    _, preferencia, conteiner = FORMATOS_VIDEO.get(formato, FORMATOS_VIDEO["mp4"])
+    ordem = ([f"res:{qualidade}"] if qualidade != "melhor" else []) + preferencia  # res:720 = até 720p
+    return ["yt-dlp", "-f", "bv*+ba/b", *(["-S", ",".join(ordem)] if ordem else []), *conteiner, *saida_arq]
 
 
-def baixar_video(alvo: str) -> bool:
+def escolher_formato_video():
+    """Pergunta formato e qualidade (começam nos últimos usados). Devolve (formato, qualidade) ou None."""
+    c = cfg()
+    chaves = list(FORMATOS_VIDEO)
+    atual = c.get("formato_video", "mp4")
+    i = escolher("Em qual formato baixar?", [FORMATOS_VIDEO[k][0] for k in chaves],
+                 str(chaves.index(atual) + 1 if atual in chaves else 1))
+    if i is None:
+        return None
+    qualidade = c.get("qualidade_video", "melhor")
+    if chaves[i] != "mp3":
+        niveis = list(QUALIDADES_VIDEO)
+        j = escolher("Qual qualidade?", list(QUALIDADES_VIDEO.values()),
+                     str(niveis.index(qualidade) + 1 if qualidade in niveis else 1))
+        if j is None:
+            return None
+        qualidade = niveis[j]
+    c["formato_video"], c["qualidade_video"] = chaves[i], qualidade
+    salvar_cfg()
+    return chaves[i], qualidade
+
+
+def baixar_video(alvo: str, formato: str | None = None, qualidade: str | None = None) -> bool:
     """Baixa um link (TikTok, YouTube, Shorts, playlist...) ou o 1º resultado de uma busca."""
     if not garantir_deps_musica(com_player=False):
         return False
@@ -4771,7 +4846,7 @@ def baixar_video(alvo: str) -> bool:
     pasta_videos().mkdir(parents=True, exist_ok=True)
     if not alvo.startswith(("http://", "https://")):
         alvo = f"ytsearch1:{alvo}"
-    return rodar(comando_video(alvo)).returncode == 0
+    return rodar(comando_video(alvo, formato, qualidade)).returncode == 0
 
 
 def videos_locais() -> list:
@@ -4788,7 +4863,10 @@ def menu_videos():
     def por_link():
         info("Cole um ou mais links separados por espaço (TikTok, YouTube, Shorts, playlist...).")
         links = perguntar("Link(s)").split()
-        baixados = sum(baixar_video(link) for link in links)
+        escolha = escolher_formato_video() if links else None
+        if not escolha:
+            return
+        baixados = sum(baixar_video(link, *escolha) for link in links)
         if links:
             (ok if baixados == len(links) else aviso)(f"{baixados} de {len(links)} vídeo(s) baixado(s) em {pasta_videos()}")
 
@@ -4797,7 +4875,8 @@ def menu_videos():
         if not termo or not garantir_deps_musica(com_player=False):
             return
         r = escolher_resultado(termo)
-        if r and baixar_video(r["url"]):
+        escolha = escolher_formato_video() if r else None
+        if escolha and baixar_video(r["url"], *escolha):
             ok(f"Salvo em {pasta_videos()}")
 
     def abrir():
@@ -9249,8 +9328,11 @@ def main(argv=None) -> int:
     p.add_argument("arquivo", nargs="?", help="programa .bas para rodar")
     p = sub.add_parser("baixar", help="baixa áudio (link do YouTube/Spotify ou termo de busca)")
     p.add_argument("alvos", nargs="+")
+    p.add_argument("--formato", choices=list(FORMATOS_MUSICA), help="padrão: o último escolhido no menu")
     p = sub.add_parser("video", help="baixa vídeos (links do TikTok/YouTube ou termo de busca)")
     p.add_argument("alvos", nargs="+")
+    p.add_argument("--formato", choices=list(FORMATOS_VIDEO), help="padrão: o último escolhido no menu")
+    p.add_argument("--qualidade", choices=list(QUALIDADES_VIDEO), help="padrão: a última escolhida no menu")
     p = sub.add_parser("midia", help="servidor de vídeo (links de compartilhamento) em primeiro plano")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--porta", type=int)
@@ -9303,9 +9385,9 @@ def main(argv=None) -> int:
                 interpretador.repl()
         elif args.comando == "baixar":
             for alvo in args.alvos:
-                baixar_alvo(alvo)
+                baixar_alvo(alvo, args.formato)
         elif args.comando == "video":
-            falhas = sum(not baixar_video(alvo) for alvo in args.alvos)
+            falhas = sum(not baixar_video(alvo, args.formato, args.qualidade) for alvo in args.alvos)
             if falhas:
                 raise ToonsError(f"{falhas} download(s) falharam.")
         elif args.comando == "midia":
