@@ -57,7 +57,7 @@ quando não há um terminal interativo, por exemplo em scripts).
 | 7 | 🔎 **Scraping e monitoramento** | Monitores de **preço** (alvo em R$), **notícias** (RSS/Atom), **status de site**, **texto que aparece/some** e **mudança de página**. Avisa por notificação, TTS e Telegram. Roda 24h no tmux. |
 | 8 | 🛡️ **Rede e segurança** *(só em equipamentos seus!)* | Info de rede, descoberta de dispositivos e varredura de portas com **nmap**, DNS/ping/traceroute, teste de velocidade, redes Wi-Fi próximas, captura com tcpdump (root) ou leitura de `.pcap`, **servidor SSH** (porta 8022) e geração de config **WireGuard** + QR code para o app. |
 | 9 | 👾 **Retro** | Snake em curses, adivinhe o número, **interpretador BASIC** (PRINT, INPUT, IF/THEN, GOTO, GOSUB, FOR/NEXT, matrizes, SAVE/LOAD...) e gerador de **template para criar seu próprio jogo**. |
-| 10 | 🐧 **Linux com proot-distro** | Instala Debian, Ubuntu, Arch, Alpine, Fedora..., entra na distro, roda comandos, atualiza, cria usuário com sudo, faz backup, reseta e remove. |
+| 10 | 🐧 **Linux com proot-distro** | Instala Debian, Ubuntu, Arch, Alpine, Fedora..., entra na distro, roda comandos, atualiza, cria usuário com sudo, faz backup, reseta e remove. **Interface gráfica no Termux:X11**: instala XFCE, LXQt ou MATE na distro, abre o desktop no app Termux:X11 com som, aceleração pela GPU (experimental) e atalho na tela inicial. |
 | 11 | 🗄️ **Arquivos e backup** | **Publicar uma página/site HTML num link** (rede local ou internet, pelo túnel da Cloudflare; não lista pastas nem mostra arquivos ocultos), Compartilhamento HTTP rápido, **rclone** (Drive, Dropbox, OneDrive... copiar/sincronizar e servir via WebDAV com senha), **Syncthing**, **Samba** (porta 4450, experimental) e backup/restauração do Termux em `.tar.gz`. |
 | 12 | 🎵 **Música (yt-dlp + mpv)** | Busca e toca por streaming, baixa no melhor áudio, baixa por link (YouTube, SoundCloud, playlists) e por **link do Spotify** (procura a música no YouTube), mix/rádio por busca, biblioteca local, playlists `.m3u` e player em segundo plano. |
 | 13 | 🎬 **Vídeos (TikTok, YouTube)** | Baixa vídeos por link (TikTok, YouTube, Shorts, playlists e outros sites que o yt-dlp aceita), busca no YouTube e baixa, abre os vídeos baixados no player do Android e **assiste um link sem baixar** no VLC/MX Player (link direto de arquivo ou página do YouTube/TikTok). |
@@ -103,6 +103,7 @@ python termux_toons.py assistir "https://seu-servidor/Filme.mkv"              # 
 python termux_toons.py midia                # servidor de vídeo em primeiro plano
 python termux_toons.py site ~/storage/downloads/meu-site --porta 8097   # publica uma pasta como site
 python termux_toons.py arquivos ~/storage/downloads   # gerenciador de arquivos
+python termux_toons.py desktop debian   # abre o desktop da distro no Termux:X11
 python termux_toons.py tocar                # biblioteca no aleatório
 python termux_toons.py tocar lofi hip hop   # mix por busca
 python termux_toons.py atualizar
@@ -207,6 +208,22 @@ Erro `CANNOT LINK EXECUTABLE "adb": cannot locate symbol ...`? O `adb` foi atual
 
 Desligue a Depuração por Wi-Fi quando não estiver usando: enquanto ela está ligada, um aparelho pareado tem
 acesso de "shell" ao celular.
+
+## Desktop da distro no Termux:X11
+
+Menu **🐧 Linux de verdade → 🖥️ Interface gráfica da distro (Termux:X11)**:
+
+1. **Instalar o app Termux:X11** — abre a página de download (baixe o `.apk` *universal* da versão nightly) e
+   instala no Termux o servidor X (`termux-x11-nightly`, do `x11-repo`) e o som (`pulseaudio`).
+2. **Instalar um ambiente gráfico na distro** — XFCE (recomendado), LXQt (mais leve) ou MATE, com os pacotes certos
+   para Debian, Ubuntu, Arch, Alpine, Fedora ou openSUSE, e opcionalmente um navegador (no Ubuntu vai o Epiphany:
+   o Firefox de lá é snap, que não roda no proot). Baixa de 300 MB a 1 GB.
+3. **Abrir o desktop da distro** — liga o servidor X e o som, abre o app Termux:X11 e inicia o desktop (numa sessão
+   tmux: continua rodando se você sair do menu). **Parar o desktop** encerra tudo.
+
+Extras: escolher o **usuário** que abre o desktop (navegadores não gostam de root; crie um com *Criar usuário
+não-root com sudo*), **aceleração pela GPU** (virgl, experimental) e **atalho na tela inicial** pelo app
+Termux:Widget. Pela linha de comando: `python termux_toons.py desktop debian` (ou `--parar`).
 
 ## Gerenciador de arquivos
 

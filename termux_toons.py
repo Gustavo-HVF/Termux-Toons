@@ -13,7 +13,7 @@ Reúne em um único menu:
    7. Scraping e monitoramento (preço, notícias/RSS, status de site)
    8. Rede e segurança em equipamentos seus (nmap, SSH, WireGuard, velocidade)
    9. Retro: jogos ASCII, interpretador BASIC e template para criar seu jogo
-  10. Linux de verdade com proot-distro (Debian, Ubuntu, Arch...)
+  10. Linux de verdade com proot-distro (Debian, Ubuntu, Arch...), com desktop no Termux:X11
   11. Servidor de arquivos e backup (rclone, Syncthing, Samba, HTTP) e página HTML num link
   12. "Spotify" no terminal: yt-dlp para baixar e mpv para tocar
   13. Vídeos do TikTok, YouTube e outros sites com yt-dlp
@@ -760,6 +760,8 @@ PADRAO_CFG = {
     "site_porta": 8097,
     "site_pagina": "",
     "adb_endereco": "",
+    "x11_usuarios": {},
+    "x11_gpu": False,
     "torbox_chave": "",
     "torbox_catalogo": "",
     "compartilhamentos": [],
@@ -3888,6 +3890,237 @@ def atualizar_distros() -> None:
         rodar(["proot-distro", "login", nome, "--", "sh", "-c", SCRIPT_ATUALIZAR_DISTRO])
 
 
+# ── Interface gráfica da distro no Termux:X11 ────────────────────────
+# O app Termux:X11 mostra a tela; o pacote termux-x11 é o servidor X dentro do Termux.
+# A distro (proot) enxerga o servidor pelo /tmp compartilhado (--shared-tmp) e o som
+# chega pelo PulseAudio do Termux via TCP. Cada ambiente traz os pacotes por gerenciador.
+
+X11_APP = "com.termux.x11/com.termux.x11.MainActivity"
+X11_DOWNLOAD = "https://github.com/termux/termux-x11/releases/tag/nightly"
+X11_DISPLAY = ":1"
+AMBIENTES_GRAFICOS = {
+    "xfce": {"nome": "XFCE — completo e leve (recomendado)", "iniciar": "startxfce4",
+             "apt": "xfce4 xfce4-terminal xfce4-goodies dbus-x11 fonts-dejavu",
+             "pacman": "xfce4 xfce4-goodies dbus ttf-dejavu",
+             "apk": "xfce4 xfce4-terminal dbus dbus-x11 font-dejavu adwaita-icon-theme",
+             "dnf": "xfce4-session xfwm4 xfce4-panel xfdesktop xfce4-terminal thunar xfce4-settings dbus-x11 dejavu-sans-fonts",
+             "zypper": "xfce4-session xfwm4 xfce4-panel xfdesktop xfce4-terminal thunar xfce4-settings dbus-1-x11"},
+    "lxqt": {"nome": "LXQt — o mais leve, bom para celulares mais simples", "iniciar": "startlxqt",
+             "apt": "lxqt-core qterminal dbus-x11 fonts-dejavu",
+             "pacman": "lxqt breeze-icons dbus ttf-dejavu",
+             "apk": "lxqt-desktop dbus dbus-x11 font-dejavu",
+             "dnf": "lxqt-session lxqt-panel lxqt-config pcmanfm-qt qterminal openbox dbus-x11",
+             "zypper": "lxqt-session lxqt-panel lxqt-config pcmanfm-qt qterminal openbox dbus-1-x11"},
+    "mate": {"nome": "MATE — visual clássico", "iniciar": "mate-session",
+             "apt": "mate-desktop-environment-core dbus-x11 fonts-dejavu",
+             "pacman": "mate mate-terminal dbus ttf-dejavu",
+             "apk": "mate-desktop-environment dbus dbus-x11 font-dejavu",
+             "dnf": "mate-session-manager mate-panel marco caja mate-terminal dbus-x11",
+             "zypper": "mate-session-manager mate-panel marco caja mate-terminal dbus-1-x11"},
+}
+NAVEGADOR_DISTRO = {"apt": '$(. /etc/os-release; [ "$ID" = ubuntu ] && echo epiphany-browser || echo firefox-esr)', "pacman": "firefox", "apk": "firefox", "dnf": "firefox",
+                    "zypper": "MozillaFirefox"}
+
+
+def _script_instalar(pacotes: dict) -> str:
+    """Script de shell que instala os pacotes certos para o gerenciador da distro."""
+    return (
+        "export DEBIAN_FRONTEND=noninteractive; set -e; "
+        f"if command -v apt-get >/dev/null; then apt-get update && apt-get install -y {pacotes['apt']}; "
+        f"elif command -v pacman >/dev/null; then pacman -Syu --noconfirm --needed {pacotes['pacman']}; "
+        f"elif command -v apk >/dev/null; then apk update && apk add {pacotes['apk']}; "
+        f"elif command -v dnf >/dev/null; then dnf install -y {pacotes['dnf']}; "
+        f"elif command -v zypper >/dev/null; then zypper --non-interactive install {pacotes['zypper']}; "
+        "else echo 'Gerenciador de pacotes desconhecido nesta distro.'; exit 1; fi"
+    )
+
+
+def ambiente_da_distro(distro: str) -> str | None:
+    """Comando que inicia o desktop já instalado na distro (startxfce4, startlxqt...), ou None."""
+    comandos = " ".join(a["iniciar"] for a in AMBIENTES_GRAFICOS.values())
+    proc = rodar(["proot-distro", "login", distro, "--", "sh", "-c",
+                  f"for c in {comandos}; do command -v $c >/dev/null 2>&1 && echo $c && break; done"],
+                 capturar=True, timeout=120, mostrar=False)
+    achado = (proc.stdout or "").strip().splitlines()
+    return achado[-1] if achado else None
+
+
+def garantir_termux_x11() -> bool:
+    """Pacotes do Termux para a interface gráfica: servidor X (termux-x11) e som (pulseaudio)."""
+    if not garantir_cmd("termux-x11", "termux-x11-nightly", repo="x11-repo"):
+        return False
+    if not tem("pulseaudio") and confirmar("Instalar o pulseaudio (som dos programas da distro)?", True):
+        instalar_pkg("pulseaudio")
+    return True
+
+
+def script_desktop(distro: str, iniciar: str, usuario: str = "", gpu: bool = False) -> Path:
+    """Grava o script que abre o desktop (o mesmo que o atalho da tela inicial usa) e devolve o caminho."""
+    pasta = DATA_DIR / "x11"
+    pasta.mkdir(parents=True, exist_ok=True)
+    env_distro = [f"DISPLAY={X11_DISPLAY}", "PULSE_SERVER=tcp:127.0.0.1:4713", "XDG_RUNTIME_DIR=/tmp"]
+    if gpu:  # OpenGL pela GPU do celular, via virgl (experimental)
+        env_distro += ["GALLIUM_DRIVER=virpipe", "MESA_GL_VERSION_OVERRIDE=4.0"]
+    login = ["proot-distro", "login", distro, "--shared-tmp"] + (["--user", usuario] if usuario else [])
+    linhas = [
+        f"#!{PREFIX or '/data/data/com.termux/files/usr'}/bin/bash",
+        f"# Gerado pelo Termux-Toons: abre o desktop da distro '{distro}' no app Termux:X11.",
+        'export XDG_RUNTIME_DIR="${TMPDIR:-/tmp}"',
+        "pkill -f com.termux.x11 >/dev/null 2>&1  # servidor X de uma sessão anterior",
+        "command -v pulseaudio >/dev/null && pulseaudio --start --exit-idle-time=-1 "
+        "--load='module-native-protocol-tcp auth-ip-acl=127.0.0.1 auth-anonymous=1' >/dev/null 2>&1",
+    ]
+    if gpu:
+        linhas.append("command -v virgl_test_server_android >/dev/null && (virgl_test_server_android >/dev/null 2>&1 &)")
+    linhas += [
+        f"termux-x11 {X11_DISPLAY} -ac >/dev/null 2>&1 &",
+        "sleep 3",
+        f"am start --user 0 -n {X11_APP} >/dev/null 2>&1",
+        f"{shlex.join(login)} -- env {' '.join(env_distro)} dbus-launch --exit-with-session {shlex.quote(iniciar)}",
+        "pkill -f com.termux.x11 >/dev/null 2>&1",
+    ]
+    if gpu:
+        linhas.append("pkill -f virgl_test_server >/dev/null 2>&1")
+    script = pasta / f"desktop-{distro}.sh"
+    script.write_text("\n".join(linhas) + "\n", "utf-8")
+    os.chmod(script, 0o700)
+    return script
+
+
+def iniciar_desktop(distro: str, usuario: str | None = None) -> bool:
+    """Abre o desktop da distro no Termux:X11 (roda numa sessão tmux: continua se você sair do menu)."""
+    if not garantir_cmd("proot-distro") or not garantir_termux_x11():
+        return False
+    if distro not in distros_instaladas():
+        raise ToonsError(f"A distro '{distro}' não está instalada (veja em 'Listar distros instaladas').")
+    info("Procurando o ambiente gráfico instalado na distro...")
+    iniciar = ambiente_da_distro(distro)
+    if not iniciar:
+        raise ToonsError(f"Nenhum ambiente gráfico instalado no '{distro}'. Use 'Instalar um ambiente gráfico' primeiro.")
+    c = cfg()
+    usuario = c.get("x11_usuarios", {}).get(distro, "") if usuario is None else usuario
+    gpu = bool(c.get("x11_gpu"))
+    if gpu and not tem("virgl_test_server_android"):
+        info("Aceleração ligada: instalando o virglrenderer-android...")
+        instalar_pkg("virglrenderer-android")
+    script = script_desktop(distro, iniciar, usuario, gpu)
+    if servico_ativo("desktop"):
+        parar_servico("desktop")
+    if not iniciar_servico("desktop", shlex.join([SHELL_BIN, str(script)]), wake_lock=True):
+        return False
+    time.sleep(2)
+    proc = rodar(["am", "start", "--user", "0", "-n", X11_APP], capturar=True, timeout=20, mostrar=False)
+    if proc.returncode != 0 or re.search(r"\bError\b|does not exist", f"{proc.stdout}{proc.stderr}"):
+        aviso("O app Termux:X11 não abriu: ele está instalado?")
+        info(f"Baixe o .apk em {X11_DOWNLOAD} (o 'universal' serve em qualquer celular), instale e tente de novo.")
+        return False
+    ok(f"Desktop '{iniciar}' do {distro} aberto no Termux:X11" + (f" como {usuario}" if usuario else " como root") + ".")
+    info("Para voltar ao Termux, troque de app. Para encerrar: saia pelo menu do desktop ou use 'Parar o desktop'.")
+    return True
+
+
+def parar_desktop() -> None:
+    parar_servico("desktop")
+    for padrao in ("com.termux.x11", "virgl_test_server"):
+        rodar(["pkill", "-f", padrao], capturar=True, mostrar=False)
+    if tem("pulseaudio"):
+        rodar(["pulseaudio", "--kill"], capturar=True, mostrar=False)
+    ok("Desktop encerrado.")
+
+
+@submenu
+def menu_x11():
+    c = cfg()
+
+    def instalar_app():
+        info("O Termux:X11 é o app que mostra a tela da distro. Baixe o .apk da versão 'nightly' "
+             "(o 'universal' serve em qualquer celular) e instale. Ele precisa ser da mesma origem do Termux "
+             "(GitHub/F-Droid).")
+        if tem("termux-open-url"):
+            rodar(["termux-open-url", X11_DOWNLOAD], capturar=True, timeout=20)
+        else:
+            info(X11_DOWNLOAD)
+        garantir_termux_x11()
+
+    def instalar_ambiente():
+        if not garantir_cmd("proot-distro"):
+            return
+        distro = escolher_distro_instalada()
+        if not distro:
+            return
+        chaves = list(AMBIENTES_GRAFICOS)
+        i = escolher("Qual ambiente gráfico?", [AMBIENTES_GRAFICOS[k]["nome"] for k in chaves], 1)
+        if i is None:
+            return
+        ambiente = AMBIENTES_GRAFICOS[chaves[i]]
+        aviso("Baixa de 300 MB a 1 GB e leva de 10 a 40 minutos, conforme o celular e a internet. "
+              "Deixe o celular carregando e o Termux aberto.")
+        if not confirmar(f"Instalar {ambiente['nome'].split(' —')[0]} no {distro}?", True):
+            return
+        with manter_acordado():
+            proc = rodar(["proot-distro", "login", distro, "--", "sh", "-c", _script_instalar(ambiente)])
+        if proc.returncode != 0:
+            raise ToonsError("A instalação falhou (veja as mensagens acima). Tente 'Atualizar pacotes das distros' e repita.")
+        ok("Ambiente gráfico instalado.")
+        if confirmar("Instalar também um navegador (Firefox; no Ubuntu, o Epiphany)?", True):
+            # no Ubuntu o Firefox e o Chromium vêm por snap, que não roda no proot
+            rodar(["proot-distro", "login", distro, "--", "sh", "-c", _script_instalar(NAVEGADOR_DISTRO)])
+        garantir_termux_x11()
+        if confirmar("Abrir o desktop agora?", True):
+            iniciar_desktop(distro)
+
+    def abrir():
+        distro = escolher_distro_instalada()
+        if distro:
+            iniciar_desktop(distro)
+
+    def usuario():
+        distro = escolher_distro_instalada()
+        if not distro:
+            return
+        info("Alguns programas (navegadores, por exemplo) não gostam de rodar como root. Crie um usuário em "
+             "'Criar usuário não-root com sudo' e indique-o aqui.")
+        atual = c.get("x11_usuarios", {}).get(distro, "")
+        nome = perguntar("Usuário que abre o desktop (Enter = root)", atual).strip()
+        c.setdefault("x11_usuarios", {})[distro] = nome
+        salvar_cfg()
+        ok(f"O desktop do {distro} abre como {nome or 'root'}.")
+
+    def gpu():
+        if not c.get("x11_gpu"):
+            info("Usa a GPU do celular para OpenGL (virgl). Pode deixar jogos e efeitos mais rápidos, mas em "
+                 "alguns aparelhos causa telas pretas ou travamentos. Se der problema, desligue aqui.")
+        c["x11_gpu"] = not c.get("x11_gpu")
+        salvar_cfg()
+        if c["x11_gpu"] and not tem("virgl_test_server_android"):
+            instalar_pkg("virglrenderer-android")
+        ok(f"Aceleração gráfica {'ligada' if c['x11_gpu'] else 'desligada'} (vale na próxima vez que abrir o desktop).")
+
+    def atalho():
+        distro = escolher_distro_instalada()
+        if not distro:
+            return
+        pasta = HOME / ".shortcuts"
+        pasta.mkdir(parents=True, exist_ok=True)
+        arq = pasta / f"Desktop {distro}.sh"
+        arq.write_text(f"#!{PREFIX or '/data/data/com.termux/files/usr'}/bin/bash\n"
+                       f"{shlex.join([sys.executable, str(SCRIPT), 'desktop', distro])}\n", "utf-8")
+        os.chmod(arq, 0o700)
+        ok(f"Atalho criado: {arq}")
+        info("Instale o app Termux:Widget (mesma loja do Termux), adicione o widget na tela inicial e toque em "
+             f"'Desktop {distro}' para abrir o desktop direto.")
+
+    menu("🖥️ Interface gráfica da distro (Termux:X11)", [
+        ("1. Instalar o app Termux:X11 e o servidor X do Termux", instalar_app),
+        ("2. Instalar um ambiente gráfico na distro (XFCE, LXQt, MATE)", instalar_ambiente),
+        ("▶  Abrir o desktop da distro", abrir),
+        ("■  Parar o desktop", parar_desktop),
+        ("Usuário que abre o desktop (root ou outro)", usuario),
+        (lambda: f"Aceleração gráfica pela GPU ({'ligada' if c.get('x11_gpu') else 'desligada'}, experimental)", gpu),
+        ("Criar atalho na tela inicial (Termux:Widget)", atalho),
+    ])
+
+
 @submenu
 def menu_proot():
     def instalar_distro():
@@ -3959,6 +4192,7 @@ def menu_proot():
             rodar(["proot-distro", "reset", nome])
 
     menu("🐧 Linux de verdade (proot-distro)", [
+        ("🖥️ Interface gráfica da distro (Termux:X11)", menu_x11),
         ("Instalar o proot-distro", lambda: instalar_pkg("proot-distro")),
         ("Instalar uma distro (Debian, Ubuntu, Arch, Alpine...)", instalar_distro),
         ("Listar distros instaladas", lambda: rodar(["proot-distro", "list"])),
@@ -8908,6 +9142,7 @@ FERRAMENTAS = [
     ("mpv", "mpv", "música"),
     ("nmap", "nmap", "rede"), ("sshd", "openssh", "SSH"), ("wg", "wireguard-tools", "WireGuard"),
     ("cloudflared", "cloudflared", "túnel"), ("adb", "android-tools", "depuração sem fio e Android/data"),
+    ("termux-x11", "termux-x11-nightly", "desktop da distro (x11-repo)"),
     ("7z", "p7zip", "extrair .7z e .rar"), ("proot-distro", "proot-distro", "Linux"),
     ("rclone", "rclone", "nuvem"), ("syncthing", "syncthing", "sincronização"),
 ]
@@ -9019,6 +9254,9 @@ def main(argv=None) -> int:
     p = sub.add_parser("midia", help="servidor de vídeo (links de compartilhamento) em primeiro plano")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--porta", type=int)
+    p = sub.add_parser("desktop", help="abre o desktop de uma distro no Termux:X11 (atalho da tela inicial)")
+    p.add_argument("distro", nargs="?", help="nome da distro (padrão: a primeira instalada)")
+    p.add_argument("--parar", action="store_true", help="encerra o desktop")
     p = sub.add_parser("arquivos", help="gerenciador de arquivos (copiar, mover, renomear, Android/data...)")
     p.add_argument("pasta", nargs="?")
     p = sub.add_parser("site", help="publica uma pasta como site (página HTML) em primeiro plano")
@@ -9072,6 +9310,15 @@ def main(argv=None) -> int:
                 raise ToonsError(f"{falhas} download(s) falharam.")
         elif args.comando == "midia":
             servir_midia(args.host, args.porta or cfg()["midia_porta"])
+        elif args.comando == "desktop":
+            if args.parar:
+                parar_desktop()
+            else:
+                distro = args.distro or next(iter(distros_instaladas()), None)
+                if not distro:
+                    raise ToonsError("Nenhuma distro instalada (use o menu Linux de verdade).")
+                if not iniciar_desktop(distro):
+                    return 1
         elif args.comando == "arquivos":
             gerenciador_arquivos(args.pasta)
         elif args.comando == "site":
