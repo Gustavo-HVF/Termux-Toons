@@ -756,6 +756,8 @@ PADRAO_CFG = {
     "site_porta": 8097,
     "site_pagina": "",
     "adb_endereco": "",
+    "torbox_chave": "",
+    "torbox_catalogo": "",
     "compartilhamentos": [],
     "llama_porta": 8080,
     "llama_modelo": "",
@@ -4642,7 +4644,11 @@ PAGINA_FILME = r"""<!doctype html>
  .camada>*{pointer-events:auto}
  #player.ocioso .camada{opacity:0}
  #player.ocioso .camada *{pointer-events:none}
- #topo{top:0;padding:max(14px,env(safe-area-inset-top)) 18px 48px;background:linear-gradient(rgba(0,0,0,.8),transparent)}
+ #topo{top:0;padding:max(14px,env(safe-area-inset-top)) 18px 48px;background:linear-gradient(rgba(0,0,0,.8),transparent);
+  display:flex;align-items:center;gap:10px}
+ #voltar{display:grid;place-items:center;width:38px;height:38px;border-radius:50%;flex:none;color:#fff;background:rgba(255,255,255,.1)}
+ #voltar svg{width:22px;height:22px;fill:currentColor}
+ #voltar[hidden]{display:none}
  #topo h1{margin:0;font-size:1.05em;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
   text-shadow:0 1px 3px #000;pointer-events:none}
  #baixo{bottom:0;padding:56px max(12px,env(safe-area-inset-right)) max(8px,env(safe-area-inset-bottom)) max(12px,env(safe-area-inset-left));
@@ -4734,7 +4740,7 @@ PAGINA_FILME = r"""<!doctype html>
  <div id="legenda"></div>
  <div id="centro"><button id="grande" aria-label="Assistir"></button><div id="girando"></div></div>
  <div class="pulo" id="puloE"></div><div class="pulo" id="puloD"></div>
- <div id="topo" class="camada"><h1>@TITULO@</h1></div>
+ <div id="topo" class="camada"><a id="voltar" hidden title="Voltar à biblioteca" aria-label="Voltar à biblioteca"></a><h1>@TITULO@</h1></div>
  <div id="baixo" class="camada">
   <div id="barra" role="slider" aria-label="Posição no vídeo">
    <div id="trilho"><div id="buf"></div><div id="prog"></div></div><div id="bola"></div><div id="dica">0:00</div>
@@ -4749,6 +4755,7 @@ PAGINA_FILME = r"""<!doctype html>
    <span class="esp"></span>
    <button class="bt" id="btAudio" title="Trilha de áudio (A)" hidden></button>
    <button class="bt" id="btLegenda" title="Legendas (C)" hidden></button>
+   <button class="bt" id="btProximo" title="Próximo episódio (N)" hidden></button>
    <button class="bt" id="btAjustes" title="Ajustes"></button>
    <button class="bt opcional" id="btPip" title="Janela flutuante" hidden></button>
    <button class="bt" id="btTela" title="Tela cheia (F)"></button>
@@ -4772,6 +4779,7 @@ PAGINA_FILME = r"""<!doctype html>
   audio: 'M12 1c-4.97 0-9 4.03-9 9v7c0 1.66 1.34 3 3 3h3v-8H5v-2c0-3.87 3.13-7 7-7s7 3.13 7 7v2h-4v8h3c1.66 0 3-1.34 3-3v-7c0-4.97-4.03-9-9-9z',
   legenda: 'M19 4H5c-1.11 0-2 .9-2 2v12c0 1.1.89 2 2 2h14c1.1 0 2-.9 2-2V6c0-1.1-.9-2-2-2zm-8 7H9.5v-.5h-2v3h2V13H11v1c0 .55-.45 1-1 1H7c-.55 0-1-.45-1-1v-4c0-.55.45-1 1-1h3c.55 0 1 .45 1 1v1zm7 0h-1.5v-.5h-2v3h2V13H18v1c0 .55-.45 1-1 1h-3c-.55 0-1-.45-1-1v-4c0-.55.45-1 1-1h3c.55 0 1 .45 1 1v1z',
   ajustes: 'M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z',
+  proximo: 'M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z',
   pip: 'M19 7h-8v6h8V7zm2-4H3c-1.1 0-2 .9-2 2v14c0 1.1.9 1.98 2 1.98h18c1.1 0 2-.88 2-1.98V5c0-1.1-.9-2-2-2zm0 16.01H3V4.98h18v14.03z',
   tela: 'M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z',
   sairTela: 'M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z',
@@ -4806,7 +4814,8 @@ PAGINA_FILME = r"""<!doctype html>
  function lerSalvo() { try { return JSON.parse(localStorage.getItem(CHAVE)) || {}; } catch (e) { return {}; } }
  function salvar(fim) {
   try {
-   localStorage.setItem(CHAVE, JSON.stringify({t: fim ? 0 : agora(), a: E.audio, l: E.legenda, tam: E.tam, at: E.atraso}));
+   localStorage.setItem(CHAVE, JSON.stringify({t: fim ? 0 : agora(), d: duracao(), quando: Date.now(), a: E.audio,
+                                                 l: E.legenda, tam: E.tam, at: E.atraso}));
    localStorage.setItem('toons:vol', JSON.stringify({v: v.volume, m: v.muted}));
   } catch (e) {}
  }
@@ -4931,6 +4940,7 @@ PAGINA_FILME = r"""<!doctype html>
    if (!r || t - r > 5) { E.reconexao = t; aviso('Reconectando…'); return carregar(t, true); }
   }
   P.classList.remove('tocando', 'carregando'); atualizarPlay(true); mostrarControles(); salvar(true);
+  if (C.proximo) cartao('Próximo episódio', C.proximo.titulo, [['Assistir', proximo, true], ['Rever este', function () { pular(0); tocarVideo(); }]]);
  });
  v.addEventListener('error', function () {
   if (!v.error || !v.getAttribute('src')) return;
@@ -5101,6 +5111,7 @@ PAGINA_FILME = r"""<!doctype html>
   else if (k === 'c' || k === 'C') alternarLegenda();
   else if (k === 'a' || k === 'A') { if (podeTrocarAudio()) trocarAudio((E.audio + 1) % C.audios.length); }
   else if (k === 'Escape' && painelAberto()) fecharPainel();
+  else if ((k === 'n' || k === 'N') && C.proximo) proximo();
   else if (/^[0-9]$/.test(k) && duracao() && E.iniciado) pular(duracao() * (+k) / 10);
   else feito = false;
   if (feito) { ev.preventDefault(); mostrarControles(); }
@@ -5332,6 +5343,9 @@ PAGINA_FILME = r"""<!doctype html>
  $('btAudio').innerHTML = svg('audio');
  $('btLegenda').innerHTML = svg('legenda');
  $('btAjustes').innerHTML = svg('ajustes');
+ function proximo() { location.href = '/v/' + C.proximo.token; }
+ if (C.proximo) { $('btProximo').innerHTML = svg('proximo'); $('btProximo').hidden = false; ao('btProximo', proximo); }
+ if (C.voltar) { $('voltar').href = C.voltar; $('voltar').innerHTML = svg('voltar'); $('voltar').hidden = false; }
  $('btPip').innerHTML = svg('pip');
  atualizarPlay(); atualizarSom(); atualizarTela(); atualizarBotoes(); atualizarTempo();
  window.addEventListener('pagehide', function () { if (E.iniciado) salvar(); });
@@ -5355,7 +5369,11 @@ def eh_link(texto) -> bool:
 
 
 def fonte_de(item: dict) -> str:
-    """O vídeo de um compartilhamento como foi cadastrado: página, link da internet ou caminho do arquivo."""
+    """O vídeo de um compartilhamento como foi cadastrado: página, link da internet ou caminho do arquivo.
+    Um vídeo do catálogo do TorBox ganha um endereço só para identificá-lo (o link real é pedido na hora)."""
+    if item.get("torbox"):
+        letra, id_item, fid = item["torbox"]
+        return f"{TORBOX_API}/{TORBOX_TIPOS[letra][0]}/{id_item}/{fid}"
     return item.get("pagina") or item.get("url") or item.get("caminho", "")
 
 
@@ -5364,6 +5382,8 @@ def fontes_de(item: dict, renovar: bool = False) -> list:
     (sites como o YouTube separam os dois), achados pelo yt-dlp."""
     if item.get("pagina"):
         return info_pagina(item["pagina"], renovar)["enderecos"]
+    if item.get("torbox"):
+        return [torbox_link(_torbox_config()[0], *item["torbox"], renovar=renovar)]
     return [fonte_de(item)]
 
 
@@ -5703,6 +5723,9 @@ def legendas_do_item(item: dict, sonda) -> list:
         nome = urllib.parse.unquote(Path(urllib.parse.urlsplit(extra).path if eh_link(extra) else extra).stem)
         lista.append({"tipo": "link" if eh_link(extra) else "arquivo", "ref": extra, "rotulo": f"{nome} · extra",
                       "pt": bool(_PORTUGUES.search(nome)), "forcada": False})
+    for legenda in item.get("legendas_tb") or []:  # .srt que vieram junto no torrent
+        lista.append({"tipo": "torbox", "ref": legenda["fid"], "rotulo": f"{legenda.get('rotulo') or legenda['nome']} · TorBox",
+                      "pt": _parece_portugues(legenda["caminho"]), "forcada": "forced" in legenda["caminho"].lower()})
     if sonda:
         permitidas = set(item.get("legendas_embutidas") or []) if eh_link(fonte) else None
         for n, faixa in enumerate(sonda["legendas"]):
@@ -5884,6 +5907,414 @@ def info_link(url: str) -> dict:
     return {"status": status, "nome": nome, "tamanho": tamanho, "tipo": cab.get_content_type()}
 
 
+# ── TorBox: catálogo da sua biblioteca ───────────────────────────────
+# Com a chave da API do TorBox, o servidor mostra todos os seus filmes e séries numa página
+# (um link secreto só, /tb/<código>) e cada vídeo vira um "compartilhamento virtual" que abre no
+# mesmo player: o link de download é pedido ao TorBox na hora de assistir. A chave nunca sai do celular.
+
+TORBOX_API = os.environ.get("TOONS_TORBOX_API", "https://api.torbox.app/v1/api")
+TORBOX_TIPOS = {"t": ("torrents", "torrent_id"), "u": ("usenet", "usenet_id"), "w": ("webdl", "web_id")}
+EXTENSOES_VIDEO_TORBOX = EXTENSOES_VIDEO | {".ts", ".m2ts", ".wmv", ".flv", ".mpg", ".mpeg"}
+_TORBOX: dict = {"quando": 0.0, "chave": "", "itens": [], "links": {}}
+_TORBOX_TRAVA = threading.Lock()
+
+
+def _ordem_natural(texto: str) -> list:
+    """'Ep 2' antes de 'Ep 10'."""
+    return [int(p) if p.isdigit() else p.lower() for p in re.split(r"(\d+)", texto)]
+
+
+def _torbox_config() -> tuple:
+    """(chave da API, código do catálogo), relidos do arquivo: o menu pode ter trocado."""
+    c = ler_json(CONFIG_FILE, {})
+    return c.get("torbox_chave") or "", c.get("torbox_catalogo") or ""
+
+
+def torbox_chamar(caminho: str, chave: str, **params):
+    """Chama a API do TorBox e devolve o campo 'data' da resposta."""
+    url = f"{TORBOX_API}/{caminho}" + ("?" + urllib.parse.urlencode(params) if params else "")
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {chave}", "Accept": "application/json",
+                                               "User-Agent": f"TermuxToons/{VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resposta:
+            dados = json.loads(resposta.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        detalhe = ""
+        with contextlib.suppress(Exception):
+            corpo = json.loads(e.read() or b"{}")
+            detalhe = str(corpo.get("detail") or corpo.get("error") or "")
+        if e.code in (401, 403):
+            raise ToonsError("O TorBox recusou a chave da API (confira em torbox.app → Settings → API).") from None
+        raise ToonsError(f"O TorBox respondeu HTTP {e.code}. {detalhe}".strip()) from None
+    except (OSError, ValueError) as e:
+        raise ToonsError(f"Não consegui falar com o TorBox: {e}") from None
+    if isinstance(dados, dict) and dados.get("success") is False:
+        raise ToonsError(f"TorBox: {dados.get('detail') or dados.get('error') or 'erro desconhecido'}")
+    return dados.get("data") if isinstance(dados, dict) else dados
+
+
+def _torbox_item(letra: str, bruto: dict) -> dict:
+    """Um torrent/usenet/download da web, só com os vídeos (sem os 'sample') e as legendas."""
+    videos, legendas = [], []
+    for arq in bruto.get("files") or []:
+        caminho = str(arq.get("name") or arq.get("short_name") or "")
+        nome = str(arq.get("short_name") or caminho.rsplit("/", 1)[-1])
+        tamanho_arq = int(arq.get("size") or 0)
+        entrada = {"fid": int(arq.get("id") or 0), "nome": nome, "caminho": caminho, "tamanho": tamanho_arq}
+        ext = os.path.splitext(nome)[1].lower()
+        if ext in EXTENSOES_VIDEO_TORBOX and not (re.search(r"\bsample\b", caminho, re.I) and tamanho_arq < 300 * 2**20):
+            videos.append(entrada)
+        elif ext in (".srt", ".vtt"):
+            legendas.append(entrada)
+    videos.sort(key=lambda v: _ordem_natural(v["caminho"]))
+    return {"tipo": letra, "id": int(bruto.get("id") or 0), "nome": str(bruto.get("name") or "Sem nome"),
+            "tamanho": int(bruto.get("size") or 0), "data": str(bruto.get("created_at") or ""),
+            "pronto": bool(bruto.get("download_finished") or bruto.get("download_present")),
+            "progresso": float(bruto.get("progress") or 0), "videos": videos, "legendas": legendas}
+
+
+def torbox_biblioteca(chave: str, renovar: bool = False) -> list:
+    """Torrents, usenet e downloads da web da conta que têm vídeo, mais novos primeiro (guardado por 1 minuto)."""
+    with _TORBOX_TRAVA:
+        if not renovar and _TORBOX["chave"] == chave and time.time() - _TORBOX["quando"] < 60:
+            return _TORBOX["itens"]
+        itens = []
+        for letra, (rota, _) in TORBOX_TIPOS.items():
+            try:
+                lista = torbox_chamar(f"{rota}/mylist", chave, bypass_cache="true") or []
+            except ToonsError:
+                if letra == "t":  # os torrents são o principal; usenet e web podem não existir no seu plano
+                    raise
+                continue
+            for bruto in lista if isinstance(lista, list) else [lista]:
+                if isinstance(bruto, dict):
+                    item = _torbox_item(letra, bruto)
+                    if item["videos"]:
+                        itens.append(item)
+        itens.sort(key=lambda it: it["data"], reverse=True)
+        _TORBOX.update(quando=time.time(), chave=chave, itens=itens)
+        return itens
+
+
+def torbox_link(chave: str, letra: str, id_item: int, fid: int, renovar: bool = False) -> str:
+    """Link de download de um arquivo, pedido ao TorBox (vale algumas horas: fica 1 hora guardado)."""
+    with _TORBOX_TRAVA:
+        achado = _TORBOX["links"].get((letra, id_item, fid))
+    if achado and not renovar and time.time() - achado[0] < 3600:
+        return achado[1]
+    rota, campo = TORBOX_TIPOS[letra]
+    url = torbox_chamar(f"{rota}/requestdl", chave, token=chave, file_id=fid, zip_link="false", redirect="false",
+                        **{campo: id_item})
+    if not isinstance(url, str) or not eh_link(url):
+        raise ToonsError("O TorBox não devolveu um link para este arquivo (ele ainda está sendo baixado?).")
+    with _TORBOX_TRAVA:
+        _TORBOX["links"][(letra, id_item, fid)] = (time.time(), url)
+    return url
+
+
+def token_torbox(catalogo: str, letra: str, id_item: int, fid: int) -> str:
+    """Código do 'compartilhamento virtual' de um vídeo do TorBox: só funciona com o código do catálogo."""
+    return f"tb{letra}{id_item}x{fid}k{catalogo}"
+
+
+def _parece_portugues(texto: str) -> bool:
+    return bool(_PORTUGUES.search(texto) or re.search(r"portugu|brazil|brasil", texto, re.I))
+
+
+def item_torbox(token: str):
+    """Monta o compartilhamento virtual de um vídeo do catálogo (título, legendas da pasta, próximo episódio)."""
+    m = re.fullmatch(r"tb([tuw])(\d+)x(\d+)k([A-Za-z0-9_-]{8,40})", token)
+    chave, catalogo = _torbox_config()
+    if not m or not chave or not catalogo or not hmac.compare_digest(m.group(4).encode(), catalogo.encode()):
+        return None
+    letra, id_item, fid = m.group(1), int(m.group(2)), int(m.group(3))
+    item = {"token": token, "torbox": [letra, id_item, fid], "titulo": "Vídeo", "voltar": f"/tb/{catalogo}"}
+    with contextlib.suppress(ToonsError):
+        entrada = next((it for it in torbox_biblioteca(chave) if it["tipo"] == letra and it["id"] == id_item), None)
+        videos = entrada["videos"] if entrada else []
+        n = next((i for i, v in enumerate(videos) if v["fid"] == fid), None)
+        if n is not None:
+            video = videos[n]
+            item["titulo"] = titulo_do_arquivo(Path(video["nome"]))
+            if n + 1 < len(videos):
+                seguinte = videos[n + 1]
+                item["proximo"] = {"token": token_torbox(catalogo, letra, id_item, seguinte["fid"]),
+                                   "titulo": titulo_do_arquivo(Path(seguinte["nome"]))}
+            base = os.path.splitext(video["nome"])[0]
+            item["legendas_tb"] = []
+            for legenda in entrada["legendas"]:
+                if len(videos) == 1 or base.lower() in legenda["caminho"].lower():
+                    nome = os.path.splitext(legenda["nome"])[0]  # 'Filme.pt-BR' -> 'Português (BR)'
+                    resto = nome[len(base):].strip("._- ") if nome.lower().startswith(base.lower()) else nome
+                    item["legendas_tb"].append({**legenda, "rotulo": IDIOMAS.get(resto.lower(), resto or "Legenda")})
+            item["legendas_tb"] = item["legendas_tb"][:20]
+    return item
+
+
+PAGINA_TORBOX = r"""<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow">
+<meta name="theme-color" content="#09090b">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8D%BF%3C/text%3E%3C/svg%3E">
+<title>Minha biblioteca</title>
+<style>
+ :root{--acc:#8b5cf6;--acc2:#a78bfa;--fundo:#09090b;--card:#18181b;--txt:#f4f4f5;--sub:#a1a1aa;--borda:rgba(255,255,255,.08)}
+ *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+ html,body{margin:0;background:var(--fundo);color:var(--txt);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+ button,input,select{font:inherit;color:inherit}
+ button{background:none;border:0;cursor:pointer;padding:0}
+ a{color:inherit;text-decoration:none}
+ header{position:sticky;top:0;z-index:5;background:rgba(9,9,11,.92);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px);
+  border-bottom:1px solid var(--borda);padding:max(12px,env(safe-area-inset-top)) 16px 10px}
+ .linha{display:flex;gap:10px;align-items:center;max-width:1400px;margin:0 auto}
+ h1{margin:0;font-size:1.25em;white-space:nowrap}
+ #busca{flex:1;min-width:0;background:var(--card);border:1px solid var(--borda);border-radius:99px;padding:9px 16px;outline:none}
+ #busca:focus{border-color:var(--acc)}
+ .icone{width:40px;height:40px;border-radius:50%;display:grid;place-items:center;background:var(--card);border:1px solid var(--borda);flex:none}
+ .icone svg{width:20px;height:20px;fill:currentColor}
+ .filtros{display:flex;gap:8px;margin-top:10px;overflow-x:auto;scrollbar-width:none}
+ .filtros::-webkit-scrollbar{display:none}
+ .chip{padding:6px 14px;border-radius:99px;background:var(--card);border:1px solid var(--borda);white-space:nowrap;color:var(--sub)}
+ .chip.sel{background:var(--acc);border-color:var(--acc);color:#fff}
+ select.chip{appearance:none;-webkit-appearance:none;margin-left:auto}
+ main{max-width:1400px;margin:0 auto;padding:16px 16px 40px}
+ h2{font-size:1.05em;margin:8px 0 12px;color:#e4e4e7}
+ .grade{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:14px}
+ @media (max-width:520px){.grade{grid-template-columns:repeat(2,1fr);gap:10px}}
+ .card{display:flex;flex-direction:column;background:var(--card);border:1px solid var(--borda);border-radius:14px;overflow:hidden;
+  text-align:left;transition:transform .15s,border-color .15s}
+ .card:hover{transform:translateY(-3px);border-color:rgba(167,139,250,.5)}
+ .card.off{opacity:.55}
+ .capa{position:relative;aspect-ratio:2/3;display:grid;place-items:center;font-size:2.6em;font-weight:800;color:rgba(255,255,255,.9);
+  text-shadow:0 2px 12px rgba(0,0,0,.4);letter-spacing:-.02em;padding:12px;text-align:center;overflow:hidden}
+ .capa small{position:absolute;left:8px;top:8px;font-size:.3em;font-weight:700;padding:3px 8px;border-radius:6px;background:rgba(0,0,0,.55);
+  text-shadow:none;letter-spacing:0}
+ .capa .q{left:auto;right:8px}
+ .barra{position:absolute;left:0;right:0;bottom:0;height:4px;background:rgba(0,0,0,.4)}
+ .barra i{display:block;height:100%;background:var(--acc2)}
+ .info{padding:10px 12px 12px}
+ .info b{display:block;font-size:.95em;line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+ .info span{display:block;color:var(--sub);font-size:.8em;margin-top:4px}
+ .continuar{display:flex;gap:12px;overflow-x:auto;padding-bottom:6px;margin-bottom:18px;scrollbar-width:thin}
+ .continuar .card{flex:0 0 220px}
+ .continuar .capa{aspect-ratio:16/9;font-size:1.6em}
+ #msg{color:var(--sub);text-align:center;padding:60px 20px}
+ #msg b{display:block;color:var(--txt);font-size:1.1em;margin-bottom:6px}
+ .girando{width:38px;height:38px;margin:0 auto 14px;border-radius:50%;border:4px solid rgba(255,255,255,.15);border-top-color:var(--acc2);
+  animation:gira .8s linear infinite}
+ @keyframes gira{to{transform:rotate(360deg)}}
+ #painel{position:fixed;inset:0;z-index:10;background:rgba(0,0,0,.65);display:none;align-items:flex-end;justify-content:center}
+ #painel.ver{display:flex}
+ #folha{width:100%;max-width:720px;max-height:88vh;overflow:auto;background:#111113;border:1px solid var(--borda);border-radius:18px 18px 0 0;
+  padding:18px 16px max(18px,env(safe-area-inset-bottom))}
+ @media (min-width:760px){#painel{align-items:center}#folha{border-radius:18px}}
+ #folha h3{margin:0 0 4px;font-size:1.2em}
+ #folha .sub{color:var(--sub);font-size:.85em;margin-bottom:12px}
+ .temps{display:flex;gap:8px;overflow-x:auto;margin-bottom:10px}
+ .ep{display:flex;align-items:center;gap:12px;width:100%;text-align:left;padding:10px;border-radius:12px}
+ .ep:hover{background:rgba(255,255,255,.06)}
+ .ep .n{flex:none;width:42px;height:42px;border-radius:10px;background:var(--card);display:grid;place-items:center;font-weight:700;color:var(--acc2)}
+ .ep .t{flex:1;min-width:0}
+ .ep .t b{display:block;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+ .ep .t span{color:var(--sub);font-size:.8em}
+ .ep .p{height:3px;border-radius:3px;background:rgba(255,255,255,.12);margin-top:5px;overflow:hidden}
+ .ep .p i{display:block;height:100%;background:var(--acc2)}
+ .fechar{float:right;font-size:1.4em;color:var(--sub);width:36px;height:36px}
+</style></head><body>
+<header>
+ <div class="linha">
+  <h1>🍿 Biblioteca</h1>
+  <input id="busca" type="search" placeholder="Buscar filme ou série" autocomplete="off">
+  <button class="icone" id="atualizar" title="Atualizar a lista"><svg viewBox="0 0 24 24"><path d="M17.65 6.35A7.96 7.96 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg></button>
+ </div>
+ <div class="filtros linha" id="filtros">
+  <button class="chip sel" data-f="tudo">Tudo</button>
+  <button class="chip" data-f="filme">🎬 Filmes</button>
+  <button class="chip" data-f="serie">📺 Séries</button>
+  <button class="chip" data-f="baixando">⏳ Baixando</button>
+  <select class="chip" id="ordem" aria-label="Ordenar">
+   <option value="data">Mais recentes</option><option value="nome">Nome (A–Z)</option><option value="tamanho">Maiores</option>
+  </select>
+ </div>
+</header>
+<main>
+ <section id="secContinuar" hidden><h2>Continuar assistindo</h2><div class="continuar" id="continuar"></div></section>
+ <h2 id="tituloGrade" hidden></h2>
+ <div class="grade" id="grade"></div>
+ <div id="msg"><div class="girando"></div>Buscando sua biblioteca no TorBox…</div>
+</main>
+<div id="painel"><div id="folha"></div></div>
+<script>
+(function () {
+ 'use strict';
+ function $(id) { return document.getElementById(id); }
+ var BASE = location.pathname.replace(/\/+$/, '');
+ var itens = [], filtro = 'tudo', DESC = /\b(19[3-9]\d|20[0-4]\d|S\d{1,2}E\d{1,3}|S\d{1,2}|\d{1,2}x\d{2,3}|2160p|1080p|720p|480p|4k|uhd|web[- ]?dl|web[- ]?rip|webrip|blu[- ]?ray|bdrip|brrip|dvdrip|hdtv|hdrip|x26[45]|h ?26[45]|hevc|dual|dublado|legendado|complete|completa|temporada|season|nacional)\b/i;
+
+ function el(tag, classe, texto) { var e = document.createElement(tag); if (classe) e.className = classe; if (texto != null) e.textContent = texto; return e; }
+ function bytes(n) { var u = ['B', 'KB', 'MB', 'GB', 'TB'], i = 0; while (n >= 1024 && i < 4) { n /= 1024; i++; } return (i ? n.toFixed(1) : n) + ' ' + u[i]; }
+ function fmt(s) { s = Math.floor(s || 0); var h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60); return h ? h + 'h' + (m < 10 ? '0' : '') + m : m + 'min'; }
+ function ler(n) {
+  n = n.replace(/\.[a-z0-9]{2,4}$/i, '').replace(/[._]+/g, ' ').replace(/\s+/g, ' ');
+  var ano = (n.match(/\b(19[3-9]\d|20[0-4]\d)\b/) || [])[1];
+  var q = (n.match(/\b(2160p|4k|uhd|1080p|720p|480p)\b/i) || [])[1];
+  if (q && /4k|uhd|2160/i.test(q)) q = '4K';
+  var ep = n.match(/\bS(\d{1,2}) ?E(\d{1,3})\b/i) || n.match(/\b(\d{1,2})x(\d{2,3})\b/);
+  var temp = !ep && n.match(/\b(?:S|season |temporada )(\d{1,2})\b/i);
+  var corte = n.search(DESC);
+  var titulo = (corte > 0 ? n.slice(0, corte) : n).replace(/[\[\(\-–\s]+$/, '').trim();
+  return {titulo: titulo || n.trim(), ano: ano, q: q, temp: ep ? +ep[1] : temp ? +temp[1] : null, ep: ep ? +ep[2] : null};
+ }
+ function progresso(token) {
+  try { var s = JSON.parse(localStorage.getItem('toons:' + token)); return s && s.t > 30 ? s : null; } catch (e) { return null; }
+ }
+ function cor(texto) { var h = 0; for (var i = 0; i < texto.length; i++) h = (h * 31 + texto.charCodeAt(i)) % 360; return h; }
+ function capa(info, pequeno) {
+  var c = el('div', 'capa'), h = cor(info.titulo);
+  c.style.background = 'linear-gradient(150deg,hsl(' + h + ' 55% 38%),hsl(' + ((h + 50) % 360) + ' 60% 14%))';
+  c.textContent = pequeno ? info.titulo : info.titulo.split(' ').slice(0, 3).map(function (p) { return p[0] || ''; }).join('').toUpperCase();
+  return c;
+ }
+ function preparar(it) {
+  var info = ler(it.nome), episodios = 0;
+  it.videos.forEach(function (v) { v.info = ler(v.nome); if (v.info.ep != null) episodios++; });
+  it.info = info;
+  it.serie = it.videos.length > 1 && (episodios > 0 || info.temp != null) || info.temp != null && it.videos.length > 0 && episodios > 0;
+  it.busca = (info.titulo + ' ' + it.nome).toLowerCase();
+  return it;
+ }
+ function abrir(token) { location.href = '/v/' + token; }
+
+ function card(it) {
+  var b = el('button', 'card' + (it.pronto ? '' : ' off')), c = capa(it.info);
+  c.appendChild(el('small', '', it.serie ? 'SÉRIE' : 'FILME'));
+  if (it.info.q) c.appendChild(el('small', 'q', it.info.q));
+  if (!it.pronto) { var bar = el('div', 'barra'), i = el('i'); i.style.width = Math.round((it.progresso || 0) * 100) + '%'; bar.appendChild(i); c.appendChild(bar); }
+  b.appendChild(c);
+  var inf = el('div', 'info');
+  inf.appendChild(el('b', '', it.info.titulo));
+  var meta = [it.info.ano, it.serie ? it.videos.length + ' episódios' : null, bytes(it.tamanho)].filter(Boolean).join(' · ');
+  inf.appendChild(el('span', '', it.pronto ? meta : 'Baixando no TorBox · ' + Math.round((it.progresso || 0) * 100) + '%'));
+  b.appendChild(inf);
+  b.onclick = function () {
+   if (!it.pronto) return alert('Ainda está sendo baixado no TorBox. Tente de novo quando terminar.');
+   if (it.videos.length === 1) return abrir(it.videos[0].token);
+   folha(it);
+  };
+  return b;
+ }
+
+ function folha(it) {
+  var f = $('folha'); f.innerHTML = '';
+  var x = el('button', 'fechar', '✕'); x.onclick = fechar; f.appendChild(x);
+  f.appendChild(el('h3', '', it.info.titulo));
+  f.appendChild(el('div', 'sub', [it.info.ano, it.videos.length + ' vídeos', bytes(it.tamanho)].filter(Boolean).join(' · ')));
+  var grupos = {};
+  it.videos.forEach(function (v) { var t = v.info.temp != null ? v.info.temp : 0; (grupos[t] = grupos[t] || []).push(v); });
+  var temps = Object.keys(grupos).map(Number).sort(function (a, b) { return a - b; });
+  var lista = el('div');
+  function mostrar(t) {
+   lista.innerHTML = '';
+   grupos[t].forEach(function (v, n) {
+    var b = el('button', 'ep'), p = progresso(v.token);
+    b.appendChild(el('div', 'n', v.info.ep != null ? String(v.info.ep) : String(n + 1)));
+    var tx = el('div', 't');
+    tx.appendChild(el('b', '', v.info.ep != null ? 'Episódio ' + v.info.ep : v.info.titulo));
+    tx.appendChild(el('span', '', [bytes(v.tamanho), v.info.q, p ? 'parou em ' + fmt(p.t) : '', v.nome].filter(Boolean).join(' · ')));
+    if (p && p.d) { var bar = el('div', 'p'), i = el('i'); i.style.width = Math.min(100, p.t / p.d * 100) + '%'; bar.appendChild(i); tx.appendChild(bar); }
+    b.appendChild(tx);
+    b.onclick = function () { abrir(v.token); };
+    lista.appendChild(b);
+   });
+  }
+  if (temps.length > 1) {
+   var barra = el('div', 'temps');
+   temps.forEach(function (t, i) {
+    var c = el('button', 'chip' + (i ? '' : ' sel'), t ? 'Temporada ' + t : 'Outros');
+    c.onclick = function () { [].forEach.call(barra.children, function (x) { x.classList.remove('sel'); }); c.classList.add('sel'); mostrar(t); };
+    barra.appendChild(c);
+   });
+   f.appendChild(barra);
+  }
+  f.appendChild(lista);
+  mostrar(temps[0]);
+  $('painel').classList.add('ver');
+ }
+ function fechar() { $('painel').classList.remove('ver'); }
+ $('painel').onclick = function (ev) { if (ev.target === this) fechar(); };
+ document.addEventListener('keydown', function (ev) { if (ev.key === 'Escape') fechar(); });
+
+ function desenhar() {
+  var termo = $('busca').value.trim().toLowerCase(), ordem = $('ordem').value;
+  var lista = itens.filter(function (it) {
+   if (termo && it.busca.indexOf(termo) < 0) return false;
+   if (filtro === 'filme') return it.pronto && !it.serie;
+   if (filtro === 'serie') return it.pronto && it.serie;
+   if (filtro === 'baixando') return !it.pronto;
+   return true;
+  });
+  lista.sort(function (a, b) {
+   if (ordem === 'nome') return a.info.titulo.localeCompare(b.info.titulo, 'pt');
+   if (ordem === 'tamanho') return b.tamanho - a.tamanho;
+   return String(b.data).localeCompare(String(a.data));
+  });
+  var g = $('grade'); g.innerHTML = '';
+  lista.forEach(function (it) { g.appendChild(card(it)); });
+  $('tituloGrade').hidden = !lista.length;
+  $('tituloGrade').textContent = lista.length + (lista.length === 1 ? ' título' : ' títulos');
+  $('msg').hidden = !!lista.length;
+  if (!lista.length) $('msg').innerHTML = itens.length ? '<b>Nada encontrado</b>Tente outra busca ou outro filtro.'
+   : '<b>Nenhum vídeo na sua conta</b>Adicione filmes ou séries no TorBox e toque em atualizar.';
+  // Continuar assistindo: vídeos com posição salva pelo player
+  var cont = [];
+  itens.forEach(function (it) { it.videos.forEach(function (v) { var p = progresso(v.token); if (p && (!p.d || p.t < p.d - 60)) cont.push({it: it, v: v, p: p}); }); });
+  cont.sort(function (a, b) { return (b.p.quando || 0) - (a.p.quando || 0); });
+  var c = $('continuar'); c.innerHTML = '';
+  cont.slice(0, 12).forEach(function (x) {
+   var b = el('button', 'card'), cp = capa({titulo: x.it.info.titulo}, true);
+   if (x.p.d) { var bar = el('div', 'barra'), i = el('i'); i.style.width = Math.min(100, x.p.t / x.p.d * 100) + '%'; bar.appendChild(i); cp.appendChild(bar); }
+   b.appendChild(cp);
+   var inf = el('div', 'info');
+   inf.appendChild(el('b', '', x.it.serie && x.v.info.ep != null ? x.it.info.titulo + ' · ' + (x.v.info.temp != null ? 'T' + x.v.info.temp + ' ' : '') + 'E' + x.v.info.ep : x.it.info.titulo));
+   inf.appendChild(el('span', '', 'parou em ' + fmt(x.p.t)));
+   b.appendChild(inf);
+   b.onclick = function () { abrir(x.v.token); };
+   c.appendChild(b);
+  });
+  $('secContinuar').hidden = !cont.length;
+ }
+
+ function carregar(renovar) {
+  $('msg').hidden = false; $('msg').innerHTML = '<div class="girando"></div>Buscando sua biblioteca no TorBox…';
+  fetch(BASE + '/lista.json' + (renovar ? '?renovar=1' : '')).then(function (r) { return r.json().then(function (j) { return [r.ok, j]; }); })
+   .then(function (res) {
+    if (!res[0]) throw new Error(res[1].erro || 'erro');
+    itens = res[1].itens.map(preparar);
+    desenhar();
+   }).catch(function (e) {
+    $('grade').innerHTML = ''; $('msg').hidden = false;
+    $('msg').innerHTML = '<b>Não consegui carregar a biblioteca</b>';
+    $('msg').appendChild(document.createTextNode(e.message === 'Failed to fetch' ? 'Sem conexão com o celular.' : e.message));
+   });
+ }
+ $('busca').addEventListener('input', desenhar);
+ $('ordem').addEventListener('change', desenhar);
+ $('atualizar').onclick = function () { carregar(true); };
+ [].forEach.call(document.querySelectorAll('#filtros [data-f]'), function (b) {
+  b.onclick = function () {
+   filtro = b.dataset.f;
+   [].forEach.call(document.querySelectorAll('#filtros [data-f]'), function (x) { x.classList.toggle('sel', x === b); });
+   desenhar();
+  };
+ });
+ window.addEventListener('pageshow', function (ev) { if (ev.persisted && itens.length) desenhar(); });  // voltou do player
+ carregar(false);
+})();
+</script></body></html>
+"""
+
+
 # ── O servidor ───────────────────────────────────────────────────────
 
 def _compartilhamentos() -> list:
@@ -5892,6 +6323,8 @@ def _compartilhamentos() -> list:
 
 
 def achar_compartilhamento(token: str):
+    if re.fullmatch(r"tb[tuw]\d+x\d+k[A-Za-z0-9_-]+", token):  # vídeo do catálogo do TorBox
+        return item_torbox(token)
     achado = None
     for item in _compartilhamentos():
         if hmac.compare_digest(str(item.get("token", "")).encode(), token.encode()):
@@ -5924,6 +6357,8 @@ def config_do_player(item: dict, fontes: list, sonda) -> dict:
         "audio_padrao": audio_padrao,
         "legendas": [{"rotulo": l["rotulo"]} for l in legendas],
         "legenda_padrao": _legenda_padrao(legendas, bool(audios) and _eh_portugues(audios[audio_padrao])),
+        "voltar": item.get("voltar"),
+        "proximo": item.get("proximo"),
     }
 
 
@@ -5991,6 +6426,12 @@ class _HandlerMidia(BaseHTTPRequestHandler):
                 return self._json(500, {"erro": "Não consegui extrair essa legenda."}, com_corpo)
         elif legenda["tipo"] == "link":
             dados = _baixar_legenda_link(legenda["ref"])
+        elif legenda["tipo"] == "torbox":
+            try:
+                letra, id_item, _ = item["torbox"]
+                dados = _baixar_legenda_link(torbox_link(_torbox_config()[0], letra, id_item, legenda["ref"]))
+            except ToonsError:
+                dados = None
         else:
             try:
                 dados = Path(legenda["ref"]).read_bytes()
@@ -6107,7 +6548,7 @@ class _HandlerMidia(BaseHTTPRequestHandler):
     def _estado(self, item: dict, com_corpo: bool) -> None:
         """Por que a transmissão falhou? O player pergunta isso para mostrar uma mensagem útil."""
         fonte = fonte_de(item)
-        if item.get("pagina"):  # pede endereços novos ao yt-dlp: os antigos podem ter expirado
+        if item.get("pagina") or item.get("torbox"):  # pede endereços novos: os antigos podem ter expirado
             try:
                 fonte = fontes_de(item, renovar=True)[0]
             except ToonsError as e:
@@ -6128,8 +6569,30 @@ class _HandlerMidia(BaseHTTPRequestHandler):
             return self._json(200, {"ok": False, "erro": "Muita gente assistindo ao mesmo tempo. Tente de novo daqui a pouco."}, com_corpo)
         return self._json(200, {"ok": True}, com_corpo)
 
+    def _catalogo(self, codigo: str, lista: bool, consulta: dict, com_corpo: bool) -> None:
+        """Página da biblioteca do TorBox (/tb/<código>) e a lista dela em JSON."""
+        chave, catalogo = _torbox_config()
+        if not chave or not catalogo or not hmac.compare_digest(codigo.encode(), catalogo.encode()):
+            return self._aviso(404, "Link não encontrado.", com_corpo)
+        if not lista:
+            return self._enviar(200, "text/html; charset=utf-8", PAGINA_TORBOX.encode(), com_corpo,
+                                {"Content-Security-Policy": "default-src 'self'; script-src 'unsafe-inline'; "
+                                 "style-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'"})
+        try:
+            itens = torbox_biblioteca(chave, renovar=consulta.get("renovar") == ["1"])
+        except ToonsError as e:
+            return self._json(502, {"erro": str(e)}, com_corpo)
+        saida = [{**{k: it[k] for k in ("tipo", "id", "nome", "tamanho", "data", "pronto", "progresso")},
+                  "videos": [{"nome": v["nome"], "tamanho": v["tamanho"],
+                              "token": token_torbox(catalogo, it["tipo"], it["id"], v["fid"])} for v in it["videos"]]}
+                 for it in itens]
+        return self._json(200, {"itens": saida}, com_corpo)
+
     def _tratar(self, com_corpo: bool) -> None:
         partes = urllib.parse.urlsplit(self.path)
+        catalogo = re.fullmatch(r"/tb/([A-Za-z0-9_-]{8,40})(/lista\.json)?/?", partes.path)
+        if catalogo:
+            return self._catalogo(catalogo.group(1), bool(catalogo.group(2)), urllib.parse.parse_qs(partes.query), com_corpo)
         m = re.fullmatch(r"/v/([A-Za-z0-9_-]{8,64})(?:/(video|stream|ponto|estado|legenda/(\d{1,3})\.vtt))?/?", partes.path)
         item = achar_compartilhamento(m.group(1)) if m else None
         if item is None:
@@ -6169,7 +6632,7 @@ class _HandlerMidia(BaseHTTPRequestHandler):
         self._tratar(False)
 
     def log_message(self, fmt, *args):
-        texto = re.sub(r"/v/([A-Za-z0-9_-]{4})[A-Za-z0-9_-]*", r"/v/\1…", fmt % args)  # não grava o link inteiro
+        texto = re.sub(r"/(v|tb)/([A-Za-z0-9_-]{4})[A-Za-z0-9_-]*", r"/\1/\2…", fmt % args)  # não grava o link inteiro
         log(f"{self.client_address[0]} {texto}")
 
 
@@ -6586,6 +7049,114 @@ def _preparar_legendas(item: dict, sonda) -> None:
 
 
 @submenu
+def menu_torbox():
+    """Catálogo da biblioteca do TorBox no navegador: um link só para todos os filmes e séries."""
+    c = cfg()
+
+    def exigir_chave():
+        if not c.get("torbox_chave"):
+            raise ToonsError("Configure primeiro a chave da API do TorBox (primeira opção deste menu).")
+        if not c.get("torbox_catalogo"):
+            c["torbox_catalogo"] = secrets.token_urlsafe(12)
+            salvar_cfg()
+
+    def links() -> list:
+        caminho = f"/tb/{c['torbox_catalogo']}"
+        lista = [("Mesma rede Wi-Fi", f"http://{ip_local()}:{c['midia_porta']}{caminho}")]
+        if servico_ativo("tunel-midia") and url_tunel("tunel-midia"):
+            lista.append(("Internet", f"{url_tunel('tunel-midia')}{caminho}"))
+        return lista
+
+    def configurar():
+        info("No TorBox: torbox.app → Settings → API → copie a 'API Key'. Ela fica só neste celular "
+             "(no config.json, com permissão 600) e nunca é enviada para quem abre o catálogo.")
+        chave = perguntar("Chave da API do TorBox").strip()
+        if not chave:
+            return
+        info("Testando a chave...")
+        itens = torbox_biblioteca(chave, renovar=True)
+        c["torbox_chave"] = chave
+        exigir_chave()
+        salvar_cfg()
+        ok(f"Chave funcionando: {len(itens)} título(s) com {sum(len(it['videos']) for it in itens)} vídeo(s).")
+        if confirmar("Abrir o catálogo agora?", True):
+            abrir()
+
+    def abrir():
+        exigir_chave()
+        garantir_servidor_midia()
+        link = f"http://127.0.0.1:{c['midia_porta']}/tb/{c['torbox_catalogo']}"
+        if tem("termux-open-url"):
+            rodar(["termux-open-url", link], capturar=True, timeout=20)
+        else:
+            info(f"Abra no navegador: {link}")
+
+    def mostrar_enviar():
+        exigir_chave()
+        garantir_servidor_midia()
+        for onde, link in links():
+            print(f"  {CIANO}{onde}:{RST}\n  {NEG}{link}{RST}")
+        aviso("Quem tiver este link vê e assiste a TODA a sua biblioteca do TorBox. Mande só para quem você "
+              "confia; 'Gerar um link novo' corta o acesso de quem tem o antigo.")
+        if len(links()) == 1:
+            info("Para assistir fora do seu Wi-Fi, ligue o túnel neste menu.")
+        _, link = links()[-1]
+        i = escolher("O que fazer com o link?", ["Copiar link", "Enviar pelo WhatsApp, Telegram... (menu do Android)",
+                                                 "Mostrar QR code", "Nada"], "4")
+        if i == 0:
+            _tapi(["termux-clipboard-set"], 10, entrada=link, json_saida=False)
+            ok("Link copiado.")
+        elif i == 1:
+            _tapi(["termux-share", "-a", "send"], 30, entrada=f"🍿 Minha biblioteca\n{link}", json_saida=False)
+        elif i == 2 and garantir_cmd("qrencode", "libqrencode"):
+            rodar(["qrencode", "-t", "ansiutf8"], entrada=link, mostrar=False)
+
+    def assistir_aqui():
+        exigir_chave()
+        itens = [it for it in torbox_biblioteca(c["torbox_chave"], renovar=True) if it["pronto"]]
+        i = escolher("Qual título?", [f"{it['nome']} · {len(it['videos'])} vídeo(s)" for it in itens])
+        if i is None:
+            return
+        videos = itens[i]["videos"]
+        j = 0 if len(videos) == 1 else escolher("Qual vídeo?", [v["nome"] for v in videos])
+        if j is None:
+            return
+        link = torbox_link(c["torbox_chave"], itens[i]["tipo"], itens[i]["id"], videos[j]["fid"])
+        k = escolher("Abrir em qual app?", ["VLC", "Escolher o app (MX Player, Just Player...)"])
+        if k is not None:
+            abrir_no_android(link, VLC_ANDROID if k == 0 else None)
+
+    def tunel():
+        exigir_chave()
+        garantir_servidor_midia()
+        abrir_tunel("tunel-midia", c["midia_porta"])
+        mostrar_enviar()
+
+    def novo_link():
+        if confirmar("Gerar um link novo? O antigo (e os vídeos abertos por ele) param de funcionar.", True):
+            c["torbox_catalogo"] = secrets.token_urlsafe(12)
+            salvar_cfg()
+            ok("Link novo gerado.")
+            mostrar_enviar()
+
+    def remover():
+        if confirmar("Apagar a chave do TorBox deste celular? O catálogo para de funcionar.", False):
+            c["torbox_chave"] = c["torbox_catalogo"] = ""
+            salvar_cfg()
+            ok("Chave apagada.")
+
+    menu("🍿 Catálogo do TorBox", [
+        (lambda: f"Configurar a chave da API ({'configurada' if c.get('torbox_chave') else 'não configurada'})", configurar),
+        ("Abrir o catálogo neste celular (navegador)", abrir),
+        ("Mostrar / enviar o link do catálogo", mostrar_enviar),
+        ("Túnel para a internet: ligar (assistir fora do Wi-Fi)", tunel),
+        ("Assistir um vídeo da biblioteca no VLC deste celular", assistir_aqui),
+        ("Gerar um link novo (o antigo para de funcionar)", novo_link),
+        ("Remover a chave do TorBox", remover),
+    ])
+
+
+@submenu
 def menu_midia():
     c = cfg()
     direitos = ("Compartilhe só o que você pode distribuir: vídeos seus, de domínio público, de licença livre "
@@ -6784,6 +7355,7 @@ def menu_midia():
     menu("📺 Compartilhar filme por link", [
         ("▶  Compartilhar um filme do celular (criar link)", compartilhar),
         ("🌐 Transmitir de um link da internet (sem baixar)", compartilhar_link),
+        ("🍿 Catálogo do TorBox (todos os seus filmes e séries num link só)", menu_torbox),
         ("Meus links (copiar, enviar, assistir, apagar)", ver_links),
         ("Assistir um link neste celular (VLC, MX Player...)", assistir_link_no_celular),
         ("Converter filme para MP4 compatível", converter),
@@ -8280,7 +8852,7 @@ def menu_config():
         for chave, valor in c.items():
             if chave in ("monitores", "compartilhamentos"):
                 valor = f"{len(valor)} item(ns)"
-            elif chave.endswith("token"):
+            elif chave.endswith(("token", "_chave", "_catalogo")):
                 valor = mascarar(valor)
             print(f"  {CIANO}{chave:<24}{RST} {valor}")
         print(f"\nArquivo: {CONFIG_FILE}")
