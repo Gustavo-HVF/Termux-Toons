@@ -80,8 +80,12 @@ try:
 except ImportError:  # sem terminal POSIX (ex.: Windows): só o modo numérico
     termios = tty = None
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 SCRIPT = Path(__file__).resolve()
+try:  # muda a cada atualização do código: serve para reiniciar serviços que ainda rodam a versão antiga
+    ASSINATURA = hashlib.sha1(SCRIPT.read_bytes()).hexdigest()[:10]
+except OSError:
+    ASSINATURA = "?"
 HOME = Path.home()
 PREFIX = os.environ.get("PREFIX", "")
 IS_TERMUX = "com.termux" in PREFIX or "TERMUX_VERSION" in os.environ
@@ -6371,7 +6375,7 @@ def _numero(consulta: dict, chave: str, padrao: float) -> float:
 
 
 class _HandlerMidia(BaseHTTPRequestHandler):
-    server_version = f"TermuxToons/{VERSION}"
+    server_version = f"TermuxToons/{VERSION}-{ASSINATURA}"
     timeout = 120  # solta conexões paradas
     maximo_transmissoes = 3
 
@@ -6765,9 +6769,9 @@ def garantir_servidor_midia() -> bool:
     porta = cfg()["midia_porta"]
     if servico_ativo("midia"):
         versao = _versao_servidor_midia(porta)
-        if not versao or f"TermuxToons/{VERSION}" in versao:
+        if not versao or f"TermuxToons/{VERSION}-{ASSINATURA}" in versao:
             return True
-        info("O servidor de vídeo é de uma versão anterior do Termux-Toons; reiniciando...")
+        info("O servidor de vídeo ainda roda o código antigo do Termux-Toons (de antes da atualização); reiniciando...")
         parar_servico("midia")
         time.sleep(1)
     if not porta_livre(porta):
