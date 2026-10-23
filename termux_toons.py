@@ -23,7 +23,7 @@ Reúne em um único menu:
       player próprio, troca de trilha de áudio e conversão na hora (servidor de vídeo + túnel)
   17. Depuração sem fio (ADB pelo Wi-Fi) do próprio celular, sem PC e sem root
   18. Gerenciador de arquivos: copiar, mover, renomear, compactar e ver Android/data (ADB ou root)
-  19. Calculadora científica (funções, constantes, variáveis, graus/radianos), sem instalar nada
+  19. Calculadora científica (fatorial, porcentagem, trigonometria, estatística, bases, frações)
 
 Uso:
     python termux_toons.py            # menu interativo
@@ -60,6 +60,7 @@ import shlex
 import shutil
 import socket
 import stat
+import statistics
 import subprocess
 import sys
 import tarfile
@@ -74,6 +75,7 @@ import uuid
 import xml.etree.ElementTree as ET
 import zipfile
 from datetime import datetime
+from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -9534,7 +9536,7 @@ def gerenciador_arquivos(inicio: str | None = None) -> None:
 
 CALC_MAX_BITS = 14000      # ~4200 dígitos; abaixo do limite de int→texto do Python
 CALC_MAX_FATORIAL = 1000
-CALC_RESERVADOS = ("ans", "pi", "e", "tau", "inf")
+CALC_RESERVADOS = ("ans", "pi", "e", "tau", "inf", "mod")
 
 
 def _calc_int(x, nome: str) -> int:
@@ -9596,6 +9598,39 @@ def _calc_funcoes(graus: bool) -> dict:
     def log(x, base=10):
         return math.log(x, base)
 
+    def raiz(x, n=2):
+        n = _calc_int(n, "raiz")
+        if n == 0:
+            raise ToonsError("Raiz de índice zero não existe.")
+        if x < 0 and n % 2:  # raiz ímpar de negativo é real: raiz(-27, 3) = -3
+            return -(abs(x) ** (1 / n))
+        if x < 0:
+            raise ToonsError("Raiz par de número negativo não é real.")
+        r = x ** (1 / n)
+        return round(r) if round(r) ** n == x else r  # raiz(8, 3) dá 2, não 2.0000000000000004
+
+    def inversa(f, nome):
+        def g(x):
+            v = f(x)
+            if v == 0:
+                raise ToonsError(f"{nome} não existe nesse ângulo.")
+            return 1 / v
+        return g
+
+    def lista(f, minimo=1):
+        def g(*v):
+            if len(v) < minimo:
+                raise ToonsError(f"Informe pelo menos {minimo} número(s), separados por vírgula.")
+            return f(v)
+        return g
+
+    def aleatorio(a=None, b=None):
+        if a is None:
+            return random.random()
+        if b is None:
+            a, b = 1, a
+        return random.randint(_calc_int(a, "aleatorio"), _calc_int(b, "aleatorio"))
+
     def arredondar(x, casas=0):
         return round(x, _calc_int(casas, "round"))
 
@@ -9603,9 +9638,13 @@ def _calc_funcoes(graus: bool) -> dict:
         "sin": sen, "sen": sen, "cos": cos, "tan": tan,
         "asin": lambda x: de_rad(math.asin(x)), "asen": lambda x: de_rad(math.asin(x)),
         "acos": lambda x: de_rad(math.acos(x)), "atan": lambda x: de_rad(math.atan(x)),
+        "sec": inversa(cos, "Secante"), "csc": inversa(sen, "Cossecante"),
+        "cossec": inversa(sen, "Cossecante"), "cot": inversa(tan, "Cotangente"),
+        "cotg": inversa(tan, "Cotangente"),
         "sinh": math.sinh, "senh": math.sinh, "cosh": math.cosh, "tanh": math.tanh,
-        "sqrt": math.sqrt, "raiz": math.sqrt, "cbrt": lambda x: math.copysign(abs(x) ** (1 / 3), x),
-        "ln": math.log, "log": log, "log2": math.log2, "exp": math.exp,
+        "asinh": math.asinh, "asenh": math.asinh, "acosh": math.acosh, "atanh": math.atanh,
+        "sqrt": math.sqrt, "raiz": raiz, "cbrt": lambda x: raiz(x, 3),
+        "ln": math.log, "log": log, "log10": math.log10, "log2": math.log2, "exp": math.exp,
         "abs": abs, "floor": math.floor, "ceil": math.ceil, "round": arredondar,
         "fat": _calc_fatorial, "fact": _calc_fatorial, "factorial": _calc_fatorial,
         "gcd": lambda a, b: math.gcd(_calc_int(a, "gcd"), _calc_int(b, "gcd")),
@@ -9615,7 +9654,11 @@ def _calc_funcoes(graus: bool) -> dict:
         "comb": lambda n, k: math.comb(_calc_int(n, "comb"), _calc_int(k, "comb")),
         "perm": lambda n, k: math.perm(_calc_int(n, "perm"), _calc_int(k, "perm")),
         "graus": math.degrees, "radianos": math.radians,
-        "min": min, "max": max,
+        "min": lista(min), "max": lista(max), "soma": lista(sum),
+        "media": lista(statistics.fmean), "mediana": lista(statistics.median),
+        "desvio": lista(statistics.stdev, 2),
+        "aleatorio": aleatorio, "rand": aleatorio,
+        "_pct": lambda x: x / 100,  # 'x%' (porcentagem) vira _pct(x)
     }
     return funcs
 
@@ -9628,17 +9671,96 @@ _CALC_BINARIOS = {
 }
 
 
+_CALC_TOKEN = re.compile(
+    r"\s*(?:(0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|(?:\d[\d_]*\.?\d*|\.\d+)(?:[eE][+-]?\d+)?)"
+    r"|([A-Za-z_]\w*)|(\*\*|//|[-+*/%^(),!√]))")
+
+
+def _calc_preparar(texto: str, funcoes: dict) -> str:
+    """Reescreve o jeito de digitar de calculadora em sintaxe que o `ast` entende:
+    5! → fat(5), 10% → _pct(10), √9 → sqrt(9), 'mod' → %, ^ → **, 2pi → 2*pi, 3(4+5) → 3*(4+5)."""
+    tokens, pos = [], 0
+    texto = texto.rstrip()
+    while pos < len(texto):
+        m = _CALC_TOKEN.match(texto, pos)
+        if not m:
+            raise ToonsError(f"Caractere inválido: '{texto[pos:].strip()[0]}'.")
+        pos = m.end()
+        if m.group(1):
+            tokens.append(("num", m.group(1)))
+        elif m.group(2):
+            tokens.append(("op", "%") if m.group(2) == "mod" else ("nome", m.group(2)))
+        else:
+            tokens.append(("op", "**" if m.group(3) == "^" else m.group(3)))
+
+    # √ vale para o que vem logo depois: um número, um nome, (grupo) ou função(...)
+    while ("op", "√") in tokens:
+        i = len(tokens) - 1 - tokens[::-1].index(("op", "√"))  # de trás para frente: √√16
+        fim = i + 1
+        if fim < len(tokens) and tokens[fim][0] == "nome" and tokens[fim][1] in funcoes:
+            fim += 1
+        if fim < len(tokens) and tokens[fim] == ("op", "("):
+            nivel = 0
+            for fim in range(fim, len(tokens)):
+                nivel += {("op", "("): 1, ("op", ")"): -1}.get(tokens[fim], 0)
+                if nivel == 0:
+                    break
+            else:
+                raise ToonsError("Parênteses não fecham.")
+        elif fim >= len(tokens) or tokens[fim][0] not in ("num", "nome"):
+            raise ToonsError("'√' precisa de um número depois.")
+        tokens[i:fim + 1] = [("nome", "sqrt"), ("op", "(")] + tokens[i + 1:fim + 1] + [("op", ")")]
+
+    def inicio_operando(saida, simbolo):
+        """Índice onde começa o número, nome ou (grupo) logo antes de '!' ou '%'."""
+        if not saida:
+            raise ToonsError(f"'{simbolo}' precisa de um número antes.")
+        if saida[-1] == ("op", ")"):
+            nivel = 0
+            for i in range(len(saida) - 1, -1, -1):
+                nivel += {("op", ")"): 1, ("op", "("): -1}.get(saida[i], 0)
+                if nivel == 0:
+                    # inclui o nome da função: sqrt(4)! → fat(sqrt(4))
+                    return i - 1 if i and saida[i - 1][0] == "nome" and saida[i - 1][1] in funcoes else i
+            raise ToonsError("Parênteses não fecham.")
+        if saida[-1][0] in ("num", "nome"):
+            return len(saida) - 1
+        raise ToonsError(f"'{simbolo}' precisa de um número antes.")
+
+    saida = []
+    for i, tok in enumerate(tokens):
+        seguinte = tokens[i + 1] if i + 1 < len(tokens) else None
+        # '%' no fim ou antes de outro operador é porcentagem; antes de um número é resto (mod)
+        porcentagem = tok == ("op", "%") and (seguinte is None or (seguinte[0] == "op" and seguinte[1] != "("))
+        if tok == ("op", "!") or porcentagem:
+            j = inicio_operando(saida, tok[1])
+            nome = "fat" if tok[1] == "!" else "_pct"
+            saida[j:] = [("nome", nome), ("op", "(")] + saida[j:] + [("op", ")")]
+            continue
+        if saida:
+            antes = saida[-1]
+            # multiplicação implícita: 2pi, 2x, 2(3+4), (1+2)(3+4), 2sin(30), x(2)
+            if ((antes[0] == "num" or antes == ("op", ")") or (antes[0] == "nome" and antes[1] not in funcoes))
+                    and (tok[0] == "nome" or tok == ("op", "("))):
+                saida.append(("op", "*"))
+            elif antes == ("op", ")") and tok[0] == "num":
+                saida.append(("op", "*"))
+        saida.append(tok)
+    return " ".join(valor for _, valor in saida)
+
+
 def calc_avaliar(texto: str, variaveis: dict | None = None, graus: bool = True):
     """Calcula uma expressão e devolve int ou float. Erros viram ToonsError."""
     variaveis = variaveis or {}
     constantes = {"pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf, **variaveis}
     funcoes = _calc_funcoes(graus)
-    texto = (texto.strip().replace("^", "**").replace("×", "*").replace("÷", "/")
-             .replace("π", "pi").replace("−", "-"))
+    texto = (texto.strip().replace("×", "*").replace("÷", "/").replace("π", "pi")
+             .replace("−", "-"))
     if not texto:
         raise ToonsError("Digite uma conta.")
     if len(texto) > 500:
         raise ToonsError("Expressão longa demais.")
+    texto = _calc_preparar(texto, funcoes)
 
     def calc(no):
         if isinstance(no, ast.Expression):
@@ -9652,6 +9774,15 @@ def calc_avaliar(texto: str, variaveis: dict | None = None, graus: bool = True):
         if isinstance(no, ast.UnaryOp) and isinstance(no.op, (ast.USub, ast.UAdd)):
             valor = calc(no.operand)
             return -valor if isinstance(no.op, ast.USub) else valor
+        if isinstance(no, ast.Tuple):
+            raise ToonsError("Use ponto para decimais (3.5); a vírgula separa argumentos, como em log(8, 2).")
+        # porcentagem como no celular: 200 + 10% = 220, 200 - 10% = 180
+        if (isinstance(no, ast.BinOp) and isinstance(no.op, (ast.Add, ast.Sub))
+                and isinstance(no.right, ast.Call) and isinstance(no.right.func, ast.Name)
+                and no.right.func.id == "_pct" and len(no.right.args) == 1):
+            base = calc(no.left)
+            parte = base * calc(no.right.args[0]) / 100
+            return _calc_verificar(base + parte if isinstance(no.op, ast.Add) else base - parte)
         if isinstance(no, ast.BinOp) and type(no.op) in _CALC_BINARIOS:
             return _calc_verificar(_CALC_BINARIOS[type(no.op)](calc(no.left), calc(no.right)))
         if isinstance(no, ast.Call) and isinstance(no.func, ast.Name) and not no.keywords:
@@ -9671,6 +9802,8 @@ def calc_avaliar(texto: str, variaveis: dict | None = None, graus: bool = True):
         raise ToonsError("Divisão por zero.") from None
     except ValueError as e:
         motivo = "fora do domínio da função" if "domain" in str(e) else str(e)
+        if isinstance(e, statistics.StatisticsError):
+            motivo = "faltam números para essa estatística"
         raise ToonsError(f"Conta impossível ({motivo}).") from None
     except OverflowError:
         raise ToonsError("Resultado grande demais.") from None
@@ -9691,15 +9824,19 @@ def calc_formatar(v) -> str:
 
 
 AJUDA_CALCULADORA = """\
-Operadores:  + - * /  ^ ou **  (potência)   // (divisão inteira)   % (resto)   ( )
-Constantes:  pi  e  tau  inf        ans = último resultado
-Funções:     sin cos tan asin acos atan  sinh cosh tanh   sqrt raiz cbrt
-             ln log(x) log(x, base) log2 exp   abs floor ceil round(x, casas)
-             fat(n)  mdc/gcd  mmc/lcm  comb(n,k)  perm(n,k)  min max
-             graus(rad) radianos(graus)
-Variáveis:   x = 5   e depois  x*2   ('vars' lista)
-Comandos:    deg / rad (modo dos ângulos)   hist   limpar   ajuda   (Enter vazio sai)
-Exemplos:    sqrt(2)*pi    sin(30)    2^10    fat(10)/comb(10,3)    log(1000)"""
+Operadores:  + - * /  ^ ou **  (potência)  //  mod (resto)  5! (fatorial)  ( )
+Porcentagem: 10%  200*10%  200+10% (=220)  200-10% (=180)
+Constantes:  pi  e  tau  inf        ans = último resultado (começar com * / ^ continua dele)
+Trigonom.:   sin cos tan  asin acos atan  sec csc cot  sinh cosh tanh  asinh acosh atanh
+Funções:     sqrt  raiz(x, n)  cbrt  ln  log(x)  log(x, base)  log2  exp
+             abs floor ceil round(x, casas)  fat(n)  mdc  mmc  comb(n,k)  perm(n,k)
+             graus(rad)  radianos(graus)  aleatorio()  aleatorio(a, b)
+Estatística: soma(…)  media(…)  mediana(…)  desvio(…)  min(…)  max(…)
+Números:     1.5e3   0xFF   0b1010   0o17      2pi e 3(4+5) multiplicam sozinhos
+Variáveis:   x = 5   e depois  2x   ('vars' lista)
+Comandos:    deg / rad   hex  bin  oct  frac (mostra ans em outra forma)
+             hist   limpar   ajuda   (Enter vazio sai)
+Exemplos:    sqrt(2)pi    sin(30)    2^10    10!/3!    log(1000)    media(7, 8.5, 10)"""
 
 
 @submenu
@@ -9735,6 +9872,22 @@ def menu_calculadora():
                 print(f"  {DIM}{conta}{RST} = {calc_formatar(resultado)}")
             if not historico:
                 info("Nada calculado ainda.")
+        elif comando in ("hex", "bin", "oct", "frac"):
+            if "ans" not in variaveis:
+                info("Faça uma conta primeiro.")
+            elif comando == "frac":
+                fracao = Fraction(variaveis["ans"]).limit_denominator(10**6)
+                exata = float(fracao) == variaveis["ans"]
+                print(f"  {VERD}={RST} {NEG}{fracao}{RST}" + ("" if exata else f"  {DIM}(aproximada){RST}"))
+            else:
+                valor = variaveis["ans"]
+                if isinstance(valor, float) and valor.is_integer():
+                    valor = int(valor)
+                if not isinstance(valor, int):
+                    erro("Só números inteiros podem ser mostrados em outra base.")
+                else:
+                    convertido = {"hex": hex, "bin": bin, "oct": oct}[comando](valor)
+                    print(f"  {VERD}={RST} {NEG}{convertido}{RST}")
         elif comando in ("limpar", "clear", "cls"):
             variaveis.clear()
             historico.clear()
@@ -9743,6 +9896,9 @@ def menu_calculadora():
         else:
             atribuicao = re.fullmatch(r"([A-Za-z_]\w*)\s*=(?!=)\s*(.+)", entrada)
             expressao = atribuicao.group(2) if atribuicao else entrada
+            # começar com operador continua do último resultado, como numa calculadora: "* 2"
+            if "ans" in variaveis and re.match(r"\s*(\*|/|\^|mod\b|%)", expressao):
+                expressao = "ans " + expressao
             try:
                 if atribuicao and (atribuicao.group(1) in CALC_RESERVADOS
                                    or atribuicao.group(1).lower() in _calc_funcoes(graus)):
