@@ -2973,25 +2973,48 @@ def _modem_dispositivo() -> str:
     return dev
 
 
-def modem_enviar(comando: str, espera: float = 3.0, final: str | None = None) -> str:
+# Códigos com que o modem encerra uma resposta (3GPP TS 27.007 / V.250).
+_MODEM_FALHA = re.compile(r"^(?:ERROR|\+CM[ES] ERROR\b.*|NO CARRIER|BUSY|NO ANSWER|NO DIALTONE)$", re.M | re.I)
+
+# Lê linha a linha e para assim que chega um código final, em vez de sempre esperar o tempo todo.
+_MODEM_LER = (
+    'CR=$(printf "\\r"); '
+    'while IFS= read -r l; do l=${l%"$CR"}; printf "%s\\n" "$l"; '
+    'case "$l" in OK|ERROR|"+CME ERROR"*|"+CMS ERROR"*|"NO CARRIER"|BUSY|"NO ANSWER"|"NO DIALTONE") exit 0;; esac; '
+    'done'
+)
+
+# Confere que a porta é um dispositivo (como root, '<>' criaria um arquivo comum num caminho
+# errado), abre como leitura+escrita (fd 3) num bloco { } — se a abertura falhar o shell segue
+# (um 'exec 3<>' que falha encerra o sh do Android antes de avisar) —, descarta restos de
+# respostas antigas, envia o comando com CR e lê a resposta.
+_MODEM_SCRIPT = (
+    '[ -c "$DEV" ] && { stty -F "$DEV" "$BAUD" raw -echo clocal; '
+    'timeout 0.3 cat <&3 >/dev/null; '
+    'printf "%s\\r" "$CMD" >&3; '
+    '[ -n "$FIM" ] && { sleep 1; printf "%s" "$FIM" >&3; }; '
+    'timeout "$TO" sh -c "$LER" <&3; exit 0; } 2>/dev/null 3<>"$DEV"; '
+    'echo __SEM_PORTA__; exit 7'
+)
+
+
+def modem_enviar(comando: str, espera: float = 3.0, final: str | None = None, dev: str | None = None) -> str:
     """Envia um comando AT ao modem (via root) e devolve a resposta já limpa.
-    `final`, se dado, é um texto enviado logo depois (ex.: Ctrl-Z para concluir um SMS)."""
+    `espera` é o tempo MÁXIMO: a leitura termina antes, no código final (OK, ERROR...).
+    `final`, se dado, é um texto enviado logo depois (ex.: Ctrl-Z para concluir um SMS).
+    `dev` usa outra porta sem mexer na configuração (para testar portas)."""
     if not tem_root():
         raise ToonsError("Falar com o modem exige root (o comando 'su' não respondeu).")
-    dev = _modem_dispositivo()
-    baud = str(cfg().get("modem_baud", "115200"))
-    # abre a porta como leitura+escrita (fd 3), escreve o comando com CR e lê a resposta até estourar o tempo
-    script = (
-        'exec 3<>"$DEV" 2>/dev/null || { echo __SEM_PORTA__; exit 7; }; '
-        'stty -F "$DEV" "$BAUD" raw -echo 2>/dev/null; '
-        'printf "%s\\r" "$CMD" >&3; '
-        '[ -n "$FIM" ] && { sleep 0.5; printf "%s" "$FIM" >&3; }; '
-        'timeout "$TO" cat <&3'
-    )
-    env = (f"DEV={shlex.quote(dev)} BAUD={shlex.quote(baud)} CMD={shlex.quote(comando)} "
-           f"TO={shlex.quote(str(espera))} FIM={shlex.quote(final or '')}; ")
-    proc = rodar(["su", "-c", env + script], capturar=True, timeout=espera + 15, mostrar=False)
-    saida_bruta = (proc.stdout or "") + (proc.stderr or "")
+    dev = dev or _modem_dispositivo()
+    variaveis = {"DEV": dev, "BAUD": str(cfg().get("modem_baud", "115200")), "CMD": comando,
+                 "TO": f"{espera:g}", "FIM": final or "", "LER": _MODEM_LER, "SCRIPT": _MODEM_SCRIPT}
+    # o 'timeout' de fora garante que nada fique preso como root segurando a porta (o timeout
+    # do Python só mata o cliente 'su', não o shell que roda como root)
+    limite = int(espera) + 6
+    linha = ("export " + " ".join(f"{k}={shlex.quote(v)}" for k, v in variaveis.items())
+             + f'; timeout {limite} sh -c "$SCRIPT"')
+    proc = rodar(["su", "-c", linha], capturar=True, timeout=limite + 15, mostrar=False)
+    saida_bruta = proc.stdout or ""
     if "__SEM_PORTA__" in saida_bruta:
         raise ToonsError(f"Não consegui abrir {dev}. É a porta certa? O modem pede root e a porta exata do seu chip.")
     return _modem_limpar(saida_bruta, comando)
@@ -3002,17 +3025,30 @@ def _modem_limpar(saida_bruta: str, comando: str) -> str:
     linhas = []
     for linha in saida_bruta.replace("\r", "\n").split("\n"):
         linha = linha.strip()
-        if linha and linha != comando and linha.upper() != comando.upper():
+        if linha and linha.upper() != comando.upper():
             linhas.append(linha)
     return "\n".join(linhas)
 
 
 def modem_ok(comando: str, espera: float = 3.0) -> str:
-    """Envia o comando e confere se o modem terminou com OK; erro vira ToonsError."""
+    """Envia o comando e confere se o modem terminou com OK; erro ou silêncio vira ToonsError.
+    Devolve a resposta sem a linha final 'OK'."""
     resposta = modem_enviar(comando, espera)
-    if re.search(r"\bERROR\b|\+CM[ES] ERROR", resposta, re.I):
+    if _MODEM_FALHA.search(resposta):
         raise ToonsError(f"O modem respondeu com erro:\n{resposta}")
-    return resposta
+    linhas = resposta.split("\n")
+    if "OK" not in linhas:
+        raise ToonsError(f"O modem não confirmou '{comando}' com OK (em até {espera:g}s):\n"
+                         f"{resposta or '(sem resposta — a porta é a certa?)'}")
+    del linhas[len(linhas) - 1 - linhas[::-1].index("OK")]
+    return "\n".join(linhas)
+
+
+def _sms_modo_texto() -> None:
+    """SMS em modo texto, com o conjunto de caracteres ASCII (IRA) quando o modem aceita."""
+    modem_ok("AT+CMGF=1")
+    with contextlib.suppress(ToonsError):
+        modem_ok('AT+CSCS="IRA"')
 
 
 def _so_valor(resposta: str, prefixo: str) -> str:
@@ -3024,7 +3060,7 @@ def _so_valor(resposta: str, prefixo: str) -> str:
 def _descrever_sinal(resposta: str) -> str:
     valor = _so_valor(resposta, "+CSQ")
     rssi = valor.split(",")[0].strip()
-    if not rssi.isdigit() or rssi == "99":
+    if not rssi.isdigit() or int(rssi) > 31:  # 99 = desconhecido; 100–191 é outra escala (TD-SCDMA)
         return "sinal desconhecido (sem rede?)"
     dbm = -113 + 2 * int(rssi)
     barras = min(5, max(1, (int(rssi) + 3) // 6))
@@ -3051,20 +3087,18 @@ def menu_modem():
         if not tem_root():
             raise ToonsError("Procurar a porta do modem exige root.")
         info("Procurando portas do modem e testando com 'AT' (precisa responder OK)...")
-        existentes = saida(["su", "-c", "ls -1 /dev/smd* /dev/radio/* /dev/tty_ril* /dev/ttyC_ril* "
-                             "/dev/at_mdm* /dev/ttyUSB* /dev/ttyACM* /dev/ttyGS* 2>/dev/null"])
-        candidatos = list(dict.fromkeys([l.strip() for l in existentes.splitlines() if l.strip()]
-                                        + MODEM_DISPOSITIVOS))
+        # só nós de caractere que existem ('ls' com um padrão sem resultado sairia com erro e
+        # esconderia os que existem); o 'exit 0' evita o mesmo problema com o último teste
+        padroes = ("/dev/smd* /dev/radio/* /dev/tty_ril* /dev/ttyC_ril* /dev/at_mdm* "
+                   "/dev/ttyUSB* /dev/ttyACM* /dev/ttyGS* " + " ".join(MODEM_DISPOSITIVOS))
+        existentes = saida(["su", "-c", f'for f in {padroes}; do [ -c "$f" ] && echo "$f"; done; exit 0'])
+        candidatos = list(dict.fromkeys(l.strip() for l in existentes.splitlines() if l.strip()))
         funcionam = []
         for dev in candidatos:
-            c["modem_dispositivo"] = dev
-            try:
-                if re.search(r"\bOK\b", modem_enviar("AT", espera=1.5)):
+            with contextlib.suppress(ToonsError):
+                if re.search(r"^OK$", modem_enviar("AT", espera=1.5, dev=dev), re.M):
                     funcionam.append(dev)
                     print(f"  {VERD}✔{RST} {dev}")
-            except ToonsError:
-                pass
-        c["modem_dispositivo"] = ""
         if not funcionam:
             raise ToonsError("Nenhuma porta respondeu 'AT'. Seu aparelho pode não expor o modem, ou a porta tem "
                              "outro nome. Veja 'ls /dev/' com root ou informe o caminho manualmente.")
@@ -3110,8 +3144,8 @@ def menu_modem():
                 print(f"  Operadora atual:  {NEG}{nome.group(1)}{RST}")
 
     def listar_operadoras():
-        info("Procurando operadoras disponíveis (pode levar até 1 minuto)...")
-        resposta = modem_ok("AT+COPS=?", espera=60)
+        info("Procurando operadoras disponíveis (pode levar alguns minutos)...")
+        resposta = modem_ok("AT+COPS=?", espera=180)
         nomes = re.findall(r'\(\s*\d+\s*,\s*"([^"]+)"', resposta)
         if nomes:
             for nome in dict.fromkeys(nomes):
@@ -3123,12 +3157,13 @@ def menu_modem():
         aviso("Selecionar manualmente pode deixar você sem sinal se a operadora não for a do seu chip.")
         i = escolher("Modo de seleção", ["Automático (recomendado)", "Manual (digitar código MCCMNC)"])
         if i == 0:
-            ok(modem_ok("AT+COPS=0") or "Modo automático ativado.")
+            ok(modem_ok("AT+COPS=0", espera=60) or "Modo automático ativado.")
         elif i == 1:
             codigo = perguntar("Código da operadora (MCCMNC, ex.: 72410)")
-            if codigo.isdigit():
-                modem_ok(f'AT+COPS=1,2,"{codigo}"', espera=30)
-                ok("Operadora selecionada.")
+            if not re.fullmatch(r"\d{5,6}", codigo):
+                raise ToonsError("O código MCCMNC tem 5 ou 6 dígitos (ex.: 72410).")
+            modem_ok(f'AT+COPS=1,2,"{codigo}"', espera=120)
+            ok("Operadora selecionada.")
 
     # ── Chamadas ──
     def ligar():
@@ -3137,7 +3172,11 @@ def menu_modem():
             raise ToonsError("Número inválido.")
         if not confirmar(f"Ligar para {numero}? (pode gastar créditos)", False):
             return
-        modem_ok(f"ATD{numero};")  # o ';' faz uma chamada de VOZ
+        # o ';' faz uma chamada de VOZ; alguns modems só dão OK quando atendem, então o
+        # silêncio aqui não é erro — só um código de falha é
+        resposta = modem_enviar(f"ATD{numero};", espera=5)
+        if _MODEM_FALHA.search(resposta):
+            raise ToonsError(f"A chamada não completou:\n{resposta}")
         ok(f"Chamando {numero}... Use 'Encerrar a chamada' para desligar.")
 
     def atender():
@@ -3152,18 +3191,26 @@ def menu_modem():
         if not re.fullmatch(r"[+0-9]{3,20}", numero or ""):
             raise ToonsError("Número inválido.")
         texto = perguntar("Mensagem")
+        # o modo texto só leva ASCII com segurança: acentos viram letras sem acento
+        ascii_ = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
+        ascii_ = "".join(ch for ch in ascii_ if ch.isprintable()).strip()
+        if ascii_ != texto:
+            aviso(f"Sem acentos/emojis, a mensagem vai assim: {ascii_}")
+            texto = ascii_
+        if len(texto) > 160:
+            raise ToonsError(f"A mensagem tem {len(texto)} caracteres; um SMS em modo texto leva até 160.")
         if not texto or not confirmar(f"Enviar SMS para {numero}? (pode gastar créditos)", False):
             return
-        modem_ok("AT+CMGF=1")  # modo texto
+        _sms_modo_texto()
         # manda AT+CMGS="numero", espera o '>' e então o texto + Ctrl-Z (0x1A)
-        resposta = modem_enviar(f'AT+CMGS="{numero}"', espera=8, final=texto + "\x1a")
-        if re.search(r"\+CMGS:|\bOK\b", resposta) and "ERROR" not in resposta.upper():
+        resposta = modem_enviar(f'AT+CMGS="{numero}"', espera=60, final=texto + "\x1a")
+        if re.search(r"\+CMGS:|^OK$", resposta, re.M) and not _MODEM_FALHA.search(resposta):
             ok("SMS enviado.")
         else:
             raise ToonsError(f"Não confirmou o envio:\n{resposta or '(sem resposta)'}")
 
     def ler_sms():
-        modem_ok("AT+CMGF=1")
+        _sms_modo_texto()
         filtros = {"Não lidas": '"REC UNREAD"', "Recebidas": '"REC READ"', "Todas": '"ALL"'}
         i = escolher("Quais mensagens?", list(filtros), 1)
         if i is None:
@@ -3172,7 +3219,7 @@ def menu_modem():
         blocos = re.findall(r'\+CMGL:\s*(\d+),"[^"]*","([^"]*)"[^\n]*\n(.*?)(?=\n\+CMGL:|\nOK|$)',
                             resposta, re.S)
         if not blocos:
-            info("Nenhuma mensagem." if "OK" in resposta else (resposta or "(sem resposta)"))
+            info(resposta or "Nenhuma mensagem.")
             return
         for idx, remetente, corpo in blocos:
             print(f"  {CIANO}#{idx}{RST} de {NEG}{remetente or '?'}{RST}: {corpo.strip()}")
@@ -3197,25 +3244,29 @@ def menu_modem():
         apn = perguntar("APN da operadora (ex.: zap.vivo.com.br)")
         if not apn:
             return
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", apn):
+            raise ToonsError("APN inválida: use só letras, números, ponto, hífen e sublinhado.")
         cid = perguntar_int("Número do contexto (geralmente 1)", 1, 1, 15)
         modem_ok(f'AT+CGDCONT={cid},"IP","{apn}"')
         ok(f"APN '{apn}' definida no contexto {cid}.")
 
     def ativar_dados(ligar_dados: bool):
         cid = perguntar_int("Número do contexto", 1, 1, 15)
-        modem_ok(f"AT+CGACT={1 if ligar_dados else 0},{cid}", espera=20)
+        modem_ok(f"AT+CGACT={1 if ligar_dados else 0},{cid}", espera=60)
         ok(f"Contexto de dados {cid} {'ativado' if ligar_dados else 'desativado'}.")
 
     def endereco_ip():
         resposta = ""
         with contextlib.suppress(ToonsError):
             resposta = modem_ok("AT+CGPADDR")
-        ip = re.search(r'\+CGPADDR:\s*\d+,"?([0-9.:]+)"?', resposta)
-        if not ip:
+        # contextos sem conexão aparecem vazios ou como 0.0.0.0
+        ips = [ip for ip in re.findall(r'\+CGPADDR:\s*\d+,"?([0-9.:]+)"?', resposta)
+               if ip.strip("0.:")]
+        if not ips:
             with contextlib.suppress(ToonsError):
-                resposta = modem_ok("AT+CIFSR")
-                ip = re.search(r"(\d+\.\d+\.\d+\.\d+)", resposta)
-        print(f"  IP da conexão de dados: {NEG}{ip.group(1) if ip else '(sem IP / dados desligados)'}{RST}")
+                ips = [ip for ip in re.findall(r"(\d+\.\d+\.\d+\.\d+)", modem_ok("AT+CIFSR"))
+                       if ip != "0.0.0.0"]
+        print(f"  IP da conexão de dados: {NEG}{ips[0] if ips else '(sem IP / dados desligados)'}{RST}")
 
     # ── Console livre ──
     def console():
@@ -3227,7 +3278,7 @@ def menu_modem():
             if not cmd.upper().startswith("AT"):
                 cmd = "AT" + cmd
             try:
-                print(modem_enviar(cmd, espera=8) or "(sem resposta)")
+                print(modem_enviar(cmd, espera=30) or "(sem resposta)")
             except ToonsError as e:
                 erro(str(e))
 
