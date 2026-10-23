@@ -11,7 +11,7 @@ Reúne em um único menu:
    5. Interfaces TUI (dashboard com rich, tarefas com curses)
    6. Ambiente de desenvolvimento (Neovim + LSP, git, C/Rust/Go, code-server)
    7. Scraping e monitoramento (preço, notícias/RSS, status de site)
-   8. Rede e segurança em equipamentos seus (nmap, SSH, WireGuard, velocidade)
+   8. Rede e segurança em equipamentos seus (nmap, SSH, WireGuard, velocidade, modem AT)
    9. Retro: jogos ASCII, interpretador BASIC e template para criar seu jogo
   10. Linux de verdade com proot-distro (Debian, Ubuntu, Arch...), com desktop no Termux:X11
   11. Servidor de arquivos e backup (rclone, Syncthing, Samba, HTTP) e página HTML num link
@@ -773,6 +773,9 @@ PADRAO_CFG = {
     "llama_threads": 4,
     "llama_contexto": 2048,
     "aviso_rede_aceito": False,
+    "modem_aviso_aceito": False,
+    "modem_dispositivo": "",
+    "modem_baud": "115200",
     "monitores": [],
 }
 
@@ -2941,6 +2944,316 @@ def menu_monitor():
     ])
 
 
+# ── Modem (comandos AT / 3GPP) ───────────────────────────────────────
+# Fala direto com o modem (rádio) do próprio celular por comandos AT, o
+# padrão 3GPP TS 27.007. No Android isso exige root e uma porta serial do
+# modem exposta (o nó de dispositivo varia por chip); muitos aparelhos
+# não a expõem. Use só no SEU aparelho, com o SEU chip: ligar e mandar SMS
+# gastam créditos, e mexer em operadora/dados pode derrubar sua conexão.
+
+# Nós de dispositivo onde a porta AT do modem costuma aparecer, por fabricante de chip.
+MODEM_DISPOSITIVOS = [
+    "/dev/smd0", "/dev/smd7", "/dev/smd8", "/dev/smd11",           # Qualcomm
+    "/dev/radio/pttycmd1", "/dev/radio/atci_mdport",              # MediaTek
+    "/dev/ttyC_ril_ctl", "/dev/ttyGS0", "/dev/at_mdm0",           # outros
+    "/dev/ttyUSB2", "/dev/ttyUSB3", "/dev/ttyACM0",               # modem USB (OTG)
+]
+
+CREG_ESTADOS = {
+    "0": "não registrado e não procurando", "1": "registrado (rede local)",
+    "2": "procurando operadora", "3": "registro negado", "4": "desconhecido",
+    "5": "registrado (roaming)", "6": "registrado (só SMS)", "7": "registrado (só SMS, roaming)",
+}
+
+
+def _modem_dispositivo() -> str:
+    dev = cfg().get("modem_dispositivo", "")
+    if not dev:
+        raise ToonsError("Nenhuma porta do modem escolhida. Use 'Procurar a porta do modem' primeiro.")
+    return dev
+
+
+def modem_enviar(comando: str, espera: float = 3.0, final: str | None = None) -> str:
+    """Envia um comando AT ao modem (via root) e devolve a resposta já limpa.
+    `final`, se dado, é um texto enviado logo depois (ex.: Ctrl-Z para concluir um SMS)."""
+    if not tem_root():
+        raise ToonsError("Falar com o modem exige root (o comando 'su' não respondeu).")
+    dev = _modem_dispositivo()
+    baud = str(cfg().get("modem_baud", "115200"))
+    # abre a porta como leitura+escrita (fd 3), escreve o comando com CR e lê a resposta até estourar o tempo
+    script = (
+        'exec 3<>"$DEV" 2>/dev/null || { echo __SEM_PORTA__; exit 7; }; '
+        'stty -F "$DEV" "$BAUD" raw -echo 2>/dev/null; '
+        'printf "%s\\r" "$CMD" >&3; '
+        '[ -n "$FIM" ] && { sleep 0.5; printf "%s" "$FIM" >&3; }; '
+        'timeout "$TO" cat <&3'
+    )
+    env = (f"DEV={shlex.quote(dev)} BAUD={shlex.quote(baud)} CMD={shlex.quote(comando)} "
+           f"TO={shlex.quote(str(espera))} FIM={shlex.quote(final or '')}; ")
+    proc = rodar(["su", "-c", env + script], capturar=True, timeout=espera + 15, mostrar=False)
+    saida_bruta = (proc.stdout or "") + (proc.stderr or "")
+    if "__SEM_PORTA__" in saida_bruta:
+        raise ToonsError(f"Não consegui abrir {dev}. É a porta certa? O modem pede root e a porta exata do seu chip.")
+    return _modem_limpar(saida_bruta, comando)
+
+
+def _modem_limpar(saida_bruta: str, comando: str) -> str:
+    """Tira o eco do comando e linhas vazias; devolve só a resposta do modem."""
+    linhas = []
+    for linha in saida_bruta.replace("\r", "\n").split("\n"):
+        linha = linha.strip()
+        if linha and linha != comando and linha.upper() != comando.upper():
+            linhas.append(linha)
+    return "\n".join(linhas)
+
+
+def modem_ok(comando: str, espera: float = 3.0) -> str:
+    """Envia o comando e confere se o modem terminou com OK; erro vira ToonsError."""
+    resposta = modem_enviar(comando, espera)
+    if re.search(r"\bERROR\b|\+CM[ES] ERROR", resposta, re.I):
+        raise ToonsError(f"O modem respondeu com erro:\n{resposta}")
+    return resposta
+
+
+def _so_valor(resposta: str, prefixo: str) -> str:
+    """Pega o que vem depois de '+XXX:' na resposta (ex.: '+CSQ: 17,99' → '17,99')."""
+    m = re.search(rf"{re.escape(prefixo)}:\s*(.+)", resposta)
+    return m.group(1).strip() if m else resposta.strip()
+
+
+def _descrever_sinal(resposta: str) -> str:
+    valor = _so_valor(resposta, "+CSQ")
+    rssi = valor.split(",")[0].strip()
+    if not rssi.isdigit() or rssi == "99":
+        return "sinal desconhecido (sem rede?)"
+    dbm = -113 + 2 * int(rssi)
+    barras = min(5, max(1, (int(rssi) + 3) // 6))
+    return f"{dbm} dBm  {'▮' * barras}{'▯' * (5 - barras)}  (CSQ {rssi}/31)"
+
+
+@submenu
+def menu_modem():
+    c = cfg()
+    if not c.get("modem_aviso_aceito"):
+        limpar()
+        titulo("📡 Modem — comandos AT")
+        print("Isto fala direto com o rádio do SEU celular (padrão 3GPP/AT). Precisa de ROOT e da\n"
+              "porta serial do modem, que nem todo aparelho expõe.\n\n"
+              "• Ligar e enviar SMS GASTAM créditos do seu chip.\n"
+              "• Mexer em operadora (COPS) ou dados (CGACT) pode derrubar sua conexão até reiniciar.\n"
+              "• Use só no seu aparelho, com o seu chip. Consulta o IMEI, não altera (alterar é crime).\n")
+        if not confirmar("Entendi e vou usar só no meu aparelho", False):
+            return
+        c["modem_aviso_aceito"] = True
+        salvar_cfg()
+
+    def procurar_porta():
+        if not tem_root():
+            raise ToonsError("Procurar a porta do modem exige root.")
+        info("Procurando portas do modem e testando com 'AT' (precisa responder OK)...")
+        existentes = saida(["su", "-c", "ls -1 /dev/smd* /dev/radio/* /dev/tty_ril* /dev/ttyC_ril* "
+                             "/dev/at_mdm* /dev/ttyUSB* /dev/ttyACM* /dev/ttyGS* 2>/dev/null"])
+        candidatos = list(dict.fromkeys([l.strip() for l in existentes.splitlines() if l.strip()]
+                                        + MODEM_DISPOSITIVOS))
+        funcionam = []
+        for dev in candidatos:
+            c["modem_dispositivo"] = dev
+            try:
+                if re.search(r"\bOK\b", modem_enviar("AT", espera=1.5)):
+                    funcionam.append(dev)
+                    print(f"  {VERD}✔{RST} {dev}")
+            except ToonsError:
+                pass
+        c["modem_dispositivo"] = ""
+        if not funcionam:
+            raise ToonsError("Nenhuma porta respondeu 'AT'. Seu aparelho pode não expor o modem, ou a porta tem "
+                             "outro nome. Veja 'ls /dev/' com root ou informe o caminho manualmente.")
+        i = escolher("Qual porta usar?", funcionam)
+        if i is not None:
+            c["modem_dispositivo"] = funcionam[i]
+            salvar_cfg()
+            ok(f"Porta do modem: {funcionam[i]}")
+
+    def escolher_porta():
+        i = escolher("Porta do modem (ou digite o caminho)", MODEM_DISPOSITIVOS + ["Digitar outro caminho..."])
+        if i is None:
+            return
+        dev = perguntar("Caminho (/dev/...)") if i == len(MODEM_DISPOSITIVOS) else MODEM_DISPOSITIVOS[i]
+        if dev:
+            c["modem_dispositivo"] = dev
+            salvar_cfg()
+            ok(f"Porta do modem: {dev}  (teste com 'Informações do aparelho').")
+
+    # ── Informações do aparelho ──
+    def informacoes():
+        for rotulo, cmd in (("Fabricante (CGMI)", "AT+CGMI"), ("Modelo (CGMM)", "AT+CGMM"),
+                            ("Versão de firmware (CGMR)", "AT+CGMR"), ("IMEI (GSN)", "AT+GSN")):
+            try:
+                resposta = modem_ok(cmd)
+                valor = "\n".join(l for l in resposta.splitlines() if l.upper() != "OK") or "?"
+                print(f"  {CIANO}{rotulo:<26}{RST} {valor}")
+            except ToonsError as e:
+                print(f"  {CIANO}{rotulo:<26}{RST} {VERM}{e}{RST}")
+
+    # ── Rede ──
+    def sinal():
+        print(f"  Sinal: {NEG}{_descrever_sinal(modem_ok('AT+CSQ'))}{RST}")
+
+    def registro():
+        valor = _so_valor(modem_ok("AT+CREG?"), "+CREG")
+        estado = valor.split(",")[1].strip() if "," in valor else valor
+        print(f"  Registro na rede: {NEG}{CREG_ESTADOS.get(estado, 'código ' + estado)}{RST}")
+        with contextlib.suppress(ToonsError):
+            atual = _so_valor(modem_ok("AT+COPS?"), "+COPS")
+            nome = re.search(r'"([^"]+)"', atual)
+            if nome:
+                print(f"  Operadora atual:  {NEG}{nome.group(1)}{RST}")
+
+    def listar_operadoras():
+        info("Procurando operadoras disponíveis (pode levar até 1 minuto)...")
+        resposta = modem_ok("AT+COPS=?", espera=60)
+        nomes = re.findall(r'\(\s*\d+\s*,\s*"([^"]+)"', resposta)
+        if nomes:
+            for nome in dict.fromkeys(nomes):
+                print(f"  • {nome}")
+        else:
+            print(resposta or "(sem resposta)")
+
+    def selecionar_operadora():
+        aviso("Selecionar manualmente pode deixar você sem sinal se a operadora não for a do seu chip.")
+        i = escolher("Modo de seleção", ["Automático (recomendado)", "Manual (digitar código MCCMNC)"])
+        if i == 0:
+            ok(modem_ok("AT+COPS=0") or "Modo automático ativado.")
+        elif i == 1:
+            codigo = perguntar("Código da operadora (MCCMNC, ex.: 72410)")
+            if codigo.isdigit():
+                modem_ok(f'AT+COPS=1,2,"{codigo}"', espera=30)
+                ok("Operadora selecionada.")
+
+    # ── Chamadas ──
+    def ligar():
+        numero = perguntar("Número para ligar (com DDD)")
+        if not re.fullmatch(r"[+0-9*#]{2,20}", numero or ""):
+            raise ToonsError("Número inválido.")
+        if not confirmar(f"Ligar para {numero}? (pode gastar créditos)", False):
+            return
+        modem_ok(f"ATD{numero};")  # o ';' faz uma chamada de VOZ
+        ok(f"Chamando {numero}... Use 'Encerrar a chamada' para desligar.")
+
+    def atender():
+        ok(modem_ok("ATA") or "Chamada atendida.")
+
+    def encerrar():
+        ok(modem_ok("ATH") or "Chamada encerrada.")
+
+    # ── SMS ──
+    def enviar_sms():
+        numero = perguntar("Número de destino (com DDD)")
+        if not re.fullmatch(r"[+0-9]{3,20}", numero or ""):
+            raise ToonsError("Número inválido.")
+        texto = perguntar("Mensagem")
+        if not texto or not confirmar(f"Enviar SMS para {numero}? (pode gastar créditos)", False):
+            return
+        modem_ok("AT+CMGF=1")  # modo texto
+        # manda AT+CMGS="numero", espera o '>' e então o texto + Ctrl-Z (0x1A)
+        resposta = modem_enviar(f'AT+CMGS="{numero}"', espera=8, final=texto + "\x1a")
+        if re.search(r"\+CMGS:|\bOK\b", resposta) and "ERROR" not in resposta.upper():
+            ok("SMS enviado.")
+        else:
+            raise ToonsError(f"Não confirmou o envio:\n{resposta or '(sem resposta)'}")
+
+    def ler_sms():
+        modem_ok("AT+CMGF=1")
+        filtros = {"Não lidas": '"REC UNREAD"', "Recebidas": '"REC READ"', "Todas": '"ALL"'}
+        i = escolher("Quais mensagens?", list(filtros), 1)
+        if i is None:
+            return
+        resposta = modem_ok(f"AT+CMGL={list(filtros.values())[i]}", espera=10)
+        blocos = re.findall(r'\+CMGL:\s*(\d+),"[^"]*","([^"]*)"[^\n]*\n(.*?)(?=\n\+CMGL:|\nOK|$)',
+                            resposta, re.S)
+        if not blocos:
+            info("Nenhuma mensagem." if "OK" in resposta else (resposta or "(sem resposta)"))
+            return
+        for idx, remetente, corpo in blocos:
+            print(f"  {CIANO}#{idx}{RST} de {NEG}{remetente or '?'}{RST}: {corpo.strip()}")
+
+    def apagar_sms():
+        idx = perguntar("Número da mensagem para apagar (veja em 'Ler mensagens')")
+        if idx.isdigit() and confirmar(f"Apagar a mensagem #{idx}?", False):
+            modem_ok(f"AT+CMGD={idx}")
+            ok("Mensagem apagada.")
+
+    # ── Dados móveis ──
+    def ver_apn():
+        resposta = modem_ok("AT+CGDCONT?")
+        contextos = re.findall(r'\+CGDCONT:\s*(\d+),"([^"]*)","([^"]*)"', resposta)
+        if contextos:
+            for cid, tipo, apn in contextos:
+                print(f"  Contexto {cid}: APN {NEG}{apn or '(vazio)'}{RST} ({tipo})")
+        else:
+            print(resposta or "(sem contextos)")
+
+    def definir_apn():
+        apn = perguntar("APN da operadora (ex.: zap.vivo.com.br)")
+        if not apn:
+            return
+        cid = perguntar_int("Número do contexto (geralmente 1)", 1, 1, 15)
+        modem_ok(f'AT+CGDCONT={cid},"IP","{apn}"')
+        ok(f"APN '{apn}' definida no contexto {cid}.")
+
+    def ativar_dados(ligar_dados: bool):
+        cid = perguntar_int("Número do contexto", 1, 1, 15)
+        modem_ok(f"AT+CGACT={1 if ligar_dados else 0},{cid}", espera=20)
+        ok(f"Contexto de dados {cid} {'ativado' if ligar_dados else 'desativado'}.")
+
+    def endereco_ip():
+        resposta = ""
+        with contextlib.suppress(ToonsError):
+            resposta = modem_ok("AT+CGPADDR")
+        ip = re.search(r'\+CGPADDR:\s*\d+,"?([0-9.:]+)"?', resposta)
+        if not ip:
+            with contextlib.suppress(ToonsError):
+                resposta = modem_ok("AT+CIFSR")
+                ip = re.search(r"(\d+\.\d+\.\d+\.\d+)", resposta)
+        print(f"  IP da conexão de dados: {NEG}{ip.group(1) if ip else '(sem IP / dados desligados)'}{RST}")
+
+    # ── Console livre ──
+    def console():
+        info("Digite comandos AT (ex.: AT+CSQ). Enter vazio sai. Veja 3GPP TS 27.007 para a lista.")
+        while True:
+            cmd = perguntar("AT")
+            if not cmd:
+                return
+            if not cmd.upper().startswith("AT"):
+                cmd = "AT" + cmd
+            try:
+                print(modem_enviar(cmd, espera=8) or "(sem resposta)")
+            except ToonsError as e:
+                erro(str(e))
+
+    menu("📡 Modem (comandos AT / 3GPP)", [
+        (lambda: f"Porta do modem ({c.get('modem_dispositivo') or 'não definida'})", escolher_porta),
+        ("Procurar a porta do modem automaticamente", procurar_porta),
+        ("Informações do aparelho (IMEI, fabricante, modelo)", informacoes),
+        ("Qualidade do sinal (CSQ)", sinal),
+        ("Registro na rede e operadora atual (CREG/COPS)", registro),
+        ("Listar operadoras disponíveis (COPS=?)", listar_operadoras),
+        ("Selecionar operadora (COPS)", selecionar_operadora),
+        ("☎  Ligar para um número (ATD)", ligar),
+        ("☎  Atender a chamada (ATA)", atender),
+        ("☎  Encerrar a chamada (ATH)", encerrar),
+        ("✉  Enviar SMS (CMGS)", enviar_sms),
+        ("✉  Ler mensagens (CMGL)", ler_sms),
+        ("✉  Apagar uma mensagem (CMGD)", apagar_sms),
+        ("📶 Ver APN / contextos de dados (CGDCONT?)", ver_apn),
+        ("📶 Definir APN (CGDCONT)", definir_apn),
+        ("📶 Ativar dados (CGACT=1)", lambda: ativar_dados(True)),
+        ("📶 Desativar dados (CGACT=0)", lambda: ativar_dados(False)),
+        ("📶 Ver o IP da conexão de dados (CGPADDR)", endereco_ip),
+        ("⌨  Console AT (digitar comandos à mão)", console),
+    ])
+
+
 # ════════════════════════════════════════════════════════════════════
 #  8. Rede e segurança — use SOMENTE em redes e equipamentos seus
 # ════════════════════════════════════════════════════════════════════
@@ -3133,6 +3446,7 @@ def menu_rede():
         ("SSH: parar servidor", lambda: rodar(["pkill", "sshd"])),
         ("SSH: autorizar chave pública", ssh_chave),
         ("WireGuard: gerar chaves + config + QR code", wireguard),
+        ("📡 Modem: comandos AT (chamadas, SMS, sinal, APN; precisa de root)", menu_modem),
     ])
 
 
