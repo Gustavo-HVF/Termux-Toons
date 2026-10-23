@@ -23,7 +23,7 @@ Reúne em um único menu:
       player próprio, troca de trilha de áudio e conversão na hora (servidor de vídeo + túnel)
   17. Depuração sem fio (ADB pelo Wi-Fi) do próprio celular, sem PC e sem root
   18. Gerenciador de arquivos: copiar, mover, renomear, compactar e ver Android/data (ADB ou root)
-  19. Calculadora científica (fatorial, porcentagem, trigonometria, estatística, bases, frações)
+  19. Calculadora científica com botões (setas + Enter): trigonometria, fatorial, %, frações
 
 Uso:
     python termux_toons.py            # menu interativo
@@ -9823,6 +9823,21 @@ def calc_formatar(v) -> str:
     return f"{v:.12g}"
 
 
+def _calc_converter(valor, modo: str) -> str:
+    """Resultado como fração ('frac') ou em outra base ('hex', 'bin', 'oct')."""
+    try:
+        if modo == "frac":
+            fracao = Fraction(valor).limit_denominator(10**6)
+            return str(fracao) + ("" if float(fracao) == valor else " (aproximada)")
+    except (OverflowError, ValueError):
+        raise ToonsError("Esse número não vira fração.") from None
+    if isinstance(valor, float) and valor.is_integer():
+        valor = int(valor)
+    if not isinstance(valor, int):
+        raise ToonsError("Só números inteiros podem ser mostrados em outra base.")
+    return {"hex": hex, "bin": bin, "oct": oct}[modo](valor)
+
+
 AJUDA_CALCULADORA = """\
 Operadores:  + - * /  ^ ou **  (potência)  //  mod (resto)  5! (fatorial)  ( )
 Porcentagem: 10%  200*10%  200+10% (=220)  200-10% (=180)
@@ -9841,6 +9856,14 @@ Exemplos:    sqrt(2)pi    sin(30)    2^10    10!/3!    log(1000)    media(7, 8.5
 
 @submenu
 def menu_calculadora():
+    # sem terminal interativo (ou com TOONS_NUMEROS=1) não há setas: usa o modo digitado
+    if setas_ativas():
+        _calculadora_botoes()
+    else:
+        _calculadora_texto()
+
+
+def _calculadora_texto():
     limpar()
     titulo("🧮 Calculadora científica")
     print(f"{AJUDA_CALCULADORA}\n")
@@ -9875,19 +9898,11 @@ def menu_calculadora():
         elif comando in ("hex", "bin", "oct", "frac"):
             if "ans" not in variaveis:
                 info("Faça uma conta primeiro.")
-            elif comando == "frac":
-                fracao = Fraction(variaveis["ans"]).limit_denominator(10**6)
-                exata = float(fracao) == variaveis["ans"]
-                print(f"  {VERD}={RST} {NEG}{fracao}{RST}" + ("" if exata else f"  {DIM}(aproximada){RST}"))
             else:
-                valor = variaveis["ans"]
-                if isinstance(valor, float) and valor.is_integer():
-                    valor = int(valor)
-                if not isinstance(valor, int):
-                    erro("Só números inteiros podem ser mostrados em outra base.")
-                else:
-                    convertido = {"hex": hex, "bin": bin, "oct": oct}[comando](valor)
-                    print(f"  {VERD}={RST} {NEG}{convertido}{RST}")
+                try:
+                    print(f"  {VERD}={RST} {NEG}{_calc_converter(variaveis['ans'], comando)}{RST}")
+                except ToonsError as e:
+                    erro(str(e))
         elif comando in ("limpar", "clear", "cls"):
             variaveis.clear()
             historico.clear()
@@ -9912,6 +9927,262 @@ def menu_calculadora():
                 variaveis[atribuicao.group(1)] = valor
             historico.append((entrada, valor))
             print(f"  {VERD}={RST} {NEG}{calc_formatar(valor)}{RST}")
+
+
+# ── Calculadora com botões (setas + Enter) ──
+# Cada botão: (rótulo, ação). A ação é o texto que entra na conta ou, começando
+# com '#', um comando. Navega com as setas, Enter aperta; o teclado também digita.
+CALC_BOTOES = [
+    [("DEG", "#modo"), ("(", "("), (")", ")"), ("%", "%"), ("AC", "#limpar"), ("DEL", "#apagar"), ("÷", "/")],
+    [("sin", "sin("), ("cos", "cos("), ("tan", "tan("), ("7", "7"), ("8", "8"), ("9", "9"), ("×", "*")],
+    [("asin", "asin("), ("acos", "acos("), ("atan", "atan("), ("4", "4"), ("5", "5"), ("6", "6"), ("−", "-")],
+    [("ln", "ln("), ("log", "log("), ("e^x", "exp("), ("1", "1"), ("2", "2"), ("3", "3"), ("+", "+")],
+    [("√", "√("), ("x^2", "^2"), ("x^y", "^"), ("±", "#sinal"), ("0", "0"), (".", "."), ("=", "#igual")],
+    [("π", "pi"), ("e", "e"), ("n!", "!"), ("1/x", "^(-1)"), ("∛", "cbrt("), ("10^x", "10^("), ("ans", "ans")],
+    [("EXP", "E"), ("mod", " mod "), ("frac", "#frac"), ("hex", "#hex"), ("hist", "#hist"),
+     ("?", "#ajuda"), ("sair", "#sair")],
+]
+CALC_GRADE_COLUNAS = len(CALC_BOTOES[0])
+# o que, depois de um '=', continua a conta a partir do resultado (ans) em vez de começar outra
+_CALC_CONTINUA = re.compile(r"^(\s*mod\s*|[-+*/^%!)])")
+# pedaço apagado pelo DEL: uma função inteira 'sin(', ' mod ', 'ans', 'pi', '^(-1)' ou um caractere
+_CALC_ULTIMO = re.compile(r"(?:[A-Za-z_]+\(|\s*mod\s*|ans|pi|\^\(-1\)|.)$")
+
+AJUDA_BOTOES = [
+    "←↑↓→   escolhe o botão",
+    "Enter  aperta o botão",
+    "Esc    sai",
+    "",
+    "O teclado também digita:",
+    "  0-9 . + - * / ^ ( ) ! % ,",
+    "  = calcula · Backspace apaga",
+    "  x depois de um número = vezes",
+    "",
+    "RAD/DEG  troca radianos e graus",
+    "±     troca o sinal do número",
+    "%     200+10% = 220, 200-10% = 180",
+    "n!    fatorial",
+    "EXP   1.5 EXP 3 = 1500",
+    "ans   último resultado; depois do",
+    "      '=', + − × ÷ continuam dele",
+    "frac  último resultado em fração",
+    "hex   último resultado em hexa",
+    "Parênteses abertos fecham sozinhos.",
+]
+
+
+def _calc_estilo(acao: str, rotulo: str) -> str:
+    """Cor de fundo/texto de cada tipo de botão."""
+    if not _COR:
+        return ""
+    if acao == "#igual":
+        return "\033[1;30;42m"
+    if acao in ("#limpar", "#apagar"):
+        return "\033[1;97;41m"
+    if rotulo.isdigit() or rotulo == ".":
+        return "\033[1;97;100m"
+    if acao in ("+", "-", "*", "/", "%", "^", "(", ")"):
+        return "\033[1;93;100m"
+    if acao.startswith("#"):
+        return "\033[37;100m"
+    return "\033[96;100m"
+
+
+def _calc_tela(linhas: list) -> None:
+    # sem '\n' depois da última linha: numa tela do tamanho exato ele rolaria tudo uma linha
+    sys.stdout.write("\033[H" + "\033[K\n".join(linhas) + "\033[K\033[J")
+    sys.stdout.flush()
+
+
+def _calc_painel(titulo_painel: str, linhas: list) -> None:
+    """Mostra uma tela de texto (histórico, ajuda) até apertar uma tecla."""
+    colunas = shutil.get_terminal_size((60, 24)).columns
+    _calc_tela([f"{NEG}{titulo_painel}{RST}", ""] + [_cortar(linha, colunas - 1) for linha in linhas]
+               + ["", f"{DIM}Aperte qualquer tecla para voltar{RST}"])
+    ler_tecla()
+
+
+def _cortar(texto: str, largura: int) -> str:
+    """Corta o texto (sem cores) para caber na largura, com '…' no fim."""
+    if _largura(texto) <= largura:
+        return texto
+    while texto and _largura(texto) > largura - 1:
+        texto = texto[:-1]
+    return texto + "…"
+
+
+def _calculadora_botoes():
+    graus = True
+    variaveis: dict = {}
+    historico: list = []
+    conta = ""            # o que está sendo digitado
+    linha_resultado = ""  # prévia, resultado ou mensagem de erro
+    tipo_resultado = ""   # "previa", "final" ou "erro"
+    calculou = False      # True logo depois do '='
+    lin, col = 4, 6       # começa no '='
+
+    def fechada(texto: str) -> str:
+        return texto + ")" * max(0, texto.count("(") - texto.count(")"))
+
+    def previa() -> None:
+        nonlocal linha_resultado, tipo_resultado
+        linha_resultado, tipo_resultado = "", ""
+        if conta and not calculou:
+            with contextlib.suppress(ToonsError):
+                linha_resultado = calc_formatar(calc_avaliar(fechada(conta), variaveis, graus))
+                tipo_resultado = "previa"
+
+    def acionar(acao: str) -> bool:
+        """Executa um botão ou tecla; devolve False para sair."""
+        nonlocal conta, linha_resultado, tipo_resultado, calculou, graus
+        if acao == "#sair":
+            return False
+        if acao == "#igual":
+            if not conta:
+                return True
+            texto = fechada(conta)
+            try:
+                valor = calc_avaliar(texto, variaveis, graus)
+            except ToonsError as e:
+                linha_resultado, tipo_resultado = str(e), "erro"
+                return True
+            variaveis["ans"] = valor
+            historico.append((texto, valor))
+            conta, calculou = texto, True
+            linha_resultado, tipo_resultado = calc_formatar(valor), "final"
+            return True
+        if acao in ("#frac", "#hex"):
+            if "ans" not in variaveis:
+                linha_resultado, tipo_resultado = "Faça uma conta primeiro.", "erro"
+                return True
+            try:
+                linha_resultado, tipo_resultado = _calc_converter(variaveis["ans"], acao[1:]), "final"
+            except ToonsError as e:
+                linha_resultado, tipo_resultado = str(e), "erro"
+            return True
+        if acao == "#hist":
+            _calc_painel("Histórico", [f"{DIM}{c}{RST} = {NEG}{calc_formatar(v)}{RST}" for c, v in historico[-30:]]
+                         or ["Nada calculado ainda."])
+            return True
+        if acao == "#ajuda":
+            _calc_painel("Calculadora científica — ajuda", AJUDA_BOTOES)
+            return True
+        if acao == "#modo":
+            graus = not graus
+        elif acao == "#limpar":
+            conta, calculou = "", False
+        elif acao == "#apagar":
+            conta = "" if calculou else _CALC_ULTIMO.sub("", conta, count=1)
+            calculou = False
+        elif acao == "#sinal":
+            if calculou:
+                conta, calculou = "ans", False
+            m = re.search(r"(\(-)?(\d+\.?\d*|\.\d+|ans|pi|e)$", conta)
+            if m and m.group(1):
+                conta = conta[:m.start()] + m.group(2)
+            elif m:
+                conta = conta[:m.start()] + "(-" + m.group(2)
+            else:
+                conta += "-"
+        else:
+            if calculou:
+                # depois do '=': operador continua do resultado; número ou função começa outra conta
+                conta = "ans" + acao if _CALC_CONTINUA.match(acao) else acao
+                calculou = False
+            elif len(conta) < 300:
+                conta += acao
+        previa()
+        return True
+
+    sys.stdout.write("\033[?1049h")  # tela alternativa: ao sair, o terminal volta como estava
+    _cursor(False)
+    try:
+        while True:
+            colunas, linhas_tela = shutil.get_terminal_size((60, 24))
+            largura_botao = min(9, (colunas - 1 - (CALC_GRADE_COLUNAS - 1)) // CALC_GRADE_COLUNAS)
+            if largura_botao < 4 or linhas_tela < len(CALC_BOTOES) + 8:  # visor 6 + rodapé 2
+                _calc_tela(["Tela pequena demais.", "Esconda o teclado,", "gire o celular ou",
+                            "diminua a fonte (pinça).", f"{DIM}Esc sai{RST}"])
+                if ler_tecla() == "esc":
+                    return
+                continue
+            total = largura_botao * CALC_GRADE_COLUNAS + CALC_GRADE_COLUNAS - 1
+            interno = total - 2
+            espaco = linhas_tela >= len(CALC_BOTOES) * 2 + 8  # linha em branco entre fileiras, se couber
+
+            # visor
+            if len(conta) > interno - 1:
+                mostrar_conta = "…" + conta[-(interno - 2):]
+            else:
+                mostrar_conta = conta or "0"
+            if tipo_resultado == "erro":
+                resultado = f"{VERM}{_cortar(linha_resultado, interno - 1)}{RST}"
+            elif tipo_resultado == "final":
+                resultado = f"{NEG}{VERD}= {_cortar(linha_resultado, interno - 3)}{RST}"
+            elif tipo_resultado == "previa":
+                resultado = f"{DIM}= {_cortar(linha_resultado, interno - 3)}{RST}"
+            else:
+                resultado = ""
+            modo = "DEG" if graus else "RAD"
+            topo = f"{AMAR}{modo}{RST}" + " " * (interno - 3 - len(f"hist {len(historico)}")) \
+                + f"{DIM}hist {len(historico)}{RST}"
+            conta_cor = f"{DIM}{mostrar_conta}{RST}" if calculou else f"{NEG}{mostrar_conta}{RST}"
+
+            def caixa(texto: str) -> str:
+                return f" │{' ' * max(0, interno - _largura(texto))}{texto}│"
+
+            tela = [f" {NEG}{MAG}🧮 Calculadora científica{RST}",
+                    " ╭" + "─" * interno + "╮", f" │{topo}│", caixa(conta_cor), caixa(resultado),
+                    " ╰" + "─" * interno + "╯"]
+
+            # botões
+            for i, fileira in enumerate(CALC_BOTOES):
+                celulas = []
+                for j, (rotulo, acao) in enumerate(fileira):
+                    if acao == "#modo":
+                        rotulo = "RAD" if graus else "DEG"  # mostra para qual modo o botão troca
+                    texto = rotulo.center(largura_botao)
+                    if (i, j) == (lin, col):
+                        celula = f"\033[1;30;103m{texto}{RST}" if _COR else f"[{rotulo.center(largura_botao - 2)}]"
+                    else:
+                        celula = f"{_calc_estilo(acao, rotulo)}{texto}{RST}"
+                    celulas.append(celula)
+                if espaco:
+                    tela.append("")
+                tela.append(" " + " ".join(celulas))
+            tela.append("")
+            tela.append(f" {DIM}{_cortar('←↑↓→ move · Enter aperta · ? ajuda · Esc sai', total)}{RST}")
+            _calc_tela(tela)
+
+            tecla = ler_tecla()
+            if tecla == "esc":
+                return
+            if tecla in ("cima", "baixo"):
+                lin = (lin + (1 if tecla == "baixo" else -1)) % len(CALC_BOTOES)
+            elif tecla in ("esq", "dir"):
+                col = (col + (1 if tecla == "dir" else -1)) % CALC_GRADE_COLUNAS
+            elif tecla == "home":
+                col = 0
+            elif tecla == "end":
+                col = CALC_GRADE_COLUNAS - 1
+            elif tecla == "enter":
+                if not acionar(CALC_BOTOES[lin][col][1]):
+                    return
+            elif tecla == "backspace":
+                acionar("#apagar")
+            elif tecla == "=":
+                acionar("#igual")
+            elif tecla == "?":
+                acionar("#ajuda")
+            elif tecla == "x" and (calculou or conta[-1:].isdigit() or conta.endswith(")")):
+                acionar("*")  # 'x' depois de um número (ou do resultado) é vezes
+            elif len(tecla) == 1 and (tecla in "0123456789.+-*/^()!%," or tecla.isalpha()):
+                acionar(tecla)
+    except KeyboardInterrupt:
+        return
+    finally:
+        sys.stdout.write("\033[?1049l")
+        _cursor(True)
 
 
 # ════════════════════════════════════════════════════════════════════
