@@ -19,7 +19,7 @@ Reúne em um único menu:
   11. Utilitários: notas, tarefas, lembretes/alarmes, cronômetro/Pomodoro, agenda, conversor, gastos,
       senhas, previsão do tempo, QR code (Wi-Fi, PIX) e tradutor
   12. Celular e sistema: depuração sem fio (ADB), Termux:API, painel do sistema, bateria, uso de dados e
-      apps, fotos, conversor de arquivos, automação por eventos e espelhamento de tela
+      apps, fotos, conversor de arquivos, automação por eventos, espelhamento e transmissão da tela por link
   13. Internet: e-mail, notícias, downloads (aria2), chat na rede local, Browsh/w3m e encurtador/pastebin
   14. Inteligência artificial: Claude/ChatGPT/Gemini, LLMs locais (llama.cpp), voz (whisper.cpp) e OCR
   15. Diversão e aprendizado: jogos (incluindo os retrô), cursos de Python/Bash/Git, BASIC, leitor de
@@ -71,6 +71,7 @@ import socket
 import stat
 import statistics
 import string
+import struct
 import subprocess
 import sys
 import tarfile
@@ -817,6 +818,10 @@ PADRAO_CFG = {
     "banner_texto": "",
     "banner_fonte": "standard",
     "minecraft_memoria": "1G",
+    "tela_porta": 8093,
+    "tela_token": "",
+    "tela_controle": False,
+    "tela_qualidade": "normal",
 }
 
 _CFG: dict | None = None
@@ -13221,8 +13226,405 @@ def iniciar_x11() -> None:
     rodar(["am", "start", "--user", "0", "-n", X11_APP], capturar=True, timeout=20, mostrar=False)
 
 
+# ── Transmitir a tela por link (navegador, pela rede ou pelo túnel) ──
+# O scrcpy precisa de uma conexão ADB direta, que só passaria pelo túnel expondo a depuração do celular à
+# internet. Aqui o próprio celular tira a tela (pelo ADB ligado a ele mesmo, ou root) e manda as imagens
+# para uma página com link secreto: abre em qualquer navegador, na mesma rede ou pelo túnel da Cloudflare.
+# O navegador pede o próximo quadro e o servidor só responde quando a tela muda (o túnel rápido não lida
+# bem com streams contínuos, e assim a tela parada não gasta dados nem bateria).
+
+TELA_QUALIDADES = {"rapida": ("Rápida (480 px, gasta menos dados)", 480, 55), "normal": ("Normal (720 px)", 720, 70),
+                   "nitida": ("Nítida (1080 px, mais pesada)", 1080, 85)}
+# formato do 'screencap' (PixelFormat do Android) → (modo do Pillow, modo bruto, bytes por pixel)
+_FORMATOS_TELA = {1: ("RGBA", "RGBA", 4), 2: ("RGBA", "RGBX", 4), 5: ("RGBA", "BGRA", 4), 3: ("RGB", "RGB", 3),
+                  4: ("RGB", "BGR;16", 2)}
+TECLAS_TELA = {"voltar": 4, "inicio": 3, "recentes": 187, "volume_mais": 24, "volume_menos": 25, "energia": 26}
+
+
+def _comando_no_celular(comando: str, saida_binaria: bool = False, timeout: float = 15, serial: str | None = None):
+    """Roda um comando no Android com permissão de 'shell': por root, ou pelo ADB ligado ao próprio celular."""
+    cmd = ["su", "-c", comando] if tem_root() else ["adb", "-s", serial or adb_alvo(), "exec-out", comando]
+    proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise ToonsError(f"'{comando.split()[0]}' falhou: {proc.stderr.decode(errors='replace').strip()[-200:]}")
+    return proc.stdout if saida_binaria else proc.stdout.decode(errors="replace")
+
+
+def quadro_da_tela(bruto: bytes, largura_max: int, qualidade: int) -> tuple:
+    """(JPEG, largura e altura reais da tela) a partir da saída crua do 'screencap' (cabeçalho + pixels)."""
+    from PIL import Image
+    if len(bruto) < 16:
+        raise ToonsError("Captura vazia.")
+    largura, altura, formato = struct.unpack_from("<III", bruto)
+    modo, bruto_modo, bpp = _FORMATOS_TELA.get(formato, ("RGBA", "RGBA", 4))
+    cabecalho = len(bruto) - largura * altura * bpp  # 12 bytes (Android antigo) ou 16 (com o espaço de cor)
+    if not largura or not altura or cabecalho not in (12, 16):
+        raise ToonsError(f"Formato de captura inesperado ({largura}x{altura}, formato {formato}).")
+    img = Image.frombuffer(modo, (largura, altura), bruto[cabecalho:], "raw", bruto_modo, 0, 1).convert("RGB")
+    if largura > largura_max:
+        img = img.resize((largura_max, max(1, round(altura * largura_max / largura))))
+    buffer = io.BytesIO()
+    img.save(buffer, "JPEG", quality=qualidade)
+    return buffer.getvalue(), (largura, altura)
+
+
+def tamanho_png(dados: bytes) -> tuple:
+    """Largura e altura de um PNG (bloco IHDR)."""
+    if dados[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ToonsError("A captura não veio em PNG.")
+    return struct.unpack(">II", dados[16:24])
+
+
+class TransmissaoTela:
+    """Captura a tela enquanto alguém assiste e guarda o último quadro para as páginas abertas."""
+
+    def __init__(self, largura: int, qualidade: int):
+        self.largura, self.qualidade = largura, qualidade
+        self.quadro, self.tipo, self.n, self.tamanho = None, "image/jpeg", 0, (0, 0)
+        self.erro, self.ultimo_pedido, self.serial = "", 0.0, None
+        self.cond = threading.Condition()
+        self.com_pillow = modulo_existe("PIL")
+        threading.Thread(target=self._laco, daemon=True).start()
+
+    def capturar(self) -> tuple:
+        if not tem_root() and not self.serial:
+            self.serial = adb_alvo()  # uma vez só (não a cada quadro); volta a procurar se a conexão cair
+        if self.com_pillow:
+            bruto = _comando_no_celular("screencap", True, serial=self.serial)
+            return (*quadro_da_tela(bruto, self.largura, self.qualidade), "image/jpeg")
+        png = _comando_no_celular("screencap -p", True, serial=self.serial)  # sem o Pillow: PNG (mais lento)
+        return png, tamanho_png(png), "image/png"
+
+    def _laco(self) -> None:
+        anterior = None
+        while True:
+            if time.time() - self.ultimo_pedido > 10:
+                time.sleep(0.3)  # ninguém assistindo: não captura (economiza bateria)
+                continue
+            inicio = time.time()
+            try:
+                quadro, tamanho, tipo = self.capturar()
+                if quadro != anterior:
+                    anterior = quadro
+                    with self.cond:
+                        self.quadro, self.tamanho, self.tipo, self.erro = quadro, tamanho, tipo, ""
+                        self.n += 1
+                        self.cond.notify_all()
+            except Exception as e:  # noqa: BLE001 — a transmissão continua tentando
+                self.erro, self.serial = str(e), None
+                log(f"Captura falhou: {e}")
+                time.sleep(2)
+            time.sleep(max(0.0, 0.12 - (time.time() - inicio)))  # no máximo uns 8 quadros por segundo
+
+    def proximo(self, depois: int, espera: float = 10) -> tuple:
+        """(número, quadro, tipo) do primeiro quadro mais novo que `depois` (ou o atual, se demorar)."""
+        self.ultimo_pedido = time.time()
+        with self.cond:
+            self.cond.wait_for(lambda: self.n > depois, timeout=espera)
+            return self.n, self.quadro, self.tipo
+
+
+def comando_de_controle(acao: dict, tamanho: tuple) -> str:
+    """Comando 'input' do Android para um toque, arrasto, tecla ou texto vindo do navegador.
+    As posições chegam de 0 a 1 (proporção da imagem) e viram pixels da tela de verdade."""
+    largura, altura = tamanho
+    if not largura or not altura:
+        raise ToonsError("Ainda não há imagem da tela.")
+
+    def px(valor, total) -> int:
+        return max(0, min(total - 1, int(float(valor) * total)))
+
+    tipo = acao.get("tipo")
+    if tipo == "toque":
+        return f"input tap {px(acao['x'], largura)} {px(acao['y'], altura)}"
+    if tipo == "arrastar":
+        duracao = max(50, min(3000, int(acao.get("ms", 300))))
+        return (f"input swipe {px(acao['x1'], largura)} {px(acao['y1'], altura)} {px(acao['x2'], largura)} "
+                f"{px(acao['y2'], altura)} {duracao}")
+    if tipo == "tecla" and acao.get("tecla") in TECLAS_TELA:
+        return f"input keyevent {TECLAS_TELA[acao['tecla']]}"
+    if tipo == "texto":
+        texto = "".join(ch for ch in sem_acento(str(acao.get("texto", ""))) if 32 <= ord(ch) < 127)[:200]
+        if not texto:
+            raise ToonsError("Texto vazio (o Android só aceita letras sem acento por aqui).")
+        return "input text " + shlex.quote(texto.replace(" ", "%s"))
+    raise ToonsError(f"Ação desconhecida: {tipo}")
+
+
+PAGINA_TELA = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<meta name="referrer" content="no-referrer"><title>Tela do celular</title>
+<style>
+html,body{margin:0;height:100%;background:#111;color:#eee;font-family:system-ui,sans-serif;overflow:hidden}
+body{display:flex;flex-direction:column}
+#palco{flex:1;min-height:0;display:flex;align-items:center;justify-content:center;padding:6px}
+#tela{max-width:100%;max-height:100%;touch-action:none;user-select:none;-webkit-user-drag:none;
+  box-shadow:0 0 24px #000;border-radius:6px;background:#222;min-width:40px;min-height:40px}
+#barra{display:flex;gap:6px;align-items:center;justify-content:center;flex-wrap:wrap;padding:6px 6px 10px}
+button{background:#2b2b2b;color:#eee;border:1px solid #444;border-radius:10px;padding:8px 12px;font-size:15px}
+#status{position:fixed;top:8px;left:10px;font-size:13px;background:#000a;padding:2px 8px;border-radius:8px}
+</style></head><body>
+<div id="status">conectando…</div>
+<div id="palco"><img id="tela" alt="Tela do celular" draggable="false"></div>
+<div id="barra">__BARRA__</div>
+<script>
+const token = new URLSearchParams(location.search).get("t") || "";
+const CONTROLE = __CONTROLE__;
+const img = document.getElementById("tela"), st = document.getElementById("status");
+const espera = ms => new Promise(f => setTimeout(f, ms));
+let n = 0;
+async function laco() {
+  for (;;) {
+    try {
+      const r = await fetch(`/quadro?t=${encodeURIComponent(token)}&n=${n}`, {cache: "no-store"});
+      if (r.status === 200) {
+        n = +r.headers.get("X-Quadro");
+        const url = URL.createObjectURL(await r.blob()), antigo = img.src;
+        img.src = url;
+        if (antigo.startsWith("blob:")) URL.revokeObjectURL(antigo);
+        st.textContent = "● ao vivo";
+      } else if (r.status === 204) {
+        const e = r.headers.get("X-Erro");
+        st.textContent = e ? "⚠ " + decodeURIComponent(e) : "● ao vivo (tela parada)";
+        if (e) await espera(1500);
+      } else {
+        st.textContent = r.status === 403 ? "link inválido ou trocado" : "transmissão parada";
+        await espera(3000);
+      }
+    } catch (e) {
+      st.textContent = "sem conexão… tentando de novo";
+      await espera(2000);
+    }
+  }
+}
+function enviar(acao) {
+  fetch(`/controle?t=${encodeURIComponent(token)}`, {method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(acao)}).then(r => { if (!r.ok) st.textContent = "⚠ o controle não foi aceito"; });
+}
+if (CONTROLE) {
+  let ini = null;
+  const pos = e => { const b = img.getBoundingClientRect();
+    return {x: (e.clientX - b.left) / b.width, y: (e.clientY - b.top) / b.height}; };
+  img.addEventListener("pointerdown", e => { ini = {...pos(e), t: Date.now()}; img.setPointerCapture(e.pointerId);
+    e.preventDefault(); });
+  img.addEventListener("pointerup", e => {
+    if (!ini) return;
+    const fim = pos(e), b = img.getBoundingClientRect(), ms = Date.now() - ini.t;
+    const dist = Math.hypot((fim.x - ini.x) * b.width, (fim.y - ini.y) * b.height);
+    if (dist < 12 && ms < 600) enviar({tipo: "toque", x: ini.x, y: ini.y});
+    else enviar({tipo: "arrastar", x1: ini.x, y1: ini.y, x2: fim.x, y2: fim.y, ms: Math.max(80, ms)});
+    ini = null;
+  });
+  img.addEventListener("contextmenu", e => e.preventDefault());
+  document.querySelectorAll("[data-tecla]").forEach(b => b.onclick = () => enviar({tipo: "tecla", tecla: b.dataset.tecla}));
+  document.getElementById("texto").onclick = () => { const t = prompt("Texto para digitar no celular (sem acentos):");
+    if (t) enviar({tipo: "texto", texto: t}); };
+}
+laco();
+</script></body></html>"""
+
+BARRA_CONTROLE = ('<button data-tecla="voltar">◀ Voltar</button><button data-tecla="inicio">● Início</button>'
+                  '<button data-tecla="recentes">▢ Recentes</button><button id="texto">⌨ Texto</button>'
+                  '<button data-tecla="volume_menos">🔉</button><button data-tecla="volume_mais">🔊</button>')
+PAGINA_SEM_ACESSO = ("<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width'>"
+                     "<body style='background:#111;color:#eee;font-family:sans-serif;text-align:center;padding:40px'>"
+                     "<h2>Link inválido</h2><p>Peça um link novo para quem está transmitindo a tela.</p>")
+
+
+class _HandlerTela(BaseHTTPRequestHandler):
+    server_version = "TermuxToons"
+    transmissao: TransmissaoTela | None = None
+    token = ""
+    controle = False
+    executar = staticmethod(lambda comando: _comando_no_celular(comando, serial=_HandlerTela.transmissao.serial))
+
+    def log_message(self, formato, *args):
+        pass
+
+    def _consulta(self) -> dict:
+        return urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+
+    def _autorizado(self) -> bool:
+        token = (self._consulta().get("t") or [""])[0]
+        return bool(self.token) and hmac.compare_digest(token.encode(), self.token.encode())
+
+    def _responder(self, codigo: int, corpo: bytes = b"", tipo: str = "text/plain; charset=utf-8",
+                   extra: dict | None = None) -> None:
+        self.send_response(codigo)
+        for chave, valor in {"Content-Type": tipo, "Content-Length": str(len(corpo)), "Cache-Control": "no-store",
+                             "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer",
+                             **(extra or {})}.items():
+            self.send_header(chave, valor)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(corpo)
+
+    def do_GET(self):
+        caminho = urllib.parse.urlsplit(self.path).path
+        if not self._autorizado():
+            self._responder(403, PAGINA_SEM_ACESSO.encode(), "text/html; charset=utf-8")
+            return
+        if caminho == "/":
+            pagina = PAGINA_TELA.replace("__CONTROLE__", "true" if self.controle else "false").replace(
+                "__BARRA__", BARRA_CONTROLE if self.controle else "<span style='opacity:.6'>Só visualização</span>")
+            self._responder(200, pagina.encode(), "text/html; charset=utf-8")
+        elif caminho == "/quadro":
+            try:
+                depois = int((self._consulta().get("n") or ["0"])[0])
+            except ValueError:
+                depois = 0
+            n, quadro, tipo = self.transmissao.proximo(depois)
+            if quadro is None or n <= depois:
+                erro_txt = urllib.parse.quote(self.transmissao.erro[:200]) if self.transmissao.erro else ""
+                self._responder(204, extra={"X-Erro": erro_txt} if erro_txt else None)
+            else:
+                self._responder(200, quadro, tipo, {"X-Quadro": str(n)})
+        else:
+            self._responder(404, b"nada aqui")
+
+    def do_POST(self):
+        if urllib.parse.urlsplit(self.path).path != "/controle":
+            self._responder(404)
+            return
+        if not self._autorizado() or not self.controle:
+            self._responder(403, b"controle bloqueado")
+            return
+        try:
+            tamanho = int(self.headers.get("Content-Length") or 0)
+            acao = json.loads(self.rfile.read(min(tamanho, 10_000)) or b"{}")
+            self.executar(comando_de_controle(acao, self.transmissao.tamanho))
+        except (ToonsError, ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as e:
+            self._responder(400, str(e).encode())
+            return
+        self._responder(204)
+
+
+def servir_tela(porta: int) -> None:
+    """Servidor da transmissão de tela (roda dentro do tmux)."""
+    c = cfg()
+    if not c.get("tela_token"):
+        raise ToonsError("Crie a transmissão pelo menu primeiro (ela gera o link secreto).")
+    _, largura, qualidade = TELA_QUALIDADES.get(c.get("tela_qualidade"), TELA_QUALIDADES["normal"])
+    _HandlerTela.transmissao = TransmissaoTela(largura, qualidade)
+    _HandlerTela.token, _HandlerTela.controle = c["tela_token"], bool(c.get("tela_controle"))
+    with ThreadingHTTPServer(("0.0.0.0", porta), _HandlerTela) as servidor:
+        log(f"Transmissão da tela em http://{ip_local()}:{porta} · controle "
+            f"{'PERMITIDO' if _HandlerTela.controle else 'bloqueado'}")
+        servidor.serve_forever()
+
+
+def links_da_tela() -> list:
+    c = cfg()
+    links = [("Mesma rede Wi-Fi", f"http://{ip_local()}:{c['tela_porta']}/?t={c['tela_token']}")]
+    if servico_ativo("tunel-tela") and url_tunel("tunel-tela"):
+        links.append(("Internet (de qualquer lugar)", f"{url_tunel('tunel-tela')}/?t={c['tela_token']}"))
+    return links
+
+
+def mostrar_links_tela(oferecer_acoes: bool = True) -> None:
+    if not servico_ativo("tela"):
+        info("A transmissão está parada.")
+        return
+    links = links_da_tela()
+    print(f"\n{NEG}📡 Transmissão da tela{RST} {DIM}(controle "
+          f"{'permitido' if cfg().get('tela_controle') else 'bloqueado'}){RST}")
+    for onde, link in links:
+        print(f"  {CIANO}{onde}:{RST}\n  {NEG}{link}{RST}")
+    if len(links) == 1:
+        print(f"  {DIM}Para alguém fora do seu Wi-Fi, ligue a transmissão escolhendo 'qualquer lugar'.{RST}")
+    if not oferecer_acoes:
+        return
+    link = links[-1][1]
+    i = escolher("E agora?", ["Copiar o link", "Mostrar QR code", "Enviar (WhatsApp, Telegram...)",
+                              "Abrir aqui para testar", "Nada"])
+    if i == 0:
+        copiar_texto(link)
+    elif i == 1:
+        mostrar_qr(link, "tela")
+    elif i == 2 and tem("termux-share"):
+        _tapi(["termux-share", "-a", "send"], 30, entrada=f"📱 Veja a tela do meu celular:\n{link}", json_saida=False)
+    elif i == 3:
+        abrir_link(links[0][1])
+
+
+def iniciar_transmissao_tela() -> None:
+    c = cfg()
+    if not tem_root():
+        try:
+            adb_alvo()
+        except ToonsError as e:
+            erro(str(e))
+            info("Sem root, a tela é capturada pelo ADB ligado ao próprio celular: conecte em "
+                 "📲 Celular e sistema → 🔌 Depuração sem fio e volte aqui.")
+            return
+    if not modulo_existe("PIL"):
+        garantir_modulo("PIL", pip_nome="pillow", pkg_nome="python-pillow",
+                        aviso_extra="Com ele a transmissão fica bem mais rápida (sem ele, funciona com imagens PNG).")
+    chaves = list(TELA_QUALIDADES)
+    i = escolher("Qualidade da imagem", [TELA_QUALIDADES[k][0] for k in chaves],
+                 chaves.index(c.get("tela_qualidade", "normal")) + 1)
+    if i is None:
+        return
+    c["tela_qualidade"] = chaves[i]
+    j = escolher("Quem vai assistir?", ["Alguém na mesma rede Wi-Fi", "Qualquer lugar (internet, pelo túnel)"])
+    if j is None:
+        return
+    aviso("Quem tiver o link vê TUDO o que aparece na tela: notificações, mensagens, senhas digitadas...")
+    c["tela_controle"] = confirmar("Permitir que quem assiste TOQUE e digite no seu celular?", False)
+    if not c.get("tela_token"):
+        c["tela_token"] = secrets.token_urlsafe(18)
+    salvar_cfg()
+    if servico_ativo("tela"):
+        parar_servico("tela")  # reinicia para valer a qualidade e o controle escolhidos
+        time.sleep(1)
+    if not porta_livre(c["tela_porta"]):
+        raise ToonsError(f"A porta {c['tela_porta']} está em uso por outro programa.")
+    if not iniciar_servico("tela", cmd_self("tela", "--porta", str(c["tela_porta"])), reiniciar=True):
+        return
+    if j == 1:
+        abrir_tunel("tunel-tela", c["tela_porta"])
+    elif servico_ativo("tunel-tela"):
+        parar_servico("tunel-tela")
+    mostrar_links_tela()
+    info("Telas de apps protegidos (bancos, por exemplo) aparecem pretas: o Android não deixa capturar.")
+
+
+def parar_transmissao_tela() -> None:
+    parar_servico("tunel-tela")
+    parar_servico("tela")
+
+
+def novo_link_tela() -> None:
+    c = cfg()
+    c["tela_token"] = secrets.token_urlsafe(18)
+    salvar_cfg()
+    ok("Link novo criado: o antigo parou de funcionar.")
+    if servico_ativo("tela"):
+        parar_servico("tela")
+        time.sleep(1)
+        iniciar_servico("tela", cmd_self("tela", "--porta", str(c["tela_porta"])), reiniciar=True)
+        mostrar_links_tela()
+
+
+def alternar_controle_tela() -> None:
+    c = cfg()
+    if not c.get("tela_controle"):
+        aviso("Com o controle ligado, quem tiver o link toca, arrasta e digita no seu celular.")
+        if not confirmar("Permitir o controle pelo navegador?", False):
+            return
+    c["tela_controle"] = not c.get("tela_controle")
+    salvar_cfg()
+    ok(f"Controle pelo navegador {'PERMITIDO' if c['tela_controle'] else 'bloqueado'}.")
+    if servico_ativo("tela"):
+        parar_servico("tela")
+        time.sleep(1)
+        iniciar_servico("tela", cmd_self("tela", "--porta", str(c["tela_porta"])), reiniciar=True)
+
+
 @submenu
 def menu_espelhar():
+    c = cfg()
+
     def outro_celular():
         if not garantir_adb() or not garantir_cmd("scrcpy", "scrcpy", repo="x11-repo"):
             return
@@ -13251,9 +13653,15 @@ def menu_espelhar():
             print(f"\n  No PC, rode:  {NEG}scrcpy --tcpip={ip}:5555{RST}\n")
             aviso("A porta 5555 fica aberta na rede até reiniciar o celular. Use só em redes de confiança.")
 
-    menu("📲 Espelhar e controlar a tela (scrcpy)", [
-        ("Ver e controlar OUTRO celular aqui (Termux:X11)", outro_celular),
-        ("Ver e controlar ESTE celular num PC", num_pc),
+    menu("📲 Espelhar e transmitir a tela", [
+        ("🌍 Transmitir a tela por link (navegador; Wi-Fi ou internet)", iniciar_transmissao_tela),
+        (lambda: f"Transmissão: mostrar o link ({'no ar' if servico_ativo('tela') else 'parada'})", mostrar_links_tela),
+        (lambda: f"Transmissão: controle pelo navegador ({'permitido' if c.get('tela_controle') else 'bloqueado'})",
+         alternar_controle_tela),
+        ("Transmissão: gerar link novo (o antigo para de funcionar)", novo_link_tela),
+        ("Transmissão: parar (e fechar o túnel)", parar_transmissao_tela),
+        ("Ver e controlar OUTRO celular aqui (scrcpy + Termux:X11)", outro_celular),
+        ("Ver e controlar ESTE celular num PC (scrcpy, mesma rede)", num_pc),
     ])
 
 
@@ -13269,7 +13677,7 @@ def menu_celular():
         ("📸 Organizador de fotos", menu_fotos),
         ("🔁 Conversor de arquivos (imagem, vídeo, áudio, PDF)", menu_conversor_arquivos),
         ("🤖 Automação por eventos (Wi-Fi, carregador, horário)", menu_automacao),
-        ("📲 Espelhar e controlar a tela (scrcpy)", menu_espelhar),
+        ("📲 Espelhar e transmitir a tela (scrcpy ou link pela internet)", menu_espelhar),
     ])
 
 
@@ -17289,6 +17697,8 @@ def main(argv=None) -> int:
     p = sub.add_parser("site", help="publica uma pasta como site (página HTML) em primeiro plano")
     p.add_argument("pasta")
     p.add_argument("--porta", type=int)
+    p = sub.add_parser("tela", help="transmite a tela do celular para o navegador (link secreto)")
+    p.add_argument("--porta", type=int)
     p = sub.add_parser("compartilhar", help="cria um link para assistir a um vídeo e liga o servidor")
     p.add_argument("arquivo", help="vídeo do celular, link direto de arquivo ou página de vídeo (YouTube...)")
     p.add_argument("--titulo")
@@ -17356,6 +17766,8 @@ def main(argv=None) -> int:
             gerenciador_arquivos(args.pasta)
         elif args.comando == "site":
             servir_site(args.pasta, args.porta or cfg()["site_porta"])
+        elif args.comando == "tela":
+            servir_tela(args.porta or cfg()["tela_porta"])
         elif args.comando == "compartilhar":
             link = conferir_link(args.arquivo) if eh_link(args.arquivo) else {"pagina": False, "titulo": None}
             item = criar_compartilhamento(args.arquivo, args.titulo or link["titulo"], args.horas,
