@@ -24,6 +24,14 @@ Reúne em um único menu:
   17. Depuração sem fio (ADB pelo Wi-Fi) do próprio celular, sem PC e sem root
   18. Gerenciador de arquivos: copiar, mover, renomear, compactar e ver Android/data (ADB ou root)
   19. Calculadora científica com botões (setas + Enter): trigonometria, fatorial, %, frações
+  20. Utilitários: notas, lembretes/alarmes, cronômetro/Pomodoro, agenda, conversor, gastos, senhas,
+      previsão do tempo, QR code (Wi-Fi, PIX) e tradutor
+  21. Celular e sistema: bateria, uso de dados/tempo de tela e apps (ADB), fotos, conversor de arquivos,
+      automação por eventos e espelhamento de tela
+  22. Internet: e-mail, notícias, downloads (aria2), chat na rede local, Browsh/w3m e encurtador/pastebin
+  23. Inteligência artificial: Claude/ChatGPT/Gemini, voz para texto (whisper.cpp) e OCR
+  24. Diversão e aprendizado: jogos, cursos de Python/Bash/Git, leitor de livros, rádio e podcasts, arte ASCII
+  25. Programação e servidores: SQLite/MariaDB/PostgreSQL, GitHub, cron, Minecraft, Jellyfin e Navidrome
 
 Uso:
     python termux_toons.py            # menu interativo
@@ -38,8 +46,11 @@ from __future__ import annotations
 import argparse
 import ast
 import atexit
+import base64
+import calendar
 import contextlib
 import copy
+import csv
 import fnmatch
 import getpass
 import hashlib
@@ -52,6 +63,7 @@ import math
 import operator
 import os
 import platform
+import posixpath
 import random
 import re
 import secrets
@@ -61,9 +73,11 @@ import shutil
 import socket
 import stat
 import statistics
+import string
 import subprocess
 import sys
 import tarfile
+import textwrap
 import threading
 import time
 import traceback
@@ -74,7 +88,7 @@ import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 import zipfile
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -234,8 +248,11 @@ def ler_tecla() -> str:
     'esc', 'home', 'end', 'pgup', 'pgdn', 'backspace' ou o próprio caractere."""
     fd = sys.stdin.fileno()
     antigo = termios.tcgetattr(fd)
+    # numa tela cheia o terminal já está assim: mudar de novo (TCSAFLUSH) jogaria fora a tecla já apertada
+    ja_sem_enter = not antigo[3] & termios.ICANON
     try:
-        tty.setcbreak(fd)  # sem eco e sem esperar Enter; Ctrl+C continua funcionando
+        if not ja_sem_enter:
+            tty.setcbreak(fd)  # sem eco e sem esperar Enter; Ctrl+C continua funcionando
         ch = os.read(fd, 1)
         if not ch:
             raise SystemExit(0)
@@ -257,7 +274,8 @@ def ler_tecla() -> str:
             ch += os.read(fd, 1 if ch[0] < 0xE0 else 2 if ch[0] < 0xF0 else 3)
         return ch.decode("utf-8", errors="ignore")
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
+        if not ja_sem_enter:
+            termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
 
 
 def _cursor(visivel: bool) -> None:
@@ -782,6 +800,26 @@ PADRAO_CFG = {
     "modem_dispositivo": "",
     "modem_baud": "115200",
     "monitores": [],
+    "tts_velocidade": 1.0,
+    "tempo_local": {},
+    "tradutor_destino": "en",
+    "tradutor_falar": False,
+    "bateria_alerta_carga": 80,
+    "bateria_alerta_baixa": 15,
+    "bateria_alerta_temp": 42,
+    "automacoes": [],
+    "email": {},
+    "feeds": [],
+    "aria2_segredo": "",
+    "aria2_pasta": "",
+    "aria2_simultaneos": 3,
+    "chat_nome": "",
+    "whisper_modelo": "base",
+    "radios_favoritas": [],
+    "podcasts": [],
+    "banner_texto": "",
+    "banner_fonte": "standard",
+    "minecraft_memoria": "1G",
 }
 
 _CFG: dict | None = None
@@ -989,9 +1027,11 @@ def notificar(titulo_n: str, texto: str, nid: str | None = None, som: bool = Fal
 
 def falar(texto: str) -> None:
     cmd = ["termux-tts-speak"]
-    idioma = cfg().get("tts_idioma")
+    idioma, velocidade = cfg().get("tts_idioma"), cfg().get("tts_velocidade") or 1.0
     if idioma:
         cmd += ["-l", idioma]
+    if float(velocidade) != 1.0:
+        cmd += ["-r", str(velocidade)]
     _tapi(cmd, 180, entrada=texto, json_saida=False)  # sem argumentos o texto vem do stdin
 
 
@@ -2605,6 +2645,7 @@ TIPOS_MONITOR = {
     "mudanca": "Qualquer mudança no conteúdo",
     "rss": "Notícias novas em feed RSS/Atom",
     "bateria": "Bateria abaixo de um limite",
+    "chuva": "Chuva prevista nas próximas horas",
 }
 
 REGEX_PRECO = {
@@ -2699,6 +2740,8 @@ def ler_feed(dados: bytes) -> list:
 def checar_monitor(m: dict, est: dict) -> tuple:
     """Executa um monitor. Devolve (texto do alerta ou None, resumo)."""
     tipo, nome = m["tipo"], m["nome"]
+    if tipo == "chuva":
+        return checar_chuva(m, est)
     if tipo == "bateria":
         pct = int(bateria().get("percentage", 100))
         baixa = pct <= int(m.get("limite", 20))
@@ -2855,6 +2898,8 @@ def menu_monitor():
         if tipo == "bateria":
             dados["limite"] = perguntar_int("Limite (%)", 20, 1, 99)
             dados["nome"] = f"Bateria < {dados['limite']}%"
+        elif tipo == "chuva":
+            dados.update(configurar_alerta_chuva())
         else:
             dados["url"] = perguntar("URL" + (" do feed" if tipo == "rss" else ""))
             if not dados["url"].startswith(("http://", "https://")):
@@ -10002,15 +10047,6 @@ def _calc_painel(titulo_painel: str, linhas: list) -> None:
     ler_tecla()
 
 
-def _cortar(texto: str, largura: int) -> str:
-    """Corta o texto (sem cores) para caber na largura, com '…' no fim."""
-    if _largura(texto) <= largura:
-        return texto
-    while texto and _largura(texto) > largura - 1:
-        texto = texto[:-1]
-    return texto + "…"
-
-
 def _calculadora_botoes():
     graus = True
     variaveis: dict = {}
@@ -10186,6 +10222,6926 @@ def _calculadora_botoes():
 
 
 # ════════════════════════════════════════════════════════════════════
+#  Ajudantes das ferramentas novas (menus 20 a 25)
+# ════════════════════════════════════════════════════════════════════
+
+NOTAS_DIR = DATA_DIR / "notas"
+LEMBRETES_FILE = DATA_DIR / "lembretes.json"
+AGENDA_FILE = DATA_DIR / "agenda.json"
+GASTOS_FILE = DATA_DIR / "gastos.json"
+COFRE_FILE = DATA_DIR / "cofre.json"
+CAMBIO_FILE = DATA_DIR / "cambio.json"
+POMODORO_FILE = DATA_DIR / "pomodoro.json"
+
+MESES = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro",
+         "outubro", "novembro", "dezembro"]
+DIAS_SEMANA = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"]
+
+
+def pasta_saida(*sub: str) -> Path:
+    """Onde salvar o que a pessoa vai querer abrir: Downloads/Termux-Toons (ou ~/.termux_toons/saida)."""
+    base = DOWNLOADS / "Termux-Toons" if DOWNLOADS.exists() else DATA_DIR / "saida"
+    pasta = base.joinpath(*sub)
+    pasta.mkdir(parents=True, exist_ok=True)
+    return pasta
+
+
+def _abridor(url: str):
+    local = urllib.parse.urlsplit(url).hostname in ("127.0.0.1", "localhost")
+    return _SEM_PROXY if local else urllib.request.build_opener()
+
+
+def pedir_bytes(url: str, dados: bytes | None = None, cabecalhos: dict | None = None, timeout: float = 30,
+                metodo: str | None = None) -> bytes:
+    """Faz uma requisição HTTP e devolve o corpo. Erros viram ToonsError com uma mensagem legível."""
+    req = urllib.request.Request(url, data=dados, method=metodo,
+                                 headers={"User-Agent": USER_AGENT, **(cabecalhos or {})})
+    host = urllib.parse.urlsplit(url).netloc
+    try:
+        with _abridor(url).open(req, timeout=timeout) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        detalhe = e.read()[:300].decode("utf-8", errors="replace").strip()
+        raise ToonsError(f"HTTP {e.code} em {host}" + (f": {detalhe}" if detalhe else "")) from None
+    except (OSError, ValueError) as e:
+        raise ToonsError(f"Sem resposta de {host} ({getattr(e, 'reason', e)}). Está com internet?") from None
+
+
+def pedir_json(url: str, dados=None, cabecalhos: dict | None = None, timeout: float = 30,
+               metodo: str | None = None):
+    """Chama uma API e devolve o JSON da resposta; `dados` (dict/list) vai como corpo JSON."""
+    corpo = json.dumps(dados).encode() if dados is not None else None
+    extra = {"Accept": "application/json", **({"Content-Type": "application/json"} if corpo else {})}
+    bruto = pedir_bytes(url, corpo, {**extra, **(cabecalhos or {})}, timeout, metodo)
+    try:
+        return json.loads(bruto.decode("utf-8", errors="replace") or "null")
+    except ValueError:
+        raise ToonsError(f"Resposta inesperada de {urllib.parse.urlsplit(url).netloc}.") from None
+
+
+def url_com(base: str, **params) -> str:
+    """Monta uma URL com parâmetros (ignora os vazios)."""
+    limpos = {k: v for k, v in params.items() if v not in (None, "")}
+    return base + ("?" + urllib.parse.urlencode(limpos) if limpos else "")
+
+
+def sem_acento(texto: str) -> str:
+    return unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
+
+
+def contem(texto: str, termo: str) -> bool:
+    """Busca sem diferenciar maiúsculas nem acentos."""
+    return sem_acento(termo).lower() in sem_acento(texto).lower()
+
+
+def numero_br(v: float, casas: int = 6) -> str:
+    """1234.5 → '1.234,5' (até `casas` decimais, sem zeros sobrando)."""
+    if v != v or v in (float("inf"), float("-inf")):
+        return str(v)
+    if v and not 1e-4 <= abs(v) < 1e15:
+        return f"{v:.4e}".replace(".", ",")
+    texto = f"{v:,.{casas}f}".rstrip("0").rstrip(".") if casas else f"{v:,.0f}"
+    return texto.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def ler_numero(msg: str, padrao=None, minimo: float | None = None) -> float:
+    """Lê um número aceitando vírgula ('12,50') ou ponto e separador de milhar ('1.299,90')."""
+    while True:
+        texto = perguntar(msg, padrao)
+        valor = parse_preco(texto) if re.search(r"\d", texto) else None
+        if texto.strip().startswith("-") and valor is not None:
+            valor = -valor
+        if valor is None:
+            erro("Digite um número (ex.: 12,50).")
+        elif minimo is not None and valor < minimo:
+            erro(f"O valor mínimo é {numero_br(minimo)}.")
+        else:
+            return valor
+
+
+def copiar_texto(texto: str, avisar: bool = True) -> bool:
+    """Copia para a área de transferência do Android (Termux:API)."""
+    try:
+        _tapi(["termux-clipboard-set"], 10, entrada=texto, json_saida=False)
+    except ToonsError as e:
+        aviso(f"Não consegui copiar ({e}).")
+        return False
+    if avisar:
+        ok("Copiado para a área de transferência.")
+    return True
+
+
+def abrir_link(url: str) -> None:
+    """Abre um link no navegador do Android."""
+    for cmd in (["termux-open-url", url], ["xdg-open", url]):
+        if tem(cmd[0]):
+            rodar(cmd, capturar=True, timeout=20)
+            return
+    info(f"Abra no navegador: {url}")
+
+
+def abrir_arquivo(caminho) -> None:
+    """Abre um arquivo no app padrão do Android."""
+    if tem("termux-open"):
+        rodar(["termux-open", str(caminho)], capturar=True, timeout=20)
+    else:
+        info(f"Arquivo: {caminho}")
+
+
+def notificar_seguro(titulo_n: str, texto: str, **extra) -> None:
+    """Notificação que nunca derruba quem chamou (fora do Termux só imprime)."""
+    try:
+        notificar(titulo_n, texto, **extra)
+    except ToonsError as e:
+        log(f"Notificação falhou: {e}")
+
+
+def _pastas_de_arquivos() -> list:
+    """(pasta, profundidade) onde os arquivos da pessoa costumam estar."""
+    s = HOME / "storage"
+    pastas = [(s / "downloads", 3), (s / "dcim", 3), (s / "pictures", 3), (s / "music", 3), (s / "movies", 3),
+              (s / "shared" / "Documents", 3), (s / "shared", 2), (HOME, 1)]
+    return [(p, n) for p, n in pastas if p.exists()]
+
+
+def listar_arquivos(extensoes: tuple = (), pastas: list | None = None, limite: int = 200) -> list:
+    """Arquivos com essas extensões, os mais novos primeiro (sem repetir os que aparecem por dois caminhos)."""
+    vistos, achados = set(), []
+    for pasta, profundidade in pastas or _pastas_de_arquivos():
+        pasta = Path(pasta)
+        for raiz, dirs, arquivos in os.walk(pasta, onerror=lambda e: None):
+            nivel = len(Path(raiz).relative_to(pasta).parts)
+            dirs[:] = [] if nivel + 1 >= profundidade else \
+                [d for d in dirs if not d.startswith(".") and d not in ("Android", "node_modules", "__pycache__")]
+            for nome in arquivos:
+                if nome.startswith(".") or (extensoes and not nome.lower().endswith(extensoes)):
+                    continue
+                caminho = Path(raiz) / nome
+                try:
+                    real, mtime = caminho.resolve(), caminho.stat().st_mtime
+                except OSError:
+                    continue
+                if real not in vistos:
+                    vistos.add(real)
+                    achados.append((mtime, caminho))
+    achados.sort(key=lambda par: par[0], reverse=True)
+    return [c for _, c in achados[:limite]]
+
+
+def _rotulo_arquivo(caminho: Path) -> str:
+    try:
+        quando = datetime.fromtimestamp(caminho.stat().st_mtime).strftime("%d/%m %H:%M")
+        tamanho_txt = bytes_humanos(caminho.stat().st_size)
+    except OSError:
+        quando = tamanho_txt = "?"
+    return f"{caminho.name}  {DIM}{tamanho_txt} · {quando} · {caminho.parent.name}{RST}"
+
+
+def escolher_arquivo(msg: str, extensoes: tuple = (), pastas: list | None = None) -> Path | None:
+    """Mostra os arquivos recentes (Downloads, DCIM...) e devolve o escolhido; dá para digitar o caminho."""
+    arquivos = listar_arquivos(extensoes, pastas)
+    opcoes = [_rotulo_arquivo(a) for a in arquivos] + ["Digitar o caminho do arquivo..."]
+    if not arquivos:
+        info(f"Nenhum arquivo {'/'.join(extensoes) or ''} encontrado nas pastas comuns.")
+    i = escolher(msg, opcoes)
+    if i is None:
+        return None
+    if i < len(arquivos):
+        return arquivos[i]
+    caminho = Path(os.path.expanduser(perguntar("Caminho do arquivo").strip().strip("'\"")))
+    if not caminho.is_file():
+        raise ToonsError(f"Arquivo não encontrado: {caminho}")
+    return caminho
+
+
+def escolher_arquivos(msg: str, extensoes: tuple = (), pastas: list | None = None) -> list:
+    """Vários arquivos de uma vez (Espaço marca)."""
+    arquivos = listar_arquivos(extensoes, pastas)
+    if not arquivos:
+        raise ToonsError(f"Nenhum arquivo {'/'.join(extensoes)} encontrado nas pastas comuns.")
+    return [arquivos[i] for i in escolher_varios(msg, [_rotulo_arquivo(a) for a in arquivos])]
+
+
+def editar_texto(inicial: str = "", sufixo: str = ".md") -> str | None:
+    """Texto longo: abre o nano (ou $EDITOR); sem editor, lê linhas até uma linha só com '.'."""
+    editor = os.environ.get("EDITOR") or ("nano" if tem("nano") else "vim" if tem("vim") else "")
+    if editor and sys.stdin.isatty():
+        pasta = DATA_DIR / "tmp"
+        pasta.mkdir(parents=True, exist_ok=True)
+        arq = pasta / f"texto_{os.getpid()}{sufixo}"
+        arq.write_text(inicial, "utf-8")
+        if "nano" in editor:
+            info("No nano: escreva, depois Ctrl+O e Enter para salvar e Ctrl+X para sair.")
+            time.sleep(1.2)
+        try:
+            rodar(shlex.split(editor) + [str(arq)], mostrar=False)
+            return arq.read_text("utf-8")
+        finally:
+            arq.unlink(missing_ok=True)
+    info("Digite o texto. Para terminar, digite uma linha só com um ponto (.)")
+    linhas = []
+    while True:
+        try:
+            linha = input()
+        except EOFError:
+            break
+        if linha.strip() == ".":
+            break
+        linhas.append(linha)
+    return "\n".join(linhas) if linhas else (inicial or None)
+
+
+def ler_linhas(msg: str) -> str:
+    """Lê várias linhas no próprio terminal até uma linha vazia."""
+    info(f"{msg} (linha vazia termina)")
+    linhas = []
+    while True:
+        try:
+            linha = input(f"{DIM}…{RST} ")
+        except EOFError:
+            break
+        if not linha.strip():
+            break
+        linhas.append(linha)
+    return "\n".join(linhas)
+
+
+class TelaCheia:
+    """Tela alternativa do terminal, teclas lidas sem Enter e cursor escondido; tudo volta ao sair."""
+
+    def __enter__(self):
+        if not setas_ativas():
+            raise ToonsError("Isto precisa de um terminal interativo (abra pelo Termux).")
+        self.fd = sys.stdin.fileno()
+        self.antigo = termios.tcgetattr(self.fd)
+        sys.stdout.write("\033[?1049h\033[?25l")
+        sys.stdout.flush()
+        tty.setcbreak(self.fd)
+        return self
+
+    def __exit__(self, *erro_info):
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.antigo)
+        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.flush()
+        return False
+
+    @contextlib.contextmanager
+    def normal(self):
+        """Volta ao terminal normal por um instante (para perguntar algo com Enter)."""
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.antigo)
+        sys.stdout.write("\033[?25h\033[?1049l")
+        sys.stdout.flush()
+        try:
+            yield
+        finally:
+            sys.stdout.write("\033[?1049h\033[?25l")
+            sys.stdout.flush()
+            tty.setcbreak(self.fd)
+
+
+def desenhar(linhas: list) -> None:
+    """Redesenha a tela inteira (sem quebra depois da última linha, para não rolar)."""
+    colunas, altura = shutil.get_terminal_size((60, 24))
+    linhas = [_cortar(linha, colunas) for linha in linhas[:altura]]
+    sys.stdout.write("\033[H" + "\033[K\n".join(linhas) + "\033[K\033[J")
+    sys.stdout.flush()
+
+
+def tecla_ou_nada(espera: float) -> str | None:
+    """Uma tecla, se alguém apertar dentro de `espera` segundos (use dentro de TelaCheia)."""
+    if select.select([sys.stdin], [], [], espera)[0]:
+        return ler_tecla()
+    return None
+
+
+_DIGITOS_GRANDES = {
+    "0": ("███", "█ █", "█ █", "█ █", "███"), "1": (" █ ", "██ ", " █ ", " █ ", "███"),
+    "2": ("███", "  █", "███", "█  ", "███"), "3": ("███", "  █", "███", "  █", "███"),
+    "4": ("█ █", "█ █", "███", "  █", "  █"), "5": ("███", "█  ", "███", "  █", "███"),
+    "6": ("███", "█  ", "███", "█ █", "███"), "7": ("███", "  █", "  █", "  █", "  █"),
+    "8": ("███", "█ █", "███", "█ █", "███"), "9": ("███", "█ █", "███", "  █", "███"),
+    ":": (" ", "█", " ", "█", " "), ".": (" ", " ", " ", " ", "█"), "-": ("   ", "   ", "███", "   ", "   "),
+    " ": ("  ",) * 5,
+}
+
+
+def numeros_grandes(texto: str) -> list:
+    """'12:34' em algarismos de 5 linhas feitos de blocos."""
+    linhas = [""] * 5
+    for ch in texto:
+        desenho = _DIGITOS_GRANDES.get(ch, ("   ",) * 5)
+        for i in range(5):
+            linhas[i] += desenho[i] + " "
+    return [linha.rstrip() for linha in linhas]
+
+
+def parse_duracao(texto: str, unidade_padrao: str = "m") -> int:
+    """'25' (minutos), '90s', '1h30m', '1h 30min', '10:00' (mm:ss) → segundos."""
+    t = sem_acento(texto).strip().lower().replace(" ", "")
+    if re.fullmatch(r"\d+:\d{1,2}(:\d{1,2})?", t):
+        segundos = 0
+        for parte in t.split(":"):
+            segundos = segundos * 60 + int(parte)
+        return segundos
+    if re.fullmatch(r"\d+(?:[.,]\d+)?", t):
+        return int(float(t.replace(",", ".")) * {"s": 1, "m": 60, "h": 3600}[unidade_padrao])
+    padrao = r"(\d+(?:[.,]\d+)?)(horas?|h|minutos?|mins?|m|segundos?|seg|s)"
+    if not t or not re.fullmatch(f"(?:{padrao})+", t):
+        raise ToonsError("Não entendi o tempo. Exemplos: 25 (minutos), 90s, 1h30m, 10:00.")
+    total = 0.0
+    for numero, unidade in re.findall(padrao, t):
+        total += float(numero.replace(",", ".")) * {"h": 3600, "m": 60, "s": 1}[unidade[0]]
+    return int(total)
+
+
+def fmt_relogio(segundos: float, decimos: bool = False) -> str:
+    segundos = max(0.0, segundos)
+    h, resto = divmod(int(segundos), 3600)
+    m, s = divmod(resto, 60)
+    texto = f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+    return texto + (f".{int(segundos * 10) % 10}" if decimos else "")
+
+
+def tempo_ate(quando: datetime, agora: datetime | None = None) -> str:
+    """'em 2 h 5 min', 'em 3 dias', 'há 10 min'."""
+    diferenca = (quando - (agora or datetime.now())).total_seconds()
+    passado, s = diferenca < 0, abs(int(diferenca))
+    if s < 60:
+        texto = "menos de 1 min"
+    elif s < 3600:
+        texto = f"{s // 60} min"
+    elif s < 86400:
+        texto = f"{s // 3600} h" + (f" {s % 3600 // 60} min" if s % 3600 >= 60 else "")
+    else:
+        texto = f"{s // 86400} dia{'s' if s >= 172800 else ''}"
+    return f"há {texto}" if passado else f"em {texto}"
+
+
+def barra_horizontal(frac: float, largura: int = 20) -> str:
+    cheio = max(0, min(largura, round(frac * largura)))
+    return "█" * cheio + "░" * (largura - cheio)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  20. Utilitários
+# ════════════════════════════════════════════════════════════════════
+
+# ── Bloco de notas ───────────────────────────────────────────────────
+
+def _slug(texto: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", sem_acento(texto).lower()).strip("-")[:40] or "nota"
+
+
+def ler_nota(arq: Path) -> dict:
+    linhas = arq.read_text("utf-8", errors="replace").splitlines()
+    titulo_n = linhas[0].lstrip("#").strip() if linhas else ""
+    tags, inicio = [], 1
+    if len(linhas) > 1 and linhas[1].lower().startswith("tags:"):
+        tags, inicio = [t.strip() for t in linhas[1][5:].split(",") if t.strip()], 2
+    return {"arq": arq, "titulo": titulo_n or arq.stem, "tags": tags,
+            "corpo": "\n".join(linhas[inicio:]).strip("\n"), "mtime": arq.stat().st_mtime}
+
+
+def listar_notas() -> list:
+    notas = []
+    for arq in NOTAS_DIR.glob("*.md") if NOTAS_DIR.exists() else []:
+        with contextlib.suppress(OSError):
+            notas.append(ler_nota(arq))
+    return sorted(notas, key=lambda n: n["mtime"], reverse=True)
+
+
+def salvar_nota(titulo_n: str, corpo: str, tags=(), arq: Path | None = None) -> Path:
+    """Grava uma nota em Markdown (usada também pelo OCR, ditado e IA)."""
+    NOTAS_DIR.mkdir(parents=True, exist_ok=True)
+    arq = arq or NOTAS_DIR / f"{datetime.now():%Y%m%d-%H%M%S}-{_slug(titulo_n)}.md"
+    cabeca = f"# {titulo_n.strip() or 'Sem título'}\n" + (f"tags: {', '.join(tags)}\n" if tags else "")
+    arq.write_text(cabeca + "\n" + (corpo or "").strip() + "\n", "utf-8")
+    return arq
+
+
+@submenu
+def menu_notas():
+    def ler_tags(padrao: str = "") -> list:
+        return [t.strip() for t in perguntar("Tags separadas por vírgula (opcional)", padrao).split(",") if t.strip()]
+
+    def nova():
+        titulo_n = perguntar("Título da nota")
+        if not titulo_n:
+            return
+        tags = ler_tags()
+        corpo = editar_texto()
+        if not (corpo or "").strip() and not confirmar("A nota ficou vazia. Salvar mesmo assim?", False):
+            return
+        ok(f"Nota salva: {salvar_nota(titulo_n, corpo or '', tags).name}")
+
+    def abrir(nota: dict):
+        while True:
+            limpar()
+            titulo(nota["titulo"])
+            data_n = datetime.fromtimestamp(nota["mtime"]).strftime("%d/%m/%Y %H:%M")
+            print(f"{DIM}{data_n}{' · tags: ' + ', '.join(nota['tags']) if nota['tags'] else ''}{RST}\n")
+            print(nota["corpo"] or f"{DIM}(vazia){RST}")
+            print()
+            acoes = ["Editar o texto", "Mudar título e tags", "Copiar o texto", "Ouvir (ler em voz alta)",
+                     "Exportar para Downloads", "Apagar", "Voltar"]
+            i = escolher("O que fazer?", acoes)
+            if i in (None, 6):
+                return
+            if i == 0:
+                novo = editar_texto(nota["corpo"])
+                if novo is not None:
+                    salvar_nota(nota["titulo"], novo, nota["tags"], nota["arq"])
+            elif i == 1:
+                novo_titulo = perguntar("Título", nota["titulo"])
+                salvar_nota(novo_titulo, nota["corpo"], ler_tags(", ".join(nota["tags"])), nota["arq"])
+            elif i == 2:
+                copiar_texto(f"{nota['titulo']}\n\n{nota['corpo']}")
+                pausar()
+            elif i == 3:
+                try:
+                    falar(f"{nota['titulo']}. {nota['corpo']}")
+                except ToonsError as e:
+                    erro(str(e))
+                    pausar()
+            elif i == 4:
+                destino = pasta_saida("Notas") / nota["arq"].name
+                shutil.copy2(nota["arq"], destino)
+                ok(f"Exportada: {destino}")
+                pausar()
+            elif i == 5:
+                if confirmar(f"Apagar a nota '{nota['titulo']}'?", False):
+                    nota["arq"].unlink(missing_ok=True)
+                    ok("Nota apagada.")
+                    return
+            nota.update(ler_nota(nota["arq"]))
+
+    def escolher_e_abrir(notas: list, msg: str = "Qual nota?"):
+        if not notas:
+            info("Nenhuma nota encontrada.")
+            return
+        rotulos = [f"{n['titulo']}  {DIM}{datetime.fromtimestamp(n['mtime']):%d/%m}"
+                   f"{' · ' + ', '.join(n['tags']) if n['tags'] else ''}{RST}" for n in notas]
+        i = escolher(msg, rotulos)
+        if i is not None:
+            abrir(notas[i])
+
+    def buscar():
+        termo = perguntar("Procurar por")
+        if termo:
+            escolher_e_abrir([n for n in listar_notas()
+                              if contem(n["titulo"] + "\n" + n["corpo"] + " " + " ".join(n["tags"]), termo)])
+
+    def por_tag():
+        notas = listar_notas()
+        contagem = {}
+        for n in notas:
+            for t in n["tags"]:
+                contagem[t] = contagem.get(t, 0) + 1
+        if not contagem:
+            info("Nenhuma nota tem tags ainda.")
+            return
+        tags = sorted(contagem, key=str.lower)
+        i = escolher("Qual tag?", [f"{t} ({contagem[t]})" for t in tags])
+        if i is not None:
+            escolher_e_abrir([n for n in notas if tags[i] in n["tags"]])
+
+    def exportar_todas():
+        notas = listar_notas()
+        if not notas:
+            info("Nenhuma nota para exportar.")
+            return
+        destino = pasta_saida() / f"notas_{datetime.now():%Y%m%d_%H%M}.zip"
+        with zipfile.ZipFile(destino, "w", zipfile.ZIP_DEFLATED) as z:
+            for n in notas:
+                z.write(n["arq"], n["arq"].name)
+        ok(f"{len(notas)} nota(s) exportada(s): {destino}")
+
+    menu("📝 Bloco de notas", [
+        ("Nova nota", nova),
+        (lambda: f"Minhas notas ({len(listar_notas())})", lambda: escolher_e_abrir(listar_notas())),
+        ("Buscar nas notas", buscar),
+        ("Ver por tag", por_tag),
+        ("Exportar todas (.zip em Downloads)", exportar_todas),
+    ])
+
+
+# ── Lembretes e alarmes ──────────────────────────────────────────────
+
+REPETICOES = {"nao": "Não repetir", "diario": "Todo dia", "dias_uteis": "Dias úteis (segunda a sexta)",
+              "semanal": "Toda semana", "mensal": "Todo mês"}
+
+
+def parse_quando(texto: str, agora: datetime | None = None) -> datetime:
+    """Entende '18:30', '18h', 'amanhã 7h', '25/12 08:00', '10min', 'em 2 horas', '+1d'."""
+    agora = (agora or datetime.now()).replace(second=0, microsecond=0)
+    t = re.sub(r"\s+", " ", sem_acento(texto).strip().lower())
+    # relativo: '+2h', 'em 2 horas', '10min', '3 dias' (um '7h' sozinho é horário, não 'daqui a 7 horas')
+    m = re.fullmatch(r"(\+|em |daqui (?:a )?)?\s*(\d+)\s*(s|seg|segundos?|m|min|minutos?|h|horas?|d|dias?)", t)
+    if m and (m.group(1) or m.group(3) != "h"):
+        unidade = {"s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(3)[0]]
+        return (datetime.now() + timedelta(seconds=int(m.group(2)) * unidade)).replace(microsecond=0)
+    dia = None
+    m = re.match(r"(hoje|amanha|depois de amanha)\b\s*(?:as\s*|a\s*)?", t)
+    if m:
+        dia = agora.date() + timedelta(days={"hoje": 0, "amanha": 1, "depois de amanha": 2}[m.group(1)])
+        t = t[m.end():]
+    else:
+        m = re.match(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?\s*(?:as\s*)?", t)
+        if m:
+            ano = int(m.group(3)) if m.group(3) else agora.year
+            ano += 2000 if ano < 100 else 0
+            try:
+                dia = date(ano, int(m.group(2)), int(m.group(1)))
+            except ValueError:
+                raise ToonsError("Data inválida.") from None
+            if not m.group(3) and dia < agora.date():
+                dia = dia.replace(year=ano + 1)  # '05/01' digitado em dezembro é do ano que vem
+            t = t[m.end():]
+    t = t.strip()
+    hora = minuto = None
+    if t:
+        m = re.fullmatch(r"(\d{1,2})(?:[:h](\d{2})?)?(?:min)?", t)
+        if not m:
+            raise ToonsError("Não entendi. Exemplos: 18:30 · 7h · amanhã 7h · 25/12 08:00 · 10min · em 2 horas")
+        hora, minuto = int(m.group(1)), int(m.group(2) or 0)
+        if hora > 23 or minuto > 59:
+            raise ToonsError("Hora inválida.")
+    if dia is None and hora is None:
+        raise ToonsError("Diga quando: 18:30, amanhã 7h, 25/12 08:00, 10min...")
+    if hora is None:
+        hora, minuto = 9, 0
+    quando = datetime.combine(dia or agora.date(), datetime.min.time()).replace(hour=hora, minute=minuto)
+    if dia is None and quando <= agora:
+        quando += timedelta(days=1)  # '7h' já passou hoje: é amanhã
+    return quando
+
+
+def proxima_vez(quando: datetime, repetir: str, agora: datetime, dia_mes: int | None = None) -> datetime | None:
+    """Próxima ocorrência de um lembrete que se repete (None se não repete)."""
+    if repetir not in REPETICOES or repetir == "nao":
+        return None
+    while quando <= agora:
+        if repetir == "diario":
+            quando += timedelta(days=1)
+        elif repetir == "semanal":
+            quando += timedelta(weeks=1)
+        elif repetir == "dias_uteis":
+            quando += timedelta(days=1)
+            while quando.weekday() >= 5:
+                quando += timedelta(days=1)
+        else:
+            ano, mes = (quando.year + 1, 1) if quando.month == 12 else (quando.year, quando.month + 1)
+            dia_alvo = min(dia_mes or quando.day, calendar.monthrange(ano, mes)[1])
+            quando = quando.replace(year=ano, month=mes, day=dia_alvo)
+    return quando
+
+
+def lembretes() -> list:
+    return sorted(ler_json(LEMBRETES_FILE, []), key=lambda lem: lem["quando"])
+
+
+def adicionar_lembrete(texto: str, quando: datetime, repetir: str = "nao", alarme: bool = False,
+                       falar_texto: bool = False) -> dict:
+    lista = ler_json(LEMBRETES_FILE, [])
+    lem = {"id": uuid.uuid4().hex[:8], "texto": texto, "quando": quando.isoformat(), "repetir": repetir,
+           "alarme": alarme, "falar": falar_texto, "dia_mes": quando.day}
+    lista.append(lem)
+    gravar_json(LEMBRETES_FILE, lista)
+    return lem
+
+
+def disparar_lembrete(lem: dict, atrasado: bool = False) -> None:
+    texto = ("(atrasado) " if atrasado else "") + lem["texto"]
+    log(f"{'Alarme' if lem.get('alarme') else 'Lembrete'}: {texto}")
+    titulo_n = "⏰ Alarme" if lem.get("alarme") else "🔔 Lembrete"
+    if tem("termux-notification"):
+        with contextlib.suppress(ToonsError):
+            _tapi(["termux-notification", "--title", titulo_n, "--content", texto, "--id", f"lembrete{lem['id']}",
+                   "--sound", "--priority", "high", "--vibrate", "500,300,500,300,500"], 15, json_saida=False)
+    else:
+        print(f"[{titulo_n}] {texto}")
+    if lem.get("alarme") and not atrasado:
+        for _ in range(6):
+            with contextlib.suppress(ToonsError):
+                vibrar(700)
+            time.sleep(1.2)
+    if (lem.get("falar") or lem.get("alarme")) and not atrasado:
+        with contextlib.suppress(ToonsError):
+            falar(lem["texto"])
+
+
+def rodar_lembretes() -> None:
+    """Laço do serviço de lembretes (roda dentro do tmux)."""
+    log("Serviço de lembretes iniciado.")
+    while True:
+        agora = datetime.now()
+        mudancas = {}
+        for lem in ler_json(LEMBRETES_FILE, []):
+            quando = datetime.fromisoformat(lem["quando"])
+            if quando > agora:
+                continue
+            disparar_lembrete(lem, atrasado=agora - quando > timedelta(minutes=30))
+            mudancas[lem["id"]] = proxima_vez(quando, lem.get("repetir", "nao"), agora, lem.get("dia_mes"))
+        if mudancas:
+            # relê o arquivo antes de gravar: o menu pode ter mudado algo enquanto o alarme tocava
+            atual = []
+            for lem in ler_json(LEMBRETES_FILE, []):
+                if lem["id"] in mudancas:
+                    if mudancas[lem["id"]] is None:
+                        continue
+                    lem["quando"] = mudancas[lem["id"]].isoformat()
+                atual.append(lem)
+            gravar_json(LEMBRETES_FILE, atual)
+        time.sleep(10)
+
+
+def _garantir_servico_lembretes() -> None:
+    if not servico_ativo("lembretes") and confirmar("O serviço de lembretes está parado. Iniciar agora?", True):
+        iniciar_servico("lembretes", cmd_self("lembretes"), reiniciar=True)
+
+
+@submenu
+def menu_lembretes():
+    def novo(alarme: bool):
+        texto = perguntar("Mensagem do alarme" if alarme else "Lembrar de quê?", "Alarme" if alarme else None)
+        if not texto:
+            return
+        quando = parse_quando(perguntar("Quando? (18:30 · amanhã 7h · 25/12 08:00 · 10min · em 2 horas)"))
+        chaves = list(REPETICOES)
+        i = escolher("Repetir?", list(REPETICOES.values()), 1)
+        repetir = chaves[i] if i is not None else "nao"
+        falar_texto = not alarme and confirmar("Falar o lembrete em voz alta também?", False)
+        adicionar_lembrete(texto, quando, repetir, alarme, falar_texto)
+        ok(f"{'Alarme' if alarme else 'Lembrete'} para {quando:%d/%m %H:%M} ({tempo_ate(quando)}).")
+        _garantir_servico_lembretes()
+
+    def listar():
+        lista = lembretes()
+        if not lista:
+            info("Nenhum lembrete.")
+            return
+        for lem in lista:
+            quando = datetime.fromisoformat(lem["quando"])
+            icone = "⏰" if lem.get("alarme") else "🔔"
+            rep = "" if lem.get("repetir", "nao") == "nao" else f" {DIM}({REPETICOES[lem['repetir']].lower()}){RST}"
+            print(f"  {icone} {NEG}{quando:%d/%m %H:%M}{RST} {DIM}{tempo_ate(quando)}{RST}  {lem['texto']}{rep}")
+        print(f"\nServiço: {'RODANDO' if servico_ativo('lembretes') else 'PARADO (os lembretes não tocam)'}")
+
+    def apagar_lembrete():
+        lista = lembretes()
+        if not lista:
+            info("Nenhum lembrete.")
+            return
+        marcados = escolher_varios("Apagar quais?", [f"{datetime.fromisoformat(l['quando']):%d/%m %H:%M}  {l['texto']}"
+                                                     for l in lista])
+        ids = {lista[i]["id"] for i in marcados}
+        if ids:
+            gravar_json(LEMBRETES_FILE, [l for l in ler_json(LEMBRETES_FILE, []) if l["id"] not in ids])
+            ok(f"{len(ids)} apagado(s).")
+
+    def testar():
+        disparar_lembrete({"id": "teste", "texto": "Teste de alarme do Termux-Toons", "alarme": True})
+
+    menu("⏰ Lembretes e alarmes", [
+        ("Novo lembrete", lambda: novo(False)),
+        ("Novo alarme (toca, vibra e fala)", lambda: novo(True)),
+        (lambda: f"Ver lembretes ({len(lembretes())})", listar),
+        ("Apagar lembretes", apagar_lembrete),
+        ("Testar o alarme agora", testar),
+        *itens_servico("lembretes", "Serviço de lembretes",
+                       lambda: iniciar_servico("lembretes", cmd_self("lembretes"), reiniciar=True)),
+    ])
+
+
+# ── Cronômetro, timer e Pomodoro ─────────────────────────────────────
+
+def _tela_relogio(nome: str, tempo_txt: str, extras: list, dica: str, destaque: bool = False) -> None:
+    colunas, _ = shutil.get_terminal_size((60, 24))
+    grandes = numeros_grandes(tempo_txt)
+    if max(len(linha) for linha in grandes) > colunas - 2:
+        grandes = [tempo_txt]
+    cor = (INV if destaque else "") + NEG + (VERD if not destaque else "")
+    linhas = ["", _centralizar(f"{NEG}{nome}{RST}", colunas), ""]
+    linhas += [_centralizar(f"{cor}{linha}{RST}", colunas) for linha in grandes]
+    linhas += [""] + [_centralizar(e, colunas) for e in extras] + ["", f"{DIM}{_centralizar(dica, colunas)}{RST}"]
+    desenhar(linhas)
+
+
+def _avisar_fim(titulo_n: str, texto: str) -> None:
+    notificar_seguro(titulo_n, texto, som=True)
+    with contextlib.suppress(ToonsError):
+        vibrar(1000)
+    sys.stdout.write("\a")
+
+
+def cronometro() -> None:
+    voltas, acumulado, inicio, rodando = [], 0.0, time.monotonic(), True
+    with TelaCheia():
+        while True:
+            decorrido = acumulado + (time.monotonic() - inicio if rodando else 0)
+            extras = [f"Volta {i}: {fmt_relogio(v, True)}  (+{fmt_relogio(v - (voltas[i - 2] if i > 1 else 0), True)})"
+                      for i, v in enumerate(voltas, 1)][-8:]
+            _tela_relogio("⌚ Cronômetro" + ("" if rodando else "  (pausado)"), fmt_relogio(decorrido, True),
+                          extras, "Espaço pausa · Enter marca volta · r zera · Esc sai")
+            tecla = tecla_ou_nada(0.1)
+            if tecla in ("esc", "q"):
+                break
+            if tecla == " ":
+                if rodando:
+                    acumulado, rodando = decorrido, False
+                else:
+                    inicio, rodando = time.monotonic(), True
+            elif tecla in ("enter", "v"):
+                voltas.append(decorrido)
+            elif tecla == "r":
+                voltas, acumulado, inicio = [], 0.0, time.monotonic()
+    print(f"Tempo: {fmt_relogio(decorrido, True)}" + (f" · {len(voltas)} volta(s)" if voltas else ""))
+
+
+def temporizador(segundos: int | None = None) -> None:
+    if segundos is None:
+        segundos = parse_duracao(perguntar("Quanto tempo? (5 = 5 min · 90s · 1h30m · 10:00)", "5"))
+    if segundos <= 0:
+        raise ToonsError("O tempo precisa ser maior que zero.")
+    with TelaCheia():
+        fim, restante, pausado = time.monotonic() + segundos, float(segundos), False
+        while True:
+            if not pausado:
+                restante = fim - time.monotonic()
+            if restante <= 0:
+                break
+            _tela_relogio("⏳ Timer" + ("  (pausado)" if pausado else ""), fmt_relogio(restante + 0.999),
+                          [f"de {fmt_relogio(segundos)}"], "Espaço pausa · + / - um minuto · Esc cancela")
+            tecla = tecla_ou_nada(0.2)
+            if tecla in ("esc", "q"):
+                return
+            if tecla == " ":
+                pausado = not pausado
+                fim = time.monotonic() + restante
+            elif tecla in ("+", "-"):
+                ajuste = 60 if tecla == "+" else -min(60, restante - 1)
+                restante += ajuste
+                fim += ajuste
+        _avisar_fim("⏰ Tempo esgotado!", f"O timer de {fmt_relogio(segundos)} terminou.")
+        t0, piscar = time.monotonic(), False
+        while time.monotonic() - t0 < 120:
+            piscar = not piscar
+            _tela_relogio("⏰ TEMPO ESGOTADO!", "00:00", [], "Aperte qualquer tecla", destaque=piscar)
+            if not piscar and time.monotonic() - t0 < 30:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+            if tecla_ou_nada(0.5) is not None:
+                break
+
+
+def pomodoro() -> None:
+    foco = perguntar_int("Minutos de foco", 25, 1, 180)
+    pausa = perguntar_int("Minutos de pausa curta", 5, 1, 60)
+    longa = perguntar_int("Minutos de pausa longa (a cada 4 focos)", 15, 1, 120)
+    hoje = date.today().isoformat()
+    estat = ler_json(POMODORO_FILE, {})
+    feitos = 0
+    fase, n_foco = "foco", 0
+    with TelaCheia():
+        while True:
+            duracao = {"foco": foco, "pausa": pausa, "longa": longa}[fase] * 60
+            nome = {"foco": "🍅 Foco", "pausa": "☕ Pausa curta", "longa": "🌴 Pausa longa"}[fase]
+            fim, restante, pausado, pulou = time.monotonic() + duracao, float(duracao), False, False
+            while restante > 0:
+                if not pausado:
+                    restante = fim - time.monotonic()
+                total_hoje = estat.get(hoje, 0) + feitos
+                _tela_relogio(f"{nome}{'  (pausado)' if pausado else ''}", fmt_relogio(max(0, restante) + 0.999),
+                              [f"Pomodoros hoje: {'🍅' * min(total_hoje, 12)} {total_hoje}"],
+                              "Espaço pausa · p pula a fase · Esc sai")
+                tecla = tecla_ou_nada(0.3)
+                if tecla in ("esc", "q"):
+                    estat[hoje] = estat.get(hoje, 0) + feitos
+                    gravar_json(POMODORO_FILE, estat)
+                    print(f"Pomodoros concluídos agora: {feitos} (hoje: {estat[hoje]}).")
+                    return
+                if tecla == " ":
+                    pausado = not pausado
+                    fim = time.monotonic() + restante
+                elif tecla == "p":
+                    pulou = True
+                    break
+            if fase == "foco":
+                if not pulou:
+                    feitos += 1
+                n_foco += 1
+                fase = "longa" if n_foco % 4 == 0 else "pausa"
+                _avisar_fim("🍅 Foco concluído!", "Hora da pausa.")
+            else:
+                fase = "foco"
+                _avisar_fim("☕ Pausa terminou", "Hora de focar de novo.")
+
+
+@submenu
+def menu_relogio():
+    menu("⏱️ Cronômetro, timer e Pomodoro", [
+        ("Cronômetro (com voltas)", cronometro),
+        ("Timer (contagem regressiva)", temporizador),
+        ("Pomodoro (25 min foco / 5 min pausa)", pomodoro),
+        ("Timer rápido: 1 minuto", lambda: temporizador(60)),
+        ("Timer rápido: 5 minutos", lambda: temporizador(300)),
+        ("Timer rápido: 10 minutos", lambda: temporizador(600)),
+    ])
+
+
+# ── Calendário e agenda ──────────────────────────────────────────────
+
+def pascoa(ano: int) -> date:
+    """Domingo de Páscoa (algoritmo de Meeus/Jones/Butcher)."""
+    a, (b, c) = ano % 19, divmod(ano, 100)
+    d, e = divmod(b, 4)
+    g = (b - (b + 8) // 25 + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i, k = divmod(c, 4)
+    l = (32 + 2 * e + 2 * i - h - k) % 7  # noqa: E741
+    m = (a + 11 * h + 22 * l) // 451
+    return date(ano, (h + l - 7 * m + 114) // 31, (h + l - 7 * m + 114) % 31 + 1)
+
+
+def feriados(ano: int) -> dict:
+    """Feriados nacionais do Brasil (e os pontos facultativos mais comuns)."""
+    p = pascoa(ano)
+    lista = {
+        date(ano, 1, 1): "Confraternização Universal", date(ano, 4, 21): "Tiradentes",
+        date(ano, 5, 1): "Dia do Trabalho", date(ano, 9, 7): "Independência do Brasil",
+        date(ano, 10, 12): "Nossa Senhora Aparecida", date(ano, 11, 2): "Finados",
+        date(ano, 11, 15): "Proclamação da República", date(ano, 12, 25): "Natal",
+        p - timedelta(days=48): "Carnaval (ponto facultativo)", p - timedelta(days=47): "Carnaval (ponto facultativo)",
+        p - timedelta(days=2): "Sexta-feira Santa", p: "Páscoa",
+        p + timedelta(days=60): "Corpus Christi (ponto facultativo)",
+    }
+    if ano >= 2024:
+        lista[date(ano, 11, 20)] = "Dia Nacional de Zumbi e da Consciência Negra"
+    return lista
+
+
+def eventos_do_dia(dia: date) -> list:
+    return sorted(ler_json(AGENDA_FILE, {}).get(dia.isoformat(), []), key=lambda ev: ev.get("hora") or "")
+
+
+def parse_data(texto: str, hoje: date | None = None) -> date:
+    """'hoje', 'amanhã', '25/12', '25/12/2026' → data."""
+    hoje = hoje or date.today()
+    t = sem_acento(texto).strip().lower()
+    if t in ("", "hoje"):
+        return hoje
+    if t == "amanha":
+        return hoje + timedelta(days=1)
+    m = re.fullmatch(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?", t)
+    if not m:
+        raise ToonsError("Data inválida. Use dd/mm ou dd/mm/aaaa.")
+    ano = int(m.group(3)) if m.group(3) else hoje.year
+    try:
+        return date(ano + (2000 if ano < 100 else 0), int(m.group(2)), int(m.group(1)))
+    except ValueError:
+        raise ToonsError("Data inválida.") from None
+
+
+def adicionar_evento(dia: date | None = None) -> None:
+    dia = dia or parse_data(perguntar("Data (dd/mm, hoje, amanhã)", "hoje"))
+    texto = perguntar(f"O que acontece em {dia:%d/%m/%Y}?")
+    if not texto:
+        return
+    hora = perguntar("Hora (hh:mm, opcional)", "").replace("h", ":").strip(":")
+    if hora:
+        m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?", hora)
+        if not m or int(m.group(1)) > 23 or int(m.group(2) or 0) > 59:
+            raise ToonsError("Hora inválida.")
+        hora = f"{int(m.group(1)):02d}:{m.group(2) or '00'}"
+    agenda = ler_json(AGENDA_FILE, {})
+    agenda.setdefault(dia.isoformat(), []).append({"hora": hora, "texto": texto})
+    gravar_json(AGENDA_FILE, agenda)
+    ok("Evento salvo.")
+    antecedencias = [("Não criar lembrete", None), ("Na hora", 0), ("15 minutos antes", 15), ("1 hora antes", 60),
+                     ("1 dia antes", 1440)]
+    i = escolher("Criar um lembrete?", [a for a, _ in antecedencias], 1)
+    if i and antecedencias[i][1] is not None:
+        quando = datetime.combine(dia, datetime.min.time()).replace(
+            hour=int(hora[:2]) if hora else 9, minute=int(hora[3:]) if hora else 0)
+        quando -= timedelta(minutes=antecedencias[i][1])
+        if quando <= datetime.now():
+            aviso("Esse horário já passou: lembrete não criado.")
+            return
+        adicionar_lembrete(f"{texto} ({dia:%d/%m}{' ' + hora if hora else ''})", quando)
+        ok(f"Lembrete para {quando:%d/%m %H:%M}.")
+        _garantir_servico_lembretes()
+
+
+def apagar_evento(dia: date) -> None:
+    agenda = ler_json(AGENDA_FILE, {})
+    eventos = sorted(agenda.get(dia.isoformat(), []), key=lambda ev: ev.get("hora") or "")
+    if not eventos:
+        info("Nenhum evento nesse dia.")
+        return
+    i = escolher("Apagar qual?", [f"{ev.get('hora') or '--:--'}  {ev['texto']}" for ev in eventos])
+    if i is not None:
+        eventos.pop(i)
+        if eventos:
+            agenda[dia.isoformat()] = eventos
+        else:
+            agenda.pop(dia.isoformat(), None)
+        gravar_json(AGENDA_FILE, agenda)
+        ok("Evento apagado.")
+
+
+def somar_meses(dia: date, n: int) -> date:
+    ano, mes = divmod(dia.month - 1 + n, 12)
+    ano += dia.year
+    return date(ano, mes + 1, min(dia.day, calendar.monthrange(ano, mes + 1)[1]))
+
+
+def calendario() -> None:
+    sel = hoje = date.today()
+    with TelaCheia() as tela:
+        while True:
+            agenda = ler_json(AGENDA_FILE, {})
+            fer = {**feriados(sel.year - 1), **feriados(sel.year), **feriados(sel.year + 1)}
+            linhas = ["", f"  {NEG}{MAG}◀  {MESES[sel.month - 1].capitalize()} de {sel.year}  ▶{RST}", "",
+                      f"  {VERM}Do{RST} Se  Te  Qu  Qu  Se  Sá"]
+            for semana in calendar.Calendar(firstweekday=6).monthdatescalendar(sel.year, sel.month):
+                celulas = []
+                for d in semana:
+                    marca = "•" if agenda.get(d.isoformat()) else ("*" if d in fer else " ")
+                    txt = f"{d.day:>2}{marca}"
+                    if d == sel:
+                        txt = f"{INV}{NEG}{txt}{RST}"
+                    elif d.month != sel.month:
+                        txt = f"{DIM}{txt}{RST}"
+                    elif d == hoje:
+                        txt = f"{NEG}{AMAR}\033[4m{txt}{RST}" if _COR else txt
+                    elif d in fer or d.weekday() == 6:
+                        txt = f"{VERM}{txt}{RST}"
+                    celulas.append(txt)
+                linhas.append("  " + " ".join(celulas))
+            linhas += ["", f"  {NEG}{DIAS_SEMANA[sel.weekday()].capitalize()}, {sel.day} de "
+                           f"{MESES[sel.month - 1]} de {sel.year}{RST}", f"  {DIM}{tempo_ate_dia(sel, hoje)}{RST}"]
+            if sel in fer:
+                linhas.append(f"  {VERM}🎉 {fer[sel]}{RST}")
+            eventos = sorted(agenda.get(sel.isoformat(), []), key=lambda ev: ev.get("hora") or "")
+            linhas += [f"  {CIANO}•{RST} {ev.get('hora') or '--:--'}  {ev['texto']}" for ev in eventos]
+            if not eventos and sel not in fer:
+                linhas.append(f"  {DIM}Nenhum evento.{RST}")
+            linhas += ["", f"  {DIM}←→ dia · ↑↓ semana · PgUp/PgDn mês{RST}",
+                       f"  {DIM}t hoje · a adiciona · d apaga · Esc sai{RST}",
+                       f"  {DIM}• evento · * feriado{RST}"]
+            desenhar(linhas)
+            tecla = ler_tecla()
+            passos = {"esq": -1, "dir": 1, "cima": -7, "baixo": 7}
+            if tecla in ("esc", "q"):
+                return
+            if tecla in passos:
+                sel += timedelta(days=passos[tecla])
+            elif tecla in ("pgup", "<", ","):
+                sel = somar_meses(sel, -1)
+            elif tecla in ("pgdn", ">", "."):
+                sel = somar_meses(sel, 1)
+            elif tecla in ("t", "home"):
+                sel = hoje
+            elif tecla in ("a", "enter"):
+                with tela.normal():
+                    try:
+                        adicionar_evento(sel)
+                    except ToonsError as e:
+                        erro(str(e))
+                        pausar()
+            elif tecla in ("d", "backspace"):
+                with tela.normal():
+                    apagar_evento(sel)
+
+
+def tempo_ate_dia(dia: date, hoje: date | None = None) -> str:
+    n = (dia - (hoje or date.today())).days
+    if n == 0:
+        return "hoje"
+    if n == 1:
+        return "amanhã"
+    if n == -1:
+        return "ontem"
+    return f"daqui a {n} dias" if n > 0 else f"há {-n} dias"
+
+
+@submenu
+def menu_agenda():
+    def proximos():
+        hoje = date.today()
+        itens = []
+        for chave, eventos in ler_json(AGENDA_FILE, {}).items():
+            dia = date.fromisoformat(chave)
+            if dia >= hoje:
+                itens += [(dia, ev.get("hora") or "", ev["texto"], False) for ev in eventos]
+        for dia, nome in {**feriados(hoje.year), **feriados(hoje.year + 1)}.items():
+            if hoje <= dia <= hoje + timedelta(days=120):
+                itens.append((dia, "", nome, True))
+        if not itens:
+            info("Nada nos próximos dias.")
+            return
+        for dia, hora, texto, feriado in sorted(itens)[:30]:
+            cor = VERM if feriado else ""
+            print(f"  {NEG}{dia:%d/%m}{RST} {DIAS_SEMANA[dia.weekday()][:3]} {hora:5}  {cor}{texto}{RST}  "
+                  f"{DIM}{tempo_ate_dia(dia, hoje)}{RST}")
+
+    def lista_feriados():
+        ano = perguntar_int("Ano", date.today().year, 1900, 2200)
+        for dia, nome in sorted(feriados(ano).items()):
+            print(f"  {NEG}{dia:%d/%m}{RST} {DIAS_SEMANA[dia.weekday()]:<8} {nome}")
+
+    def contagem():
+        dia = parse_data(perguntar("Contar quantos dias até (dd/mm/aaaa)"))
+        n = (dia - date.today()).days
+        semanas, dias = divmod(abs(n), 7)
+        ok(f"{tempo_ate_dia(dia).capitalize()} ({semanas} semana(s) e {dias} dia(s)) · {DIAS_SEMANA[dia.weekday()]}.")
+
+    menu("📅 Calendário e agenda", [
+        ("Abrir o calendário (setas)", calendario),
+        ("Adicionar evento", adicionar_evento),
+        ("Próximos eventos e feriados", proximos),
+        ("Feriados nacionais de um ano", lista_feriados),
+        ("Quantos dias faltam até...", contagem),
+    ])
+
+
+# ── Conversor de unidades e moedas ───────────────────────────────────
+
+UNIDADES = {
+    "Comprimento": {"milímetro (mm)": 0.001, "centímetro (cm)": 0.01, "metro (m)": 1, "quilômetro (km)": 1000,
+                    "polegada (in)": 0.0254, "pé (ft)": 0.3048, "jarda (yd)": 0.9144, "milha (mi)": 1609.344,
+                    "milha náutica": 1852},
+    "Massa": {"miligrama (mg)": 1e-6, "grama (g)": 1e-3, "quilo (kg)": 1, "tonelada (t)": 1000,
+              "onça (oz)": 0.028349523125, "libra (lb)": 0.45359237, "arroba (@)": 15},
+    "Área": {"cm²": 1e-4, "m²": 1, "km²": 1e6, "hectare (ha)": 1e4, "alqueire paulista": 24200,
+             "alqueire mineiro": 48400, "acre": 4046.8564224, "pé²": 0.09290304},
+    "Volume": {"mililitro (ml)": 1e-3, "litro (l)": 1, "metro cúbico (m³)": 1000, "xícara (240 ml)": 0.24,
+               "colher de sopa (15 ml)": 0.015, "colher de chá (5 ml)": 0.005, "galão americano": 3.785411784,
+               "onça líquida (fl oz)": 0.0295735295625},
+    "Velocidade": {"m/s": 1, "km/h": 1 / 3.6, "mph": 0.44704, "nó": 1852 / 3600},
+    "Tempo": {"segundo": 1, "minuto": 60, "hora": 3600, "dia": 86400, "semana": 604800, "mês (30 dias)": 2592000,
+              "ano (365 dias)": 31536000},
+    "Dados": {"bit": 0.125, "byte (B)": 1, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12, "KiB": 1024,
+              "MiB": 1024 ** 2, "GiB": 1024 ** 3, "TiB": 1024 ** 4},
+    "Energia": {"joule (J)": 1, "quilojoule (kJ)": 1000, "caloria (cal)": 4.184, "quilocaloria (kcal)": 4184,
+                "watt-hora (Wh)": 3600, "quilowatt-hora (kWh)": 3.6e6},
+    "Pressão": {"pascal (Pa)": 1, "quilopascal (kPa)": 1000, "bar": 1e5, "atmosfera (atm)": 101325,
+                "psi (libra/pol²)": 6894.757293168, "mmHg": 133.322387415},
+    "Temperatura": {"Celsius (°C)": None, "Fahrenheit (°F)": None, "Kelvin (K)": None},
+}
+
+MOEDAS = {"BRL": "Real", "USD": "Dólar americano", "EUR": "Euro", "GBP": "Libra esterlina", "ARS": "Peso argentino",
+          "CLP": "Peso chileno", "UYU": "Peso uruguaio", "PYG": "Guarani paraguaio", "MXN": "Peso mexicano",
+          "CAD": "Dólar canadense", "AUD": "Dólar australiano", "JPY": "Iene japonês", "CNY": "Yuan chinês",
+          "CHF": "Franco suíço", "INR": "Rúpia indiana"}
+
+
+def converter_temperatura(valor: float, de: str, para: str) -> float:
+    celsius = {"C": valor, "F": (valor - 32) * 5 / 9, "K": valor - 273.15}[de[0] if de[0] in "CFK" else de]
+    return {"C": celsius, "F": celsius * 9 / 5 + 32, "K": celsius + 273.15}[para[0]]
+
+
+def converter_unidade(categoria: str, valor: float, de: str, para: str) -> float:
+    if categoria == "Temperatura":
+        return converter_temperatura(valor, de, para)
+    tabela = UNIDADES[categoria]
+    return valor * tabela[de] / tabela[para]
+
+
+def cotacoes(renovar: bool = False) -> dict:
+    """Câmbio a partir do real (open.er-api.com, sem chave); guarda por 6 h para funcionar sem internet."""
+    cache = ler_json(CAMBIO_FILE, {})
+    if not renovar and cache.get("taxas") and time.time() - cache.get("quando", 0) < 6 * 3600:
+        return cache
+    try:
+        dados = pedir_json("https://open.er-api.com/v6/latest/BRL", timeout=20)
+        if dados.get("result") != "success":
+            raise ToonsError(f"Serviço de câmbio respondeu: {dados.get('error-type', 'erro')}")
+        cache = {"quando": time.time(), "taxas": dados["rates"], "fonte": dados.get("time_last_update_utc", "")}
+        gravar_json(CAMBIO_FILE, cache)
+    except ToonsError:
+        if not cache.get("taxas"):
+            raise
+        aviso(f"Sem internet: usando a cotação salva em {datetime.fromtimestamp(cache['quando']):%d/%m %H:%M}.")
+    return cache
+
+
+def converter_moeda(valor: float, de: str, para: str, taxas: dict) -> float:
+    if de not in taxas or para not in taxas:
+        raise ToonsError(f"Moeda sem cotação: {de if de not in taxas else para}")
+    return valor / taxas[de] * taxas[para]
+
+
+@submenu
+def menu_conversor():
+    def unidades(categoria: str):
+        nomes = list(UNIDADES[categoria])
+        i = escolher("Converter de", nomes)
+        if i is None:
+            return
+        j = escolher("Para", nomes, (i + 1) % len(nomes) + 1)
+        if j is None:
+            return
+        valor = ler_numero(f"Valor em {nomes[i]}")
+        resultado = converter_unidade(categoria, valor, nomes[i], nomes[j])
+        print(f"\n  {numero_br(valor)} {nomes[i]} = {NEG}{VERD}{numero_br(resultado)} {nomes[j]}{RST}\n")
+        print(f"{DIM}  Em todas as unidades:{RST}")
+        for nome in nomes:
+            print(f"    {numero_br(converter_unidade(categoria, valor, nomes[i], nome)):>18}  {nome}")
+
+    def moedas():
+        dados = cotacoes()
+        siglas = [s for s in MOEDAS if s in dados["taxas"]]
+        rotulos = [f"{s} · {MOEDAS[s]}" for s in siglas] + ["Outra (digitar a sigla)"]
+
+        def pegar(msg, padrao):
+            k = escolher(msg, rotulos, padrao)
+            if k is None:
+                return None
+            if k < len(siglas):
+                return siglas[k]
+            sigla = perguntar("Sigla da moeda (ex.: COP, PEN, KRW)").upper()
+            if sigla not in dados["taxas"]:
+                raise ToonsError(f"Sem cotação para '{sigla}'.")
+            return sigla
+
+        de = pegar("Converter de", 2)
+        para = de and pegar("Para", 1)
+        if not para:
+            return
+        valor = ler_numero(f"Valor em {de}")
+        resultado = converter_moeda(valor, de, para, dados["taxas"])
+        print(f"\n  {numero_br(valor, 2)} {de} = {NEG}{VERD}{numero_br(resultado, 4)} {para}{RST}")
+        print(f"  {DIM}1 {de} = {numero_br(converter_moeda(1, de, para, dados['taxas']), 4)} {para} · "
+              f"cotação de {dados.get('fonte', '')[:25]}{RST}")
+
+    def tabela_real():
+        dados = cotacoes()
+        print(f"{DIM}Quanto vale 1 unidade de cada moeda em reais ({dados.get('fonte', '')[:25]}):{RST}")
+        for sigla, nome in MOEDAS.items():
+            if sigla != "BRL" and sigla in dados["taxas"]:
+                print(f"  {sigla}  {nome:<20} R$ {numero_br(1 / dados['taxas'][sigla], 4)}")
+
+    menu("💱 Conversor de unidades e moedas", [
+        ("💵 Moedas (cotação do dia)", moedas),
+        ("💵 Tabela: quanto vale cada moeda em reais", tabela_real),
+        *[(f"📏 {cat}", (lambda c=cat: unidades(c))) for cat in UNIDADES],
+        ("🔄 Atualizar a cotação agora", lambda: cotacoes(renovar=True) and ok("Cotação atualizada.")),
+    ])
+
+
+# ── Controle de gastos ───────────────────────────────────────────────
+
+CATEGORIAS_GASTO = ["Alimentação", "Mercado", "Transporte", "Moradia", "Contas", "Saúde", "Lazer", "Educação",
+                    "Compras", "Outros"]
+CATEGORIAS_ENTRADA = ["Salário", "Freelance", "Vendas", "Presente", "Outros"]
+
+
+def _gastos() -> dict:
+    dados = ler_json(GASTOS_FILE, {})
+    dados.setdefault("lancamentos", [])
+    dados.setdefault("orcamento", 0)
+    dados.setdefault("categorias", list(CATEGORIAS_GASTO))
+    return dados
+
+
+def resumo_mes(lancamentos: list, ano: int, mes: int) -> dict:
+    prefixo = f"{ano:04d}-{mes:02d}"
+    do_mes = [l for l in lancamentos if l["data"].startswith(prefixo)]
+    por_categoria = {}
+    for l in do_mes:
+        if l["tipo"] == "saida":
+            por_categoria[l["categoria"]] = por_categoria.get(l["categoria"], 0) + l["valor"]
+    entradas = sum(l["valor"] for l in do_mes if l["tipo"] == "entrada")
+    saidas = sum(l["valor"] for l in do_mes if l["tipo"] == "saida")
+    return {"lancamentos": do_mes, "entradas": entradas, "saidas": saidas, "saldo": entradas - saidas,
+            "por_categoria": dict(sorted(por_categoria.items(), key=lambda par: -par[1]))}
+
+
+@submenu
+def menu_gastos():
+    def lancar(tipo: str):
+        dados = _gastos()
+        valor = ler_numero("Valor (R$)", minimo=0.01)
+        cats = dados["categorias"] if tipo == "saida" else CATEGORIAS_ENTRADA
+        i = escolher("Categoria", cats + ["Nova categoria..."])
+        if i is None:
+            return
+        if i == len(cats):
+            nova = perguntar("Nome da categoria").strip().capitalize()
+            if not nova:
+                return
+            if tipo == "saida" and nova not in dados["categorias"]:
+                dados["categorias"].append(nova)
+            categoria = nova
+        else:
+            categoria = cats[i]
+        descricao = perguntar("Descrição (opcional)", "")
+        texto_data = perguntar("Data (hoje, ontem, dd/mm)", "hoje")
+        dia = date.today() - timedelta(days=1) if sem_acento(texto_data).lower() == "ontem" else parse_data(texto_data)
+        dados["lancamentos"].append({"id": uuid.uuid4().hex[:8], "data": dia.isoformat(), "valor": round(valor, 2),
+                                     "tipo": tipo, "categoria": categoria, "descricao": descricao})
+        gravar_json(GASTOS_FILE, dados)
+        ok(f"{'Gasto' if tipo == 'saida' else 'Entrada'} de {reais(valor)} lançado em {categoria}.")
+        if tipo == "saida" and dados["orcamento"]:
+            gasto = resumo_mes(dados["lancamentos"], dia.year, dia.month)["saidas"]
+            frac = gasto / dados["orcamento"]
+            if frac >= 1:
+                aviso(f"Você passou do orçamento do mês: {reais(gasto)} de {reais(dados['orcamento'])}.")
+            elif frac >= 0.8:
+                aviso(f"Atenção: já usou {frac:.0%} do orçamento do mês.")
+
+    def pedir_mes() -> tuple:
+        texto = perguntar("Mês (mm/aaaa)", f"{date.today():%m/%Y}")
+        m = re.fullmatch(r"(\d{1,2})/(\d{4})", texto.strip())
+        if not m or not 1 <= int(m.group(1)) <= 12:
+            raise ToonsError("Use o formato mm/aaaa.")
+        return int(m.group(2)), int(m.group(1))
+
+    def resumo():
+        dados = _gastos()
+        ano, mes = pedir_mes()
+        r = resumo_mes(dados["lancamentos"], ano, mes)
+        titulo(f"{MESES[mes - 1].capitalize()} de {ano}")
+        print(f"  Entradas: {VERD}{reais(r['entradas'])}{RST}")
+        print(f"  Saídas:   {VERM}{reais(r['saidas'])}{RST}")
+        print(f"  Saldo:    {NEG}{(VERD if r['saldo'] >= 0 else VERM)}{reais(r['saldo'])}{RST}")
+        if dados["orcamento"]:
+            frac = r["saidas"] / dados["orcamento"]
+            cor = VERM if frac >= 1 else AMAR if frac >= 0.8 else VERD
+            print(f"  Orçamento: {cor}{barra_horizontal(min(frac, 1))}{RST} {frac:.0%} de {reais(dados['orcamento'])}")
+        if r["por_categoria"]:
+            print(f"\n{NEG}  Gastos por categoria{RST}")
+            maior = max(r["por_categoria"].values())
+            for cat, valor in r["por_categoria"].items():
+                print(f"  {cat:<14} {CIANO}{barra_horizontal(valor / maior, 16)}{RST} {reais(valor):>13} "
+                      f"{DIM}{valor / r['saidas']:.0%}{RST}")
+
+    def ultimos():
+        dados = _gastos()
+        lista = sorted(dados["lancamentos"], key=lambda l: (l["data"], l["id"]), reverse=True)[:60]
+        if not lista:
+            info("Nenhum lançamento ainda.")
+            return
+        rotulos = [f"{date.fromisoformat(l['data']):%d/%m} {(VERM + '-') if l['tipo'] == 'saida' else (VERD + '+')}"
+                   f"{reais(l['valor'])}{RST} {l['categoria']}{DIM}{' · ' + l['descricao'] if l['descricao'] else ''}{RST}"
+                   for l in lista]
+        marcados = escolher_varios("Lançamentos (marque com Espaço para apagar, Enter sem marcar volta)", rotulos)
+        if marcados and confirmar(f"Apagar {len(marcados)} lançamento(s)?", False):
+            ids = {lista[i]["id"] for i in marcados}
+            dados["lancamentos"] = [l for l in dados["lancamentos"] if l["id"] not in ids]
+            gravar_json(GASTOS_FILE, dados)
+            ok("Apagado(s).")
+
+    def historico():
+        dados = _gastos()
+        hoje = date.today()
+        meses = [somar_meses(hoje.replace(day=1), -k) for k in range(5, -1, -1)]
+        resumos = [(d, resumo_mes(dados["lancamentos"], d.year, d.month)) for d in meses]
+        maior = max([max(r["entradas"], r["saidas"]) for _, r in resumos] + [1])
+        for d, r in resumos:
+            print(f"  {MESES[d.month - 1][:3]}/{d.year % 100:02d}  {VERD}{barra_horizontal(r['entradas'] / maior, 18)}{RST} "
+                  f"{reais(r['entradas'])}")
+            print(f"          {VERM}{barra_horizontal(r['saidas'] / maior, 18)}{RST} {reais(r['saidas'])}  "
+                  f"{DIM}saldo {reais(r['saldo'])}{RST}")
+
+    def orcamento():
+        dados = _gastos()
+        dados["orcamento"] = round(ler_numero("Orçamento mensal para gastos (R$, 0 desliga)",
+                                              numero_br(dados["orcamento"], 2), 0), 2)
+        gravar_json(GASTOS_FILE, dados)
+        ok("Orçamento salvo." if dados["orcamento"] else "Orçamento desligado.")
+
+    def exportar():
+        dados = _gastos()
+        destino = pasta_saida() / f"gastos_{datetime.now():%Y%m%d}.csv"
+        with open(destino, "w", newline="", encoding="utf-8-sig") as arq:  # utf-8-sig: o Excel abre com acentos
+            escritor = csv.writer(arq, delimiter=";")
+            escritor.writerow(["data", "tipo", "categoria", "valor", "descrição"])
+            for l in sorted(dados["lancamentos"], key=lambda l: l["data"]):
+                escritor.writerow([l["data"], l["tipo"], l["categoria"], numero_br(l["valor"], 2), l["descricao"]])
+        ok(f"Planilha salva: {destino}")
+
+    def cabecalho_gastos():
+        r = resumo_mes(_gastos()["lancamentos"], date.today().year, date.today().month)
+        print(f"{DIM}Este mês: entradas {reais(r['entradas'])} · saídas {reais(r['saidas'])} · "
+              f"saldo {reais(r['saldo'])}{RST}")
+
+    menu("💰 Controle de gastos", [
+        ("➖ Lançar gasto", lambda: lancar("saida")),
+        ("➕ Lançar entrada (salário, venda...)", lambda: lancar("entrada")),
+        ("Resumo do mês (por categoria)", resumo),
+        ("Últimos lançamentos (e apagar)", ultimos),
+        ("Últimos 6 meses", historico),
+        ("Orçamento mensal", orcamento),
+        ("Exportar planilha (.csv para Excel/Sheets)", exportar),
+    ], cabecalho=cabecalho_gastos)
+
+
+# ── Gerenciador de senhas ────────────────────────────────────────────
+
+SIMBOLOS_SENHA = "!@#$%&*-_=+?"
+
+
+def gerar_senha(tamanho: int = 20, simbolos: bool = True) -> str:
+    alfabeto = string.ascii_letters + string.digits + (SIMBOLOS_SENHA if simbolos else "")
+    while True:
+        senha = "".join(secrets.choice(alfabeto) for _ in range(tamanho))
+        if (any(c.islower() for c in senha) and any(c.isupper() for c in senha) and any(c.isdigit() for c in senha)
+                and (not simbolos or any(c in SIMBOLOS_SENHA for c in senha))):
+            return senha
+
+
+def gerar_frase_senha(palavras: int = 5) -> str:
+    lista = sorted({sem_acento(p).lower() for p in PALAVRAS_FORCA if len(p) >= 4 and p.isalpha()})
+    return "-".join(secrets.choice(lista) for _ in range(palavras)) + f"-{secrets.randbelow(100)}"
+
+
+def forca_senha(senha: str) -> str:
+    variedade = sum(bool(re.search(p, senha)) for p in (r"[a-z]", r"[A-Z]", r"\d", r"[^\w]"))
+    if len(senha) >= 16 and variedade >= 3 or len(senha) >= 24:
+        return f"{VERD}forte{RST}"
+    if len(senha) >= 12 and variedade >= 3:
+        return f"{AMAR}razoável{RST}"
+    return f"{VERM}fraca{RST}"
+
+
+def _cofre_chave(senha: str, meta: dict) -> bytes:
+    sal = base64.b64decode(meta["sal"])
+    if meta["kdf"] == "scrypt":
+        bruta = hashlib.scrypt(senha.encode(), salt=sal, n=2 ** 15, r=8, p=1, maxmem=64 * 1024 * 1024, dklen=32)
+    else:
+        bruta = hashlib.pbkdf2_hmac("sha256", senha.encode(), sal, 600_000, dklen=32)
+    return base64.urlsafe_b64encode(bruta)
+
+
+def cofre_salvar(entradas: list, senha: str, meta: dict | None = None) -> dict:
+    """Criptografa as entradas (Fernet: AES + HMAC) com uma chave derivada da senha mestra."""
+    from cryptography.fernet import Fernet
+    meta = meta or {"versao": 1, "kdf": "scrypt" if hasattr(hashlib, "scrypt") else "pbkdf2",
+                    "sal": base64.b64encode(secrets.token_bytes(16)).decode()}
+    token = Fernet(_cofre_chave(senha, meta)).encrypt(json.dumps(entradas, ensure_ascii=False).encode())
+    gravar_json(COFRE_FILE, {**meta, "dados": token.decode()}, privado=True)
+    return meta
+
+
+def cofre_abrir(senha: str) -> tuple:
+    from cryptography.fernet import Fernet, InvalidToken
+    dados = ler_json(COFRE_FILE, None)
+    if not dados:
+        raise ToonsError("O cofre ainda não foi criado.")
+    meta = {k: dados[k] for k in ("versao", "kdf", "sal")}
+    try:
+        entradas = json.loads(Fernet(_cofre_chave(senha, meta)).decrypt(dados["dados"].encode()))
+    except InvalidToken:
+        raise ToonsError("Senha mestra errada.") from None
+    return entradas, meta
+
+
+def _copiar_e_limpar(texto: str, segundos: int = 30) -> None:
+    """Copia e apaga da área de transferência depois de um tempo (se ninguém copiou outra coisa)."""
+    if not copiar_texto(texto, avisar=False):
+        return
+    ok(f"Copiado. A área de transferência será limpa em {segundos} s.")
+
+    def limpar_depois():
+        with contextlib.suppress(Exception):
+            if _tapi(["termux-clipboard-get"], 10, json_saida=False) == texto:
+                _tapi(["termux-clipboard-set"], 10, entrada="", json_saida=False)
+
+    temporizador_limpeza = threading.Timer(segundos, limpar_depois)
+    temporizador_limpeza.daemon = True
+    temporizador_limpeza.start()
+
+
+@submenu
+def menu_senhas():
+    def gerador():
+        tipo = escolher("Tipo", ["Senha aleatória (letras, números e símbolos)", "Senha sem símbolos",
+                                 "Frase-senha (fácil de lembrar, ex.: casa-tigre-livro-...)"])
+        if tipo is None:
+            return
+        if tipo == 2:
+            senha = gerar_frase_senha(perguntar_int("Quantas palavras", 5, 3, 10))
+        else:
+            senha = gerar_senha(perguntar_int("Tamanho", 20, 8, 128), simbolos=tipo == 0)
+        print(f"\n  {NEG}{senha}{RST}   ({forca_senha(senha)})\n")
+        if confirmar("Copiar?", True):
+            _copiar_e_limpar(senha, 60)
+
+    def abrir_cofre():
+        if not garantir_modulo("cryptography", pkg_nome="python-cryptography",
+                               aviso_extra="Ele faz a criptografia do cofre (AES)."):
+            return
+        if not COFRE_FILE.exists():
+            info("Vamos criar o cofre. A senha mestra protege todas as outras.")
+            aviso("Se você esquecer a senha mestra, NÃO há como recuperar as senhas guardadas.")
+            senha = getpass.getpass("Nova senha mestra: ")
+            if len(senha) < 8:
+                raise ToonsError("Use pelo menos 8 caracteres na senha mestra.")
+            if getpass.getpass("Repita a senha mestra: ") != senha:
+                raise ToonsError("As senhas não conferem.")
+            cofre_salvar([], senha)
+            ok("Cofre criado.")
+        else:
+            senha = getpass.getpass("Senha mestra: ")
+        info("Abrindo o cofre...")
+        entradas, meta = cofre_abrir(senha)
+        estado = {"senha": senha, "meta": meta}
+
+        def salvar():
+            estado["meta"] = cofre_salvar(entradas, estado["senha"], estado["meta"])
+
+        def pedir_entrada(base: dict | None = None) -> dict | None:
+            base = base or {}
+            nome = perguntar("Nome (ex.: Gmail, Banco)", base.get("nome"))
+            if not nome:
+                return None
+            usuario = perguntar("Usuário / e-mail", base.get("usuario", ""))
+            senha_nova = getpass.getpass("Senha (Enter = gerar uma forte" + (", ou manter a atual" if base else "")
+                                         + "): ")
+            if not senha_nova:
+                senha_nova = base.get("senha") if base and not confirmar("Gerar uma senha nova?", False) \
+                    else gerar_senha(20)
+            return {"nome": nome, "usuario": usuario, "senha": senha_nova,
+                    "url": perguntar("Site (opcional)", base.get("url", "")),
+                    "notas": perguntar("Observações (opcional)", base.get("notas", "")),
+                    "alterada": datetime.now().strftime("%Y-%m-%d")}
+
+        def ver(entrada: dict):
+            while True:
+                limpar()
+                titulo(f"🔐 {entrada['nome']}")
+                print(f"  Usuário: {entrada.get('usuario') or '-'}")
+                print(f"  Senha:   {'•' * 12}  ({forca_senha(entrada['senha'])})")
+                if entrada.get("url"):
+                    print(f"  Site:    {entrada['url']}")
+                if entrada.get("notas"):
+                    print(f"  Notas:   {entrada['notas']}")
+                print(f"  {DIM}alterada em {entrada.get('alterada', '?')}{RST}\n")
+                i = escolher("O que fazer?", ["Copiar a senha", "Copiar o usuário", "Mostrar a senha", "Editar",
+                                              "Abrir o site", "Apagar", "Voltar"])
+                if i in (None, 6):
+                    return
+                if i == 0:
+                    _copiar_e_limpar(entrada["senha"])
+                elif i == 1:
+                    copiar_texto(entrada.get("usuario", ""))
+                elif i == 2:
+                    print(f"\n  {NEG}{entrada['senha']}{RST}")
+                elif i == 3:
+                    nova = pedir_entrada(entrada)
+                    if nova:
+                        entrada.update(nova)
+                        salvar()
+                        ok("Salvo.")
+                elif i == 4 and entrada.get("url"):
+                    abrir_link(entrada["url"] if "://" in entrada["url"] else "https://" + entrada["url"])
+                elif i == 5 and confirmar(f"Apagar '{entrada['nome']}' do cofre?", False):
+                    entradas.remove(entrada)
+                    salvar()
+                    ok("Apagado.")
+                    return
+                if i in (0, 1, 2, 3):
+                    pausar()
+
+        def lista(filtro: str = ""):
+            achadas = sorted([e for e in entradas if not filtro or contem(f"{e['nome']} {e.get('usuario', '')} "
+                                                                          f"{e.get('url', '')}", filtro)],
+                             key=lambda e: e["nome"].lower())
+            if not achadas:
+                info("Nada encontrado.")
+                return
+            i = escolher("Qual?", [f"{e['nome']}  {DIM}{e.get('usuario', '')}{RST}" for e in achadas])
+            if i is not None:
+                ver(achadas[i])
+
+        def adicionar():
+            nova = pedir_entrada()
+            if nova:
+                entradas.append(nova)
+                salvar()
+                ok(f"'{nova['nome']}' guardada no cofre.")
+
+        def auditoria():
+            repetidas = {}
+            for e in entradas:
+                repetidas.setdefault(e["senha"], []).append(e["nome"])
+            problemas = 0
+            for e in entradas:
+                if "fraca" in forca_senha(e["senha"]):
+                    print(f"  {VERM}fraca{RST}     {e['nome']}")
+                    problemas += 1
+            for nomes in repetidas.values():
+                if len(nomes) > 1:
+                    print(f"  {AMAR}repetida{RST}  {', '.join(nomes)}")
+                    problemas += 1
+            if not problemas:
+                ok("Nenhuma senha fraca ou repetida. 👏")
+
+        def trocar_mestra():
+            nova = getpass.getpass("Nova senha mestra: ")
+            if len(nova) < 8 or getpass.getpass("Repita: ") != nova:
+                raise ToonsError("Senha curta (mínimo 8) ou não confere.")
+            estado["senha"] = nova
+            estado["meta"] = cofre_salvar(entradas, nova)  # sal novo junto com a senha nova
+            ok("Senha mestra trocada.")
+
+        def backup():
+            destino = pasta_saida() / f"cofre_backup_{datetime.now():%Y%m%d}.json"
+            shutil.copy2(COFRE_FILE, destino)
+            ok(f"Backup criptografado salvo em {destino} (só abre com a senha mestra).")
+
+        menu(f"🔐 Cofre ({len(entradas)} senhas)", [
+            (lambda: f"Ver senhas ({len(entradas)})", lista),
+            ("Buscar", lambda: lista(perguntar("Procurar por"))),
+            ("Guardar nova senha", adicionar),
+            ("Verificar senhas fracas ou repetidas", auditoria),
+            ("Gerar senha forte", gerador),
+            ("Trocar a senha mestra", trocar_mestra),
+            ("Backup do cofre (arquivo criptografado)", backup),
+        ], sair="Fechar o cofre")
+
+    menu("🔐 Gerenciador de senhas", [
+        ("Abrir o cofre de senhas", abrir_cofre),
+        ("Gerar senha forte (sem guardar)", gerador),
+    ])
+
+
+# ── Previsão do tempo ────────────────────────────────────────────────
+
+CLIMA_CODIGOS = {
+    0: ("☀️", "Céu limpo"), 1: ("🌤️", "Poucas nuvens"), 2: ("⛅", "Parcialmente nublado"), 3: ("☁️", "Nublado"),
+    45: ("🌫️", "Neblina"), 48: ("🌫️", "Neblina com geada"), 51: ("🌦️", "Garoa fraca"), 53: ("🌦️", "Garoa"),
+    55: ("🌧️", "Garoa forte"), 56: ("🌧️", "Garoa congelante"), 57: ("🌧️", "Garoa congelante forte"),
+    61: ("🌦️", "Chuva fraca"), 63: ("🌧️", "Chuva"), 65: ("🌧️", "Chuva forte"), 66: ("🌧️", "Chuva congelante"),
+    67: ("🌧️", "Chuva congelante forte"), 71: ("🌨️", "Neve fraca"), 73: ("🌨️", "Neve"), 75: ("❄️", "Neve forte"),
+    77: ("🌨️", "Grãos de neve"), 80: ("🌦️", "Pancadas de chuva fracas"), 81: ("🌧️", "Pancadas de chuva"),
+    82: ("⛈️", "Pancadas de chuva fortes"), 85: ("🌨️", "Pancadas de neve"), 86: ("🌨️", "Pancadas de neve fortes"),
+    95: ("⛈️", "Trovoadas"), 96: ("⛈️", "Trovoadas com granizo"), 99: ("⛈️", "Trovoadas com granizo forte"),
+}
+
+
+def clima(codigo) -> tuple:
+    return CLIMA_CODIGOS.get(int(codigo or 0), ("🌡️", f"Código {codigo}"))
+
+
+def buscar_cidade(nome: str) -> list:
+    dados = pedir_json(url_com("https://geocoding-api.open-meteo.com/v1/search", name=nome, count=8,
+                               language="pt", format="json"))
+    return [{"nome": ", ".join(x for x in (r.get("name"), r.get("admin1"), r.get("country")) if x),
+             "lat": r["latitude"], "lon": r["longitude"]} for r in (dados or {}).get("results", [])]
+
+
+def previsao(lat: float, lon: float) -> dict:
+    return pedir_json(url_com(
+        "https://api.open-meteo.com/v1/forecast", latitude=lat, longitude=lon, timezone="auto", forecast_days=7,
+        current="temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m",
+        hourly="temperature_2m,precipitation_probability,weather_code",
+        daily="weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,sunrise,sunset"))
+
+
+def proximas_horas(dados: dict, horas: int) -> list:
+    """Índices das próximas `horas` horas na previsão horária, a partir da hora atual do lugar."""
+    agora = dados.get("current", {}).get("time", "")[:13]
+    tempos = dados["hourly"]["time"]
+    inicio = next((i for i, t in enumerate(tempos) if t[:13] >= agora), 0)
+    return list(range(inicio, min(inicio + horas, len(tempos))))
+
+
+def _local_do_tempo(perguntar_sempre: bool = False) -> dict:
+    c = cfg()
+    local = c.get("tempo_local") or {}
+    if local and not perguntar_sempre:
+        return local
+    i = escolher("Onde?", ["Minha localização (GPS/rede)", "Buscar uma cidade"])
+    if i is None:
+        raise ToonsError("Cancelado.")
+    if i == 0:
+        info("Pegando a localização...")
+        loc = localizacao("network")
+        local = {"nome": "Minha localização", "lat": round(loc["latitude"], 3), "lon": round(loc["longitude"], 3)}
+    else:
+        achadas = buscar_cidade(perguntar("Cidade"))
+        if not achadas:
+            raise ToonsError("Cidade não encontrada.")
+        k = escolher("Qual?", [a["nome"] for a in achadas])
+        if k is None:
+            raise ToonsError("Cancelado.")
+        local = achadas[k]
+    c["tempo_local"] = local
+    salvar_cfg()
+    return local
+
+
+def mostrar_previsao(local: dict | None = None) -> None:
+    local = local or _local_do_tempo()
+    dados = previsao(local["lat"], local["lon"])
+    atual = dados["current"]
+    emoji, desc = clima(atual["weather_code"])
+    titulo(f"🌦️ {local['nome']}")
+    print(f"  {emoji}  {NEG}{atual['temperature_2m']:.0f}°C{RST}  {desc}")
+    print(f"  Sensação {atual['apparent_temperature']:.0f}°C · umidade {atual['relative_humidity_2m']}% · "
+          f"vento {atual['wind_speed_10m']:.0f} km/h · chuva agora {atual['precipitation']} mm")
+    h = dados["hourly"]
+    print(f"\n{NEG}  Próximas horas{RST}")
+    for i in proximas_horas(dados, 12)[::2]:
+        e, _ = clima(h["weather_code"][i])
+        chance = h["precipitation_probability"][i]
+        cor = AZUL if (chance or 0) >= 50 else DIM
+        print(f"  {h['time'][i][11:16]}  {e}  {h['temperature_2m'][i]:>5.1f}°C  {cor}💧 {chance or 0}%{RST}")
+    d = dados["daily"]
+    print(f"\n{NEG}  Próximos dias{RST}")
+    for i, dia_txt in enumerate(d["time"]):
+        dia = date.fromisoformat(dia_txt)
+        e, descricao = clima(d["weather_code"][i])
+        nome_dia = "hoje" if i == 0 else DIAS_SEMANA[dia.weekday()][:3]
+        print(f"  {nome_dia:<5} {dia:%d/%m}  {e}  {d['temperature_2m_min'][i]:>3.0f}° / {NEG}"
+              f"{d['temperature_2m_max'][i]:.0f}°{RST}  💧{d['precipitation_probability_max'][i] or 0:>3}%  "
+              f"{DIM}{descricao}{RST}")
+    print(f"\n  {DIM}🌅 {d['sunrise'][0][11:16]} · 🌇 {d['sunset'][0][11:16]} · dados: Open-Meteo{RST}")
+
+
+def configurar_alerta_chuva() -> dict:
+    """Dados de um monitor do tipo 'chuva' (usado também pelo menu de monitoramento)."""
+    local = _local_do_tempo(perguntar_sempre=True)
+    limite = perguntar_int("Avisar quando a chance de chuva passar de (%)", 60, 10, 100)
+    horas = perguntar_int("Olhando quantas horas à frente", 3, 1, 24)
+    return {"tipo": "chuva", "nome": f"Chuva em {local['nome']}", "lat": local["lat"], "lon": local["lon"],
+            "limite": limite, "horas": horas}
+
+
+def checar_chuva(m: dict, est: dict) -> tuple:
+    dados = pedir_json(url_com("https://api.open-meteo.com/v1/forecast", latitude=m["lat"], longitude=m["lon"],
+                               timezone="auto", forecast_days=2, current="weather_code",
+                               hourly="precipitation_probability"))
+    horas = int(m.get("horas", 3))
+    chances = [dados["hourly"]["precipitation_probability"][i] or 0 for i in proximas_horas(dados, horas)]
+    maximo = max(chances, default=0)
+    vai_chover = maximo >= int(m.get("limite", 60))
+    alerta = None
+    if vai_chover and not est.get("avisado"):
+        alerta = f"🌧️ {m['nome']}: {maximo}% de chance de chuva nas próximas {horas} h. Leve o guarda-chuva!"
+    est["avisado"] = vai_chover
+    return alerta, f"{maximo}% nas próximas {horas} h"
+
+
+@submenu
+def menu_tempo():
+    def alerta():
+        dados = configurar_alerta_chuva()
+        dados["intervalo"] = 1800
+        adicionar_monitor_dados(dados)
+        if not servico_ativo("monitor") and confirmar("Iniciar o serviço de monitoramento agora?", True):
+            iniciar_servico("monitor", cmd_self("monitor"), reiniciar=True)
+
+    menu("🌦️ Previsão do tempo", [
+        (lambda: f"Previsão para {(cfg().get('tempo_local') or {}).get('nome', 'meu local')}",
+         lambda: mostrar_previsao()),
+        ("Previsão de outra cidade", lambda: mostrar_previsao(_local_do_tempo(perguntar_sempre=True))),
+        ("Trocar meu local padrão", lambda: _local_do_tempo(perguntar_sempre=True) and ok("Local salvo.")),
+        ("Criar alerta de chuva (notificação)", alerta),
+    ])
+
+
+# ── QR code ──────────────────────────────────────────────────────────
+
+def crc16_pix(texto: str) -> str:
+    """CRC16-CCITT (polinômio 0x1021, início 0xFFFF), como o Banco Central pede no PIX."""
+    crc = 0xFFFF
+    for byte in texto.encode():
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) if crc & 0x8000 else crc << 1
+            crc &= 0xFFFF
+    return f"{crc:04X}"
+
+
+def pix_copia_e_cola(chave: str, nome: str, cidade: str, valor: float | None = None, descricao: str = "",
+                     txid: str = "***") -> str:
+    """Código PIX estático (BR Code), o mesmo do 'PIX copia e cola'."""
+    def campo(ident: str, conteudo: str) -> str:
+        return f"{ident}{len(conteudo):02d}{conteudo}"
+
+    def limpo(texto: str, maximo: int) -> str:
+        return re.sub(r"[^A-Za-z0-9 ]", "", sem_acento(texto)).upper().strip()[:maximo] or "X"
+
+    conta = campo("00", "br.gov.bcb.pix") + campo("01", chave) + (campo("02", descricao[:40]) if descricao else "")
+    payload = (campo("00", "01") + campo("26", conta) + campo("52", "0000") + campo("53", "986")
+               + (campo("54", f"{valor:.2f}") if valor else "") + campo("58", "BR") + campo("59", limpo(nome, 25))
+               + campo("60", limpo(cidade, 15)) + campo("62", campo("05", re.sub(r"[^A-Za-z0-9*]", "", txid)[:25]))
+               + "6304")
+    return payload + crc16_pix(payload)
+
+
+def wifi_qr(ssid: str, senha: str, seguranca: str = "WPA", oculta: bool = False) -> str:
+    def esc(t: str) -> str:
+        return re.sub(r'([\\;,:"])', r"\\\1", t)
+    return f"WIFI:T:{seguranca};S:{esc(ssid)};" + (f"P:{esc(senha)};" if seguranca != "nopass" else "") + \
+        ("H:true;" if oculta else "") + ";"
+
+
+def mostrar_qr(conteudo: str, nome_arquivo: str = "qrcode") -> Path | None:
+    if not garantir_cmd("qrencode", "libqrencode"):
+        return None
+    rodar(["qrencode", "-t", "ansiutf8", "-m", "2"], entrada=conteudo, mostrar=False)
+    destino = pasta_saida("QR codes") / f"{_slug(nome_arquivo)}_{datetime.now():%H%M%S}.png"
+    rodar(["qrencode", "-o", str(destino), "-s", "10", "-m", "3"], entrada=conteudo, mostrar=False)
+    if destino.exists():
+        ok(f"Imagem salva: {destino}")
+        return destino
+    return None
+
+
+@submenu
+def menu_qr():
+    def texto_ou_link():
+        conteudo = perguntar("Texto ou link")
+        if conteudo:
+            mostrar_qr(conteudo, "texto")
+
+    def wifi():
+        ssid = perguntar("Nome da rede (SSID)")
+        if not ssid:
+            return
+        tipos = [("WPA/WPA2/WPA3 (o mais comum)", "WPA"), ("WEP (antigo)", "WEP"), ("Sem senha", "nopass")]
+        i = escolher("Segurança", [t for t, _ in tipos], 1) or 0
+        senha = "" if tipos[i][1] == "nopass" else getpass.getpass("Senha do Wi-Fi: ")
+        mostrar_qr(wifi_qr(ssid, senha, tipos[i][1], confirmar("A rede é oculta?", False)), f"wifi_{ssid}")
+        info("Quem escanear com a câmera conecta direto, sem digitar a senha.")
+
+    def pix():
+        tipos = ["CPF/CNPJ", "Celular", "E-mail", "Chave aleatória"]
+        i = escolher("Tipo da chave PIX", tipos)
+        if i is None:
+            return
+        chave = perguntar("Chave").strip()
+        if i == 0:
+            chave = re.sub(r"\D", "", chave)
+            if len(chave) not in (11, 14):
+                raise ToonsError("CPF tem 11 dígitos e CNPJ 14.")
+        elif i == 1:
+            digitos = re.sub(r"\D", "", chave)
+            chave = "+" + (digitos if digitos.startswith("55") and len(digitos) > 11 else "55" + digitos)
+        elif i == 2 and "@" not in chave:
+            raise ToonsError("E-mail inválido.")
+        nome = perguntar("Nome de quem recebe")
+        cidade = perguntar("Cidade de quem recebe")
+        valor_txt = perguntar("Valor em R$ (Enter = quem paga digita)", "")
+        valor = parse_preco(valor_txt) if valor_txt else None
+        descricao = perguntar("Descrição (opcional)", "")
+        codigo = pix_copia_e_cola(chave, nome, cidade, valor, descricao)
+        mostrar_qr(codigo, "pix")
+        print(f"\n{NEG}PIX copia e cola:{RST}\n{codigo}\n")
+        if confirmar("Copiar o código?", True):
+            copiar_texto(codigo)
+        aviso("Confira o nome e o valor no app do banco antes de usar.")
+
+    def contato():
+        nome = perguntar("Nome")
+        fone = perguntar("Telefone", "")
+        email_c = perguntar("E-mail", "")
+        vcard = f"BEGIN:VCARD\nVERSION:3.0\nFN:{nome}\n" + (f"TEL:{fone}\n" if fone else "") + \
+            (f"EMAIL:{email_c}\n" if email_c else "") + "END:VCARD"
+        mostrar_qr(vcard, f"contato_{nome}")
+
+    def ler():
+        if not garantir_cmd("zbarimg", "zbar"):
+            return
+        i = escolher("Ler de onde?", ["Tirar uma foto agora", "Uma imagem do celular (print, foto...)"])
+        if i is None:
+            return
+        if i == 0:
+            arq = foto(DATA_DIR / "tmp" / "qr.jpg")
+        else:
+            arq = escolher_arquivo("Qual imagem?", (".jpg", ".jpeg", ".png", ".webp"))
+            if not arq:
+                return
+        proc = rodar(["zbarimg", "-q", "--raw", str(arq)], capturar=True, timeout=60, mostrar=False)
+        conteudo = (proc.stdout or "").strip()
+        if not conteudo:
+            raise ToonsError("Nenhum QR code encontrado (tente uma foto mais nítida e de perto).")
+        print(f"\n{NEG}Conteúdo:{RST}\n{conteudo}\n")
+        acoes = ["Copiar", "Abrir o link"] if re.match(r"https?://", conteudo) else ["Copiar"]
+        j = escolher("O que fazer?", acoes + ["Nada"])
+        if j == 0:
+            copiar_texto(conteudo)
+        elif j == 1 and len(acoes) == 2:
+            abrir_link(conteudo)
+
+    menu("🔳 QR code", [
+        ("Gerar de um texto ou link", texto_ou_link),
+        ("Gerar de uma rede Wi-Fi (conectar sem digitar senha)", wifi),
+        ("Gerar PIX (QR e copia e cola)", pix),
+        ("Gerar cartão de contato", contato),
+        ("Ler um QR code (câmera ou imagem)", ler),
+    ])
+
+
+# ── Tradutor e dicionário ────────────────────────────────────────────
+
+IDIOMAS = {"pt": "Português", "en": "Inglês", "es": "Espanhol", "fr": "Francês", "it": "Italiano", "de": "Alemão",
+           "ja": "Japonês", "ko": "Coreano", "zh-CN": "Chinês", "ru": "Russo", "ar": "Árabe", "nl": "Holandês"}
+
+
+def traduzir(texto: str, destino: str = "en", origem: str = "auto") -> tuple:
+    """(tradução, idioma detectado). Usa o tradutor do Google (sem chave) e o MyMemory se ele falhar."""
+    try:
+        dados = pedir_json(url_com("https://translate.googleapis.com/translate_a/single", client="gtx", sl=origem,
+                                   tl=destino, dt="t", q=texto), timeout=20)
+        traducao = "".join(parte[0] for parte in dados[0] if parte and parte[0])
+        return traducao, dados[2] if len(dados) > 2 and isinstance(dados[2], str) else origem
+    except (ToonsError, TypeError, IndexError):
+        de = origem if origem != "auto" else ("en" if destino.startswith("pt") else "pt")
+        dados = pedir_json(url_com("https://api.mymemory.translated.net/get", q=texto[:500],
+                                   langpair=f"{de}|{destino}"), timeout=20)
+        traducao = (dados.get("responseData") or {}).get("translatedText")
+        if not traducao:
+            raise ToonsError("Não consegui traduzir agora.") from None
+        return traducao, de
+
+
+def falar_em(texto: str, idioma: str) -> None:
+    _tapi(["termux-tts-speak", "-l", idioma.split("-")[0]], 180, entrada=texto, json_saida=False)
+
+
+def dicionario_pt(palavra: str) -> list:
+    """Definições do Dicionário Aberto."""
+    import html as html_mod
+    dados = pedir_json(f"https://api.dicionario-aberto.net/word/{urllib.parse.quote(palavra.lower())}")
+    definicoes = []
+    for verbete in dados or []:
+        for d in re.findall(r"<def>(.*?)</def>", verbete.get("xml", ""), re.S):
+            texto = re.sub(r"\s+", " ", html_mod.unescape(re.sub(r"<[^>]+>", " ", d))).replace("_", "").strip()
+            definicoes += [linha.strip() for linha in texto.split(";") if linha.strip()][:3]
+    return definicoes[:10]
+
+
+def dicionario_en(palavra: str) -> list:
+    try:
+        dados = pedir_json(f"https://api.dictionaryapi.dev/api/v2/entries/en/{urllib.parse.quote(palavra.lower())}")
+    except ToonsError:
+        return []
+    saida = []
+    for entrada in dados if isinstance(dados, list) else []:
+        for sentido in entrada.get("meanings", []):
+            for d in sentido.get("definitions", [])[:2]:
+                saida.append(f"({sentido.get('partOfSpeech', '')}) {d.get('definition', '')}"
+                             + (f" — ex.: {d['example']}" if d.get("example") else ""))
+    return saida[:10]
+
+
+@submenu
+def menu_tradutor():
+    c = cfg()
+
+    def destino_atual() -> str:
+        return c.get("tradutor_destino", "en")
+
+    def traduzir_loop():
+        info(f"Traduzindo para {IDIOMAS.get(destino_atual(), destino_atual())} (o idioma de origem é detectado). "
+             "Enter vazio sai.")
+        while True:
+            texto = perguntar("Texto")
+            if not texto:
+                return
+            traducao, origem = traduzir(texto, destino_atual())
+            print(f"  {DIM}[{IDIOMAS.get(origem, origem)} → {IDIOMAS.get(destino_atual(), destino_atual())}]{RST} "
+                  f"{NEG}{VERD}{traducao}{RST}")
+            if c.get("tradutor_falar"):
+                with contextlib.suppress(ToonsError):
+                    falar_em(traducao, destino_atual())
+
+    def trocar_idioma():
+        codigos = list(IDIOMAS)
+        i = escolher("Traduzir para", [f"{IDIOMAS[k]} ({k})" for k in codigos],
+                     codigos.index(destino_atual()) + 1 if destino_atual() in codigos else None)
+        if i is not None:
+            c["tradutor_destino"] = codigos[i]
+            salvar_cfg()
+            ok(f"Agora traduzindo para {IDIOMAS[codigos[i]]}.")
+
+    def traduzir_area():
+        texto = _tapi(["termux-clipboard-get"], 10, json_saida=False)
+        if not texto:
+            raise ToonsError("A área de transferência está vazia.")
+        traducao, origem = traduzir(texto, destino_atual())
+        print(f"{DIM}{texto[:300]}{RST}\n\n{NEG}{VERD}{traducao}{RST}")
+        if confirmar("Copiar a tradução?", True):
+            copiar_texto(traducao)
+
+    def dicionario():
+        palavra = perguntar("Palavra")
+        if not palavra:
+            return
+        definicoes = dicionario_pt(palavra) if not re.fullmatch(r"[A-Za-z' -]+", palavra) or \
+            escolher("Dicionário", ["Português", "Inglês"]) == 0 else dicionario_en(palavra)
+        if not definicoes:
+            info("Não encontrei essa palavra.")
+        for d in definicoes:
+            print(f"  • {d}")
+
+    menu("🌍 Tradutor e dicionário", [
+        (lambda: f"Traduzir para {IDIOMAS.get(destino_atual(), destino_atual())}", traduzir_loop),
+        ("Trocar o idioma de destino", trocar_idioma),
+        ("Traduzir o que está copiado", traduzir_area),
+        ("Dicionário (português ou inglês)", dicionario),
+        (lambda: f"Falar as traduções em voz alta: {'sim' if c.get('tradutor_falar') else 'não'}",
+         lambda: (c.update(tradutor_falar=not c.get("tradutor_falar")), salvar_cfg())),
+    ])
+
+
+@submenu
+def menu_utilitarios():
+    menu("🧰 Utilitários", [
+        ("📝 Bloco de notas", menu_notas),
+        ("⏰ Lembretes e alarmes", menu_lembretes),
+        ("⏱️ Cronômetro, timer e Pomodoro", menu_relogio),
+        ("📅 Calendário e agenda (feriados)", menu_agenda),
+        ("💱 Conversor de unidades e moedas", menu_conversor),
+        ("💰 Controle de gastos", menu_gastos),
+        ("🔐 Gerenciador de senhas", menu_senhas),
+        ("🌦️ Previsão do tempo", menu_tempo),
+        ("🔳 QR code (Wi-Fi, PIX, ler)", menu_qr),
+        ("🌍 Tradutor e dicionário", menu_tradutor),
+    ])
+
+
+# ════════════════════════════════════════════════════════════════════
+#  21. Celular e sistema
+# ════════════════════════════════════════════════════════════════════
+
+BATERIA_LOG = DATA_DIR / "bateria.csv"
+AUTOMACAO_ESTADO = DATA_DIR / "automacao_estado.json"
+
+
+# ── Saúde da bateria ─────────────────────────────────────────────────
+
+def carregando(b: dict) -> bool:
+    return b.get("status") in ("CHARGING", "FULL") or b.get("plugged") not in (None, "", "UNPLUGGED")
+
+
+def registrar_bateria() -> dict:
+    b = bateria()
+    linha = ",".join(str(b.get(k, "")) for k in ("percentage", "temperature", "status", "plugged", "current"))
+    with open(BATERIA_LOG, "a", encoding="utf-8") as arq:
+        arq.write(f"{int(time.time())},{linha}\n")
+    return b
+
+
+def historico_bateria(horas: float | None = None) -> list:
+    """[(epoch, %, °C, status, plugged, corrente)] do registro, opcionalmente só das últimas `horas`."""
+    if not BATERIA_LOG.exists():
+        return []
+    desde = time.time() - horas * 3600 if horas else 0
+    pontos = []
+    for linha in BATERIA_LOG.read_text("utf-8", errors="replace").splitlines():
+        partes = linha.split(",")
+        if len(partes) < 6:
+            continue
+        try:
+            t, pct = int(partes[0]), int(float(partes[1]))
+            temp = float(partes[2]) if partes[2] else None
+        except ValueError:
+            continue
+        if t >= desde:
+            pontos.append((t, pct, temp, partes[3], partes[4], partes[5]))
+    return pontos
+
+
+def estatisticas_bateria(pontos: list) -> dict:
+    """Ciclos estimados (soma das cargas / 100), consumo médio por hora e temperatura."""
+    carregado, gasto, horas_gastando = 0, 0, 0.0
+    for (t0, p0, _, s0, pl0, _), (t1, p1, *_) in zip(pontos, pontos[1:]):
+        if t1 - t0 > 3 * 3600:
+            continue  # buraco no registro (serviço parado): não dá para saber o que houve
+        if p1 > p0:
+            carregado += p1 - p0
+        elif p1 < p0 and not carregando({"status": s0, "plugged": pl0}):
+            gasto += p0 - p1
+            horas_gastando += (t1 - t0) / 3600
+        elif not carregando({"status": s0, "plugged": pl0}):
+            horas_gastando += (t1 - t0) / 3600
+    temps = [p[2] for p in pontos if p[2] is not None]
+    return {"ciclos": carregado / 100, "consumo_hora": gasto / horas_gastando if horas_gastando >= 0.5 else None,
+            "temp_max": max(temps, default=None), "temp_media": sum(temps) / len(temps) if temps else None,
+            "dias": (pontos[-1][0] - pontos[0][0]) / 86400 if len(pontos) > 1 else 0}
+
+
+def rodar_bateria() -> None:
+    """Serviço: registra a bateria e avisa ao chegar em 80% carregando, bateria baixa ou temperatura alta."""
+    log("Registro da bateria iniciado.")
+    avisou = {"carga": False, "baixa": False, "temp": 0.0}
+    while True:
+        c = recarregar_cfg()
+        try:
+            b = registrar_bateria()
+        except ToonsError as e:
+            log(f"Não consegui ler a bateria: {e}")
+            time.sleep(300)
+            continue
+        pct, temp, plugado = int(b.get("percentage", 0)), float(b.get("temperature") or 0), carregando(b)
+        limite_carga = int(c.get("bateria_alerta_carga", 80))
+        if limite_carga and plugado and pct >= limite_carga and not avisou["carga"]:
+            notificar_seguro(f"🔌 Bateria em {pct}%", "Pode tirar do carregador: parar perto de 80% faz a bateria "
+                             "durar mais.", som=True)
+            avisou["carga"] = True
+        elif not plugado:
+            avisou["carga"] = False
+        limite_baixa = int(c.get("bateria_alerta_baixa", 15))
+        if limite_baixa and not plugado and pct <= limite_baixa and not avisou["baixa"]:
+            notificar_seguro(f"🪫 Bateria em {pct}%", "Hora de carregar.", som=True)
+            avisou["baixa"] = True
+        elif plugado or pct > limite_baixa:
+            avisou["baixa"] = False
+        limite_temp = float(c.get("bateria_alerta_temp", 42))
+        if limite_temp and temp >= limite_temp and time.time() - avisou["temp"] > 3600:
+            notificar_seguro(f"🌡️ Bateria quente: {temp:.0f}°C", "Tire da capa, saia do sol ou pare de carregar "
+                             "um pouco.", som=True)
+            avisou["temp"] = time.time()
+        if BATERIA_LOG.exists() and BATERIA_LOG.stat().st_size > 3_000_000:
+            manter = [",".join(map(str, p)) for p in historico_bateria(24 * 60)]
+            BATERIA_LOG.write_text("\n".join(manter) + "\n", "utf-8")
+        log(f"{pct}% · {temp:.1f}°C · {b.get('status', '')}")
+        time.sleep(120 if plugado else 300)
+
+
+def _corrente_ma(valor) -> str:
+    try:
+        v = float(valor)
+    except (TypeError, ValueError):
+        return "?"
+    return f"{v / 1000:.0f} mA" if abs(v) > 20000 else f"{v:.0f} mA"  # uns aparelhos dão µA, outros mA
+
+
+@submenu
+def menu_bateria():
+    c = cfg()
+
+    def agora():
+        b = bateria()
+        pct = int(b.get("percentage", 0))
+        cor = VERD if pct > 50 else AMAR if pct > 20 else VERM
+        print(f"\n  {cor}{barra_horizontal(pct / 100, 25)}{RST} {NEG}{pct}%{RST}")
+        saude = {"GOOD": "boa", "OVERHEAT": "superaquecida", "DEAD": "ruim", "COLD": "fria",
+                 "OVER_VOLTAGE": "tensão alta"}.get(b.get("health"), b.get("health", "?"))
+        estado = {"CHARGING": "carregando", "DISCHARGING": "descarregando", "FULL": "cheia",
+                  "NOT_CHARGING": "conectada, sem carregar"}.get(b.get("status"), b.get("status", "?"))
+        fonte = {"PLUGGED_AC": "tomada", "PLUGGED_USB": "USB", "PLUGGED_WIRELESS": "sem fio",
+                 "UNPLUGGED": "nenhuma"}.get(b.get("plugged"), b.get("plugged", "?"))
+        print(f"  Estado: {estado} · fonte: {fonte}")
+        print(f"  Saúde: {saude} · temperatura: {float(b.get('temperature') or 0):.1f}°C · "
+              f"corrente: {_corrente_ma(b.get('current'))}")
+        if b.get("cycle") not in (None, -1):
+            print(f"  Ciclos de carga (informado pelo Android): {b['cycle']}")
+        est = estatisticas_bateria(historico_bateria(24 * 7))
+        if est["consumo_hora"] and not carregando(b):
+            print(f"  Consumo médio: {est['consumo_hora']:.1f}%/h · dura mais uns "
+                  f"{pct / est['consumo_hora']:.0f} h nesse ritmo")
+        if not servico_ativo("bateria"):
+            info("Ligue o 'Registro da bateria' para ter histórico, gráfico e alertas.")
+
+    def grafico():
+        pontos = historico_bateria(24)
+        if len(pontos) < 2:
+            info("Ainda não há registro suficiente. Inicie o registro e volte em algumas horas.")
+            return
+        blocos = "▁▂▃▄▅▆▇█"
+        agora_t = time.time()
+        por_meia_hora = {}
+        for t, pct, temp, *_ in pontos:
+            por_meia_hora[int((agora_t - t) // 1800)] = (pct, temp)
+        faixa = "".join(blocos[min(7, por_meia_hora[k][0] * 8 // 101)] if k in por_meia_hora else " "
+                        for k in range(47, -1, -1))
+        print(f"\n  Últimas 24 h (cada barra = 30 min):\n  {VERD}{faixa}{RST}\n  {DIM}-24h{' ' * 38}agora{RST}\n")
+        for k in range(46, -1, -4):
+            if k in por_meia_hora:
+                pct, temp = por_meia_hora[k]
+                hora = datetime.fromtimestamp(agora_t - k * 1800).strftime("%H:%M")
+                print(f"  {hora}  {barra_horizontal(pct / 100, 20)} {pct:>3}%  {DIM}{temp or 0:.0f}°C{RST}")
+
+    def estatisticas():
+        pontos = historico_bateria()
+        if len(pontos) < 2:
+            info("Sem registro ainda.")
+            return
+        est = estatisticas_bateria(pontos)
+        print(f"  Registro de {est['dias']:.1f} dia(s) · {len(pontos)} medições")
+        print(f"  Cargas somadas: {est['ciclos']:.1f} ciclo(s) completos (≈ {est['ciclos'] / max(est['dias'], 1):.2f}"
+              f" por dia)")
+        if est["consumo_hora"]:
+            print(f"  Consumo médio fora da tomada: {est['consumo_hora']:.1f}%/h")
+        if est["temp_max"] is not None:
+            print(f"  Temperatura: média {est['temp_media']:.1f}°C · máxima {est['temp_max']:.1f}°C")
+        info("Uma bateria de celular costuma aguentar de 500 a 1000 ciclos antes de perder capacidade.")
+
+    def alertas():
+        c["bateria_alerta_carga"] = perguntar_int("Avisar ao carregar até (%; 0 desliga)",
+                                                  c.get("bateria_alerta_carga", 80), 0, 100)
+        c["bateria_alerta_baixa"] = perguntar_int("Avisar quando cair para (%; 0 desliga)",
+                                                  c.get("bateria_alerta_baixa", 15), 0, 99)
+        c["bateria_alerta_temp"] = perguntar_int("Avisar se esquentar acima de (°C; 0 desliga)",
+                                                 int(c.get("bateria_alerta_temp", 42)), 0, 80)
+        salvar_cfg()
+        ok("Alertas salvos (valem com o registro da bateria ligado).")
+
+    menu("🔋 Saúde da bateria", [
+        ("Bateria agora", agora),
+        ("Gráfico das últimas 24 horas", grafico),
+        ("Estatísticas (ciclos, consumo, temperatura)", estatisticas),
+        ("Configurar alertas (80%, baixa, quente)", alertas),
+        *itens_servico("bateria", "Registro da bateria",
+                       lambda: iniciar_servico("bateria", cmd_self("bateria-log"), reiniciar=True)),
+    ])
+
+
+# ── Uso de dados e tempo de tela (ADB) ───────────────────────────────
+
+def _segundos_de(texto: str) -> int:
+    total = 0
+    for parte in texto.split(":"):
+        total = total * 60 + int(parte or 0)
+    return total
+
+
+def parse_tempo_de_tela(dump: str, periodo: str = "daily") -> list:
+    """[(pacote, segundos, aberturas)] do 'dumpsys usagestats' (bloco diário ou semanal)."""
+    inicio = dump.find(f"In-memory {periodo} stats")
+    if inicio < 0:
+        return []
+    fim = dump.find("In-memory", inicio + 10)
+    bloco = dump[inicio:fim if fim > 0 else None]
+    uso = {}
+    for linha in bloco.splitlines():
+        m = re.search(r'package=(\S+) totalTime(?:Used)?="([\d:]+)"', linha)
+        if not m:
+            continue
+        aberturas = re.search(r"appLaunchCount=(\d+)", linha)
+        s, n = _segundos_de(m.group(2)), int(aberturas.group(1)) if aberturas else 0
+        anterior = uso.get(m.group(1), (0, 0))
+        uso[m.group(1)] = (max(anterior[0], s), max(anterior[1], n))
+    return sorted(((p, s, n) for p, (s, n) in uso.items() if s > 0), key=lambda x: -x[1])
+
+
+def parse_netstats(dump: str, desde: int) -> dict:
+    """{uid: {'movel': bytes, 'wifi': bytes, 'outra': bytes}} da seção 'UID stats' do 'dumpsys netstats detail'."""
+    inicio = dump.find("UID stats:")
+    if inicio < 0:
+        return {}
+    fim = dump.find("UID tag stats:", inicio)
+    uso, atual = {}, None
+    for linha in dump[inicio:fim if fim > 0 else None].splitlines():
+        m = re.search(r"ident=\[(.*?)\] uid=(-?\d+) set=\S+ tag=(0x[0-9a-fA-F]+)", linha)
+        if m:
+            if m.group(3) != "0x0":
+                atual = None
+                continue
+            ident = m.group(1)
+            rede = "movel" if re.search(r"type=(?:MOBILE|0)\b|transports=\{0\}", ident) else \
+                "wifi" if re.search(r"type=(?:WIFI|1)\b|transports=\{1\}", ident) else "outra"
+            atual = uso.setdefault(int(m.group(2)), {"movel": 0, "wifi": 0, "outra": 0}), rede
+            continue
+        b = re.search(r"st=(\d+) rb=(\d+) rp=\d+ tb=(\d+)", linha)
+        if b and atual and int(b.group(1)) >= desde:
+            atual[0][atual[1]] += int(b.group(2)) + int(b.group(3))
+    return uso
+
+
+def mapa_uids(lista_pm: str) -> dict:
+    """uid → pacote, de 'pm list packages -U'."""
+    mapa = {}
+    for linha in lista_pm.splitlines():
+        m = re.match(r"package:(\S+) uid:([\d,]+)", linha.strip())
+        if m:
+            for uid in m.group(2).split(","):
+                mapa.setdefault(int(uid), m.group(1))
+    return mapa
+
+
+@submenu
+def menu_uso_celular():
+    def tempo_de_tela(periodo: str):
+        info("Lendo as estatísticas de uso pelo ADB...")
+        uso = parse_tempo_de_tela(adb_shell("dumpsys usagestats", timeout=120), periodo)
+        if not uso:
+            raise ToonsError("O Android não devolveu o tempo de uso (versão diferente ou sem permissão).")
+        total = sum(s for _, s, _ in uso)
+        print(f"\n  Total: {NEG}{fmt_relogio(total)}{RST} {DIM}({'hoje' if periodo == 'daily' else 'esta semana'}){RST}\n")
+        maior = uso[0][1]
+        for pacote, s, n in uso[:20]:
+            print(f"  {fmt_relogio(s):>8} {CIANO}{barra_horizontal(s / maior, 14)}{RST} {pacote}"
+                  + (f" {DIM}({n}x){RST}" if n else ""))
+
+    def dados_por_app():
+        i = escolher("Período", ["Desde o início do mês", "Últimos 7 dias", "Últimos 30 dias"])
+        if i is None:
+            return
+        hoje = datetime.now()
+        desde = int((hoje.replace(day=1, hour=0, minute=0, second=0) if i == 0 else
+                     hoje - timedelta(days=7 if i == 1 else 30)).timestamp())
+        info("Lendo o uso de dados pelo ADB (pode levar alguns segundos)...")
+        uso = parse_netstats(adb_shell("dumpsys netstats detail", timeout=180), desde)
+        if not uso:
+            raise ToonsError("O Android não devolveu o uso de dados por app (versão diferente ou sem permissão).")
+        nomes = mapa_uids(adb_shell("pm list packages -U"))
+        nomes.update({0: "root (sistema)", 1000: "Android (sistema)", 1013: "mídia", -5: "tethering (roteador)"})
+        linhas = sorted(((nomes.get(uid, f"uid {uid}"), v) for uid, v in uso.items()),
+                        key=lambda par: -(par[1]["movel"] + par[1]["wifi"] + par[1]["outra"]))
+        movel = sum(v["movel"] for _, v in linhas)
+        wifi = sum(v["wifi"] for _, v in linhas)
+        print(f"\n  Dados móveis: {NEG}{bytes_humanos(movel)}{RST} · Wi-Fi: {NEG}{bytes_humanos(wifi)}{RST}\n")
+        print(f"  {'móvel':>10} {'Wi-Fi':>10}  app")
+        for nome, v in linhas[:25]:
+            if v["movel"] + v["wifi"] + v["outra"] < 1024 * 100:
+                continue
+            print(f"  {bytes_humanos(v['movel']):>10} {bytes_humanos(v['wifi']):>10}  {nome}")
+
+    menu("📊 Uso de dados e tempo de tela (pelo ADB)", [
+        ("Tempo de tela hoje", lambda: tempo_de_tela("daily")),
+        ("Tempo de tela na semana", lambda: tempo_de_tela("weekly")),
+        ("Internet gasta por app (móvel e Wi-Fi)", dados_por_app),
+        ("Conectar o ADB (depuração sem fio)", menu_adb),
+    ], cabecalho=lambda: print(f"{DIM}Precisa do ADB conectado ao próprio celular (menu 🔌 Depuração sem fio).{RST}"))
+
+
+# ── Gerenciador de apps (ADB) ────────────────────────────────────────
+
+def listar_pacotes(tipo: str = "-3") -> list:
+    return sorted(l.split(":", 1)[1].strip() for l in adb_shell(f"pm list packages {tipo}").splitlines()
+                  if l.startswith("package:"))
+
+
+def info_pacote(pacote: str) -> dict:
+    dump = adb_shell(f"dumpsys package {shlex.quote(pacote)}", timeout=60)
+
+    def achar(chave):
+        m = re.search(rf"{chave}=(\S+(?: \S+)?)", dump)
+        return m.group(1) if m else "?"
+    permissoes = re.findall(r"(android\.permission\.[A-Z_]+|[\w.]+\.permission\.[\w.]+): granted=true", dump)
+    return {"versão": achar("versionName"), "instalado em": achar("firstInstallTime"),
+            "atualizado em": achar("lastUpdateTime"), "Android alvo": achar("targetSdk"),
+            "desativado": "enabled=3" in dump or "enabled=2" in dump, "permissões": sorted(set(permissoes))}
+
+
+@submenu
+def menu_apps():
+    def acoes(pacote: str):
+        while True:
+            limpar()
+            titulo(f"📦 {pacote}")
+            dados = info_pacote(pacote)
+            for chave in ("versão", "instalado em", "atualizado em", "Android alvo"):
+                print(f"  {CIANO}{chave}{RST}: {dados[chave]}")
+            if dados["desativado"]:
+                print(f"  {AMAR}(desativado){RST}")
+            print()
+            opcoes = ["Abrir o app", "Forçar parada", "Ver e revogar permissões", "Extrair o APK para Downloads",
+                      "Reativar" if dados["desativado"] else "Desativar (congelar, sem desinstalar)",
+                      "Limpar os dados do app (apaga tudo dele!)", "Desinstalar só para mim (bloatware, reversível)",
+                      "Desinstalar de vez", "Voltar"]
+            i = escolher("O que fazer?", opcoes)
+            if i in (None, 8):
+                return
+            q = shlex.quote(pacote)
+            if i == 0:
+                print(adb_shell(f"monkey -p {q} -c android.intent.category.LAUNCHER 1")[-200:])
+            elif i == 1:
+                adb_shell(f"am force-stop {q}")
+                ok("Parado.")
+            elif i == 2:
+                perms = dados["permissões"]
+                if not perms:
+                    info("Nenhuma permissão perigosa concedida.")
+                else:
+                    marcadas = escolher_varios("Revogar quais? (Espaço marca)", perms)
+                    if marcadas and confirmar(f"Revogar {len(marcadas)} permissão(ões)?", True):
+                        for k in marcadas:
+                            print(adb_shell(f"pm revoke {q} {perms[k]}") or f"  revogada: {perms[k]}")
+            elif i == 3:
+                caminhos = [l.split(":", 1)[1] for l in adb_shell(f"pm path {q}").splitlines() if l.startswith("package:")]
+                destino = pasta_saida("APKs", pacote)
+                for caminho in caminhos:
+                    adb("pull", caminho, str(destino / Path(caminho).name), serial=adb_alvo(), timeout=600)
+                ok(f"{len(caminhos)} arquivo(s) em {destino}" + (" (APK dividido: instale todos juntos)"
+                                                                 if len(caminhos) > 1 else ""))
+            elif i == 4:
+                cmd = f"pm enable {q}" if dados["desativado"] else f"pm disable-user --user 0 {q}"
+                print(adb_shell(cmd))
+            elif i == 5 and confirmar(f"Apagar TODOS os dados de {pacote} (login, arquivos, configurações)?", False):
+                print(adb_shell(f"pm clear {q}"))
+            elif i == 6:
+                aviso("Remover app do sistema pode quebrar funções do celular. Volta com 'Reinstalar app removido'.")
+                if confirmar(f"Desinstalar {pacote} para o seu usuário?", False):
+                    print(adb_shell(f"pm uninstall -k --user 0 {q}"))
+                    return
+            elif i == 7 and confirmar(f"Desinstalar {pacote} de vez?", False):
+                print(adb_shell(f"pm uninstall {q}"))
+                return
+            pausar()
+
+    def listar(tipo: str, msg: str):
+        pacotes = listar_pacotes(tipo)
+        filtro = perguntar("Filtrar por nome (Enter = todos)", "")
+        pacotes = [p for p in pacotes if filtro.lower() in p.lower()]
+        if not pacotes:
+            info("Nenhum app encontrado.")
+            return
+        i = escolher(f"{msg} ({len(pacotes)})", pacotes)
+        if i is not None:
+            acoes(pacotes[i])
+
+    def reinstalar():
+        todos = set(listar_pacotes("-u"))
+        instalados = set(listar_pacotes(""))
+        removidos = sorted(todos - instalados)
+        if not removidos:
+            info("Nenhum app removido só para o seu usuário.")
+            return
+        i = escolher("Reinstalar qual?", removidos)
+        if i is not None:
+            print(adb_shell(f"cmd package install-existing {shlex.quote(removidos[i])}"))
+
+    menu("📦 Gerenciador de apps (pelo ADB, sem root)", [
+        ("Apps que eu instalei", lambda: listar("-3", "Apps instalados")),
+        ("Apps do sistema", lambda: listar("-s", "Apps do sistema")),
+        ("Apps desativados (para reativar)", lambda: listar("-d", "Apps desativados")),
+        ("Reinstalar app removido", reinstalar),
+        ("Conectar o ADB (depuração sem fio)", menu_adb),
+    ], cabecalho=lambda: print(f"{DIM}Precisa do ADB conectado ao próprio celular (menu 🔌 Depuração sem fio).{RST}"))
+
+
+# ── Organizador de fotos ─────────────────────────────────────────────
+
+EXT_IMAGEM = (".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".gif")
+
+
+def _pasta_fotos() -> Path:
+    for p in (HOME / "storage" / "dcim" / "Camera", HOME / "storage" / "dcim", HOME / "storage" / "pictures"):
+        if p.exists():
+            return p
+    return HOME
+
+
+def data_da_foto(caminho: Path) -> datetime:
+    """Data em que a foto foi tirada (EXIF), ou a data do arquivo."""
+    with contextlib.suppress(Exception):
+        from PIL import Image
+        with Image.open(caminho) as img:
+            exif = img.getexif()
+            texto = exif.get_ifd(0x8769).get(36867) or exif.get(306)
+            if texto:
+                return datetime.strptime(str(texto)[:19], "%Y:%m:%d %H:%M:%S")
+    return datetime.fromtimestamp(caminho.stat().st_mtime)
+
+
+def dhash(caminho: Path) -> int | None:
+    """Impressão digital visual de 64 bits: fotos parecidas têm números com poucos bits diferentes."""
+    try:
+        from PIL import Image
+        with Image.open(caminho) as img:
+            cinza = img.convert("L").resize((9, 8))
+            px = list(cinza.getdata())
+    except Exception:  # noqa: BLE001 — arquivo que o Pillow não abre fica de fora
+        return None
+    bits = 0
+    for linha in range(8):
+        for col in range(8):
+            bits = (bits << 1) | (px[linha * 9 + col] > px[linha * 9 + col + 1])
+    return bits
+
+
+def agrupar_parecidas(hashes: dict, limite: int = 6) -> list:
+    """Grupos de caminhos cujas impressões digitais diferem em até `limite` bits."""
+    itens = list(hashes.items())
+    grupos, usados = [], set()
+    for i, (a, ha) in enumerate(itens):
+        if a in usados:
+            continue
+        grupo = [a] + [b for b, hb in itens[i + 1:] if b not in usados and bin(ha ^ hb).count("1") <= limite]
+        if len(grupo) > 1:
+            usados.update(grupo)
+            grupos.append(grupo)
+    return grupos
+
+
+@submenu
+def menu_fotos():
+    estado = {"pasta": _pasta_fotos()}
+
+    def fotos(recursivo: bool = False) -> list:
+        pasta = estado["pasta"]
+        arquivos = pasta.rglob("*") if recursivo else pasta.iterdir()
+        return sorted((a for a in arquivos if a.is_file() and a.suffix.lower() in EXT_IMAGEM),
+                      key=lambda a: a.stat().st_mtime, reverse=True)
+
+    def precisa_pillow() -> bool:
+        return garantir_modulo("PIL", pip_nome="pillow", pkg_nome="python-pillow",
+                               aviso_extra="O Pillow lê e grava as imagens.")
+
+    def trocar_pasta():
+        opcoes = [p for p in (HOME / "storage" / "dcim" / "Camera", HOME / "storage" / "dcim",
+                              HOME / "storage" / "pictures", HOME / "storage" / "downloads",
+                              HOME / "storage" / "shared" / "Pictures" / "Screenshots") if p.exists()]
+        i = escolher("Pasta das fotos", [str(p) for p in opcoes] + ["Digitar outra..."])
+        if i is None:
+            return
+        pasta = opcoes[i] if i < len(opcoes) else Path(os.path.expanduser(perguntar("Pasta")))
+        if not pasta.is_dir():
+            raise ToonsError("Pasta não encontrada.")
+        estado["pasta"] = pasta
+
+    def organizar():
+        lista = fotos()
+        if not lista:
+            info("Nenhuma foto nessa pasta.")
+            return
+        mover = escolher("Como organizar?", [
+            "Copiar para Downloads/Termux-Toons/Fotos por data (as originais ficam onde estão)",
+            f"Mover para subpastas ano/mês dentro de {estado['pasta'].name}"]) == 1
+        if precisa_pillow() is False:
+            aviso("Sem o Pillow: uso a data do arquivo em vez da data da foto.")
+        base = estado["pasta"] if mover else pasta_saida("Fotos por data")
+        feitos = 0
+        for arq in lista:
+            quando = data_da_foto(arq)
+            destino = base / f"{quando:%Y}" / f"{quando:%m}"
+            destino.mkdir(parents=True, exist_ok=True)
+            alvo = destino / arq.name
+            if alvo.exists():
+                continue
+            (shutil.move if mover else shutil.copy2)(str(arq), str(alvo))
+            feitos += 1
+            print(f"\r  {feitos}/{len(lista)}", end="", flush=True)
+        print()
+        ok(f"{feitos} foto(s) {'movida(s)' if mover else 'copiada(s)'} para {base}/ano/mês.")
+
+    def duplicadas():
+        lista = fotos(recursivo=True)
+        por_tamanho = {}
+        for a in lista:
+            por_tamanho.setdefault(a.stat().st_size, []).append(a)
+        grupos = {}
+        for candidatos in (g for g in por_tamanho.values() if len(g) > 1):
+            for a in candidatos:
+                grupos.setdefault(_hash_arquivo(a), []).append(a)
+        grupos = [sorted(g, key=lambda a: a.stat().st_mtime) for g in grupos.values() if len(g) > 1]
+        if not grupos:
+            ok("Nenhuma foto repetida (idêntica).")
+            return
+        sobra = [a for g in grupos for a in g[1:]]
+        for g in grupos[:15]:
+            print(f"  {CIANO}•{RST} {g[0].name} {DIM}+ {len(g) - 1} cópia(s){RST}")
+        espaco = sum(a.stat().st_size for a in sobra)
+        if confirmar(f"Apagar as {len(sobra)} cópias e liberar {bytes_humanos(espaco)}? (fica a mais antiga)", False):
+            for a in sobra:
+                a.unlink(missing_ok=True)
+            ok("Cópias apagadas.")
+
+    def parecidas():
+        if not precisa_pillow():
+            return
+        lista = fotos()[:600]
+        info(f"Comparando {len(lista)} fotos...")
+        hashes = {}
+        for n, a in enumerate(lista, 1):
+            h = dhash(a)
+            if h is not None:
+                hashes[a] = h
+            if n % 20 == 0:
+                print(f"\r  {n}/{len(lista)}", end="", flush=True)
+        print()
+        grupos = agrupar_parecidas(hashes)
+        if not grupos:
+            ok("Nenhuma foto parecida encontrada.")
+            return
+        info(f"{len(grupos)} grupo(s) de fotos parecidas (rajadas, repetidas, prints iguais).")
+        for n, grupo in enumerate(grupos, 1):
+            limpar()
+            titulo(f"Grupo {n} de {len(grupos)}")
+            marcadas = escolher_varios("Marque as que quer APAGAR (Espaço) e Enter; Esc pula o grupo",
+                                       [_rotulo_arquivo(a) for a in grupo])
+            if len(marcadas) == len(grupo):
+                aviso("Você marcou todas: nenhuma foi apagada nesse grupo.")
+            elif marcadas and confirmar(f"Apagar {len(marcadas)} foto(s)?", False):
+                for k in marcadas:
+                    grupo[k].unlink(missing_ok=True)
+
+    def comprimir():
+        if not precisa_pillow():
+            return
+        from PIL import Image, ImageOps
+        lista = escolher_arquivos("Quais fotos comprimir? (Espaço marca, a = todas)", EXT_IMAGEM,
+                                  [(estado["pasta"], 1)])
+        if not lista:
+            return
+        lado = perguntar_int("Lado maior em pixels (1920 = Full HD)", 1920, 320, 8000)
+        qualidade = perguntar_int("Qualidade JPEG (60 a 95)", 80, 30, 100)
+        destino = pasta_saida("Fotos comprimidas")
+        antes = depois = 0
+        for a in lista:
+            with Image.open(a) as img:
+                img = ImageOps.exif_transpose(img).convert("RGB")
+                img.thumbnail((lado, lado))
+                alvo = destino / (a.stem + ".jpg")
+                img.save(alvo, "JPEG", quality=qualidade, optimize=True)
+            antes += a.stat().st_size
+            depois += alvo.stat().st_size
+        ok(f"{len(lista)} foto(s): {bytes_humanos(antes)} → {bytes_humanos(depois)} em {destino}")
+
+    def sem_localizacao():
+        if not precisa_pillow():
+            return
+        from PIL import Image
+        lista = escolher_arquivos("Quais fotos? (Espaço marca)", (".jpg", ".jpeg", ".webp", ".png"),
+                                  [(estado["pasta"], 1)])
+        destino = pasta_saida("Fotos sem localização")
+        for a in lista:
+            with Image.open(a) as img:
+                exif = img.getexif()
+                exif.pop(0x8825, None)  # bloco GPS
+                img.save(destino / a.name, exif=exif.tobytes(), **({"quality": 95} if a.suffix.lower() in
+                                                                      (".jpg", ".jpeg") else {}))
+        ok(f"{len(lista)} foto(s) sem a localização em {destino}. Compartilhe essas cópias.")
+
+    menu("📸 Organizador de fotos", [
+        (lambda: f"Pasta: {estado['pasta']}", trocar_pasta),
+        ("Organizar por data (ano/mês)", organizar),
+        ("Achar fotos repetidas (idênticas)", duplicadas),
+        ("Achar fotos parecidas (rajadas, prints)", parecidas),
+        ("Comprimir fotos (para enviar ou guardar)", comprimir),
+        ("Tirar a localização (GPS) antes de compartilhar", sem_localizacao),
+    ])
+
+
+# ── Conversor de arquivos ────────────────────────────────────────────
+
+EXT_VIDEO = (".mp4", ".mkv", ".webm", ".mov", ".avi", ".3gp", ".m4v")
+EXT_AUDIO = (".mp3", ".m4a", ".opus", ".ogg", ".wav", ".flac", ".aac", ".amr", ".wma")
+EXT_DOC = (".docx", ".doc", ".odt", ".rtf", ".pptx", ".ppt", ".odp", ".xlsx", ".xls", ".ods")
+
+
+def _saida_convertida(origem: Path, extensao: str, sufixo: str = "") -> Path:
+    destino = pasta_saida("Convertidos") / f"{origem.stem}{sufixo}{extensao}"
+    n = 2
+    while destino.exists():
+        destino = destino.with_name(f"{origem.stem}{sufixo}_{n}{extensao}")
+        n += 1
+    return destino
+
+
+def _ffmpeg(*args) -> None:
+    if not garantir_cmd("ffmpeg"):
+        raise ToonsError("O ffmpeg é necessário.")
+    proc = rodar(["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y", *map(str, args)], mostrar=False)
+    if proc.returncode != 0:
+        raise ToonsError("O ffmpeg não conseguiu converter esse arquivo.")
+
+
+@submenu
+def menu_conversor_arquivos():
+    def pillow() -> bool:
+        return garantir_modulo("PIL", pip_nome="pillow", pkg_nome="python-pillow")
+
+    def imagem():
+        if not pillow():
+            return
+        from PIL import Image, ImageOps
+        arq = escolher_arquivo("Qual imagem?", EXT_IMAGEM)
+        if not arq:
+            return
+        formatos = [("JPG", ".jpg", "JPEG"), ("PNG", ".png", "PNG"), ("WEBP", ".webp", "WEBP"), ("PDF", ".pdf", "PDF")]
+        i = escolher("Converter para", [f[0] for f in formatos])
+        if i is None:
+            return
+        lado = perguntar_int("Redimensionar: lado maior em pixels (0 = manter)", 0, 0, 20000)
+        with Image.open(arq) as img:
+            img = ImageOps.exif_transpose(img)
+            if formatos[i][2] in ("JPEG", "PDF"):
+                img = img.convert("RGB")
+            if lado:
+                img.thumbnail((lado, lado))
+            destino = _saida_convertida(arq, formatos[i][1])
+            img.save(destino, formatos[i][2], **({"quality": 90} if formatos[i][2] in ("JPEG", "WEBP") else {}))
+        ok(f"Salvo: {destino}")
+
+    def imagens_para_pdf():
+        if not pillow():
+            return
+        from PIL import Image, ImageOps
+        lista = escolher_arquivos("Quais imagens? (Espaço marca; a ordem é a da lista)", EXT_IMAGEM)
+        if not lista:
+            return
+        paginas = []
+        for a in lista:
+            with Image.open(a) as img:
+                paginas.append(ImageOps.exif_transpose(img).convert("RGB"))
+        destino = _saida_convertida(lista[0], ".pdf", "_documento")
+        paginas[0].save(destino, "PDF", save_all=True, append_images=paginas[1:], resolution=150)
+        ok(f"PDF com {len(paginas)} página(s): {destino}")
+
+    def video_gif():
+        arq = escolher_arquivo("Qual vídeo?", EXT_VIDEO)
+        if not arq:
+            return
+        inicio = perguntar("Começar em (segundos ou mm:ss)", "0")
+        duracao = perguntar_int("Duração do GIF (segundos)", 5, 1, 60)
+        largura = perguntar_int("Largura (px)", 480, 120, 1080)
+        destino = _saida_convertida(arq, ".gif")
+        filtro = (f"fps=12,scale={largura}:-1:flags=lanczos,split[a][b];[a]palettegen[p];[b][p]paletteuse")
+        _ffmpeg("-ss", parse_duracao(inicio, "s") if inicio.strip() else 0, "-t", duracao, "-i", arq,
+                "-vf", filtro, "-loop", "0", destino)
+        ok(f"GIF salvo: {destino} ({bytes_humanos(destino.stat().st_size)})")
+
+    def audio(origem_exts: tuple, msg: str):
+        arq = escolher_arquivo(msg, origem_exts)
+        if not arq:
+            return
+        formatos = [("MP3", ".mp3", ["-c:a", "libmp3lame", "-q:a", "2"]), ("M4A (AAC)", ".m4a", ["-c:a", "aac", "-b:a", "192k"]),
+                    ("OPUS", ".opus", ["-c:a", "libopus", "-b:a", "128k"]), ("WAV", ".wav", []),
+                    ("FLAC", ".flac", ["-c:a", "flac"])]
+        i = escolher("Converter para", [f[0] for f in formatos])
+        if i is None:
+            return
+        destino = _saida_convertida(arq, formatos[i][1])
+        _ffmpeg("-i", arq, "-vn", *formatos[i][2], destino)
+        ok(f"Salvo: {destino}")
+
+    def comprimir_video():
+        arq = escolher_arquivo("Qual vídeo?", EXT_VIDEO)
+        if not arq:
+            return
+        alturas = [("720p (bom para WhatsApp)", 720), ("480p (bem menor)", 480), ("1080p", 1080)]
+        i = escolher("Resolução", [a for a, _ in alturas])
+        if i is None:
+            return
+        destino = _saida_convertida(arq, ".mp4", f"_{alturas[i][1]}p")
+        info("Comprimindo (vídeos longos demoram; deixe a tela ligada)...")
+        _ffmpeg("-i", arq, "-vf", f"scale=-2:'min({alturas[i][1]},ih)'", "-c:v", "libx264", "-preset", "veryfast",
+                "-crf", "28", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", destino)
+        ok(f"{bytes_humanos(arq.stat().st_size)} → {bytes_humanos(destino.stat().st_size)}: {destino}")
+
+    def pdf_juntar():
+        if not garantir_cmd("qpdf"):
+            return
+        lista = escolher_arquivos("Quais PDFs juntar? (Espaço marca; a ordem é a da lista)", (".pdf",))
+        if len(lista) < 2:
+            raise ToonsError("Marque pelo menos dois PDFs.")
+        destino = _saida_convertida(lista[0], ".pdf", "_juntado")
+        rodar(["qpdf", "--empty", "--pages", *map(str, lista), "--", str(destino)], check=True, capturar=True)
+        ok(f"PDF juntado: {destino}")
+
+    def pdf_paginas():
+        if not garantir_cmd("qpdf"):
+            return
+        arq = escolher_arquivo("Qual PDF?", (".pdf",))
+        if not arq:
+            return
+        total = saida(["qpdf", "--show-npages", str(arq)])
+        i = escolher(f"O PDF tem {total} página(s)", ["Separar páginas (ex.: 1-3,5)", "Uma página por arquivo"])
+        if i == 0:
+            paginas = perguntar("Quais páginas? (ex.: 1-3,5,8-z; z = última)")
+            destino = _saida_convertida(arq, ".pdf", "_paginas")
+            rodar(["qpdf", str(arq), "--pages", ".", paginas, "--", str(destino)], check=True, capturar=True)
+            ok(f"Salvo: {destino}")
+        elif i == 1:
+            pasta = pasta_saida("Convertidos", arq.stem)
+            rodar(["qpdf", "--split-pages", str(arq), str(pasta / f"{arq.stem}-%d.pdf")], check=True, capturar=True)
+            ok(f"Páginas separadas em {pasta}")
+
+    def pdf_comprimir():
+        if not garantir_cmd("gs", "ghostscript"):
+            return
+        arq = escolher_arquivo("Qual PDF?", (".pdf",))
+        if not arq:
+            return
+        niveis = [("Média (bom para e-mail)", "/ebook"), ("Máxima (menor, imagens piores)", "/screen"),
+                  ("Leve (para imprimir)", "/printer")]
+        i = escolher("Compressão", [n for n, _ in niveis])
+        if i is None:
+            return
+        destino = _saida_convertida(arq, ".pdf", "_comprimido")
+        rodar(["gs", "-sDEVICE=pdfwrite", "-dCompatibilityLevel=1.4", f"-dPDFSETTINGS={niveis[i][1]}", "-dNOPAUSE",
+               "-dQUIET", "-dBATCH", f"-sOutputFile={destino}", str(arq)], check=True)
+        ok(f"{bytes_humanos(arq.stat().st_size)} → {bytes_humanos(destino.stat().st_size)}: {destino}")
+
+    def pdf_para_imagens():
+        if not garantir_cmd("pdftoppm", "poppler"):
+            return
+        arq = escolher_arquivo("Qual PDF?", (".pdf",))
+        if not arq:
+            return
+        pasta = pasta_saida("Convertidos", f"{arq.stem}_imagens")
+        rodar(["pdftoppm", "-png", "-r", "120", str(arq), str(pasta / "pagina")], check=True)
+        ok(f"Imagens em {pasta}")
+
+    def pdf_para_texto():
+        if not garantir_cmd("pdftotext", "poppler"):
+            return
+        arq = escolher_arquivo("Qual PDF?", (".pdf",))
+        if not arq:
+            return
+        destino = _saida_convertida(arq, ".txt")
+        rodar(["pdftotext", "-layout", str(arq), str(destino)], check=True)
+        ok(f"Texto salvo: {destino}")
+
+    def documento_pdf():
+        arq = escolher_arquivo("Qual documento?", EXT_DOC)
+        if not arq:
+            return
+        distros = distros_instaladas()
+        if not distros:
+            raise ToonsError("Converter Word/Excel/PowerPoint em PDF usa o LibreOffice, que roda numa distro Linux. "
+                             "Instale uma (Debian é a mais leve) no menu 🐧 Linux de verdade e tente de novo.")
+        distro = distros[0] if len(distros) == 1 else distros[escolher("Qual distro?", distros) or 0]
+        tem_office = rodar(["proot-distro", "login", distro, "--", "sh", "-c", "command -v soffice"],
+                           capturar=True, timeout=120).returncode == 0
+        if not tem_office:
+            aviso("O LibreOffice não está na distro (são uns 500 MB).")
+            if not confirmar("Instalar agora?", True):
+                return
+            rodar(["proot-distro", "login", distro, "--", "sh", "-c",
+                   "(apt-get update && apt-get install -y libreoffice-writer libreoffice-calc libreoffice-impress) || "
+                   "(pacman -Sy --noconfirm libreoffice-fresh) || (apk add libreoffice) || (dnf install -y libreoffice)"])
+        tmp = Path(os.environ.get("TMPDIR", PREFIX + "/tmp" if PREFIX else "/tmp")) / "toons_doc"
+        tmp.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(arq, tmp / arq.name)
+        info("Convertendo com o LibreOffice (a primeira vez demora)...")
+        rodar(["proot-distro", "login", distro, "--shared-tmp", "--", "soffice", "--headless", "--convert-to", "pdf",
+               "--outdir", "/tmp/toons_doc", f"/tmp/toons_doc/{arq.name}"], timeout=900)
+        pdf = tmp / (arq.stem + ".pdf")
+        if not pdf.exists():
+            raise ToonsError("O LibreOffice não gerou o PDF.")
+        destino = _saida_convertida(arq, ".pdf")
+        shutil.move(str(pdf), destino)
+        ok(f"PDF salvo: {destino}")
+
+    menu("🔁 Conversor de arquivos", [
+        ("🖼️ Imagem: trocar formato / redimensionar (JPG, PNG, WEBP, PDF)", imagem),
+        ("🖼️ Várias imagens → um PDF (documento escaneado)", imagens_para_pdf),
+        ("🎬 Vídeo → GIF", video_gif),
+        ("🎬 Vídeo → áudio (MP3, M4A...)", lambda: audio(EXT_VIDEO, "De qual vídeo?")),
+        ("🎬 Comprimir vídeo (720p/480p)", comprimir_video),
+        ("🎵 Áudio → outro formato (ex.: áudio do WhatsApp .opus → MP3)", lambda: audio(EXT_AUDIO, "Qual áudio?")),
+        ("📄 PDF: juntar vários", pdf_juntar),
+        ("📄 PDF: separar páginas", pdf_paginas),
+        ("📄 PDF: comprimir", pdf_comprimir),
+        ("📄 PDF → imagens (PNG)", pdf_para_imagens),
+        ("📄 PDF → texto", pdf_para_texto),
+        ("📄 Word/Excel/PowerPoint → PDF (LibreOffice na distro)", documento_pdf),
+    ])
+
+
+# ── Automação por eventos ────────────────────────────────────────────
+
+GATILHOS = {
+    "horario": "Num horário (todo dia ou em dias da semana)",
+    "intervalo": "A cada X minutos",
+    "wifi_conectar": "Ao conectar num Wi-Fi",
+    "wifi_desconectar": "Ao sair de um Wi-Fi",
+    "carregando": "Ao começar a carregar",
+    "descarregando": "Ao tirar do carregador",
+    "bateria_abaixo": "Bateria caiu abaixo de X%",
+    "bateria_acima": "Bateria subiu acima de X%",
+}
+ACOES = {
+    "notificar": "Mostrar uma notificação",
+    "falar": "Falar um texto",
+    "vibrar": "Vibrar",
+    "volume": "Mudar o volume",
+    "lanterna": "Ligar/desligar a lanterna",
+    "abrir_link": "Abrir um link",
+    "telegram": "Mandar mensagem no Telegram (bot configurado)",
+    "comando": "Rodar um comando do Termux",
+}
+
+
+def descrever_automacao(a: dict) -> str:
+    g, ac = a["gatilho"], a["acao"]
+    quando = {
+        "horario": lambda: f"às {g['hora']}" + ("" if len(g.get("dias", [])) in (0, 7) else
+                                                 " (" + ",".join(DIAS_SEMANA[d][:3] for d in g["dias"]) + ")"),
+        "intervalo": lambda: f"a cada {g['minutos']} min",
+        "wifi_conectar": lambda: f"ao conectar em {g.get('ssid') or 'qualquer Wi-Fi'}",
+        "wifi_desconectar": lambda: f"ao sair de {g.get('ssid') or 'qualquer Wi-Fi'}",
+        "carregando": lambda: "ao começar a carregar", "descarregando": lambda: "ao tirar do carregador",
+        "bateria_abaixo": lambda: f"bateria < {g['limite']}%", "bateria_acima": lambda: f"bateria > {g['limite']}%",
+    }[g["tipo"]]()
+    return f"{quando} → {ACOES[ac['tipo']].lower()}" + (f": {ac.get('texto') or ac.get('valor') or ''}"[:60]
+                                                         if ac.get("texto") or ac.get("valor") else "")
+
+
+def executar_acao(acao: dict) -> None:
+    tipo = acao["tipo"]
+    if tipo == "notificar":
+        notificar("Termux-Toons", acao["texto"], som=True)
+    elif tipo == "falar":
+        falar(acao["texto"])
+    elif tipo == "vibrar":
+        vibrar(int(acao.get("valor") or 800))
+    elif tipo == "volume":
+        _tapi(["termux-volume", acao["fluxo"], str(acao["valor"])], 15, json_saida=False)
+    elif tipo == "lanterna":
+        lanterna(acao["valor"] == "on")
+    elif tipo == "abrir_link":
+        abrir_link(acao["valor"])
+    elif tipo == "telegram":
+        c = cfg()
+        if not c.get("telegram_token") or not c.get("telegram_ids_permitidos"):
+            raise ToonsError("Configure o bot do Telegram primeiro (menu Bots).")
+        for chat in c["telegram_ids_permitidos"]:
+            tg_enviar_texto(c["telegram_token"], chat, acao["texto"])
+    elif tipo == "comando":
+        proc = rodar(acao["valor"], capturar=True, timeout=600, mostrar=False)
+        log(f"comando terminou com código {proc.returncode}: {(proc.stdout or '')[-300:]}")
+    else:
+        raise ToonsError(f"Ação desconhecida: {tipo}")
+
+
+def gatilhos_disparados(automacoes: list, anterior: dict, atual: dict, agora: datetime, ja_rodou: dict) -> list:
+    """Automações cujo gatilho aconteceu entre o estado `anterior` e o `atual` (funções puras, para testar)."""
+    disparar = []
+    for a in automacoes:
+        if not a.get("ativo", True):
+            continue
+        g, ident = a["gatilho"], a["id"]
+        tipo = g["tipo"]
+        if tipo == "horario":
+            dias = g.get("dias") or list(range(7))
+            chave = agora.strftime("%Y-%m-%d")
+            if agora.strftime("%H:%M") >= g["hora"] and agora.weekday() in dias and ja_rodou.get(ident) != chave \
+                    and agora - datetime.combine(agora.date(), datetime.strptime(g["hora"], "%H:%M").time()) \
+                    < timedelta(minutes=10):
+                ja_rodou[ident] = chave
+                disparar.append(a)
+        elif tipo == "intervalo":
+            if agora.timestamp() - float(ja_rodou.get(ident, 0)) >= int(g["minutos"]) * 60:
+                ja_rodou[ident] = agora.timestamp()
+                disparar.append(a)
+        elif not anterior:
+            continue  # primeira leitura: ainda não há mudança para comparar
+        elif tipo in ("wifi_conectar", "wifi_desconectar"):
+            alvo = g.get("ssid") or None
+            antes, depois = anterior.get("ssid"), atual.get("ssid")
+            if antes == depois:
+                continue
+            if tipo == "wifi_conectar" and depois and (alvo is None or depois == alvo):
+                disparar.append(a)
+            elif tipo == "wifi_desconectar" and antes and (alvo is None or antes == alvo):
+                disparar.append(a)
+        elif tipo in ("carregando", "descarregando"):
+            if anterior.get("carregando") is not None and anterior.get("carregando") != atual.get("carregando") \
+                    and atual.get("carregando") == (tipo == "carregando"):
+                disparar.append(a)
+        elif tipo in ("bateria_abaixo", "bateria_acima") and anterior.get("pct") is not None:
+            limite = int(g["limite"])
+            if tipo == "bateria_abaixo" and anterior["pct"] >= limite > atual["pct"]:
+                disparar.append(a)
+            elif tipo == "bateria_acima" and anterior["pct"] <= limite < atual["pct"]:
+                disparar.append(a)
+    return disparar
+
+
+def _estado_do_celular(automacoes: list) -> dict:
+    tipos = {a["gatilho"]["tipo"] for a in automacoes if a.get("ativo", True)}
+    estado = {}
+    if tipos & {"wifi_conectar", "wifi_desconectar"}:
+        with contextlib.suppress(ToonsError):
+            w = _tapi(["termux-wifi-connectioninfo"], 20)
+            ssid = (w.get("ssid") or "").strip('"') if isinstance(w, dict) else ""
+            conectado = isinstance(w, dict) and w.get("supplicant_state") == "COMPLETED"
+            estado["ssid"] = ssid if conectado and ssid not in ("", "<unknown ssid>") else None
+    if tipos & {"carregando", "descarregando", "bateria_abaixo", "bateria_acima"}:
+        with contextlib.suppress(ToonsError):
+            b = bateria()
+            estado["pct"], estado["carregando"] = int(b.get("percentage", 0)), carregando(b)
+    return estado
+
+
+def rodar_automacoes() -> None:
+    """Laço do serviço de automação (roda dentro do tmux)."""
+    log("Automação iniciada.")
+    persistido = ler_json(AUTOMACAO_ESTADO, {})
+    ja_rodou, anterior = persistido.get("ja_rodou", {}), {}
+    while True:
+        automacoes = recarregar_cfg().get("automacoes", [])
+        atual = _estado_do_celular(automacoes)
+        for a in gatilhos_disparados(automacoes, anterior, atual, datetime.now(), ja_rodou):
+            log(f"▶ {a['nome']}: {descrever_automacao(a)}")
+            try:
+                executar_acao(a["acao"])
+            except Exception as e:  # noqa: BLE001 — uma automação com erro não derruba as outras
+                log(f"  erro: {e}")
+        anterior = {**anterior, **atual}
+        gravar_json(AUTOMACAO_ESTADO, {"ja_rodou": ja_rodou})
+        time.sleep(20)
+
+
+@submenu
+def menu_automacao():
+    c = cfg()
+    c.setdefault("automacoes", [])
+
+    def pedir_gatilho() -> dict | None:
+        chaves = list(GATILHOS)
+        i = escolher("Quando?", list(GATILHOS.values()))
+        if i is None:
+            return None
+        tipo = chaves[i]
+        g = {"tipo": tipo}
+        if tipo == "horario":
+            hora = perguntar("Hora (hh:mm)", "07:00").replace("h", ":")
+            m = re.fullmatch(r"(\d{1,2}):?(\d{2})?", hora)
+            if not m or int(m.group(1)) > 23:
+                raise ToonsError("Hora inválida.")
+            g["hora"] = f"{int(m.group(1)):02d}:{m.group(2) or '00'}"
+            dias = escolher_varios("Em quais dias? (Espaço marca, a = todos)",
+                                   [d.capitalize() for d in DIAS_SEMANA])
+            g["dias"] = sorted(dias)
+        elif tipo == "intervalo":
+            g["minutos"] = perguntar_int("A cada quantos minutos", 60, 1, 10080)
+        elif tipo.startswith("wifi"):
+            atual = ""
+            with contextlib.suppress(ToonsError, AttributeError):
+                atual = (_tapi(["termux-wifi-connectioninfo"], 20).get("ssid") or "").strip('"')
+            g["ssid"] = perguntar("Nome da rede (Enter = qualquer uma)", atual if atual != "<unknown ssid>" else "")
+        elif tipo.startswith("bateria"):
+            g["limite"] = perguntar_int("Limite (%)", 20 if tipo == "bateria_abaixo" else 80, 1, 99)
+        return g
+
+    def pedir_acao() -> dict | None:
+        chaves = list(ACOES)
+        i = escolher("Fazer o quê?", list(ACOES.values()))
+        if i is None:
+            return None
+        tipo = chaves[i]
+        a = {"tipo": tipo}
+        if tipo in ("notificar", "falar", "telegram"):
+            a["texto"] = perguntar("Texto")
+        elif tipo == "vibrar":
+            a["valor"] = perguntar_int("Duração (ms)", 800, 50, 5000)
+        elif tipo == "volume":
+            fluxos = ["music", "ring", "notification", "alarm", "system", "call"]
+            nomes = ["Mídia (música/vídeo)", "Toque", "Notificações", "Alarme", "Sistema", "Chamada"]
+            k = escolher("Qual volume?", nomes)
+            if k is None:
+                return None
+            a["fluxo"], a["valor"] = fluxos[k], perguntar_int("Nível (0 = mudo; o máximo costuma ser 15)", 0, 0, 30)
+        elif tipo == "lanterna":
+            a["valor"] = "on" if confirmar("Ligar? (Não = desligar)", True) else "off"
+        elif tipo == "abrir_link":
+            a["valor"] = perguntar("Link")
+        elif tipo == "comando":
+            a["valor"] = perguntar("Comando (ex.: termux-wifi-enable false)")
+        return a
+
+    def nova():
+        g = pedir_gatilho()
+        a = g and pedir_acao()
+        if not a:
+            return
+        auto = {"id": uuid.uuid4().hex[:8], "gatilho": g, "acao": a, "ativo": True}
+        auto["nome"] = perguntar("Nome da automação", descrever_automacao(auto)[:40])
+        c["automacoes"].append(auto)
+        salvar_cfg()
+        ok(f"Automação criada: {descrever_automacao(auto)}")
+        if not servico_ativo("automacao") and confirmar("Iniciar o serviço de automação agora?", True):
+            iniciar_servico("automacao", cmd_self("automacao"), reiniciar=True)
+
+    def escolher_auto(msg: str) -> dict | None:
+        if not c["automacoes"]:
+            info("Nenhuma automação ainda.")
+            return None
+        i = escolher(msg, [f"{'✅' if a.get('ativo', True) else '⏸️'} {a['nome']}  {DIM}{descrever_automacao(a)}{RST}"
+                           for a in c["automacoes"]])
+        return None if i is None else c["automacoes"][i]
+
+    def alternar():
+        a = escolher_auto("Ligar/desligar qual?")
+        if a:
+            a["ativo"] = not a.get("ativo", True)
+            salvar_cfg()
+            ok(f"'{a['nome']}' {'ligada' if a['ativo'] else 'desligada'}.")
+
+    def testar():
+        a = escolher_auto("Testar a ação de qual?")
+        if a:
+            executar_acao(a["acao"])
+            ok("Ação executada.")
+
+    def apagar_auto():
+        a = escolher_auto("Apagar qual?")
+        if a and confirmar(f"Apagar '{a['nome']}'?", False):
+            c["automacoes"].remove(a)
+            salvar_cfg()
+            ok("Apagada.")
+
+    menu("🤖 Automação por eventos (um 'Tasker' no Termux)", [
+        ("Nova automação", nova),
+        (lambda: f"Ligar/desligar automações ({len(c['automacoes'])})", alternar),
+        ("Testar a ação de uma automação", testar),
+        ("Apagar automação", apagar_auto),
+        *itens_servico("automacao", "Serviço de automação",
+                       lambda: iniciar_servico("automacao", cmd_self("automacao"), reiniciar=True)),
+    ], cabecalho=lambda: print(f"{DIM}Ex.: ao conectar no Wi-Fi de casa → volume no máximo · 23h → modo silencioso"
+                               f" · bateria < 20% → falar 'carregue o celular'{RST}"))
+
+
+# ── Espelhar e controlar a tela ──────────────────────────────────────
+
+def iniciar_x11() -> None:
+    """Sobe o servidor do Termux:X11 (display :0) e abre o app."""
+    if not garantir_termux_x11():
+        raise ToonsError("O Termux:X11 é necessário (pacote termux-x11-nightly e o app Termux:X11).")
+    if not servico_ativo("x11") and not servico_ativo("desktop"):
+        iniciar_servico("x11", "termux-x11 :0 -ac", com_log=False)
+    rodar(["am", "start", "--user", "0", "-n", X11_APP], capturar=True, timeout=20, mostrar=False)
+
+
+@submenu
+def menu_espelhar():
+    def outro_celular():
+        if not garantir_adb() or not garantir_cmd("scrcpy", "scrcpy", repo="x11-repo"):
+            return
+        info("No OUTRO celular: Opções do desenvolvedor → Depuração por Wi-Fi (os dois na mesma rede).")
+        if confirmar("É a primeira vez com esse celular (precisa parear)?", True):
+            ip, porta = pedir_endereco_adb("Endereço de 'Parear com código' (ip:porta)")
+            codigo = perguntar("Código de pareamento (6 dígitos)")
+            print((adb("pair", f"{ip}:{porta}", codigo, timeout=60).stdout or "").strip())
+        ip, porta = pedir_endereco_adb("Endereço da tela 'Depuração por Wi-Fi' (ip:porta)")
+        resultado = (adb("connect", f"{ip}:{porta}", timeout=30).stdout or "").strip()
+        print(resultado)
+        if "connected" not in resultado:
+            raise ToonsError("Não conectou. Confira o endereço e se os dois estão na mesma rede.")
+        iniciar_x11()
+        info("Abrindo a tela do outro celular no Termux:X11. Para fechar, volte aqui e aperte Ctrl+C.")
+        rodar("DISPLAY=:0 " + shlex.join(["scrcpy", "-s", f"{ip}:{porta}", "--max-size", "1280",
+                                          "--video-bit-rate", "4M"]), mostrar=False)
+
+    def num_pc():
+        print("Para ver e controlar ESTE celular num computador (Windows, Mac ou Linux):\n"
+              "  1. No PC, instale o scrcpy: https://github.com/Genymobile/scrcpy\n"
+              "  2. Celular e PC na mesma rede Wi-Fi.\n")
+        if confirmar("Liberar o ADB deste celular na porta 5555 agora (precisa do ADB sem fio conectado)?", True):
+            print(adb("tcpip", "5555", serial=adb_alvo(), timeout=30).stdout or "")
+            ip = ip_local()
+            print(f"\n  No PC, rode:  {NEG}scrcpy --tcpip={ip}:5555{RST}\n")
+            aviso("A porta 5555 fica aberta na rede até reiniciar o celular. Use só em redes de confiança.")
+
+    menu("📲 Espelhar e controlar a tela (scrcpy)", [
+        ("Ver e controlar OUTRO celular aqui (Termux:X11)", outro_celular),
+        ("Ver e controlar ESTE celular num PC", num_pc),
+        ("Print e gravação da tela deste celular (menu ADB)", menu_adb),
+    ])
+
+
+@submenu
+def menu_celular():
+    menu("📲 Celular e sistema", [
+        ("🔋 Saúde da bateria (histórico e alertas de 80%)", menu_bateria),
+        ("📊 Uso de dados e tempo de tela (ADB)", menu_uso_celular),
+        ("📦 Gerenciador de apps (ADB, sem root)", menu_apps),
+        ("📸 Organizador de fotos", menu_fotos),
+        ("🔁 Conversor de arquivos (imagem, vídeo, áudio, PDF)", menu_conversor_arquivos),
+        ("🤖 Automação por eventos (Wi-Fi, carregador, horário)", menu_automacao),
+        ("📲 Espelhar e controlar a tela (scrcpy)", menu_espelhar),
+    ])
+
+
+# ════════════════════════════════════════════════════════════════════
+#  22. Internet e comunicação
+# ════════════════════════════════════════════════════════════════════
+
+FAVORITOS_FILE = DATA_DIR / "noticias_favoritas.json"
+LINKS_FILE = DATA_DIR / "links.json"
+
+
+# ── E-mail (IMAP/SMTP) ───────────────────────────────────────────────
+
+EMAIL_PROVEDORES = {
+    "gmail.com": ("imap.gmail.com", "smtp.gmail.com", 465),
+    "googlemail.com": ("imap.gmail.com", "smtp.gmail.com", 465),
+    "outlook.com": ("outlook.office365.com", "smtp.office365.com", 587),
+    "hotmail.com": ("outlook.office365.com", "smtp.office365.com", 587),
+    "live.com": ("outlook.office365.com", "smtp.office365.com", 587),
+    "yahoo.com": ("imap.mail.yahoo.com", "smtp.mail.yahoo.com", 465),
+    "yahoo.com.br": ("imap.mail.yahoo.com", "smtp.mail.yahoo.com", 465),
+    "icloud.com": ("imap.mail.me.com", "smtp.mail.me.com", 587),
+    "zoho.com": ("imap.zoho.com", "smtp.zoho.com", 465),
+}
+
+
+def decodificar_cabecalho(valor) -> str:
+    import email.errors
+    import email.header
+    if not valor:
+        return ""
+    try:
+        return str(email.header.make_header(email.header.decode_header(str(valor))))
+    except (UnicodeDecodeError, LookupError, email.errors.HeaderParseError):
+        return str(valor)
+
+
+def html_para_texto(pagina: str) -> str:
+    """HTML → texto mantendo os parágrafos."""
+    import html as html_mod
+    pagina = re.sub(r"(?is)<(script|style|head)\b.*?</\1>", " ", pagina)
+    pagina = re.sub(r"(?i)<br\s*/?>", "\n", pagina)
+    pagina = re.sub(r"(?i)</(p|div|li|h[1-6]|tr|blockquote)>", "\n\n", pagina)
+    pagina = re.sub(r"(?s)<[^>]+>", " ", pagina)
+    texto = html_mod.unescape(pagina)
+    texto = re.sub(r"[ \t\r\f\v\xa0]+", " ", texto)
+    return re.sub(r"\n\s*\n\s*(\n\s*)+", "\n\n", "\n".join(l.strip() for l in texto.splitlines())).strip()
+
+
+def _email_cfg() -> dict:
+    e = cfg().get("email") or {}
+    if not e.get("endereco") or not e.get("senha"):
+        raise ToonsError("Configure a conta de e-mail primeiro.")
+    return e
+
+
+def conectar_imap():
+    import imaplib
+    e = _email_cfg()
+    try:
+        conexao = imaplib.IMAP4_SSL(e["imap"], 993, timeout=30)
+        conexao.login(e["endereco"], e["senha"])
+    except imaplib.IMAP4.error as falha:
+        raise ToonsError(f"O servidor recusou o login ({falha}). No Gmail use uma 'senha de app' "
+                         "(myaccount.google.com/apppasswords).") from None
+    except OSError as falha:
+        raise ToonsError(f"Sem conexão com {e['imap']} ({falha}).") from None
+    return conexao
+
+
+def listar_emails(criterio: str = "ALL", n: int = 25, caixa: str = "INBOX") -> list:
+    """[{uid, de, assunto, data, lido}] dos e-mails mais novos."""
+    import email
+    conexao = conectar_imap()
+    try:
+        conexao.select(caixa, readonly=True)
+        status, dados = conexao.uid("SEARCH", None, criterio)
+        if status != "OK":
+            raise ToonsError(f"Busca recusada pelo servidor: {dados}")
+        uids = dados[0].split()[-n:]
+        if not uids:
+            return []
+        status, dados = conexao.uid("FETCH", b",".join(uids),
+                                    "(UID FLAGS BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+        mensagens = []
+        for parte in dados:
+            if not isinstance(parte, tuple):
+                continue
+            meta = parte[0].decode(errors="replace")
+            uid = re.search(r"UID (\d+)", meta)
+            cab = email.message_from_bytes(parte[1])
+            mensagens.append({"uid": uid.group(1) if uid else "", "de": decodificar_cabecalho(cab["From"]),
+                              "assunto": decodificar_cabecalho(cab["Subject"]) or "(sem assunto)",
+                              "data": cab["Date"] or "", "lido": "\\Seen" in meta})
+        return sorted(mensagens, key=lambda m: int(m["uid"] or 0), reverse=True)
+    finally:
+        with contextlib.suppress(Exception):
+            conexao.logout()
+
+
+def baixar_email(uid: str, marcar_lido: bool = True, caixa: str = "INBOX"):
+    import email
+    import email.policy
+    conexao = conectar_imap()
+    try:
+        conexao.select(caixa, readonly=not marcar_lido)
+        status, dados = conexao.uid("FETCH", uid, "(BODY.PEEK[])")
+        bruto = next((p[1] for p in dados if isinstance(p, tuple)), None)
+        if status != "OK" or bruto is None:
+            raise ToonsError("Não consegui baixar esse e-mail.")
+        if marcar_lido:
+            conexao.uid("STORE", uid, "+FLAGS", "(\\Seen)")
+        return email.message_from_bytes(bruto, policy=email.policy.default)
+    finally:
+        with contextlib.suppress(Exception):
+            conexao.logout()
+
+
+def corpo_do_email(msg) -> str:
+    parte = msg.get_body(preferencelist=("plain", "html"))
+    if parte is None:
+        return "(sem texto)"
+    try:
+        conteudo = parte.get_content()
+    except (LookupError, UnicodeDecodeError):
+        conteudo = parte.get_payload(decode=True).decode("utf-8", errors="replace")
+    return html_para_texto(conteudo) if parte.get_content_type() == "text/html" else conteudo.strip()
+
+
+def apagar_email(uid: str, caixa: str = "INBOX") -> None:
+    """Move para a lixeira (ou marca como apagado, se o servidor não tiver lixeira)."""
+    conexao = conectar_imap()
+    try:
+        _, pastas = conexao.list()
+        lixeira = next((re.search(r'"([^"]+)"$|(\S+)$', p.decode(errors="replace")).group(0).strip('"')
+                        for p in pastas or [] if b"\\Trash" in p), None)
+        conexao.select(caixa)
+        if lixeira and conexao.uid("MOVE", uid, f'"{lixeira}"')[0] == "OK":
+            return
+        conexao.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
+        conexao.expunge()
+    finally:
+        with contextlib.suppress(Exception):
+            conexao.logout()
+
+
+def enviar_email(para: str, assunto: str, corpo: str, anexos=(), responder_a=None) -> None:
+    import mimetypes
+    import smtplib
+    from email.message import EmailMessage
+    e = _email_cfg()
+    msg = EmailMessage()
+    msg["From"], msg["To"], msg["Subject"] = e["endereco"], para, assunto
+    if responder_a is not None and responder_a["Message-ID"]:
+        msg["In-Reply-To"] = msg["References"] = responder_a["Message-ID"]
+    msg.set_content(corpo)
+    for anexo in anexos:
+        tipo = (mimetypes.guess_type(str(anexo))[0] or "application/octet-stream").split("/")
+        msg.add_attachment(Path(anexo).read_bytes(), maintype=tipo[0], subtype=tipo[1], filename=Path(anexo).name)
+    porta = int(e.get("porta_smtp", 465))
+    try:
+        servidor = smtplib.SMTP_SSL(e["smtp"], porta, timeout=60) if porta == 465 else \
+            smtplib.SMTP(e["smtp"], porta, timeout=60)
+        with servidor:
+            if porta != 465:
+                servidor.starttls()
+            servidor.login(e["endereco"], e["senha"])
+            servidor.send_message(msg)
+    except smtplib.SMTPAuthenticationError:
+        raise ToonsError("Login recusado para enviar. No Gmail use uma 'senha de app'.") from None
+    except (smtplib.SMTPException, OSError) as falha:
+        raise ToonsError(f"Falha ao enviar: {falha}") from None
+
+
+@submenu
+def menu_email():
+    c = cfg()
+
+    def configurar():
+        endereco = perguntar("Seu e-mail", (c.get("email") or {}).get("endereco"))
+        if "@" not in endereco:
+            raise ToonsError("E-mail inválido.")
+        dominio = endereco.split("@", 1)[1].lower()
+        imap, smtp, porta = EMAIL_PROVEDORES.get(dominio, ("", "", 465))
+        if not imap:
+            info("Não conheço esse provedor: digite os servidores (estão na ajuda do seu e-mail).")
+            imap = perguntar("Servidor IMAP", f"imap.{dominio}")
+            smtp = perguntar("Servidor SMTP", f"smtp.{dominio}")
+            porta = perguntar_int("Porta SMTP (465 = SSL, 587 = STARTTLS)", 465, 1, 65535)
+        if dominio.startswith(("gmail", "googlemail")):
+            info("No Gmail: ative a verificação em duas etapas e crie uma 'senha de app' em "
+                 "myaccount.google.com/apppasswords. Use ela aqui, não a sua senha normal.")
+        elif dominio in ("outlook.com", "hotmail.com", "live.com"):
+            aviso("A Microsoft bloqueou senha comum em apps de e-mail em muitas contas pessoais; pode não funcionar.")
+        senha = getpass.getpass("Senha (de app): ")
+        c["email"] = {"endereco": endereco, "senha": senha, "imap": imap, "smtp": smtp, "porta_smtp": porta}
+        salvar_cfg()
+        info("Testando o login...")
+        conectar_imap().logout()
+        ok("Conta configurada (a senha fica só neste celular, em ~/.termux_toons/config.json).")
+
+    def caixa(criterio: str = "ALL", rotulo_caixa: str = "Caixa de entrada"):
+        info("Buscando e-mails...")
+        lista = listar_emails(criterio)
+        if not lista:
+            info("Nenhum e-mail.")
+            return
+        while True:
+            rotulos = [f"{'' if m['lido'] else NEG + '● '}{m['assunto'][:60]}{RST}  {DIM}{m['de'][:30]}{RST}"
+                       for m in lista]
+            i = escolher(f"{rotulo_caixa} ({len(lista)} mais recentes)", rotulos)
+            if i is None:
+                return
+            ler(lista[i])
+            lista[i]["lido"] = True
+
+    def ler(item: dict):
+        msg = baixar_email(item["uid"])
+        while True:
+            limpar()
+            titulo(item["assunto"][:60])
+            print(f"{DIM}De: {decodificar_cabecalho(msg['From'])}\nData: {msg['Date']}{RST}\n")
+            texto = corpo_do_email(msg)
+            print(texto[:6000] + (f"\n{DIM}[... continua]{RST}" if len(texto) > 6000 else ""))
+            anexos = list(msg.iter_attachments())
+            if anexos:
+                print(f"\n📎 {', '.join(decodificar_cabecalho(a.get_filename()) or 'anexo' for a in anexos)}")
+            print()
+            acoes = ["Responder", "Salvar os anexos", "Ouvir", "Apagar (lixeira)", "Voltar"]
+            j = escolher("O que fazer?", acoes)
+            if j in (None, 4):
+                return
+            if j == 0:
+                corpo = editar_texto("\n\n" + "\n".join("> " + l for l in texto.splitlines()[:40]), ".txt")
+                if corpo and confirmar("Enviar a resposta?", True):
+                    assunto = item["assunto"] if item["assunto"].lower().startswith("re:") else "Re: " + item["assunto"]
+                    enviar_email(msg["Reply-To"] or msg["From"], assunto, corpo, responder_a=msg)
+                    ok("Resposta enviada.")
+            elif j == 1:
+                pasta = pasta_saida("Anexos")
+                for a in anexos:
+                    nome = Path(decodificar_cabecalho(a.get_filename()) or "anexo").name
+                    (pasta / nome).write_bytes(a.get_payload(decode=True) or b"")
+                ok(f"{len(anexos)} anexo(s) salvos em {pasta}" if anexos else "Este e-mail não tem anexos.")
+            elif j == 2:
+                with contextlib.suppress(ToonsError):
+                    falar(f"{item['assunto']}. {texto[:3000]}")
+            elif j == 3 and confirmar("Apagar este e-mail?", False):
+                apagar_email(item["uid"])
+                ok("Apagado.")
+                pausar()
+                return
+            pausar()
+
+    def escrever():
+        para = perguntar("Para (e-mail)")
+        if "@" not in para:
+            raise ToonsError("E-mail inválido.")
+        assunto = perguntar("Assunto")
+        corpo = editar_texto("", ".txt")
+        if not corpo:
+            return
+        anexos = []
+        while confirmar("Anexar um arquivo?" if not anexos else "Anexar mais um?", False):
+            arq = escolher_arquivo("Qual arquivo?")
+            if arq:
+                anexos.append(arq)
+        if confirmar(f"Enviar para {para}?", True):
+            enviar_email(para, assunto, corpo, anexos)
+            ok("E-mail enviado.")
+
+    def buscar():
+        termo = sem_acento(perguntar("Procurar por (palavra do assunto, remetente ou texto)")).replace('"', "")
+        if termo:
+            caixa(f'(TEXT "{termo}")', f"Busca: {termo}")
+
+    conta = lambda: (c.get("email") or {}).get("endereco") or "não configurada"  # noqa: E731
+    menu("📧 E-mail", [
+        ("Caixa de entrada", caixa),
+        ("Só os não lidos", lambda: caixa("UNSEEN", "Não lidos")),
+        ("Escrever e-mail", escrever),
+        ("Buscar e-mails", buscar),
+        (lambda: f"Configurar a conta ({conta()})", configurar),
+    ])
+
+
+# ── Leitor de notícias (RSS) ─────────────────────────────────────────
+
+FEEDS_PADRAO = [
+    {"nome": "g1", "url": "https://g1.globo.com/rss/g1/"},
+    {"nome": "BBC News Brasil", "url": "https://feeds.bbci.co.uk/portuguese/rss.xml"},
+    {"nome": "Agência Brasil", "url": "https://agenciabrasil.ebc.com.br/rss/ultimasnoticias/feed.xml"},
+    {"nome": "Folha (em cima da hora)", "url": "https://feeds.folha.uol.com.br/emcimadahora/rss091.xml"},
+    {"nome": "Tecnoblog", "url": "https://tecnoblog.net/feed/"},
+    {"nome": "Olhar Digital", "url": "https://olhardigital.com.br/feed/"},
+]
+
+
+def _data_do_feed(texto: str | None):
+    import email.utils
+    if not texto:
+        return None
+    texto = texto.strip()
+    with contextlib.suppress(TypeError, ValueError, IndexError):
+        return email.utils.parsedate_to_datetime(texto)
+    with contextlib.suppress(ValueError):
+        return datetime.fromisoformat(texto.replace("Z", "+00:00"))
+    return None
+
+
+def ler_feed_completo(dados: bytes) -> list:
+    """Itens de RSS/Atom com título, link, resumo, data e o áudio (podcasts)."""
+    try:
+        raiz = ET.fromstring(dados)
+    except ET.ParseError as e:
+        raise ToonsError(f"Feed inválido: {e}") from None
+
+    def nome(el):
+        return el.tag.split("}")[-1]
+
+    def filho(el, *nomes):
+        for f in el:
+            if nome(f) in nomes:
+                return f
+        return None
+
+    itens = []
+    for el in raiz.iter():
+        if nome(el) not in ("item", "entry"):
+            continue
+        t = filho(el, "title")
+        link_el = filho(el, "link")
+        link = ""
+        if link_el is not None:
+            link = (link_el.text or "").strip() or link_el.get("href", "")
+        resumo_el = filho(el, "description", "summary", "content", "encoded")
+        audio_el = next((f for f in el if nome(f) == "enclosure" and
+                         (f.get("type", "").startswith("audio") or f.get("url", "").split("?")[0].endswith(
+                             (".mp3", ".m4a", ".ogg", ".opus")))), None)
+        data_el = filho(el, "pubDate", "published", "updated", "date")
+        itens.append({"titulo": " ".join((t.text or "").split()) if t is not None else "(sem título)", "link": link,
+                      "resumo": html_para_texto(resumo_el.text or "") if resumo_el is not None else "",
+                      "data": _data_do_feed(data_el.text if data_el is not None else None),
+                      "audio": audio_el.get("url") if audio_el is not None else None})
+    return itens
+
+
+def baixar_feed(url: str) -> list:
+    return ler_feed_completo(pedir_bytes(url, timeout=25))
+
+
+def texto_da_materia(url: str) -> str:
+    """Os parágrafos de uma página de notícia (modo leitura)."""
+    import html as html_mod
+    codigo, pagina = baixar_pagina(url)
+    if codigo >= 400:
+        raise ToonsError(f"A página respondeu HTTP {codigo}.")
+    paragrafos = []
+    for bruto in re.findall(r"(?is)<p\b[^>]*>(.*?)</p>", re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", pagina)):
+        texto = " ".join(html_mod.unescape(re.sub(r"(?s)<[^>]+>", " ", bruto)).split())
+        if len(texto) >= 40:
+            paragrafos.append(texto)
+    return "\n\n".join(paragrafos) or texto_limpo(pagina)[:5000]
+
+
+def _quando_txt(d) -> str:
+    if not d:
+        return ""
+    try:
+        d = d.astimezone() if d.tzinfo else d
+        return d.strftime("%d/%m %H:%M")
+    except (ValueError, OverflowError):
+        return ""
+
+
+@submenu
+def menu_noticias():
+    c = cfg()
+    if not c.get("feeds"):
+        c["feeds"] = copy.deepcopy(FEEDS_PADRAO)
+
+    def abrir_item(item: dict, fonte: str):
+        while True:
+            limpar()
+            titulo(fonte)
+            print(f"{NEG}{item['titulo']}{RST}\n{DIM}{_quando_txt(item['data'])}{RST}\n")
+            print((item["resumo"] or "(sem resumo)")[:1500] + "\n")
+            i = escolher("O que fazer?", ["Ler a matéria inteira (modo leitura)", "Abrir no navegador",
+                                         "Ouvir a matéria", "Guardar nos favoritos", "Copiar o link", "Voltar"])
+            if i in (None, 5):
+                return
+            if i == 0:
+                ler_texto(item["titulo"], texto_da_materia(item["link"]))
+            elif i == 1:
+                abrir_link(item["link"])
+            elif i == 2:
+                info("Lendo em voz alta (Ctrl+C interrompe)...")
+                with contextlib.suppress(ToonsError, KeyboardInterrupt):
+                    texto = texto_da_materia(item["link"])
+                    for pedaco in fatiar(f"{item['titulo']}.\n{texto}", 3000):
+                        falar(pedaco)
+            elif i == 3:
+                favs = ler_json(FAVORITOS_FILE, [])
+                favs.insert(0, {"titulo": item["titulo"], "link": item["link"], "fonte": fonte,
+                                "quando": datetime.now().strftime("%Y-%m-%d")})
+                gravar_json(FAVORITOS_FILE, favs[:300])
+                ok("Guardada nos favoritos.")
+                pausar()
+            elif i == 4:
+                copiar_texto(item["link"])
+                pausar()
+
+    def ver_fonte(feed: dict | None):
+        fontes = [feed] if feed else c["feeds"]
+        itens = []
+        for f in fontes:
+            try:
+                itens += [(f["nome"], it) for it in baixar_feed(f["url"])[:30]]
+            except ToonsError as e:
+                aviso(f"{f['nome']}: {e}")
+        if not itens:
+            info("Nenhuma notícia carregada.")
+            return
+        itens.sort(key=lambda par: par[1]["data"].timestamp() if par[1]["data"] else 0, reverse=True)
+        while True:
+            rotulos = [f"{it['titulo'][:80]}  {DIM}{'' if feed else nome + ' · '}{_quando_txt(it['data'])}{RST}"
+                       for nome, it in itens[:80]]
+            i = escolher(feed["nome"] if feed else "Todas as fontes", rotulos)
+            if i is None:
+                return
+            abrir_item(itens[i][1], itens[i][0])
+
+    def escolher_fonte():
+        i = escolher("Qual fonte?", ["📰 Todas as fontes (mais recentes primeiro)"] + [f["nome"] for f in c["feeds"]])
+        if i is not None:
+            ver_fonte(None if i == 0 else c["feeds"][i - 1])
+
+    def favoritos():
+        favs = ler_json(FAVORITOS_FILE, [])
+        if not favs:
+            info("Nenhum favorito ainda.")
+            return
+        i = escolher("Favoritos", [f"{f['titulo'][:80]}  {DIM}{f['fonte']} · {f['quando']}{RST}" for f in favs])
+        if i is None:
+            return
+        j = escolher("O que fazer?", ["Ler (modo leitura)", "Abrir no navegador", "Remover dos favoritos"])
+        if j == 0:
+            ler_texto(favs[i]["titulo"], texto_da_materia(favs[i]["link"]))
+        elif j == 1:
+            abrir_link(favs[i]["link"])
+        elif j == 2:
+            favs.pop(i)
+            gravar_json(FAVORITOS_FILE, favs)
+            ok("Removido.")
+
+    def adicionar_fonte():
+        url = perguntar("Endereço do feed RSS/Atom (ex.: https://site.com/feed/)")
+        if not url.startswith(("http://", "https://")):
+            raise ToonsError("O endereço precisa começar com http:// ou https://")
+        itens = baixar_feed(url)
+        ok(f"Feed válido: {len(itens)} notícias.")
+        c["feeds"].append({"nome": perguntar("Nome da fonte", urllib.parse.urlsplit(url).netloc), "url": url})
+        salvar_cfg()
+
+    def remover_fonte():
+        i = escolher("Remover qual?", [f["nome"] for f in c["feeds"]])
+        if i is not None and confirmar(f"Remover '{c['feeds'][i]['nome']}'?", True):
+            c["feeds"].pop(i)
+            salvar_cfg()
+
+    menu("📰 Notícias (RSS)", [
+        ("Ler notícias", escolher_fonte),
+        ("Favoritos", favoritos),
+        ("Adicionar uma fonte (feed RSS)", adicionar_fonte),
+        ("Remover uma fonte", remover_fonte),
+        ("Avisar de notícias novas (monitor RSS)", menu_monitor),
+    ])
+
+
+# ── Gerenciador de downloads (aria2) ─────────────────────────────────
+
+def aria2(metodo: str, *params):
+    """Chama o aria2 rodando em segundo plano (JSON-RPC em 127.0.0.1:6800)."""
+    corpo = {"jsonrpc": "2.0", "id": "toons", "method": f"aria2.{metodo}",
+             "params": [f"token:{cfg().get('aria2_segredo', '')}", *params]}
+    try:
+        resposta = pedir_json("http://127.0.0.1:6800/jsonrpc", corpo, timeout=15)
+    except ToonsError as e:
+        if "HTTP" not in str(e):
+            raise ToonsError("O gerenciador de downloads não está rodando (inicie o serviço).") from None
+        raise
+    if resposta.get("error"):
+        raise ToonsError(f"aria2: {resposta['error'].get('message')}")
+    return resposta.get("result")
+
+
+def iniciar_aria2() -> bool:
+    if not garantir_cmd("aria2c", "aria2"):
+        return False
+    c = cfg()
+    if not c.get("aria2_segredo"):
+        c["aria2_segredo"] = secrets.token_hex(16)
+        salvar_cfg()
+    sessao_arq = DATA_DIR / "aria2.sessao"
+    sessao_arq.touch()
+    pasta = c.get("aria2_pasta") or str(pasta_saida("Downloads"))
+    cmd = shlex.join([
+        "aria2c", "--enable-rpc", "--rpc-listen-port=6800", f"--rpc-secret={c['aria2_segredo']}", f"--dir={pasta}",
+        "--continue=true", f"--input-file={sessao_arq}", f"--save-session={sessao_arq}", "--save-session-interval=20",
+        f"--max-concurrent-downloads={c.get('aria2_simultaneos', 3)}", "--split=8", "--max-connection-per-server=8",
+        "--min-split-size=1M", "--seed-time=0", "--follow-torrent=true", "--auto-file-renaming=true",
+        "--file-allocation=none", "--console-log-level=warn", "--summary-interval=0"])
+    return iniciar_servico("downloads", cmd, reiniciar=True)
+
+
+def _garantir_aria2() -> None:
+    if not servico_ativo("downloads"):
+        info("Iniciando o gerenciador de downloads em segundo plano...")
+        if not iniciar_aria2():
+            raise ToonsError("O aria2 não iniciou.")
+        time.sleep(1.5)
+
+
+def nome_download(d: dict) -> str:
+    info_bt = (d.get("bittorrent") or {}).get("info") or {}
+    if info_bt.get("name"):
+        return info_bt["name"]
+    arquivos = d.get("files") or [{}]
+    if arquivos[0].get("path"):
+        return Path(arquivos[0]["path"]).name
+    uris = arquivos[0].get("uris") or [{}]
+    return (uris[0].get("uri") or d.get("gid", "?")).rsplit("/", 1)[-1][:60] or "(buscando nome...)"
+
+
+def todos_downloads() -> list:
+    campos = ["gid", "status", "totalLength", "completedLength", "downloadSpeed", "files", "bittorrent",
+              "errorMessage", "numSeeders", "connections"]
+    return (aria2("tellActive", campos) or []) + (aria2("tellWaiting", 0, 100, campos) or []) + \
+        (aria2("tellStopped", 0, 100, campos) or [])
+
+
+def linha_download(d: dict, largura_barra: int = 14) -> str:
+    total, feito = int(d.get("totalLength") or 0), int(d.get("completedLength") or 0)
+    frac = feito / total if total else 0
+    estado = {"active": f"{VERD}⬇{RST}", "waiting": f"{DIM}⏳{RST}", "paused": f"{AMAR}⏸{RST}",
+              "complete": f"{VERD}✔{RST}", "error": f"{VERM}✖{RST}", "removed": f"{DIM}✖{RST}"}.get(d["status"], "?")
+    velocidade = int(d.get("downloadSpeed") or 0)
+    extra = f" {bytes_humanos(velocidade)}/s" if d["status"] == "active" else ""
+    if d["status"] == "active" and velocidade and total:
+        extra += f" · falta {fmt_relogio((total - feito) / velocidade)}"
+    return (f"{estado} {barra_horizontal(frac, largura_barra)} {frac:4.0%} {nome_download(d)[:40]}"
+            f" {DIM}{bytes_humanos(total) if total else ''}{extra}{RST}")
+
+
+@submenu
+def menu_downloads():
+    c = cfg()
+
+    def adicionar():
+        alvo = perguntar("Link (http, https, ftp ou magnet:)")
+        if not alvo:
+            return
+        if not re.match(r"(https?|ftp)://|magnet:\?", alvo):
+            raise ToonsError("Isso não parece um link de download.")
+        _garantir_aria2()
+        opcoes = {}
+        nome = perguntar("Salvar com outro nome? (Enter = nome original)", "")
+        if nome:
+            opcoes["out"] = Path(nome).name
+        aria2("addUri", [alvo], opcoes)
+        ok("Download adicionado à fila.")
+
+    def adicionar_torrent():
+        arq = escolher_arquivo("Qual arquivo .torrent?", (".torrent",))
+        if not arq:
+            return
+        _garantir_aria2()
+        aria2("addTorrent", base64.b64encode(arq.read_bytes()).decode())
+        ok("Torrent adicionado. (Ele para de compartilhar quando termina de baixar.)")
+
+    def ver():
+        lista = todos_downloads()
+        if not lista:
+            info("Nenhum download.")
+            return
+        i = escolher("Downloads", [linha_download(d) for d in lista])
+        if i is None:
+            return
+        d = lista[i]
+        if d.get("errorMessage"):
+            erro(d["errorMessage"])
+        acoes = {"active": ["Pausar", "Cancelar"], "waiting": ["Pausar", "Cancelar"], "paused": ["Continuar", "Cancelar"]}
+        opcoes = acoes.get(d["status"], ["Tirar da lista"]) + ["Voltar"]
+        j = escolher(nome_download(d), opcoes)
+        if j is None or opcoes[j] == "Voltar":
+            return
+        escolha = opcoes[j]
+        if escolha == "Pausar":
+            aria2("pause", d["gid"])
+        elif escolha == "Continuar":
+            aria2("unpause", d["gid"])
+        elif escolha == "Cancelar" and confirmar("Cancelar este download?", False):
+            aria2("remove", d["gid"])
+        elif escolha == "Tirar da lista":
+            aria2("removeDownloadResult", d["gid"])
+        ok("Feito.")
+
+    def ao_vivo():
+        with TelaCheia():
+            while True:
+                try:
+                    lista = todos_downloads()
+                    status = aria2("getGlobalStat")
+                except ToonsError as e:
+                    desenhar([str(e), "", "Aperte uma tecla"])
+                    ler_tecla()
+                    return
+                linhas = ["", f"  {NEG}⬇ Downloads{RST}  {bytes_humanos(int(status['downloadSpeed']))}/s · "
+                              f"{status['numActive']} ativo(s) · {status['numWaiting']} na fila", ""]
+                linhas += ["  " + linha_download(d) for d in lista[:20]] or [f"  {DIM}Nenhum download.{RST}"]
+                linhas += ["", f"  {DIM}Atualiza a cada segundo · qualquer tecla sai{RST}"]
+                desenhar(linhas)
+                if tecla_ou_nada(1.0) is not None:
+                    return
+
+    def configurar():
+        c["aria2_pasta"] = os.path.expanduser(perguntar("Pasta dos downloads",
+                                                        c.get("aria2_pasta") or str(pasta_saida("Downloads"))))
+        c["aria2_simultaneos"] = perguntar_int("Quantos downloads ao mesmo tempo", c.get("aria2_simultaneos", 3), 1, 10)
+        salvar_cfg()
+        if servico_ativo("downloads") and confirmar("Reiniciar o gerenciador para aplicar?", True):
+            parar_servico("downloads")
+            iniciar_aria2()
+
+    menu("⬇️ Gerenciador de downloads (aria2)", [
+        ("Adicionar link ou magnet", adicionar),
+        ("Adicionar arquivo .torrent", adicionar_torrent),
+        ("Ver downloads (pausar, continuar, cancelar)", ver),
+        ("Acompanhar ao vivo", ao_vivo),
+        ("Pausar todos", lambda: aria2("pauseAll") and ok("Pausados.")),
+        ("Continuar todos", lambda: aria2("unpauseAll") and ok("Continuando.")),
+        ("Limpar os concluídos da lista", lambda: aria2("purgeDownloadResult") and ok("Lista limpa.")),
+        ("Configurar pasta e downloads simultâneos", configurar),
+        *itens_servico("downloads", "Gerenciador", iniciar_aria2),
+    ])
+
+
+# ── Chat na rede local ───────────────────────────────────────────────
+
+CHAT_PORTA, CHAT_DESCOBERTA = 8099, 8098
+CHAT_MAX_ARQUIVO = 20 * 1024 * 1024
+
+
+def _mostrar_chat(msg: dict) -> None:
+    tipo = msg.get("t")
+    if tipo == "msg":
+        linha = f"{CIANO}{msg.get('de', '?')}{RST}: {msg.get('texto', '')}"
+    elif tipo in ("entrou", "saiu"):
+        linha = f"{DIM}→ {msg.get('de', '?')} {'entrou' if tipo == 'entrou' else 'saiu'}{RST}"
+    elif tipo == "arquivo":
+        nome = Path(msg.get("nome") or "arquivo").name
+        destino = pasta_saida("Chat") / nome
+        try:
+            destino.write_bytes(base64.b64decode(msg.get("dados", "")))
+            linha = f"📎 {CIANO}{msg.get('de', '?')}{RST} enviou {NEG}{nome}{RST} → {DIM}{destino}{RST}"
+        except (ValueError, OSError) as e:
+            linha = f"{VERM}Arquivo de {msg.get('de')} chegou com erro: {e}{RST}"
+    elif tipo == "quem":
+        linha = f"{DIM}Na sala: {', '.join(msg.get('nomes', []))}{RST}"
+    elif tipo == "erro":
+        linha = f"{VERM}{msg.get('texto')}{RST}"
+    else:
+        return
+    sys.stdout.write(f"\r\033[K{linha}\n{AMAR}>{RST} ")
+    sys.stdout.flush()
+
+
+def _ler_linhas_socket(sock, ao_receber) -> None:
+    """Lê mensagens JSON (uma por linha) até a conexão fechar."""
+    arquivo = sock.makefile("rb")
+    try:
+        for bruto in arquivo:
+            with contextlib.suppress(ValueError):
+                ao_receber(json.loads(bruto.decode("utf-8", errors="replace")))
+    except OSError:
+        pass
+
+
+def _fechar_socket(sock) -> None:
+    """Fecha de verdade: o close() sozinho não fecha enquanto outra thread lê pelo makefile()."""
+    with contextlib.suppress(OSError):
+        sock.shutdown(socket.SHUT_RDWR)
+    with contextlib.suppress(OSError):
+        sock.close()
+
+
+class SalaChat:
+    """Servidor da sala: repassa as mensagens para todos e se anuncia na rede (UDP)."""
+
+    def __init__(self, nome_sala: str, senha: str, meu_nome: str):
+        self.nome_sala, self.senha, self.meu_nome = nome_sala, senha, meu_nome
+        self.clientes, self.trava, self.ativa = {}, threading.Lock(), True
+
+    def iniciar(self) -> None:
+        self.servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            self.servidor.bind(("0.0.0.0", CHAT_PORTA))
+        except OSError:
+            raise ToonsError(f"A porta {CHAT_PORTA} está ocupada (já tem uma sala aberta?).") from None
+        self.servidor.listen()
+        threading.Thread(target=self._aceitar, daemon=True).start()
+        threading.Thread(target=self._anunciar, daemon=True).start()
+
+    def _anunciar(self) -> None:
+        aviso_udp = json.dumps({"app": "toons-chat", "sala": self.nome_sala, "porta": CHAT_PORTA,
+                                "senha": bool(self.senha)}).encode()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        ip = ip_local()
+        destinos = ["255.255.255.255"] + ([ip.rsplit(".", 1)[0] + ".255"] if ip.count(".") == 3 else [])
+        while self.ativa:
+            for destino in destinos:
+                with contextlib.suppress(OSError):
+                    sock.sendto(aviso_udp, (destino, CHAT_DESCOBERTA))
+            time.sleep(2)
+
+    def _aceitar(self) -> None:
+        while self.ativa:
+            try:
+                cli, _ = self.servidor.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._atender, args=(cli,), daemon=True).start()
+
+    def _atender(self, cli) -> None:
+        nome = None
+
+        def receber(msg: dict):
+            nonlocal nome
+            if nome is None:
+                if msg.get("t") != "oi" or (self.senha and msg.get("senha") != self.senha):
+                    self._enviar(cli, {"t": "erro", "texto": "Senha errada ou programa diferente."})
+                    cli.close()
+                    return
+                nome = str(msg.get("de") or "anônimo")[:30]
+                with self.trava:
+                    self.clientes[cli] = nome
+                self._enviar(cli, {"t": "bem-vindo", "sala": self.nome_sala})
+                self.espalhar({"t": "entrou", "de": nome}, exceto=cli)
+            elif msg.get("t") == "quem":
+                self._enviar(cli, {"t": "quem", "nomes": self.nomes()})
+            elif msg.get("t") in ("msg", "arquivo"):
+                self.espalhar({**msg, "de": nome}, exceto=cli)
+
+        _ler_linhas_socket(cli, receber)
+        with self.trava:
+            self.clientes.pop(cli, None)
+        if nome:
+            self.espalhar({"t": "saiu", "de": nome})
+
+    def _enviar(self, cli, msg: dict) -> None:
+        with contextlib.suppress(OSError):
+            cli.sendall(json.dumps(msg).encode() + b"\n")
+
+    def nomes(self) -> list:
+        with self.trava:
+            return [self.meu_nome] + list(self.clientes.values())
+
+    def espalhar(self, msg: dict, exceto=None) -> None:
+        with self.trava:
+            clientes = [c for c in self.clientes if c is not exceto]
+        for c in clientes:
+            self._enviar(c, msg)
+        if msg.get("de") != self.meu_nome:  # o que eu mesmo mandei já está na minha tela
+            _mostrar_chat(msg)
+
+    def mandar(self, msg: dict) -> None:
+        self.espalhar({**msg, "de": self.meu_nome})
+
+    def fechar(self) -> None:
+        self.ativa = False
+        with contextlib.suppress(OSError):
+            self.servidor.close()
+        with self.trava:
+            for c in list(self.clientes):
+                _fechar_socket(c)
+
+
+def procurar_salas(segundos: float = 4) -> list:
+    """Salas anunciadas na rede: [(nome, ip, porta, tem_senha)]."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.bind(("", CHAT_DESCOBERTA))
+    except OSError:
+        return []
+    sock.settimeout(0.5)
+    achadas, fim = {}, time.time() + segundos
+    while time.time() < fim:
+        try:
+            dados, (ip, _) = sock.recvfrom(4096)
+            aviso_udp = json.loads(dados)
+        except (OSError, ValueError):
+            continue
+        if aviso_udp.get("app") == "toons-chat":
+            achadas[(ip, aviso_udp.get("porta", CHAT_PORTA))] = (aviso_udp.get("sala", "?"), bool(aviso_udp.get("senha")))
+    sock.close()
+    return [(nome, ip, porta, senha) for (ip, porta), (nome, senha) in achadas.items()]
+
+
+def _conversar(mandar, pedir_quem) -> None:
+    print(f"{DIM}Digite e Enter para mandar · /arquivo envia um arquivo · /quem lista quem está · /sair{RST}")
+    while True:
+        try:
+            texto = input(f"{AMAR}>{RST} ").strip()
+        except EOFError:
+            return
+        if not texto:
+            continue
+        if texto in ("/sair", "/s"):
+            return
+        if texto == "/quem":
+            pedir_quem()
+        elif texto.startswith("/arquivo"):
+            caminho = texto[8:].strip()
+            arq = Path(os.path.expanduser(caminho)) if caminho else escolher_arquivo("Qual arquivo?")
+            if not arq or not arq.is_file():
+                erro("Arquivo não encontrado.")
+                continue
+            if arq.stat().st_size > CHAT_MAX_ARQUIVO:
+                erro(f"Arquivo grande demais (máximo {bytes_humanos(CHAT_MAX_ARQUIVO)}).")
+                continue
+            mandar({"t": "arquivo", "nome": arq.name, "dados": base64.b64encode(arq.read_bytes()).decode()})
+            ok(f"Enviado: {arq.name}")
+        else:
+            mandar({"t": "msg", "texto": texto})
+
+
+@submenu
+def menu_chat():
+    c = cfg()
+
+    def meu_nome() -> str:
+        if not c.get("chat_nome"):
+            c["chat_nome"] = perguntar("Seu nome no chat", getpass.getuser())[:30]
+            salvar_cfg()
+        return c["chat_nome"]
+
+    def criar_sala():
+        nome = meu_nome()
+        sala = SalaChat(perguntar("Nome da sala", f"Sala de {nome}"), perguntar("Senha da sala (opcional)", ""), nome)
+        sala.iniciar()
+        ok(f"Sala aberta em {ip_local()}:{CHAT_PORTA}. Os outros entram em 'Entrar numa sala' (mesmo Wi-Fi).")
+        try:
+            _conversar(sala.mandar, lambda: _mostrar_chat({"t": "quem", "nomes": sala.nomes()}))
+        finally:
+            sala.fechar()
+
+    def entrar():
+        nome = meu_nome()
+        info("Procurando salas na rede (4 s)...")
+        salas = procurar_salas()
+        opcoes = [f"{s[0]}  {DIM}{s[1]}{' 🔒' if s[3] else ''}{RST}" for s in salas] + ["Digitar o IP da sala..."]
+        i = escolher("Qual sala?", opcoes)
+        if i is None:
+            return
+        if i < len(salas):
+            ip, porta = salas[i][1], salas[i][2]
+        else:
+            ip, porta = perguntar("IP de quem abriu a sala"), CHAT_PORTA
+        senha = getpass.getpass("Senha da sala (Enter se não tiver): ")
+        sock = socket.create_connection((ip, porta), timeout=10)
+        sock.settimeout(None)
+        sock.sendall(json.dumps({"t": "oi", "de": nome, "senha": senha}).encode() + b"\n")
+        threading.Thread(target=_ler_linhas_socket, args=(sock, _mostrar_chat), daemon=True).start()
+        ok(f"Conectado a {ip}.")
+        try:
+            _conversar(lambda msg: sock.sendall(json.dumps(msg).encode() + b"\n"),
+                       lambda: sock.sendall(b'{"t": "quem"}\n'))
+        except OSError:
+            erro("A conexão caiu (a sala foi fechada?).")
+        finally:
+            _fechar_socket(sock)
+
+    menu("💬 Chat na rede local (sem internet)", [
+        ("Criar uma sala", criar_sala),
+        ("Entrar numa sala", entrar),
+        (lambda: f"Meu nome no chat: {c.get('chat_nome') or '(definir)'}",
+         lambda: (c.pop("chat_nome", None), meu_nome())),
+    ], cabecalho=lambda: print(f"{DIM}Funciona entre celulares com o Termux-Toons no mesmo Wi-Fi (ou roteador do "
+                               f"celular), sem internet.{RST}"))
+
+
+# ── Navegador em modo texto e Browsh ─────────────────────────────────
+
+def _url_digitada(texto: str) -> str:
+    texto = texto.strip()
+    if not texto:
+        raise ToonsError("Digite um endereço.")
+    if re.match(r"[a-z]+://", texto):
+        return texto
+    if "." in texto and " " not in texto:
+        return "https://" + texto
+    return url_com("https://lite.duckduckgo.com/lite/", q=texto)
+
+
+def garantir_browsh() -> bool:
+    if tem("browsh"):
+        return True
+    info("O Browsh mostra os sites modernos (com imagens, vídeos e JavaScript) dentro do terminal.\n"
+         "  Ele usa o Firefox por trás: a instalação baixa uns 250 MB (pacotes 'browsh' e 'firefox' do x11-repo).")
+    if not confirmar("Instalar o Browsh agora?", True):
+        return False
+    instalar_de_repo("x11-repo", "browsh")
+    return tem("browsh")
+
+
+def abrir_browsh(url: str | None = None) -> None:
+    if not garantir_browsh():
+        return
+    print(f"{NEG}Atalhos do Browsh:{RST} Ctrl+L digita endereço · Backspace volta · Ctrl+T nova aba · "
+          f"Ctrl+W fecha aba · Ctrl+Q sai")
+    info("A primeira abertura demora (o Firefox inicia por trás).")
+    time.sleep(2)
+    rodar(["browsh", "--startup-url", url or "https://lite.duckduckgo.com/lite/"], mostrar=False)
+
+
+@submenu
+def menu_navegador():
+    def w3m(url: str) -> None:
+        if garantir_cmd("w3m"):
+            print(f"{DIM}w3m: setas navegam · Enter abre link · B volta · U digita endereço · q sai{RST}")
+            time.sleep(1)
+            rodar(["w3m", url], mostrar=False)
+
+    def salvar_texto():
+        url = _url_digitada(perguntar("Endereço da página"))
+        destino = pasta_saida("Páginas") / f"{_slug(urllib.parse.urlsplit(url).netloc + urllib.parse.urlsplit(url).path)}.txt"
+        if tem("w3m") or garantir_cmd("w3m"):
+            texto = saida(["w3m", "-dump", "-cols", "100", url], timeout=60)
+        else:
+            texto = texto_da_materia(url)
+        destino.write_text(texto, "utf-8")
+        ok(f"Página salva como texto: {destino}")
+
+    menu("🌐 Navegador no terminal", [
+        ("🦊 Browsh: sites modernos no terminal (com Firefox)", lambda: abrir_browsh(
+            _url_digitada(perguntar("Endereço ou busca (Enter = página de busca)", "lite.duckduckgo.com/lite/")))),
+        ("w3m: abrir um site (leve, só texto)", lambda: w3m(_url_digitada(perguntar("Endereço ou busca")))),
+        ("Pesquisar na web (DuckDuckGo)", lambda: w3m(url_com("https://lite.duckduckgo.com/lite/",
+                                                               q=perguntar("Pesquisar por")))),
+        ("Modo leitura (só o texto da matéria)", lambda: ler_texto(
+            "Modo leitura", texto_da_materia(_url_digitada(perguntar("Endereço da página"))))),
+        ("Salvar uma página como texto", salvar_texto),
+        ("Abrir no navegador do Android", lambda: abrir_link(_url_digitada(perguntar("Endereço")))),
+    ])
+
+
+# ── Encurtador de links e pastebin ───────────────────────────────────
+
+def _guardar_link(tipo: str, url: str, original: str) -> None:
+    historico = ler_json(LINKS_FILE, [])
+    historico.insert(0, {"tipo": tipo, "url": url, "original": original[:200],
+                         "quando": datetime.now().strftime("%Y-%m-%d %H:%M")})
+    gravar_json(LINKS_FILE, historico[:500])
+
+
+def encurtar_link(url: str) -> str:
+    for base in ("https://is.gd/create.php", "https://v.gd/create.php"):
+        with contextlib.suppress(ToonsError):
+            curto = pedir_bytes(url_com(base, format="simple", url=url), timeout=20).decode().strip()
+            if curto.startswith("http"):
+                return curto
+    curto = pedir_bytes(url_com("https://tinyurl.com/api-create.php", url=url), timeout=20).decode().strip()
+    if not curto.startswith("http"):
+        raise ToonsError(f"Não consegui encurtar: {curto[:100]}")
+    return curto
+
+
+def colar_texto_online(texto: str) -> str:
+    """Publica um texto e devolve o link (paste.rs; dpaste.com se falhar)."""
+    with contextlib.suppress(ToonsError):
+        link = pedir_bytes("https://paste.rs/", texto.encode(), {"Content-Type": "text/plain; charset=utf-8"},
+                           timeout=30, metodo="POST").decode().strip()
+        if link.startswith("http"):
+            return link
+    corpo = urllib.parse.urlencode({"content": texto, "expiry_days": 30}).encode()
+    link = pedir_bytes("https://dpaste.com/api/v2/", corpo, {"Content-Type": "application/x-www-form-urlencoded"},
+                       timeout=30, metodo="POST").decode().strip()
+    if not link.startswith("http"):
+        raise ToonsError("Não consegui publicar o texto agora.")
+    return link
+
+
+def enviar_arquivo_online(caminho: Path, tempo: str | None = "24h") -> str:
+    """Publica um arquivo: temporário no Litterbox (1h a 72h) ou permanente no Catbox."""
+    limite = (1024 if tempo else 200) * 1024 * 1024
+    if caminho.stat().st_size > limite:
+        raise ToonsError(f"Arquivo grande demais (máximo {bytes_humanos(limite)}).")
+    campos = {"reqtype": "fileupload", **({"time": tempo} if tempo else {})}
+    corpo, tipo = _multipart(campos, {"fileToUpload": caminho})
+    url = "https://litterbox.catbox.moe/resources/internals/api.php" if tempo else "https://catbox.moe/user/api.php"
+    link = pedir_bytes(url, corpo, {"Content-Type": tipo}, timeout=600, metodo="POST").decode().strip()
+    if not link.startswith("http"):
+        raise ToonsError(f"O envio falhou: {link[:200]}")
+    return link
+
+
+@submenu
+def menu_links():
+    def depois(tipo: str, link: str, original: str):
+        _guardar_link(tipo, link, original)
+        print(f"\n  {NEG}{VERD}{link}{RST}\n")
+        i = escolher("E agora?", ["Copiar o link", "Mostrar QR code do link", "Compartilhar (WhatsApp...)", "Nada"])
+        if i == 0:
+            copiar_texto(link)
+        elif i == 1:
+            mostrar_qr(link, "link")
+        elif i == 2 and tem("termux-share"):
+            rodar(["termux-share", "-a", "send"], entrada=link, capturar=True, timeout=30)
+
+    def encurtar():
+        url = _url_digitada(perguntar("Link para encurtar"))
+        depois("curto", encurtar_link(url), url)
+
+    def colar():
+        i = escolher("De onde vem o texto?", ["Digitar agora", "O que está copiado", "Um arquivo de texto"])
+        if i is None:
+            return
+        if i == 0:
+            texto = editar_texto("", ".txt") or ""
+        elif i == 1:
+            texto = _tapi(["termux-clipboard-get"], 10, json_saida=False)
+        else:
+            arq = escolher_arquivo("Qual arquivo?", (".txt", ".md", ".py", ".sh", ".json", ".log", ".csv"))
+            texto = arq.read_text("utf-8", errors="replace") if arq else ""
+        if not texto.strip():
+            raise ToonsError("Texto vazio.")
+        aviso("O texto fica público para quem tiver o link.")
+        if confirmar("Publicar?", True):
+            depois("texto", colar_texto_online(texto), texto[:80])
+
+    def arquivo():
+        arq = escolher_arquivo("Qual arquivo?")
+        if not arq:
+            return
+        tempos = [("1 hora", "1h"), ("12 horas", "12h"), ("24 horas", "24h"), ("3 dias", "72h"),
+                  ("Para sempre (Catbox, até 200 MB)", None)]
+        i = escolher("O link vale por", [t for t, _ in tempos], 3)
+        if i is None:
+            return
+        aviso("Qualquer pessoa com o link baixa o arquivo.")
+        if confirmar(f"Enviar {arq.name} ({bytes_humanos(arq.stat().st_size)})?", True):
+            info("Enviando...")
+            depois("arquivo", enviar_arquivo_online(arq, tempos[i][1]), arq.name)
+
+    def historico():
+        lista = ler_json(LINKS_FILE, [])
+        if not lista:
+            info("Nenhum link ainda.")
+            return
+        i = escolher("Histórico", [f"{l['url']}  {DIM}{l['tipo']} · {l['quando']} · {l['original'][:30]}{RST}"
+                                   for l in lista])
+        if i is not None:
+            copiar_texto(lista[i]["url"])
+
+    menu("🔗 Encurtador de links e pastebin", [
+        ("Encurtar um link", encurtar),
+        ("Publicar um texto (pastebin)", colar),
+        ("Enviar um arquivo e gerar link", arquivo),
+        ("Histórico de links (copiar)", historico),
+    ])
+
+
+@submenu
+def menu_internet():
+    menu("🌐 Internet e comunicação", [
+        ("📧 E-mail (ler, responder, enviar)", menu_email),
+        ("📰 Notícias (RSS, modo leitura, ouvir)", menu_noticias),
+        ("⬇️ Gerenciador de downloads (links, magnet, torrent)", menu_downloads),
+        ("💬 Chat na rede local (sem internet)", menu_chat),
+        ("🦊 Navegador no terminal (Browsh e w3m)", menu_navegador),
+        ("🔗 Encurtador de links e pastebin", menu_links),
+    ])
+
+
+# ════════════════════════════════════════════════════════════════════
+#  23. Inteligência artificial: assistente na nuvem, voz e OCR
+# ════════════════════════════════════════════════════════════════════
+
+CONVERSAS_DIR = DATA_DIR / "conversas_ia"
+WHISPER_DIR = HOME / "whisper.cpp"
+
+IA_PROVEDORES = {"claude": "Claude (Anthropic)", "openai": "ChatGPT (OpenAI)", "gemini": "Gemini (Google)"}
+IA_ESFORCOS = ["low", "medium", "high", "xhigh", "max"]
+# Modelos do Claude que aceitam o 'fallbacks: "default"' (troca de modelo no servidor se o pedido for recusado).
+CLAUDE_COM_FALLBACK = {"claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-opus-5"}
+IA_SISTEMA_PADRAO = ("Você é um assistente útil que roda no celular da pessoa, dentro do Termux. Responda em "
+                     "português do Brasil, de forma clara e direta. O terminal não mostra Markdown: prefira texto "
+                     "simples, listas com hífen e blocos de código curtos.")
+
+
+def ia_config() -> dict:
+    c = cfg()
+    ia = c.setdefault("ia_nuvem", {})
+    ia.setdefault("provedor", "claude")
+    ia.setdefault("chaves", {})
+    ia.setdefault("modelos", {"claude": "claude-opus-5-5"})
+    ia.setdefault("esforco", "medium")
+    ia.setdefault("sistema", IA_SISTEMA_PADRAO)
+    return ia
+
+
+def garantir_anthropic() -> bool:
+    """Instala o SDK oficial da Anthropic (no Termux, com as rodas pré-compiladas do TUR quando houver)."""
+    if modulo_existe("anthropic"):
+        return True
+    aviso("O SDK oficial da Anthropic (pacote Python 'anthropic') não está instalado.")
+    if not confirmar("Instalar agora?", True):
+        return False
+    extra = ["--extra-index-url", "https://termux-user-repository.github.io/pypi/"] if IS_TERMUX else []
+    if rodar([sys.executable, "-m", "pip", "install", "-U", *extra, "anthropic"]).returncode != 0 and IS_TERMUX:
+        info("Algumas partes precisam ser compiladas (Rust). Isso pode levar uns 15 minutos na primeira vez.")
+        instalar_pkg("rust", "binutils")
+        rodar([sys.executable, "-m", "pip", "install", "-U", "anthropic"])
+    importlib.invalidate_caches()
+    if not modulo_existe("anthropic"):
+        erro("Não consegui instalar o SDK da Anthropic.")
+        return False
+    return True
+
+
+def _chave(provedor: str) -> str:
+    ia = ia_config()
+    chave = ia["chaves"].get(provedor) or os.environ.get(
+        {"claude": "ANTHROPIC_API_KEY", "openai": "OPENAI_API_KEY", "gemini": "GEMINI_API_KEY"}[provedor], "")
+    if not chave:
+        onde = {"claude": "console.anthropic.com → API Keys", "openai": "platform.openai.com/api-keys",
+                "gemini": "aistudio.google.com/apikey"}[provedor]
+        info(f"Você precisa de uma chave de API do {IA_PROVEDORES[provedor]} ({onde}).")
+        chave = getpass.getpass("Cole a chave (fica só neste celular): ").strip()
+        if not chave:
+            raise ToonsError("Sem chave não dá para usar esse provedor.")
+        ia["chaves"][provedor] = chave
+        salvar_cfg()
+    return chave
+
+
+def _imagem_base64(caminho: Path) -> tuple:
+    """(tipo MIME, base64) de uma imagem, reduzida para no máximo 1568 px quando o Pillow existe."""
+    tipo = {".png": "image/png", ".webp": "image/webp", ".gif": "image/gif"}.get(caminho.suffix.lower(), "image/jpeg")
+    dados = caminho.read_bytes()
+    if modulo_existe("PIL"):
+        with contextlib.suppress(Exception):
+            from PIL import Image, ImageOps
+            with Image.open(caminho) as img:
+                img = ImageOps.exif_transpose(img).convert("RGB")
+                img.thumbnail((1568, 1568))
+                buffer = io.BytesIO()
+                img.save(buffer, "JPEG", quality=85)
+                dados, tipo = buffer.getvalue(), "image/jpeg"
+    if len(dados) > 4_500_000:
+        raise ToonsError("Imagem grande demais (instale o Pillow para ela ser reduzida automaticamente).")
+    return tipo, base64.b64encode(dados).decode()
+
+
+def _mensagens_claude(historico: list) -> list:
+    mensagens = []
+    for m in historico:
+        if m["role"] == "assistant" and m.get("claude") is not None:
+            # devolve o conteúdo exatamente como veio (inclui os blocos de raciocínio, que a API exige de volta)
+            mensagens.append({"role": "assistant", "content": m["claude"]})
+            continue
+        conteudo = [{"type": "text", "text": m["texto"]}]
+        if m.get("imagem"):
+            tipo, b64 = m["imagem"]
+            conteudo.insert(0, {"type": "image", "source": {"type": "base64", "media_type": tipo, "data": b64}})
+        mensagens.append({"role": m["role"], "content": conteudo})
+    return mensagens
+
+
+def _responder_claude(historico: list, mostrar) -> dict:
+    import anthropic
+    ia = ia_config()
+    modelo = ia["modelos"].get("claude") or "claude-opus-5-5"
+    cliente = anthropic.Anthropic(api_key=_chave("claude"))
+    pedido = {"model": modelo, "max_tokens": 64000, "system": ia["sistema"], "messages": _mensagens_claude(historico)}
+    if ia.get("esforco"):
+        pedido["output_config"] = {"effort": ia["esforco"]}
+    if modelo in CLAUDE_COM_FALLBACK:
+        pedido.update(betas=["server-side-fallback-2026-07-01"], fallbacks="default")
+    try:
+        with cliente.beta.messages.stream(**pedido) as stream:
+            for evento in stream:
+                if evento.type == "content_block_delta" and evento.delta.type == "text_delta":
+                    mostrar(evento.delta.text)
+            final = stream.get_final_message()
+    except anthropic.AuthenticationError:
+        ia["chaves"].pop("claude", None)
+        salvar_cfg()
+        raise ToonsError("Chave da API recusada: confira e cole de novo.") from None
+    except anthropic.PermissionDeniedError as e:
+        raise ToonsError(f"Sua chave não tem acesso a isso: {e.message}") from None
+    except anthropic.NotFoundError:
+        raise ToonsError(f"Modelo '{modelo}' não encontrado. Escolha outro em Configurar.") from None
+    except anthropic.RateLimitError:
+        raise ToonsError("Limite de uso atingido. Espere um pouco e tente de novo.") from None
+    except anthropic.BadRequestError as e:
+        raise ToonsError(f"Pedido recusado pela API: {e.message}") from None
+    except anthropic.APIStatusError as e:
+        raise ToonsError(f"Erro da API ({e.status_code}): {e.message}") from None
+    except anthropic.APIConnectionError:
+        raise ToonsError("Sem conexão com a API da Anthropic. Está com internet?") from None
+    texto = "".join(b.text for b in final.content if b.type == "text")
+    if final.stop_reason == "refusal":
+        texto += "\n[O modelo recusou este pedido.]"
+        mostrar("\n[O modelo recusou este pedido.]")
+    elif final.stop_reason == "max_tokens":
+        mostrar("\n[Resposta cortada: chegou ao limite de tamanho.]")
+    servido_por = final.model if final.model != modelo else ""
+    return {"role": "assistant", "texto": texto, "claude": final.content, "modelo": servido_por}
+
+
+def _ler_sse(resposta):
+    """Linhas 'data: ...' de um stream SSE."""
+    for bruto in resposta:
+        linha = bruto.decode("utf-8", errors="replace").strip()
+        if linha.startswith("data:"):
+            yield linha[5:].strip()
+
+
+def _erro_http(e: urllib.error.HTTPError) -> ToonsError:
+    try:
+        dados = json.loads(e.read().decode())
+        detalhe = (dados.get("error") or {}).get("message") or str(dados)[:200]
+    except (ValueError, AttributeError):
+        detalhe = ""
+    return ToonsError(f"A API respondeu HTTP {e.code}: {detalhe}")
+
+
+def _responder_openai(historico: list, mostrar) -> dict:
+    ia = ia_config()
+    modelo = ia["modelos"].get("openai")
+    if not modelo:
+        raise ToonsError("Escolha um modelo do ChatGPT em Configurar → Modelo.")
+    mensagens = [{"role": "system", "content": ia["sistema"]}]
+    for m in historico:
+        conteudo = m["texto"]
+        if m.get("imagem"):
+            tipo, b64 = m["imagem"]
+            conteudo = [{"type": "text", "text": m["texto"]},
+                        {"type": "image_url", "image_url": {"url": f"data:{tipo};base64,{b64}"}}]
+        mensagens.append({"role": m["role"], "content": conteudo})
+    req = urllib.request.Request("https://api.openai.com/v1/chat/completions",
+                                 data=json.dumps({"model": modelo, "messages": mensagens, "stream": True}).encode(),
+                                 headers={"Authorization": f"Bearer {_chave('openai')}",
+                                          "Content-Type": "application/json"})
+    partes = []
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resposta:
+            for dado in _ler_sse(resposta):
+                if dado == "[DONE]":
+                    break
+                with contextlib.suppress(ValueError, KeyError, IndexError):
+                    pedaco = json.loads(dado)["choices"][0]["delta"].get("content")
+                    if pedaco:
+                        partes.append(pedaco)
+                        mostrar(pedaco)
+    except urllib.error.HTTPError as e:
+        raise _erro_http(e) from None
+    except OSError as e:
+        raise ToonsError(f"Sem conexão com a OpenAI ({e}).") from None
+    return {"role": "assistant", "texto": "".join(partes)}
+
+
+def _responder_gemini(historico: list, mostrar) -> dict:
+    ia = ia_config()
+    modelo = ia["modelos"].get("gemini")
+    if not modelo:
+        raise ToonsError("Escolha um modelo do Gemini em Configurar → Modelo.")
+    conteudos = []
+    for m in historico:
+        partes_msg = [{"text": m["texto"]}]
+        if m.get("imagem"):
+            partes_msg.append({"inline_data": {"mime_type": m["imagem"][0], "data": m["imagem"][1]}})
+        conteudos.append({"role": "model" if m["role"] == "assistant" else "user", "parts": partes_msg})
+    corpo = {"system_instruction": {"parts": [{"text": ia["sistema"]}]}, "contents": conteudos}
+    req = urllib.request.Request(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:streamGenerateContent?alt=sse",
+        data=json.dumps(corpo).encode(),
+        headers={"x-goog-api-key": _chave("gemini"), "Content-Type": "application/json"})
+    partes = []
+    try:
+        with urllib.request.urlopen(req, timeout=600) as resposta:
+            for dado in _ler_sse(resposta):
+                with contextlib.suppress(ValueError, KeyError, IndexError):
+                    for p in json.loads(dado)["candidates"][0]["content"]["parts"]:
+                        if p.get("text"):
+                            partes.append(p["text"])
+                            mostrar(p["text"])
+    except urllib.error.HTTPError as e:
+        raise _erro_http(e) from None
+    except OSError as e:
+        raise ToonsError(f"Sem conexão com o Google ({e}).") from None
+    return {"role": "assistant", "texto": "".join(partes)}
+
+
+def ia_responder(historico: list, mostrar=None) -> dict:
+    """Manda a conversa para o provedor escolhido e devolve a resposta (mostrando o texto enquanto chega)."""
+    provedor = ia_config()["provedor"]
+    if provedor == "claude" and not garantir_anthropic():
+        raise ToonsError("O SDK da Anthropic é necessário para usar o Claude.")
+    estado = {"primeiro": True}
+
+    def exibir(pedaco: str):
+        if estado["primeiro"]:
+            sys.stdout.write("\r\033[K")
+            estado["primeiro"] = False
+        sys.stdout.write(pedaco)
+        sys.stdout.flush()
+
+    sys.stdout.write(f"{DIM}pensando…{RST}")
+    sys.stdout.flush()
+    funcao = {"claude": _responder_claude, "openai": _responder_openai, "gemini": _responder_gemini}[provedor]
+    try:
+        resposta = funcao(historico, mostrar or exibir)
+    finally:
+        if estado["primeiro"]:
+            sys.stdout.write("\r\033[K")
+        print()
+    return resposta
+
+
+def ia_listar_modelos(provedor: str) -> list:
+    if provedor == "claude":
+        if not garantir_anthropic():
+            return []
+        import anthropic
+        try:
+            return [m.id for m in anthropic.Anthropic(api_key=_chave("claude")).models.list()]
+        except anthropic.APIError as e:
+            raise ToonsError(f"Não consegui listar os modelos: {e}") from None
+    if provedor == "openai":
+        dados = pedir_json("https://api.openai.com/v1/models", cabecalhos={"Authorization": f"Bearer {_chave('openai')}"})
+        return sorted((m["id"] for m in dados.get("data", []) if re.match(r"(gpt|o\d|chatgpt)", m["id"])), reverse=True)
+    dados = pedir_json("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+                       cabecalhos={"x-goog-api-key": _chave("gemini")})
+    return sorted((m["name"].removeprefix("models/") for m in dados.get("models", [])
+                   if "generateContent" in m.get("supportedGenerationMethods", [])), reverse=True)
+
+
+def conversa_ia(primeira: str | None = None, imagem: Path | None = None) -> None:
+    """Chat no terminal com o assistente escolhido."""
+    ia = ia_config()
+    historico = []
+    provedor = ia["provedor"]
+    print(f"{NEG}{IA_PROVEDORES[provedor]}{RST} {DIM}· {ia['modelos'].get(provedor) or '(escolha o modelo)'}{RST}")
+    print(f"{DIM}/novo recomeça · /foto manda uma imagem · /copiar copia a última resposta · /salvar vira nota · "
+          f"Enter vazio sai{RST}\n")
+    anexo = _imagem_base64(imagem) if imagem else None
+    while True:
+        if primeira:
+            texto, primeira = primeira, None
+            print(f"{AMAR}você>{RST} {texto[:300]}{'…' if len(texto) > 300 else ''}")
+        else:
+            try:
+                texto = input(f"{AMAR}você>{RST} ").strip()
+            except EOFError:
+                texto = ""
+        if not texto:
+            break
+        if texto == "/novo":
+            historico, anexo = [], None
+            ok("Conversa nova.")
+            continue
+        if texto == "/foto":
+            arq = escolher_arquivo("Qual imagem?", EXT_IMAGEM)
+            if arq:
+                anexo = _imagem_base64(arq)
+                ok(f"{arq.name} vai junto com a próxima mensagem.")
+            continue
+        if texto == "/copiar":
+            if historico:
+                copiar_texto(historico[-1]["texto"])
+            continue
+        if texto == "/salvar":
+            _salvar_conversa(historico, como_nota=True)
+            continue
+        historico.append({"role": "user", "texto": texto, "imagem": anexo})
+        anexo = None
+        print(f"{CIANO}ia>{RST} ", end="")
+        try:
+            resposta = ia_responder(historico)
+        except ToonsError as e:
+            erro(str(e))
+            historico.pop()
+            continue
+        except KeyboardInterrupt:
+            print()
+            aviso("Resposta interrompida.")
+            historico.pop()
+            continue
+        if resposta.get("modelo"):
+            info(f"(respondido por {resposta['modelo']})")
+        historico.append(resposta)
+    if historico:
+        _salvar_conversa(historico)
+
+
+def _salvar_conversa(historico: list, como_nota: bool = False) -> None:
+    texto = "\n\n".join(f"{'Você' if m['role'] == 'user' else 'IA'}: {m['texto']}" for m in historico)
+    if como_nota:
+        ok(f"Salva como nota: {salvar_nota('Conversa com IA ' + datetime.now().strftime('%d/%m %H:%M'), texto, ['ia']).name}")
+        return
+    CONVERSAS_DIR.mkdir(parents=True, exist_ok=True)
+    (CONVERSAS_DIR / f"{datetime.now():%Y%m%d-%H%M%S}.txt").write_text(texto, "utf-8")
+
+
+def texto_de_arquivo(caminho: Path) -> str:
+    """Texto de .txt/.md/.pdf/.epub/.html (para resumir, ler em voz alta etc.)."""
+    sufixo = caminho.suffix.lower()
+    if sufixo == ".pdf":
+        if not garantir_cmd("pdftotext", "poppler"):
+            raise ToonsError("O pdftotext (pacote poppler) é necessário para ler PDF.")
+        proc = rodar(["pdftotext", "-layout", str(caminho), "-"], capturar=True, timeout=300, mostrar=False)
+        return proc.stdout or ""
+    if sufixo == ".epub":
+        return "\n\n".join(ler_epub(caminho)[1])
+    texto = caminho.read_text("utf-8", errors="replace")
+    return html_para_texto(texto) if sufixo in (".html", ".htm") else texto
+
+
+# ── Voz: transcrever (whisper.cpp) e falar ───────────────────────────
+
+WHISPER_MODELOS = {"tiny": "o mais rápido, menos preciso (75 MB)", "base": "equilíbrio (142 MB)",
+                   "small": "mais preciso e mais lento (466 MB)"}
+EXT_VOZ = EXT_AUDIO + (".mp4", ".webm", ".3gp")
+
+
+def whisper_bin() -> Path | None:
+    for nome in ("whisper-cli", "main"):
+        caminho = WHISPER_DIR / "build" / "bin" / nome
+        if caminho.exists():
+            return caminho
+    achado = shutil.which("whisper-cli")
+    return Path(achado) if achado else None
+
+
+def compilar_whisper() -> None:
+    for cmd, pacote in (("git", "git"), ("cmake", "cmake"), ("clang", "clang"), ("make", "make")):
+        if not garantir_cmd(cmd, pacote):
+            raise ToonsError(f"'{cmd}' é necessário para compilar.")
+    if (WHISPER_DIR / ".git").exists():
+        rodar(["git", "-C", WHISPER_DIR, "pull", "--ff-only"])
+    else:
+        rodar(["git", "clone", "--depth", "1", "https://github.com/ggml-org/whisper.cpp", WHISPER_DIR], check=True)
+    build = WHISPER_DIR / "build"
+    rodar(["cmake", "-S", WHISPER_DIR, "-B", build, "-DCMAKE_BUILD_TYPE=Release"], check=True)
+    nucleos = os.cpu_count() or 4
+    jobs = perguntar_int("Compilar com quantos processos paralelos?", min(4, nucleos), 1, nucleos)
+    info("Compilando o whisper.cpp (uns 5 a 15 minutos)...")
+    rodar(["cmake", "--build", build, "--config", "Release", "-j", str(jobs), "--target", "whisper-cli"], check=True)
+    ok(f"Pronto: {whisper_bin()}")
+
+
+def modelo_whisper() -> Path:
+    return WHISPER_DIR / "models" / f"ggml-{cfg().get('whisper_modelo', 'base')}.bin"
+
+
+def transcrever_audio(arquivo: Path, idioma: str = "pt") -> str:
+    binario = whisper_bin()
+    if not binario:
+        raise ToonsError("O whisper.cpp ainda não foi compilado (use 'Instalar o whisper' neste menu).")
+    modelo = modelo_whisper()
+    if not modelo.exists():
+        raise ToonsError(f"Baixe o modelo '{modelo.stem}' primeiro (opção 'Baixar modelo de voz').")
+    if not garantir_cmd("ffmpeg"):
+        raise ToonsError("O ffmpeg é necessário para preparar o áudio.")
+    tmp = DATA_DIR / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    wav, base_saida = tmp / "voz16k.wav", tmp / "transcricao"
+    rodar(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(arquivo), "-ar", "16000", "-ac", "1",
+           "-c:a", "pcm_s16le", str(wav)], check=True, capturar=True)
+    info("Transcrevendo (no celular isso leva mais ou menos o tempo do áudio)...")
+    rodar([str(binario), "-m", str(modelo), "-l", idioma, "-f", str(wav), "-otxt", "-of", str(base_saida),
+           "-t", str(min(4, os.cpu_count() or 4)), "-np"], capturar=True, timeout=3600)
+    resultado = base_saida.with_suffix(".txt")
+    if not resultado.exists():
+        raise ToonsError("O whisper não gerou a transcrição.")
+    texto = " ".join(resultado.read_text("utf-8", errors="replace").split())
+    resultado.unlink(missing_ok=True)
+    return texto
+
+
+def _pastas_whatsapp() -> list:
+    s = HOME / "storage" / "shared"
+    pastas = [s / "Android" / "media" / "com.whatsapp" / "WhatsApp" / "Media" / "WhatsApp Voice Notes",
+              s / "Android" / "media" / "com.whatsapp" / "WhatsApp" / "Media" / "WhatsApp Audio",
+              s / "WhatsApp" / "Media" / "WhatsApp Voice Notes"]
+    return [(p, 3) for p in pastas if p.exists()]
+
+
+def _depois_do_texto(texto: str, titulo_nota: str) -> None:
+    """Ações para um texto gerado (transcrição, OCR)."""
+    print(f"\n{NEG}Texto:{RST}\n{texto}\n")
+    while True:
+        i = escolher("O que fazer com o texto?", ["Copiar", "Salvar como nota", "Traduzir", "Ouvir",
+                                                  "Perguntar à IA sobre ele", "Pronto"])
+        if i in (None, 5):
+            return
+        if i == 0:
+            copiar_texto(texto)
+        elif i == 1:
+            ok(f"Nota salva: {salvar_nota(titulo_nota, texto).name}")
+        elif i == 2:
+            traducao, _ = traduzir(texto, cfg().get("tradutor_destino", "en"))
+            print(f"\n{VERD}{traducao}{RST}\n")
+        elif i == 3:
+            with contextlib.suppress(ToonsError):
+                falar(texto[:3500])
+        elif i == 4:
+            pergunta = perguntar("O que você quer saber? (Enter = resumir)", "Resuma e explique este texto.")
+            conversa_ia(f"{pergunta}\n\n---\n{texto}")
+            return
+
+
+@submenu
+def menu_voz():
+    c = cfg()
+
+    def instalar():
+        compilar_whisper()
+        if not modelo_whisper().exists() and confirmar("Baixar o modelo de voz agora?", True):
+            baixar_modelo()
+
+    def baixar_modelo():
+        nomes = list(WHISPER_MODELOS)
+        i = escolher("Qual modelo?", [f"{n}: {d}" for n, d in WHISPER_MODELOS.items()], 2)
+        if i is None:
+            return
+        c["whisper_modelo"] = nomes[i]
+        salvar_cfg()
+        if not modelo_whisper().exists():
+            baixar_arquivo(f"https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{nomes[i]}.bin",
+                           modelo_whisper())
+        ok(f"Modelo em uso: {nomes[i]}")
+
+    def transcrever_arquivo():
+        pastas = _pastas_whatsapp() + _pastas_de_arquivos()
+        arq = escolher_arquivo("Qual áudio? (os do WhatsApp aparecem primeiro)", EXT_VOZ, pastas)
+        if arq:
+            _depois_do_texto(transcrever_audio(arq), f"Transcrição de {arq.name}")
+
+    def ditar():
+        if not tem("termux-microphone-record"):
+            raise ToonsError("Precisa do Termux:API (pkg install termux-api + app Termux:API).")
+        arq = DATA_DIR / "tmp" / "ditado.m4a"
+        arq.parent.mkdir(parents=True, exist_ok=True)
+        arq.unlink(missing_ok=True)
+        _tapi(["termux-microphone-record", "-f", str(arq), "-l", "0"], 20, json_saida=False)
+        try:
+            input(f"{VERM}● Gravando...{RST} fale e aperte Enter para parar. ")
+        finally:
+            _tapi(["termux-microphone-record", "-q"], 20, json_saida=False)
+        time.sleep(1)
+        if not arq.exists() or arq.stat().st_size == 0:
+            raise ToonsError("Nada foi gravado (o Termux:API tem permissão de microfone?).")
+        _depois_do_texto(transcrever_audio(arq), f"Ditado {datetime.now():%d/%m %H:%M}")
+
+    def falar_texto():
+        texto = perguntar("Texto para falar")
+        if texto:
+            falar(texto)
+
+    def ler_arquivo():
+        arq = escolher_arquivo("Qual arquivo?", (".txt", ".md", ".pdf", ".epub", ".html"))
+        if not arq:
+            return
+        texto = texto_de_arquivo(arq)
+        info(f"Lendo {len(texto)} caracteres em voz alta (Ctrl+C para parar)...")
+        with contextlib.suppress(KeyboardInterrupt):
+            for pedaco in fatiar(texto, 3000):
+                falar(pedaco)
+
+    def configurar_voz():
+        with contextlib.suppress(ToonsError):
+            motores = _tapi(["termux-tts-engines"], 15)
+            if isinstance(motores, list) and motores:
+                print("Motores de voz instalados: " + ", ".join(m.get("label", m.get("name", "?")) for m in motores))
+        c["tts_idioma"] = perguntar("Idioma da voz (pt, en, es...; Enter = do sistema)", c.get("tts_idioma", ""))
+        c["tts_velocidade"] = perguntar_float("Velocidade (1 = normal, 1.5 = mais rápido)", c.get("tts_velocidade", 1.0))
+        salvar_cfg()
+        with contextlib.suppress(ToonsError):
+            falar("Assim fica a minha voz.")
+
+    pronto = lambda: "pronto" if whisper_bin() and modelo_whisper().exists() else "não instalado"  # noqa: E731
+    menu("🎙️ Voz para texto e texto para voz", [
+        ("Transcrever um áudio (WhatsApp, gravações...)", transcrever_arquivo),
+        ("Ditar uma nota (grava e transcreve)", ditar),
+        ("Falar um texto", falar_texto),
+        ("Ler um arquivo em voz alta (audiolivro)", ler_arquivo),
+        ("Configurar a voz (idioma e velocidade)", configurar_voz),
+        (lambda: f"Instalar o whisper ({pronto()})", instalar),
+        (lambda: f"Baixar/trocar modelo de voz ({c.get('whisper_modelo', 'base')})", baixar_modelo),
+    ], cabecalho=lambda: print(f"{DIM}A transcrição roda no próprio celular (whisper.cpp): nada vai para a "
+                               f"internet.{RST}"))
+
+
+# ── Ler texto de imagens (OCR) ───────────────────────────────────────
+
+def garantir_tesseract(idiomas=("por", "eng")) -> bool:
+    if not garantir_cmd("tesseract"):
+        return False
+    lista = rodar(["tesseract", "--list-langs"], capturar=True, timeout=30, mostrar=False)
+    texto = (lista.stdout or "") + (lista.stderr or "")
+    pasta = re.search(r'"([^"]+)"', texto)
+    instalados = set(texto.split())
+    for idioma in idiomas:
+        if idioma in instalados:
+            continue
+        destino = Path(pasta.group(1) if pasta else f"{PREFIX}/share/tessdata") / f"{idioma}.traineddata"
+        info(f"Baixando o idioma '{idioma}' do OCR...")
+        baixar_arquivo(f"https://github.com/tesseract-ocr/tessdata_fast/raw/main/{idioma}.traineddata", destino)
+    return True
+
+
+def ocr(imagem: Path, idiomas: str = "por+eng") -> str:
+    proc = rodar(["tesseract", str(imagem), "stdout", "-l", idiomas], capturar=True, timeout=300, mostrar=False)
+    if proc.returncode != 0:
+        raise ToonsError(f"O tesseract falhou: {(proc.stderr or '').strip()[-200:]}")
+    return re.sub(r"\n{3,}", "\n\n", proc.stdout or "").strip()
+
+
+def ultimo_print() -> Path | None:
+    s = HOME / "storage" / "shared"
+    pastas = [(p, 1) for p in (s / "Pictures" / "Screenshots", s / "DCIM" / "Screenshots") if p.exists()]
+    prints = listar_arquivos(EXT_IMAGEM, pastas, limite=1) if pastas else []
+    return prints[0] if prints else None
+
+
+@submenu
+def menu_ocr():
+    def ler_de(origem: str):
+        if not garantir_tesseract():
+            return
+        if origem == "foto":
+            arq = foto(DATA_DIR / "tmp" / "ocr.jpg")
+        elif origem == "print":
+            arq = ultimo_print()
+            if not arq:
+                raise ToonsError("Não achei prints (pasta Screenshots).")
+            info(f"Usando o print mais recente: {arq.name}")
+        else:
+            arq = escolher_arquivo("Qual imagem?", EXT_IMAGEM)
+            if not arq:
+                return
+        info("Lendo o texto da imagem...")
+        texto = ocr(arq)
+        if not texto:
+            raise ToonsError("Não achei texto na imagem (tente uma foto mais nítida, reta e bem iluminada).")
+        _depois_do_texto(texto, f"Texto de {arq.name}")
+
+    menu("🔍 Ler texto de imagens (OCR)", [
+        ("Tirar uma foto e ler o texto", lambda: ler_de("foto")),
+        ("Ler de uma imagem do celular", lambda: ler_de("arquivo")),
+        ("Ler do último print de tela", lambda: ler_de("print")),
+    ])
+
+
+@submenu
+def menu_ia():
+    ia = ia_config()
+
+    def configurar():
+        provedores = list(IA_PROVEDORES)
+        i = escolher("Provedor", list(IA_PROVEDORES.values()), provedores.index(ia["provedor"]) + 1)
+        if i is None:
+            return
+        ia["provedor"] = provedor = provedores[i]
+        _chave(provedor)
+        j = escolher("O que mais?", ["Escolher o modelo (lista da API)", "Digitar o nome do modelo",
+                                     "Trocar a chave da API", "Esforço do Claude (quanto pensa)",
+                                     "Instruções do assistente", "Nada"])
+        if j == 0:
+            modelos = ia_listar_modelos(provedor)
+            if modelos:
+                atual = ia["modelos"].get(provedor)
+                k = escolher("Modelo", modelos, modelos.index(atual) + 1 if atual in modelos else None)
+                if k is not None:
+                    ia["modelos"][provedor] = modelos[k]
+        elif j == 1:
+            ia["modelos"][provedor] = perguntar("Nome do modelo", ia["modelos"].get(provedor) or "")
+        elif j == 2:
+            ia["chaves"].pop(provedor, None)
+            _chave(provedor)
+        elif j == 3:
+            k = escolher("Esforço (mais = respostas melhores, mais lentas e mais caras)",
+                         ["low (rápido e barato)", "medium (padrão)", "high", "xhigh", "max"],
+                         IA_ESFORCOS.index(ia.get("esforco", "medium")) + 1)
+            if k is not None:
+                ia["esforco"] = IA_ESFORCOS[k]
+        elif j == 4:
+            ia["sistema"] = editar_texto(ia["sistema"], ".txt") or IA_SISTEMA_PADRAO
+        salvar_cfg()
+        ok(f"{IA_PROVEDORES[provedor]} · {ia['modelos'].get(provedor) or '(sem modelo)'}")
+
+    def pergunta_rapida():
+        texto = perguntar("Pergunta")
+        if texto:
+            print(f"{CIANO}ia>{RST} ", end="")
+            ia_responder([{"role": "user", "texto": texto}])
+
+    def resumir():
+        i = escolher("Resumir o quê?", ["Um arquivo (PDF, texto, livro)", "O que está copiado",
+                                        "Uma página da internet"])
+        if i is None:
+            return
+        if i == 0:
+            arq = escolher_arquivo("Qual arquivo?", (".pdf", ".txt", ".md", ".epub", ".html"))
+            texto = texto_de_arquivo(arq) if arq else ""
+        elif i == 1:
+            texto = _tapi(["termux-clipboard-get"], 10, json_saida=False)
+        else:
+            texto = texto_da_materia(_url_digitada(perguntar("Endereço")))
+        if not texto.strip():
+            raise ToonsError("Nada para resumir.")
+        conversa_ia(f"Resuma o texto abaixo em tópicos curtos e diga os pontos principais.\n\n---\n{texto[:400000]}")
+
+    def sobre_foto():
+        i = escolher("Qual foto?", ["Tirar agora", "Escolher do celular"])
+        if i is None:
+            return
+        arq = foto(DATA_DIR / "tmp" / "ia.jpg") if i == 0 else escolher_arquivo("Qual imagem?", EXT_IMAGEM)
+        if arq:
+            conversa_ia(perguntar("O que você quer saber da foto?", "Descreva esta imagem."), imagem=arq)
+
+    atual = lambda: f"{IA_PROVEDORES[ia['provedor']]} · {ia['modelos'].get(ia['provedor']) or 'sem modelo'}"  # noqa: E731
+    menu("✨ Inteligência artificial", [
+        (lambda: f"💬 Conversar ({atual()})", conversa_ia),
+        ("❓ Pergunta rápida", pergunta_rapida),
+        ("📄 Resumir arquivo, texto copiado ou página", resumir),
+        ("🖼️ Perguntar sobre uma foto", sobre_foto),
+        ("⚙️ Configurar (Claude, ChatGPT ou Gemini; chave e modelo)", configurar),
+        ("🎙️ Voz para texto e texto para voz", menu_voz),
+        ("🔍 Ler texto de imagens (OCR)", menu_ocr),
+        ("🧠 IA local, sem internet (llama.cpp)", menu_llm),
+    ], cabecalho=lambda: print(f"{DIM}Na nuvem é preciso uma chave de API do provedor (paga por uso).{RST}"))
+
+
+# ════════════════════════════════════════════════════════════════════
+#  24. Diversão e aprendizado
+# ════════════════════════════════════════════════════════════════════
+
+LEITURA_FILE = DATA_DIR / "leitura.json"
+APRENDER_FILE = DATA_DIR / "aprender.json"
+
+
+def _recorde_menor(jogo: str, valor: float | None = None) -> float | None:
+    """Recorde em que menor é melhor (tempo)."""
+    recordes = ler_json(RECORDES_FILE, {})
+    atual = recordes.get(jogo)
+    if valor is not None and (atual is None or valor < atual):
+        recordes[jogo] = valor
+        gravar_json(RECORDES_FILE, recordes)
+        return valor
+    return atual
+
+
+def _curses_cores(curses) -> None:
+    with contextlib.suppress(curses.error):
+        curses.start_color()
+        curses.use_default_colors()
+        for n, cor in enumerate((curses.COLOR_RED, curses.COLOR_GREEN, curses.COLOR_YELLOW, curses.COLOR_BLUE,
+                                 curses.COLOR_MAGENTA, curses.COLOR_CYAN, curses.COLOR_WHITE), 1):
+            curses.init_pair(n, cor, -1)
+
+
+def _escrever(tela, y: int, x: int, texto: str, atributo: int = 0) -> None:
+    """addstr que não estoura quando a tela é pequena."""
+    alt, larg = tela.getmaxyx()
+    if 0 <= y < alt and 0 <= x < larg:
+        with contextlib.suppress(Exception):
+            tela.addnstr(y, x, texto, max(0, larg - x - 1), atributo)
+
+
+# ── 2048 ─────────────────────────────────────────────────────────────
+
+def mover_linha_2048(linha: list) -> tuple:
+    """Junta para a esquerda: ([2,2,4,0] → [4,4,0,0], 4 pontos)."""
+    numeros = [n for n in linha if n]
+    resultado, pontos, i = [], 0, 0
+    while i < len(numeros):
+        if i + 1 < len(numeros) and numeros[i] == numeros[i + 1]:
+            resultado.append(numeros[i] * 2)
+            pontos += numeros[i] * 2
+            i += 2
+        else:
+            resultado.append(numeros[i])
+            i += 1
+    return resultado + [0] * (len(linha) - len(resultado)), pontos
+
+
+def mover_2048(grade: list, direcao: str) -> tuple:
+    """(nova grade, pontos) movendo para 'esq', 'dir', 'cima' ou 'baixo'."""
+    linhas = [list(col) for col in zip(*grade)] if direcao in ("cima", "baixo") else [list(l) for l in grade]
+    inverter = direcao in ("dir", "baixo")
+    novas, pontos = [], 0
+    for linha in linhas:
+        movida, p = mover_linha_2048(linha[::-1] if inverter else linha)
+        novas.append(movida[::-1] if inverter else movida)
+        pontos += p
+    if direcao in ("cima", "baixo"):
+        novas = [list(col) for col in zip(*novas)]
+    return novas, pontos
+
+
+def jogo_2048() -> None:
+    import curses
+
+    def nova_peca(grade):
+        vazias = [(i, j) for i in range(4) for j in range(4) if not grade[i][j]]
+        if vazias:
+            i, j = random.choice(vazias)
+            grade[i][j] = 4 if random.random() < 0.1 else 2
+
+    def jogo(tela):
+        curses.curs_set(0)
+        tela.keypad(True)
+        _curses_cores(curses)
+        cores = {2: 7, 4: 7, 8: 3, 16: 3, 32: 1, 64: 1, 128: 2, 256: 2, 512: 6, 1024: 4, 2048: 5}
+        teclas = {curses.KEY_LEFT: "esq", curses.KEY_RIGHT: "dir", curses.KEY_UP: "cima", curses.KEY_DOWN: "baixo",
+                  ord("a"): "esq", ord("d"): "dir", ord("w"): "cima", ord("s"): "baixo"}
+        grade, pontos, venceu = [[0] * 4 for _ in range(4)], 0, False
+        nova_peca(grade)
+        nova_peca(grade)
+        while True:
+            tela.erase()
+            _escrever(tela, 0, 0, f" 2048   pontos: {pontos}   recorde: {_recorde('2048')}", curses.A_BOLD)
+            for i, linha in enumerate(grade):
+                _escrever(tela, 2 + i * 2, 1, "+------" * 4 + "+")
+                for j, n in enumerate(linha):
+                    _escrever(tela, 3 + i * 2, 1 + j * 7, "|")
+                    if n:
+                        _escrever(tela, 3 + i * 2, 2 + j * 7, f"{n:^6}",
+                                  curses.color_pair(cores.get(n, 5)) | curses.A_BOLD)
+                _escrever(tela, 3 + i * 2, 29, "|")
+            _escrever(tela, 10, 1, "+------" * 4 + "+")
+            _escrever(tela, 12, 1, "setas ou WASD movem · r recomeça · q sai")
+            sem_jogadas = all(mover_2048(grade, d)[0] == grade for d in ("esq", "dir", "cima", "baixo"))
+            if sem_jogadas:
+                _escrever(tela, 14, 1, f"FIM DE JOGO! {pontos} pontos. r recomeça, q sai.", curses.A_REVERSE)
+            if not venceu and any(2048 in l for l in grade):
+                venceu = True
+                _escrever(tela, 14, 1, "VOCÊ FEZ 2048! 🎉 Continue jogando!", curses.A_REVERSE)
+            tela.refresh()
+            tecla = tela.getch()
+            if tecla in (ord("q"), 27):
+                return pontos
+            if tecla == ord("r"):
+                _recorde("2048", pontos)
+                grade, pontos, venceu = [[0] * 4 for _ in range(4)], 0, False
+                nova_peca(grade)
+                nova_peca(grade)
+                continue
+            direcao = teclas.get(tecla)
+            if direcao and not sem_jogadas:
+                nova, ganhos = mover_2048(grade, direcao)
+                if nova != grade:
+                    grade, pontos = nova, pontos + ganhos
+                    nova_peca(grade)
+
+    pontos = curses.wrapper(jogo)
+    antigo = _recorde("2048")
+    _recorde("2048", pontos)
+    print(f"Você fez {pontos} pontos." + (" 🏆 Novo recorde!" if pontos > antigo else ""))
+
+
+# ── Campo minado ─────────────────────────────────────────────────────
+
+def vizinhos(i: int, j: int, linhas: int, colunas: int):
+    for di in (-1, 0, 1):
+        for dj in (-1, 0, 1):
+            if (di or dj) and 0 <= i + di < linhas and 0 <= j + dj < colunas:
+                yield i + di, j + dj
+
+
+def campo_minado() -> None:
+    import curses
+    niveis = [("Fácil 9x9, 10 minas", 9, 9, 10), ("Médio 16x16, 40 minas", 16, 16, 40),
+              ("Difícil 16x30, 99 minas (tela larga)", 16, 30, 99)]
+    k = escolher("Nível", [n[0] for n in niveis])
+    if k is None:
+        return
+    nome_nivel, linhas, colunas, total_minas = niveis[k]
+
+    def jogo(tela):
+        curses.curs_set(0)
+        tela.keypad(True)
+        _curses_cores(curses)
+        alt, larg = tela.getmaxyx()
+        if alt < linhas + 5 or larg < colunas * 2 + 2:
+            tela.addstr(0, 0, "Tela pequena para esse nível. Tecla para sair.")
+            tela.getch()
+            return None
+        minas, aberto, bandeira = set(), set(), set()
+        cy = cx = 0
+        inicio, perdeu = None, False
+
+        def numero(i, j):
+            return sum((a, b) in minas for a, b in vizinhos(i, j, linhas, colunas))
+
+        def abrir(i, j):
+            pilha = [(i, j)]
+            while pilha:
+                a, b = pilha.pop()
+                if (a, b) in aberto or (a, b) in bandeira:
+                    continue
+                aberto.add((a, b))
+                if numero(a, b) == 0:
+                    pilha.extend(v for v in vizinhos(a, b, linhas, colunas) if v not in aberto)
+
+        cores_num = {1: 4, 2: 2, 3: 1, 4: 5, 5: 1, 6: 6, 7: 7, 8: 7}
+        while True:
+            venceu = len(aberto) == linhas * colunas - total_minas and minas
+            tempo = int(time.time() - inicio) if inicio else 0
+            tela.erase()
+            _escrever(tela, 0, 0, f" 💣 {total_minas - len(bandeira)}   ⏱ {tempo}s   {nome_nivel.split(',')[0]}",
+                      curses.A_BOLD)
+            for i in range(linhas):
+                for j in range(colunas):
+                    if (i, j) in aberto or ((perdeu or venceu) and (i, j) in minas):
+                        if (i, j) in minas:
+                            ch, attr = "*", curses.color_pair(1) | curses.A_BOLD
+                        else:
+                            n = numero(i, j)
+                            ch, attr = (str(n), curses.color_pair(cores_num[n]) | curses.A_BOLD) if n else (" ", 0)
+                    elif (i, j) in bandeira:
+                        ch, attr = "F", curses.color_pair(3) | curses.A_BOLD
+                    else:
+                        ch, attr = "·", curses.A_DIM
+                    if (i, j) == (cy, cx):
+                        attr |= curses.A_REVERSE
+                    _escrever(tela, 2 + i, 1 + j * 2, ch, attr)
+            ajuda = "setas movem · Enter/Espaço abre · f bandeira · q sai"
+            if perdeu:
+                ajuda = "💥 BOOM! Você perdeu. r recomeça · q sai"
+            elif venceu:
+                ajuda = f"🎉 Você venceu em {tempo}s! r recomeça · q sai"
+            _escrever(tela, linhas + 3, 1, ajuda, curses.A_REVERSE if perdeu or venceu else 0)
+            tela.refresh()
+            tecla = tela.getch()
+            if tecla in (ord("q"), 27):
+                return tempo if venceu else None
+            if tecla == ord("r"):
+                if venceu:
+                    _recorde_menor(f"campo_minado_{k}", tempo)
+                minas, aberto, bandeira, inicio, perdeu = set(), set(), set(), None, False
+                continue
+            if perdeu or venceu:
+                continue
+            if tecla in (curses.KEY_UP, ord("w")):
+                cy = (cy - 1) % linhas
+            elif tecla in (curses.KEY_DOWN, ord("s")):
+                cy = (cy + 1) % linhas
+            elif tecla in (curses.KEY_LEFT, ord("a")):
+                cx = (cx - 1) % colunas
+            elif tecla in (curses.KEY_RIGHT, ord("d")):
+                cx = (cx + 1) % colunas
+            elif tecla == ord("f") and (cy, cx) not in aberto:
+                bandeira ^= {(cy, cx)}
+            elif tecla in (10, 13, curses.KEY_ENTER, ord(" ")) and (cy, cx) not in bandeira:
+                if not minas:  # a primeira jogada nunca cai numa mina
+                    proibidas = {(cy, cx), *vizinhos(cy, cx, linhas, colunas)}
+                    livres = [(i, j) for i in range(linhas) for j in range(colunas) if (i, j) not in proibidas]
+                    minas = set(random.sample(livres, total_minas))
+                    inicio = time.time()
+                if (cy, cx) in minas:
+                    perdeu = True
+                else:
+                    abrir(cy, cx)
+
+    tempo = curses.wrapper(jogo)
+    if tempo is not None:
+        recorde = _recorde_menor(f"campo_minado_{k}")
+        novo = _recorde_menor(f"campo_minado_{k}", tempo) == tempo and (recorde is None or tempo < recorde)
+        print(f"Venceu em {tempo}s." + (" 🏆 Novo recorde!" if novo else ""))
+
+
+# ── Sudoku ───────────────────────────────────────────────────────────
+
+_SUDOKU_VIZINHOS = [
+    sorted({r * 9 + c for c in range(9)} | {k * 9 + (i % 9) for k in range(9)} |
+           {(r // 3 * 3 + a) * 9 + (i % 9) // 3 * 3 + b for a in range(3) for b in range(3)} - {i})
+    for i in range(81) for r in [i // 9]
+]
+
+
+def resolver_sudoku(grade: list, limite: int = 2, aleatorio: bool = False) -> tuple:
+    """(quantidade de soluções até `limite`, primeira solução). `grade`: 81 números, 0 = vazio."""
+    g = list(grade)
+    achadas = {"n": 0, "primeira": None}
+
+    def candidatos(i):
+        usados = {g[v] for v in _SUDOKU_VIZINHOS[i]}
+        return [n for n in range(1, 10) if n not in usados]
+
+    def busca():
+        melhor, opcoes = None, None
+        for i in range(81):
+            if g[i] == 0:
+                cands = candidatos(i)
+                if not cands:
+                    return
+                if melhor is None or len(cands) < len(opcoes):
+                    melhor, opcoes = i, cands
+                    if len(cands) == 1:
+                        break
+        if melhor is None:
+            achadas["n"] += 1
+            if achadas["primeira"] is None:
+                achadas["primeira"] = list(g)
+            return
+        if aleatorio:
+            random.shuffle(opcoes)
+        for n in opcoes:
+            g[melhor] = n
+            busca()
+            g[melhor] = 0
+            if achadas["n"] >= limite:
+                return
+
+    busca()
+    return achadas["n"], achadas["primeira"]
+
+
+def gerar_sudoku(vazias: int = 45) -> tuple:
+    """(enigma com solução única, solução)."""
+    _, solucao = resolver_sudoku([0] * 81, limite=1, aleatorio=True)
+    enigma = list(solucao)
+    posicoes = list(range(81))
+    random.shuffle(posicoes)
+    tiradas = 0
+    for p in posicoes:
+        if tiradas >= vazias:
+            break
+        guardado, enigma[p] = enigma[p], 0
+        if resolver_sudoku(enigma, limite=2)[0] != 1:
+            enigma[p] = guardado
+        else:
+            tiradas += 1
+    return enigma, solucao
+
+
+def sudoku() -> None:
+    import curses
+    niveis = [("Fácil", 36), ("Médio", 46), ("Difícil", 54)]
+    k = escolher("Nível", [n for n, _ in niveis])
+    if k is None:
+        return
+    info("Gerando um sudoku com solução única...")
+    enigma, solucao = gerar_sudoku(niveis[k][1])
+
+    def jogo(tela):
+        curses.curs_set(0)
+        tela.keypad(True)
+        _curses_cores(curses)
+        g = list(enigma)
+        cursor, verificar, inicio, dicas = 0, False, time.time(), 0
+        while True:
+            tela.erase()
+            completo = g == solucao
+            _escrever(tela, 0, 0, f" SUDOKU {niveis[k][0]}   ⏱ {int(time.time() - inicio)}s   dicas: {dicas}",
+                      curses.A_BOLD)
+            for linha in range(9):
+                y = 2 + linha + linha // 3
+                if linha % 3 == 0:
+                    _escrever(tela, y - 1 if linha else 1, 0, "+-------+-------+-------+")
+                texto_x = 0
+                for col in range(9):
+                    if col % 3 == 0:
+                        _escrever(tela, y, texto_x, "|")
+                        texto_x += 2
+                    i = linha * 9 + col
+                    n = g[i]
+                    attr = curses.A_BOLD if enigma[i] else curses.color_pair(6)
+                    if n and verificar and not enigma[i] and n != solucao[i]:
+                        attr = curses.color_pair(1) | curses.A_BOLD
+                    if i == cursor:
+                        attr |= curses.A_REVERSE
+                    _escrever(tela, y, texto_x, str(n) if n else ".", attr)
+                    texto_x += 2
+                _escrever(tela, y, texto_x, "|")
+            _escrever(tela, 13, 0, "+-------+-------+-------+")
+            ajuda = "🎉 RESOLVIDO! q sai" if completo else \
+                "setas movem · 1-9 escreve · 0/Del apaga · v confere · d dica · q sai"
+            _escrever(tela, 15, 0, ajuda, curses.A_REVERSE if completo else 0)
+            tela.refresh()
+            tecla = tela.getch()
+            if tecla in (ord("q"), 27):
+                return int(time.time() - inicio) if completo else None
+            if completo:
+                continue
+            linha, col = divmod(cursor, 9)
+            if tecla in (curses.KEY_UP, ord("w")):
+                cursor = ((linha - 1) % 9) * 9 + col
+            elif tecla in (curses.KEY_DOWN, ord("s")):
+                cursor = ((linha + 1) % 9) * 9 + col
+            elif tecla in (curses.KEY_LEFT, ord("a")):
+                cursor = linha * 9 + (col - 1) % 9
+            elif tecla in (curses.KEY_RIGHT,):
+                cursor = linha * 9 + (col + 1) % 9
+            elif ord("1") <= tecla <= ord("9") and not enigma[cursor]:
+                g[cursor] = tecla - ord("0")
+            elif tecla in (ord("0"), ord("."), curses.KEY_BACKSPACE, curses.KEY_DC, 127, 8) and not enigma[cursor]:
+                g[cursor] = 0
+            elif tecla == ord("v"):
+                verificar = not verificar
+            elif tecla == ord("d") and not enigma[cursor]:
+                g[cursor] = solucao[cursor]
+                dicas += 1
+
+    tempo = curses.wrapper(jogo)
+    if tempo is not None:
+        recorde = _recorde_menor(f"sudoku_{k}")
+        _recorde_menor(f"sudoku_{k}", tempo)
+        print(f"Resolvido em {fmt_relogio(tempo)}." + (" 🏆 Novo recorde!" if recorde is None or tempo < recorde else ""))
+
+
+# ── Forca ────────────────────────────────────────────────────────────
+
+PALAVRAS_POR_TEMA = {
+    "Frutas": ["abacaxi", "banana", "laranja", "morango", "melancia", "goiaba", "maracujá", "jabuticaba", "abacate",
+               "mamão", "manga", "pitanga", "framboesa", "tangerina", "carambola", "acerola", "cupuaçu", "açaí"],
+    "Animais": ["elefante", "girafa", "tartaruga", "jacaré", "capivara", "tamanduá", "onça", "papagaio", "golfinho",
+                "borboleta", "cachorro", "coruja", "pinguim", "camaleão", "tucano", "macaco", "jabuti", "lobo"],
+    "Países": ["brasil", "argentina", "portugal", "japão", "alemanha", "canadá", "austrália", "méxico", "egito",
+               "noruega", "chile", "colômbia", "itália", "frança", "marrocos", "tailândia", "uruguai", "peru"],
+    "Objetos": ["guarda-chuva", "travesseiro", "computador", "geladeira", "bicicleta", "telescópio", "tesoura",
+                "cadeira", "liquidificador", "ventilador", "relógio", "mochila", "caderno", "lanterna", "espelho"],
+    "Profissões": ["professor", "engenheira", "médico", "programador", "bombeiro", "cozinheira", "jardineiro",
+                   "astronauta", "advogada", "veterinário", "motorista", "eletricista", "enfermeira", "arquiteto"],
+    "Comidas": ["feijoada", "brigadeiro", "coxinha", "pastel", "tapioca", "moqueca", "pamonha", "acarajé",
+                "churrasco", "lasanha", "panqueca", "quindim", "pipoca", "macarrão", "farofa", "cuscuz"],
+}
+PALAVRAS_FORCA = [p for lista in PALAVRAS_POR_TEMA.values() for p in lista]
+DESENHO_FORCA = [
+    ["  +---+", "  |   |", "      |", "      |", "      |", "=======",],
+    ["  +---+", "  |   |", "  O   |", "      |", "      |", "=======",],
+    ["  +---+", "  |   |", "  O   |", "  |   |", "      |", "=======",],
+    ["  +---+", "  |   |", "  O   |", " /|   |", "      |", "=======",],
+    ["  +---+", "  |   |", "  O   |", " /|\\  |", "      |", "=======",],
+    ["  +---+", "  |   |", "  O   |", " /|\\  |", " /    |", "=======",],
+    ["  +---+", "  |   |", "  O   |", " /|\\  |", " / \\  |", "=======",],
+]
+
+
+def forca() -> None:
+    temas = list(PALAVRAS_POR_TEMA)
+    i = escolher("Tema", ["Sorteado"] + temas)
+    if i is None:
+        return
+    tema = random.choice(temas) if i == 0 else temas[i - 1]
+    palavra = random.choice(PALAVRAS_POR_TEMA[tema])
+    base = sem_acento(palavra).lower()
+    certas, erradas = set(), []
+    while True:
+        limpar()
+        titulo(f"🪢 Forca · tema: {tema}")
+        for linha in DESENHO_FORCA[len(erradas)]:
+            print("   " + linha)
+        mostrada = " ".join(ch if not ch.isalpha() or sem_acento(ch).lower() in certas else "_" for ch in palavra)
+        print(f"\n   {NEG}{mostrada.upper()}{RST}\n")
+        print(f"   Erros: {VERM}{' '.join(erradas).upper() or '-'}{RST}   ({6 - len(erradas)} chance(s))")
+        if all(not ch.isalpha() or ch in certas for ch in base):
+            ok(f"Você acertou: {palavra.upper()}! 🎉")
+            _recorde("forca_vitorias", _recorde("forca_vitorias") + 1)
+            return
+        if len(erradas) >= 6:
+            erro(f"Enforcado! A palavra era {palavra.upper()}.")
+            return
+        print(f"\n   {DIM}Digite uma letra (ou a palavra inteira). Esc sai.{RST}")
+        if setas_ativas():
+            tecla = ler_tecla()
+            if tecla == "esc":
+                return
+            letra = sem_acento(tecla).lower()
+        else:
+            letra = sem_acento(perguntar("Letra")).lower()
+        if len(letra) > 1:
+            if letra == base:
+                certas.update(base)
+            else:
+                erradas.append(letra[:10])
+            continue
+        if not letra.isalpha() or letra in certas or letra in erradas:
+            continue
+        if letra in base:
+            certas.add(letra)
+        else:
+            erradas.append(letra)
+
+
+# ── Jogo da velha ────────────────────────────────────────────────────
+
+_LINHAS_VELHA = [(0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6), (1, 4, 7), (2, 5, 8), (0, 4, 8), (2, 4, 6)]
+
+
+def vencedor_velha(tab: list):
+    for a, b, c in _LINHAS_VELHA:
+        if tab[a] and tab[a] == tab[b] == tab[c]:
+            return tab[a]
+    return "empate" if all(tab) else None
+
+
+def melhor_jogada_velha(tab: list, eu: str = "O") -> int:
+    """Minimax: a jogada que nunca perde."""
+    outro = "X" if eu == "O" else "O"
+
+    def valor(t, vez, prof):
+        v = vencedor_velha(t)
+        if v == eu:
+            return 10 - prof
+        if v == outro:
+            return prof - 10
+        if v == "empate":
+            return 0
+        notas = []
+        for i in range(9):
+            if not t[i]:
+                t[i] = vez
+                notas.append(valor(t, outro if vez == eu else eu, prof + 1))
+                t[i] = ""
+        return max(notas) if vez == eu else min(notas)
+
+    opcoes = []
+    for i in range(9):
+        if not tab[i]:
+            tab[i] = eu
+            opcoes.append((valor(tab, outro, 1), i))
+            tab[i] = ""
+    melhor = max(n for n, _ in opcoes)
+    return random.choice([i for n, i in opcoes if n == melhor])
+
+
+def jogo_da_velha() -> None:
+    niveis = ["Fácil", "Médio", "Impossível"]
+    nivel = escolher("Dificuldade", niveis, 2)
+    if nivel is None:
+        return
+    placar = {"você": 0, "celular": 0, "empate": 0}
+    with TelaCheia():
+        while True:
+            tab, cursor, vez = [""] * 9, 4, "X" if sum(placar.values()) % 2 == 0 else "O"
+            while not vencedor_velha(tab):
+                if vez == "O":
+                    livres = [i for i in range(9) if not tab[i]]
+                    usar_ia = nivel == 2 or (nivel == 1 and random.random() < 0.6)
+                    tab[melhor_jogada_velha(tab) if usar_ia else random.choice(livres)] = "O"
+                    vez = "X"
+                    continue
+                linhas = ["", f"  {NEG}⭕ Jogo da velha · {niveis[nivel]}{RST}", "",
+                          f"  Você {NEG}X{RST} {placar['você']} · celular {NEG}O{RST} {placar['celular']} · "
+                          f"empates {placar['empate']}", ""]
+                for linha in range(3):
+                    celulas = []
+                    for col in range(3):
+                        i = linha * 3 + col
+                        simbolo = tab[i] or " "
+                        cor = AZUL if simbolo == "X" else VERM if simbolo == "O" else ""
+                        txt = f" {cor}{NEG}{simbolo}{RST} "
+                        celulas.append(f"{INV}{txt}{RST}" if i == cursor else txt)
+                    linhas.append("    " + "│".join(celulas))
+                    if linha < 2:
+                        linhas.append("    ───┼───┼───")
+                linhas += ["", f"  {DIM}setas escolhem · Enter joga · Esc sai{RST}"]
+                desenhar(linhas)
+                tecla = ler_tecla()
+                if tecla in ("esc", "q"):
+                    return
+                movimentos = {"esq": -1, "dir": 1, "cima": -3, "baixo": 3}
+                if tecla in movimentos:
+                    cursor = (cursor + movimentos[tecla]) % 9
+                elif tecla.isdigit() and tecla != "0":
+                    cursor = int(tecla) - 1
+                    tecla = "enter"
+                if tecla in ("enter", " ") and not tab[cursor]:
+                    tab[cursor] = "X"
+                    vez = "O"
+            v = vencedor_velha(tab)
+            placar["você" if v == "X" else "celular" if v == "O" else "empate"] += 1
+            linhas = [""] + ["    " + " │ ".join(t or " " for t in tab[r * 3:r * 3 + 3]) for r in range(3)]
+            resultado = "🎉 Você venceu!" if v == "X" else "😈 O celular venceu!" if v == "O" else "🤝 Empate!"
+            desenhar(linhas + ["", f"  {NEG}{resultado}{RST}", "",
+                               f"  {DIM}Enter joga de novo · Esc sai{RST}"])
+            if ler_tecla() in ("esc", "q"):
+                return
+
+
+# ── Tetris ───────────────────────────────────────────────────────────
+
+PECAS_TETRIS = {
+    "I": [(0, 0), (0, 1), (0, 2), (0, 3)], "O": [(0, 0), (0, 1), (1, 0), (1, 1)],
+    "T": [(0, 0), (0, 1), (0, 2), (1, 1)], "S": [(0, 1), (0, 2), (1, 0), (1, 1)],
+    "Z": [(0, 0), (0, 1), (1, 1), (1, 2)], "J": [(0, 0), (1, 0), (1, 1), (1, 2)],
+    "L": [(0, 2), (1, 0), (1, 1), (1, 2)],
+}
+CORES_TETRIS = {"I": 6, "O": 3, "T": 5, "S": 2, "Z": 1, "J": 4, "L": 7}
+
+
+def girar_peca(blocos: list) -> list:
+    """Gira 90° no sentido horário e encosta no canto (0, 0)."""
+    girados = [(c, -l) for l, c in blocos]
+    min_l, min_c = min(l for l, _ in girados), min(c for _, c in girados)
+    return [(l - min_l, c - min_c) for l, c in girados]
+
+
+def tetris() -> None:
+    import curses
+    linhas_t, colunas_t = 20, 10
+
+    def jogo(tela):
+        curses.curs_set(0)
+        tela.keypad(True)
+        tela.nodelay(True)
+        _curses_cores(curses)
+        alt, larg = tela.getmaxyx()
+        if alt < linhas_t + 2 or larg < colunas_t * 2 + 14:
+            tela.nodelay(False)
+            tela.addstr(0, 0, "Tela pequena (esconda o teclado ou gire o celular). Tecla para sair.")
+            tela.getch()
+            return 0
+        campo = [[None] * colunas_t for _ in range(linhas_t)]
+        saco = []
+
+        def sortear():
+            if not saco:
+                saco.extend(random.sample(list(PECAS_TETRIS), len(PECAS_TETRIS)))
+            return saco.pop()
+
+        def cabe(blocos, y, x):
+            return all(0 <= x + c < colunas_t and y + l < linhas_t and (y + l < 0 or campo[y + l][x + c] is None)
+                       for l, c in blocos)
+
+        tipo, proximo = sortear(), sortear()
+        blocos, y, x = PECAS_TETRIS[tipo], 0, 3
+        pontos, linhas_feitas, nivel, pausado = 0, 0, 1, False
+        ultima_queda = time.time()
+        while True:
+            intervalo = max(0.08, 0.8 - (nivel - 1) * 0.07)
+            tecla = tela.getch()
+            if tecla in (ord("q"), 27):
+                return pontos
+            if tecla == ord("p"):
+                pausado = not pausado
+            if not pausado:
+                if tecla in (curses.KEY_LEFT, ord("a")) and cabe(blocos, y, x - 1):
+                    x -= 1
+                elif tecla in (curses.KEY_RIGHT, ord("d")) and cabe(blocos, y, x + 1):
+                    x += 1
+                elif tecla in (curses.KEY_UP, ord("w")):
+                    girada = girar_peca(blocos)
+                    for desvio in (0, -1, 1, -2, 2):
+                        if cabe(girada, y, x + desvio):
+                            blocos, x = girada, x + desvio
+                            break
+                elif tecla in (curses.KEY_DOWN, ord("s")) and cabe(blocos, y + 1, x):
+                    y += 1
+                    pontos += 1
+                elif tecla == ord(" "):
+                    while cabe(blocos, y + 1, x):
+                        y += 1
+                        pontos += 2
+                    ultima_queda = 0
+                if time.time() - ultima_queda >= intervalo:
+                    ultima_queda = time.time()
+                    if cabe(blocos, y + 1, x):
+                        y += 1
+                    else:
+                        for l, c in blocos:
+                            if y + l < 0:
+                                return pontos
+                            campo[y + l][x + c] = tipo
+                        cheias = [i for i, linha in enumerate(campo) if all(linha)]
+                        for i in cheias:
+                            del campo[i]
+                            campo.insert(0, [None] * colunas_t)
+                        linhas_feitas += len(cheias)
+                        pontos += (0, 100, 300, 500, 800)[len(cheias)] * nivel
+                        nivel = 1 + linhas_feitas // 10
+                        tipo, proximo = proximo, sortear()
+                        blocos, y, x = PECAS_TETRIS[tipo], 0, 3
+                        if not cabe(blocos, y, x):
+                            return pontos
+            tela.erase()
+            for i in range(linhas_t):
+                _escrever(tela, i, 0, "│")
+                _escrever(tela, i, colunas_t * 2 + 1, "│")
+                for j in range(colunas_t):
+                    if campo[i][j]:
+                        _escrever(tela, i, 1 + j * 2, "██", curses.color_pair(CORES_TETRIS[campo[i][j]]))
+            _escrever(tela, linhas_t, 0, "└" + "──" * colunas_t + "┘")
+            for l, c in blocos:
+                if y + l >= 0:
+                    _escrever(tela, y + l, 1 + (x + c) * 2, "██", curses.color_pair(CORES_TETRIS[tipo]) | curses.A_BOLD)
+            px = colunas_t * 2 + 4
+            _escrever(tela, 0, px, "TETRIS", curses.A_BOLD)
+            _escrever(tela, 2, px, f"pontos {pontos}")
+            _escrever(tela, 3, px, f"linhas {linhas_feitas}")
+            _escrever(tela, 4, px, f"nível  {nivel}")
+            _escrever(tela, 5, px, f"recorde {_recorde('tetris')}")
+            _escrever(tela, 7, px, "próxima:")
+            for l, c in PECAS_TETRIS[proximo]:
+                _escrever(tela, 8 + l, px + c * 2, "██", curses.color_pair(CORES_TETRIS[proximo]))
+            for k, ajuda in enumerate(("←→ move", "↑ gira", "↓ desce", "Espaço cai", "p pausa", "q sai")):
+                _escrever(tela, 11 + k, px, ajuda, curses.A_DIM)
+            if pausado:
+                _escrever(tela, linhas_t // 2, 4, " PAUSADO ", curses.A_REVERSE)
+            tela.refresh()
+            time.sleep(0.02)
+
+    pontos = curses.wrapper(jogo)
+    antigo = _recorde("tetris")
+    _recorde("tetris", pontos)
+    print(f"Fim de jogo: {pontos} pontos." + (" 🏆 Novo recorde!" if pontos > antigo else ""))
+
+
+# ── Quiz ─────────────────────────────────────────────────────────────
+
+PERGUNTAS_QUIZ = [
+    ("Qual é a capital do Brasil?", ["Rio de Janeiro", "São Paulo", "Brasília", "Salvador"], 2),
+    ("Qual é o maior planeta do Sistema Solar?", ["Saturno", "Júpiter", "Netuno", "Terra"], 1),
+    ("Quantos estados tem o Brasil, sem contar o Distrito Federal?", ["24", "25", "26", "27"], 2),
+    ("Em que ano o Brasil declarou a independência?", ["1500", "1822", "1889", "1888"], 1),
+    ("Quem pintou a Mona Lisa?", ["Michelangelo", "Leonardo da Vinci", "Rafael", "Van Gogh"], 1),
+    ("Qual é a fórmula química da água?", ["CO2", "O2", "H2O", "NaCl"], 2),
+    ("Qual é o maior oceano do mundo?", ["Atlântico", "Índico", "Ártico", "Pacífico"], 3),
+    ("Quantas Copas do Mundo a seleção brasileira masculina venceu?", ["3", "4", "5", "6"], 2),
+    ("Quem escreveu 'Dom Casmurro'?", ["José de Alencar", "Machado de Assis", "Clarice Lispector",
+                                       "Jorge Amado"], 1),
+    ("Qual é o planeta mais próximo do Sol?", ["Vênus", "Marte", "Mercúrio", "Terra"], 2),
+    ("Quantos ossos tem o corpo humano adulto?", ["186", "206", "226", "306"], 1),
+    ("Em que ano o ser humano pisou na Lua pela primeira vez?", ["1959", "1965", "1969", "1975"], 2),
+    ("Qual é a moeda do Japão?", ["Yuan", "Won", "Iene", "Rupia"], 2),
+    ("Qual é o maior país do mundo em área?", ["China", "Canadá", "Estados Unidos", "Rússia"], 3),
+    ("Que gás as plantas absorvem na fotossíntese?", ["Oxigênio", "Gás carbônico", "Nitrogênio", "Hélio"], 1),
+    ("Qual é o maior rio totalmente brasileiro?", ["Amazonas", "São Francisco", "Paraná", "Tocantins"], 1),
+    ("Quem descobriu a penicilina?", ["Louis Pasteur", "Alexander Fleming", "Marie Curie", "Oswaldo Cruz"], 1),
+    ("Quantos lados tem um hexágono?", ["5", "6", "7", "8"], 1),
+    ("Qual é o menor estado do Brasil em área?", ["Alagoas", "Sergipe", "Espírito Santo", "Rio de Janeiro"], 1),
+    ("Qual é o maior estado do Brasil em área?", ["Pará", "Mato Grosso", "Amazonas", "Minas Gerais"], 2),
+    ("Quem escreveu 'Os Lusíadas'?", ["Fernando Pessoa", "Luís de Camões", "Eça de Queirós",
+                                      "Machado de Assis"], 1),
+    ("Qual é o símbolo químico do ferro?", ["F", "Fr", "Fe", "Ir"], 2),
+    ("Em que continente fica o Egito?", ["Ásia", "África", "Europa", "Oceania"], 1),
+    ("Qual é a capital da Argentina?", ["Montevidéu", "Santiago", "Buenos Aires", "Lima"], 2),
+    ("Qual é a capital da Austrália?", ["Sydney", "Melbourne", "Camberra", "Perth"], 2),
+    ("Quanto dura o tempo regulamentar de uma partida de futebol?", ["60 min", "80 min", "90 min", "100 min"], 2),
+    ("O que significa a sigla CPU?", ["Central de Programas Úteis", "Unidade Central de Processamento",
+                                      "Computador Pessoal Universal", "Controle de Placa Única"], 1),
+    ("Quem criou o Linux?", ["Bill Gates", "Linus Torvalds", "Steve Jobs", "Richard Stallman"], 1),
+    ("Em que ano foi lançado o primeiro iPhone?", ["2005", "2007", "2009", "2010"], 1),
+    ("Qual é o maior mamífero do mundo?", ["Elefante-africano", "Baleia-azul", "Girafa", "Tubarão-baleia"], 1),
+    ("Que aparelho mede terremotos?", ["Barômetro", "Termômetro", "Sismógrafo", "Anemômetro"], 2),
+    ("Quantos jogadores de cada time ficam em quadra no vôlei?", ["5", "6", "7", "11"], 1),
+    ("Quem foi a primeira mulher eleita presidente do Brasil?", ["Marina Silva", "Dilma Rousseff",
+                                                                 "Zélia Cardoso", "Benedita da Silva"], 1),
+    ("Em que ano foi assinada a Lei Áurea, que aboliu a escravidão no Brasil?", ["1822", "1871", "1888", "1889"], 2),
+    ("Em que ano foi proclamada a República no Brasil?", ["1822", "1888", "1889", "1930"], 2),
+    ("Quem compôs 'As Quatro Estações'?", ["Mozart", "Beethoven", "Vivaldi", "Bach"], 2),
+    ("Qual é o ponto mais alto do Brasil?", ["Pico da Bandeira", "Pico da Neblina", "Monte Roraima",
+                                             "Pico das Agulhas Negras"], 1),
+    ("Qual é a capital de Minas Gerais?", ["Uberlândia", "Juiz de Fora", "Belo Horizonte", "Ouro Preto"], 2),
+    ("Qual é a capital do Canadá?", ["Toronto", "Vancouver", "Montreal", "Ottawa"], 3),
+    ("Quantos bits tem um byte?", ["4", "8", "16", "32"], 1),
+    ("Qual é o símbolo químico do ouro?", ["Ag", "Au", "Or", "Go"], 1),
+    ("Qual país tem o formato parecido com uma bota?", ["Grécia", "Portugal", "Itália", "Chile"], 2),
+    ("Quantos dias tem um ano bissexto?", ["364", "365", "366", "367"], 2),
+    ("Em que estado nasceu o Pelé?", ["São Paulo", "Rio de Janeiro", "Minas Gerais", "Bahia"], 2),
+    ("Qual órgão bombeia o sangue pelo corpo?", ["Pulmão", "Fígado", "Coração", "Rim"], 2),
+    ("Qual é a unidade de medida da corrente elétrica?", ["Volt", "Watt", "Ohm", "Ampere"], 3),
+    ("Qual é a raiz quadrada de 144?", ["11", "12", "13", "14"], 1),
+    ("Qual é a montanha mais alta do mundo?", ["K2", "Aconcágua", "Everest", "Kilimanjaro"], 2),
+    ("Em que cidade fica o Cristo Redentor?", ["São Paulo", "Rio de Janeiro", "Salvador", "Belo Horizonte"], 1),
+    ("Qual bioma predomina no sertão nordestino?", ["Cerrado", "Pampa", "Caatinga", "Pantanal"], 2),
+    ("Que vitamina o corpo produz com a luz do sol?", ["Vitamina A", "Vitamina C", "Vitamina D", "Vitamina K"], 2),
+    ("Qual linguagem de programação tem o nome de uma cobra?", ["Java", "Python", "Ruby", "Rust"], 1),
+]
+
+
+def quiz() -> None:
+    perguntas = random.sample(PERGUNTAS_QUIZ, 10)
+    acertos = 0
+    for n, (pergunta, opcoes, certa) in enumerate(perguntas, 1):
+        limpar()
+        titulo(f"🧠 Quiz · pergunta {n} de 10 · acertos: {acertos}")
+        print(f"\n  {NEG}{pergunta}{RST}\n")
+        ordem = random.sample(range(4), 4)
+        i = escolher("Sua resposta", [opcoes[k] for k in ordem])
+        if i is None:
+            return
+        if ordem[i] == certa:
+            acertos += 1
+            ok("Certa! ✅")
+        else:
+            erro(f"Errou. A resposta é: {opcoes[certa]}")
+        time.sleep(1.2)
+    antigo = _recorde("quiz")
+    _recorde("quiz", acertos)
+    limpar()
+    titulo("🧠 Resultado")
+    print(f"\n  Você acertou {NEG}{acertos} de 10{RST}." + (" 🏆 Novo recorde!" if acertos > antigo else ""))
+
+
+@submenu
+def menu_jogos():
+    menu("🎮 Jogos", [
+        ("2048 (setas)", jogo_2048),
+        ("Campo minado", campo_minado),
+        ("Sudoku (gera um novo a cada partida)", sudoku),
+        ("Forca", forca),
+        ("Jogo da velha contra o celular", jogo_da_velha),
+        ("Tetris", tetris),
+        ("Quiz de conhecimentos gerais", quiz),
+        ("Snake e jogos retrô", menu_retro),
+        ("Ver recordes", lambda: mostrar_dados(ler_json(RECORDES_FILE, {}) or {"recordes": "nenhum ainda"})),
+    ])
+
+
+# ── Aprender programação ─────────────────────────────────────────────
+
+# (id, título, explicação, enunciado, saída esperada, dica, solução)
+LICOES = {
+    "Python": [
+        ("py1", "Olá, mundo", "O print() mostra um texto na tela. O texto fica entre aspas:\n\n  print(\"Oi!\")",
+         "Mostre na tela: Olá, Termux!", "Olá, Termux!", "Use print(\"...\")", 'print("Olá, Termux!")'),
+        ("py2", "Variáveis e contas", "Variáveis guardam valores. As contas usam + - * / e ** (potência):\n\n"
+         "  preco = 10\n  quantidade = 3\n  print(preco * quantidade)",
+         "Crie a = 7 e b = 5 e mostre a multiplicação dos dois.", "35", "a * b", "a = 7\nb = 5\nprint(a * b)"),
+        ("py3", "Textos e f-strings", "Um f-string junta texto e variáveis: coloque f antes das aspas e a variável "
+         "entre chaves:\n\n  nome = \"Bia\"\n  print(f\"Oi, {nome}!\")",
+         "Com nome = \"Ana\", mostre: Oi, Ana!", "Oi, Ana!", "print(f\"Oi, {nome}!\")",
+         'nome = "Ana"\nprint(f"Oi, {nome}!")'),
+        ("py4", "Decisões com if", "O if roda um bloco só se a condição for verdadeira. O bloco é indentado "
+         "(4 espaços):\n\n  nota = 8\n  if nota >= 7:\n      print(\"aprovado\")\n  else:\n      print(\"recuperação\")",
+         "Com idade = 20, mostre \"maior\" se idade >= 18, senão \"menor\".", "maior",
+         "if idade >= 18: ... else: ...",
+         'idade = 20\nif idade >= 18:\n    print("maior")\nelse:\n    print("menor")'),
+        ("py5", "Listas", "Uma lista guarda vários valores entre colchetes. len() diz quantos são:\n\n"
+         "  cores = [\"azul\", \"verde\"]\n  print(len(cores))",
+         "Crie frutas = [\"maçã\", \"banana\", \"uva\"] e mostre quantos itens ela tem.", "3", "print(len(frutas))",
+         'frutas = ["maçã", "banana", "uva"]\nprint(len(frutas))'),
+        ("py6", "Repetição com for", "O for repete para cada item. range(1, 4) gera 1, 2 e 3:\n\n"
+         "  for n in range(1, 4):\n      print(n)",
+         "Mostre os números de 1 a 5, um por linha.", "1\n2\n3\n4\n5", "range(1, 6)",
+         "for n in range(1, 6):\n    print(n)"),
+        ("py7", "Funções", "Funções guardam um pedaço de código com nome. return devolve o resultado:\n\n"
+         "  def dobro(x):\n      return x * 2\n  print(dobro(4))",
+         "Crie a função quadrado(x) e mostre quadrado(9).", "81", "return x * x",
+         "def quadrado(x):\n    return x * x\nprint(quadrado(9))"),
+        ("py8", "Dicionários", "Dicionários guardam pares chave: valor:\n\n"
+         "  idades = {\"Ana\": 30, \"Rui\": 25}\n  print(idades[\"Rui\"])",
+         "Crie precos = {\"pão\": 1.5, \"leite\": 4.0} e mostre o preço do leite.", "4.0", 'precos["leite"]',
+         'precos = {"pão": 1.5, "leite": 4.0}\nprint(precos["leite"])'),
+        ("py9", "Repetição com while", "O while repete enquanto a condição for verdadeira:\n\n"
+         "  n = 3\n  while n > 0:\n      print(n)\n      n = n - 1",
+         "Some os números de 1 a 100 com while e mostre o total.", "5050",
+         "total = 0, n = 1; enquanto n <= 100: total += n; n += 1",
+         "total = 0\nn = 1\nwhile n <= 100:\n    total += n\n    n += 1\nprint(total)"),
+    ],
+    "Bash": [
+        ("sh1", "echo", "No terminal, echo mostra um texto:\n\n  echo \"Bom dia\"",
+         "Mostre: Olá do Bash", "Olá do Bash", "echo \"...\"", 'echo "Olá do Bash"'),
+        ("sh2", "Variáveis", "Crie com nome=valor (sem espaços!) e use com $nome:\n\n  cidade=\"Recife\"\n"
+         "  echo \"Moro em $cidade\"", "Com nome=\"Termux\", mostre: Oi, Termux", "Oi, Termux",
+         "echo \"Oi, $nome\"", 'nome="Termux"\necho "Oi, $nome"'),
+        ("sh3", "Contas", "Contas inteiras ficam dentro de $(( )):\n\n  echo $(( 10 + 5 ))",
+         "Mostre o resultado de 6 vezes 7.", "42", "echo $(( 6 * 7 ))", "echo $(( 6 * 7 ))"),
+        ("sh4", "Repetição com for", "O for percorre uma lista de palavras:\n\n  for fruta in maçã uva; do\n"
+         "    echo $fruta\n  done", "Mostre 1, 2 e 3, um por linha, usando for.", "1\n2\n3",
+         "for i in 1 2 3; do echo $i; done", "for i in 1 2 3; do\n  echo $i\ndone"),
+        ("sh5", "Decisões com if", "Comparações de números: -gt (maior), -lt (menor), -eq (igual):\n\n"
+         "  n=3\n  if [ $n -lt 5 ]; then\n    echo pequeno\n  fi",
+         "Com num=10, mostre \"grande\" se num for maior que 5.", "grande", "[ $num -gt 5 ]",
+         "num=10\nif [ $num -gt 5 ]; then\n  echo grande\nfi"),
+        ("sh6", "Pipes", "O | manda a saída de um comando para outro. sort ordena linhas:\n\n"
+         "  printf \"b\\na\\n\" | sort", "Ordene banana, abacaxi e cereja (uma por linha) com sort.",
+         "abacaxi\nbanana\ncereja", "printf \"banana\\nabacaxi\\ncereja\\n\" | sort",
+         'printf "banana\\nabacaxi\\ncereja\\n" | sort'),
+        ("sh7", "Funções", "Funções no bash recebem argumentos em $1, $2...:\n\n  saudar() {\n"
+         "    echo \"Olá, $1\"\n  }\n  saudar Rita", "Crie a função ola e chame com: ola Mundo",
+         "Olá, Mundo", "ola() { echo \"Olá, $1\"; }", 'ola() {\n  echo "Olá, $1"\n}\nola Mundo'),
+    ],
+    "Git": [
+        ("git1", "O que é o Git", "O Git guarda o histórico das mudanças nos seus arquivos: dá para voltar "
+         "versões e trabalhar em equipe.", "Para que serve o Git?",
+         ["Controlar as versões dos arquivos", "Compilar programas", "Editar imagens", "Navegar na internet"], 0, ""),
+        ("git2", "Começar um repositório", "Numa pasta nova, git init cria o repositório.",
+         "Qual comando começa um repositório na pasta atual?",
+         ["git start", "git init", "git new", "git create"], 1, ""),
+        ("git3", "Ver o que mudou", "git status mostra os arquivos novos, alterados e os preparados para o commit.",
+         "Qual comando mostra o que mudou?", ["git log", "git diff --all", "git status", "git show"], 2, ""),
+        ("git4", "Preparar as mudanças", "git add escolhe o que vai no próximo commit. git add . pega tudo.",
+         "Como preparar todos os arquivos para o commit?", ["git add .", "git commit", "git push", "git save"], 0,
+         ""),
+        ("git5", "Gravar um commit", "O commit é uma 'foto' das mudanças preparadas, com uma mensagem.",
+         "Qual comando grava as mudanças com uma mensagem?",
+         ["git save \"msg\"", "git commit -m \"msg\"", "git push -m \"msg\"", "git add -m \"msg\""], 1, ""),
+        ("git6", "Enviar para o GitHub", "git push manda os seus commits para o repositório remoto.",
+         "Qual comando envia os commits para o GitHub?", ["git pull", "git fetch", "git push", "git send"], 2, ""),
+        ("git7", "Trazer as novidades", "git pull baixa os commits novos do remoto e junta com os seus.",
+         "Qual comando baixa e junta as novidades do remoto?", ["git pull", "git push", "git clone", "git init"], 0,
+         ""),
+        ("git8", "Branches", "Um branch é uma linha de trabalho separada. git switch -c nome cria e muda para ele.",
+         "Como criar um branch 'teste' e ir para ele?",
+         ["git branch teste --go", "git switch -c teste", "git new teste", "git commit -b teste"], 1, ""),
+    ],
+}
+
+
+def _normalizar_saida(texto: str) -> str:
+    return "\n".join(linha.rstrip() for linha in texto.strip().splitlines())
+
+
+def executar_exercicio(curso: str, codigo: str) -> tuple:
+    """(saída, erro) rodando o código do aluno num processo separado com tempo limite."""
+    pasta = DATA_DIR / "tmp" / "aprender"
+    pasta.mkdir(parents=True, exist_ok=True)
+    cmd = [sys.executable, "-c", codigo] if curso == "Python" else ["bash" if tem("bash") else "sh", "-c", codigo]
+    proc = rodar(cmd, capturar=True, timeout=10, cwd=pasta, mostrar=False)
+    if proc.returncode == 124 and proc.stderr == "tempo esgotado":
+        return "", "O código demorou demais (laço infinito?)."
+    return proc.stdout or "", (proc.stderr or "").strip()
+
+
+@submenu
+def menu_aprender():
+    def progresso() -> set:
+        return set(ler_json(APRENDER_FILE, {}).get("feitas", []))
+
+    def marcar(ident: str):
+        feitas = progresso() | {ident}
+        gravar_json(APRENDER_FILE, {"feitas": sorted(feitas)})
+
+    def licao(curso: str, dados: tuple) -> bool:
+        ident, nome, explicacao, enunciado = dados[:4]
+        limpar()
+        titulo(f"{curso}: {nome}")
+        print(f"\n{explicacao}\n")
+        print(f"{NEG}{AMAR}Exercício:{RST} {enunciado}\n")
+        if curso == "Git":
+            opcoes, certa = dados[4], dados[5]
+            i = escolher("Resposta", opcoes)
+            if i == certa:
+                ok("Certo! ✅")
+                marcar(ident)
+                return True
+            if i is not None:
+                erro(f"Não é essa. Resposta: {opcoes[certa]}")
+            return False
+        esperado, dica, solucao = dados[4], dados[5], dados[6]
+        tentativas = 0
+        while True:
+            codigo = ler_linhas("Digite o código")
+            if not codigo.strip():
+                return False
+            saida_aluno, falha = executar_exercicio(curso, codigo)
+            if saida_aluno:
+                print(f"{DIM}── saída ──{RST}\n{saida_aluno.rstrip()}")
+            if falha:
+                print(f"{VERM}{falha[-600:]}{RST}")
+            if _normalizar_saida(saida_aluno) == _normalizar_saida(esperado):
+                ok("Perfeito! ✅ Lição concluída.")
+                marcar(ident)
+                return True
+            tentativas += 1
+            erro("Ainda não. A saída esperada é:\n" + esperado)
+            if tentativas >= 2:
+                k = escolher("Quer ajuda?", ["Ver a dica", "Ver a solução", "Tentar de novo", "Sair da lição"])
+                if k == 0:
+                    info(f"Dica: {dica}")
+                elif k == 1:
+                    print(f"\n{VERD}{solucao}{RST}\n")
+                elif k in (3, None):
+                    return False
+
+    def curso(nome: str):
+        while True:
+            feitas = progresso()
+            licoes = LICOES[nome]
+            rotulos = [f"{'✅' if l[0] in feitas else '⬜'} {k}. {l[1]}" for k, l in enumerate(licoes, 1)]
+            i = escolher(f"{nome}: {sum(l[0] in feitas for l in licoes)} de {len(licoes)} concluídas", rotulos)
+            if i is None:
+                return
+            if licao(nome, licoes[i]):
+                pausar()
+
+    def playground():
+        i = escolher("Qual?", ["Python (digite exit() para sair)", "Bash (digite exit para sair)"])
+        if i == 0:
+            rodar([sys.executable], mostrar=False)
+        elif i == 1:
+            rodar(["bash" if tem("bash") else "sh"], mostrar=False)
+
+    def total(nome: str) -> str:
+        feitas = progresso()
+        return f"{sum(l[0] in feitas for l in LICOES[nome])}/{len(LICOES[nome])}"
+
+    menu("🎓 Aprender programação", [
+        (lambda: f"🐍 Python ({total('Python')})", lambda: curso("Python")),
+        (lambda: f"🐚 Bash, o terminal ({total('Bash')})", lambda: curso("Bash")),
+        (lambda: f"🌿 Git ({total('Git')})", lambda: curso("Git")),
+        ("🧪 Experimentar à vontade (Python ou Bash)", playground),
+        ("Zerar o progresso", lambda: confirmar("Zerar todas as lições?", False) and gravar_json(APRENDER_FILE, {})),
+    ])
+
+
+# ── Leitor de livros ─────────────────────────────────────────────────
+
+def ler_epub(caminho: Path) -> tuple:
+    """(título, [capítulos em texto]) de um EPUB."""
+    try:
+        with zipfile.ZipFile(caminho) as z:
+            container = ET.fromstring(z.read("META-INF/container.xml"))
+            opf_caminho = next(el.get("full-path") for el in container.iter() if el.tag.endswith("rootfile"))
+            opf = ET.fromstring(z.read(opf_caminho))
+            base = posixpath.dirname(opf_caminho)
+            manifesto = {el.get("id"): el.get("href") for el in opf.iter() if el.tag.split("}")[-1] == "item"}
+            espinha = [el.get("idref") for el in opf.iter() if el.tag.split("}")[-1] == "itemref"]
+            titulo_l = next((el.text for el in opf.iter() if el.tag.split("}")[-1] == "title" and el.text),
+                            caminho.stem)
+            capitulos = []
+            for ref in espinha:
+                href = manifesto.get(ref)
+                if not href:
+                    continue
+                interno = posixpath.normpath(posixpath.join(base, urllib.parse.unquote(href)))
+                with contextlib.suppress(KeyError):
+                    texto = html_para_texto(z.read(interno).decode("utf-8", errors="replace"))
+                    if texto.strip():
+                        capitulos.append(texto)
+    except (zipfile.BadZipFile, KeyError, StopIteration, ET.ParseError) as e:
+        raise ToonsError(f"EPUB inválido: {e}") from None
+    return titulo_l.strip(), capitulos
+
+
+def quebrar_texto(texto: str, largura: int) -> list:
+    """Linhas para mostrar: cada parágrafo quebrado na largura, com uma linha em branco entre eles."""
+    linhas = []
+    for paragrafo in re.split(r"\n\s*\n", texto.replace("\r", "")):
+        paragrafo = " ".join(paragrafo.split())
+        if paragrafo:
+            linhas += textwrap.wrap(paragrafo, largura) or [""]
+            linhas.append("")
+    return linhas or ["(vazio)"]
+
+
+def ler_texto(titulo_l: str, texto: str, chave: str | None = None) -> None:
+    """Leitor de tela cheia: páginas com as setas, ir para %, ouvir em voz alta; lembra onde parou (`chave`)."""
+    salvos = ler_json(LEITURA_FILE, {}) if chave else {}
+    fracao = float(salvos.get(chave, {}).get("fracao", 0)) if chave else 0.0
+    with TelaCheia() as tela:
+        largura_atual, linhas, topo = None, [], 0
+        while True:
+            colunas, altura = shutil.get_terminal_size((60, 24))
+            largura = max(20, min(colunas - 2, 90))
+            altura_texto = max(3, altura - 3)
+            if largura != largura_atual:
+                linhas, largura_atual = quebrar_texto(texto, largura), largura
+                topo = int(fracao * len(linhas))
+            topo = max(0, min(topo, max(0, len(linhas) - altura_texto)))
+            fracao = topo / max(1, len(linhas))
+            pct = 100 if topo + altura_texto >= len(linhas) else int(fracao * 100)
+            desenhar([f" {NEG}{titulo_l[:colunas - 8]}{RST}"] + [" " + l for l in linhas[topo:topo + altura_texto]]
+                     + [""] * (altura_texto - len(linhas[topo:topo + altura_texto]))
+                     + [f" {DIM}{pct}% · ←→ página · ↑↓ linha · g ir para % · f ouvir · Esc sai{RST}"])
+            tecla = ler_tecla()
+            if tecla in ("esc", "q"):
+                break
+            if tecla in ("dir", " ", "pgdn", "enter", "l"):
+                topo += altura_texto - 1
+            elif tecla in ("esq", "pgup", "backspace", "h"):
+                topo -= altura_texto - 1
+            elif tecla in ("baixo", "j"):
+                topo += 1
+            elif tecla in ("cima", "k"):
+                topo -= 1
+            elif tecla == "home":
+                topo = 0
+            elif tecla == "end":
+                topo = len(linhas)
+            elif tecla == "g":
+                with tela.normal():
+                    topo = int(perguntar_int("Ir para (%)", pct, 0, 100) / 100 * len(linhas))
+            elif tecla == "f":
+                while topo < len(linhas):
+                    pagina = " ".join(linhas[topo:topo + altura_texto]).strip()
+                    desenhar([f" {NEG}{titulo_l[:colunas - 8]}{RST}"] + [" " + l for l in
+                                                                       linhas[topo:topo + altura_texto]]
+                             + [f" {VERD}🔊 lendo... (qualquer tecla para parar ao fim da página){RST}"])
+                    try:
+                        if pagina:
+                            falar(pagina)
+                    except ToonsError as e:
+                        desenhar([str(e), "Aperte uma tecla"])
+                        ler_tecla()
+                        break
+                    if tecla_ou_nada(0.05) is not None:
+                        break
+                    topo += altura_texto - 1
+    if chave:
+        salvos = ler_json(LEITURA_FILE, {})
+        salvos[chave] = {"titulo": titulo_l, "fracao": round(fracao, 4), "quando": datetime.now().isoformat()}
+        gravar_json(LEITURA_FILE, salvos)
+
+
+def abrir_livro(caminho: Path) -> None:
+    sufixo = caminho.suffix.lower()
+    if sufixo == ".epub":
+        titulo_l, capitulos = ler_epub(caminho)
+        texto = "\n\n".join(capitulos)
+    elif sufixo == ".pdf":
+        if not garantir_cmd("pdftotext", "poppler"):
+            return
+        info("Extraindo o texto do PDF...")
+        texto = rodar(["pdftotext", str(caminho), "-"], capturar=True, timeout=600, mostrar=False).stdout or ""
+        texto = re.sub(r"(?<![.!?:])\n(?=\S)", " ", texto)  # junta as linhas quebradas no meio da frase
+        titulo_l = caminho.stem
+    else:
+        texto, titulo_l = texto_de_arquivo(caminho), caminho.stem
+    if not texto.strip():
+        raise ToonsError("Não achei texto nesse arquivo (PDF escaneado? use o OCR).")
+    ler_texto(titulo_l, texto, chave=str(caminho.resolve()))
+
+
+@submenu
+def menu_livros():
+    def abrir():
+        arq = escolher_arquivo("Qual livro?", (".epub", ".pdf", ".txt", ".md", ".html", ".htm"))
+        if arq:
+            abrir_livro(arq)
+
+    def continuar():
+        salvos = ler_json(LEITURA_FILE, {})
+        livros = sorted(((k, v) for k, v in salvos.items() if Path(k).exists()), key=lambda kv: kv[1]["quando"],
+                        reverse=True)
+        if not livros:
+            info("Nenhum livro aberto ainda.")
+            return
+        i = escolher("Continuar qual?", [f"{v['titulo'][:50]}  {DIM}{v['fracao']:.0%} · {v['quando'][:10]}{RST}"
+                                         for _, v in livros])
+        if i is not None:
+            abrir_livro(Path(livros[i][0]))
+
+    def esquecer():
+        salvos = ler_json(LEITURA_FILE, {})
+        if not salvos:
+            info("A lista está vazia.")
+            return
+        chaves = list(salvos)
+        marcados = escolher_varios("Tirar quais da lista?", [salvos[k]["titulo"] for k in chaves])
+        for i in marcados:
+            salvos.pop(chaves[i], None)
+        gravar_json(LEITURA_FILE, salvos)
+
+    menu("📖 Leitor de livros", [
+        ("Continuar lendo", continuar),
+        ("Abrir um livro (EPUB, PDF, TXT)", abrir),
+        ("Tirar livros da lista", esquecer),
+    ], cabecalho=lambda: print(f"{DIM}No livro: ←→ vira a página · g vai para % · f lê em voz alta · "
+                               f"ele lembra onde você parou.{RST}"))
+
+
+# ── Rádio e podcasts ─────────────────────────────────────────────────
+
+RADIO_SERVIDORES = ["https://de1.api.radio-browser.info", "https://nl1.api.radio-browser.info",
+                    "https://at1.api.radio-browser.info"]
+
+
+def buscar_radios(**filtros) -> list:
+    """Estações do radio-browser.info (gratuito, sem chave)."""
+    params = {"limit": 60, "order": "clickcount", "reverse": "true", "hidebroken": "true", **filtros}
+    ultimo_erro = None
+    for servidor in RADIO_SERVIDORES:
+        try:
+            return pedir_json(url_com(f"{servidor}/json/stations/search", **params), timeout=20) or []
+        except ToonsError as e:
+            ultimo_erro = e
+    raise ultimo_erro or ToonsError("Rádios indisponíveis agora.")
+
+
+@submenu
+def menu_radio():
+    c = cfg()
+
+    def tocar_radio(r: dict):
+        url = r.get("url_resolved") or r.get("url")
+        print(f"\n{NEG}📻 {r.get('name', '').strip()}{RST} {DIM}{r.get('codec', '')} {r.get('bitrate', '')} kbps · "
+              f"{r.get('tags', '')[:60]}{RST}")
+        if r.get("stationuuid"):
+            with contextlib.suppress(ToonsError):
+                pedir_bytes(f"{RADIO_SERVIDORES[0]}/json/url/{r['stationuuid']}", timeout=5)  # conta o clique
+        favoritas = c.setdefault("radios_favoritas", [])
+        if not any(f.get("url") == url for f in favoritas) and confirmar("Guardar nas favoritas?", False):
+            favoritas.append({"name": r.get("name", "").strip(), "url_resolved": url, "codec": r.get("codec", ""),
+                              "bitrate": r.get("bitrate", ""), "tags": r.get("tags", "")})
+            salvar_cfg()
+        tocar_mpv([url])
+
+    def lista(radios: list):
+        if not radios:
+            info("Nenhuma rádio encontrada.")
+            return
+        i = escolher("Qual rádio?", [f"{r.get('name', '?').strip()[:45]}  {DIM}{r.get('state') or r.get('country', '')}"
+                                     f" · {r.get('codec', '')} {r.get('bitrate', '')}{RST}" for r in radios])
+        if i is not None:
+            tocar_radio(radios[i])
+
+    def generos():
+        nomes = [("Sertanejo", "sertanejo"), ("Pop", "pop"), ("Rock", "rock"), ("MPB", "mpb"), ("Samba e pagode", "samba"),
+                 ("Gospel", "gospel"), ("Notícias", "news"), ("Funk", "funk"), ("Forró", "forro"),
+                 ("Clássica", "classical"), ("Jazz", "jazz"), ("Eletrônica", "electronic"), ("Lo-fi", "lofi")]
+        i = escolher("Gênero", [n for n, _ in nomes])
+        if i is not None:
+            lista(buscar_radios(tag=nomes[i][1], **({} if nomes[i][1] in ("classical", "jazz", "lofi", "electronic")
+                                                    else {"countrycode": "BR"})))
+
+    def favoritas():
+        favs = c.get("radios_favoritas", [])
+        if not favs:
+            info("Nenhuma favorita ainda (ela é oferecida quando você toca uma rádio).")
+            return
+        i = escolher("Favoritas", [f["name"] for f in favs] + ["Remover uma favorita..."])
+        if i is None:
+            return
+        if i < len(favs):
+            tocar_radio(favs[i])
+        else:
+            k = escolher("Remover qual?", [f["name"] for f in favs])
+            if k is not None:
+                favs.pop(k)
+                salvar_cfg()
+
+    menu("📻 Rádio online", [
+        ("Mais ouvidas do Brasil", lambda: lista(buscar_radios(countrycode="BR"))),
+        ("Buscar pelo nome (ex.: CBN, Jovem Pan)", lambda: lista(buscar_radios(name=perguntar("Nome da rádio")))),
+        ("Por gênero", generos),
+        ("Rádios de uma cidade/estado", lambda: lista(buscar_radios(countrycode="BR",
+                                                                     state=perguntar("Estado (ex.: Bahia)")))),
+        ("Favoritas", favoritas),
+    ])
+
+
+@submenu
+def menu_podcasts():
+    c = cfg()
+    c.setdefault("podcasts", [])
+
+    def episodios(pod: dict):
+        info("Carregando episódios...")
+        eps = [e for e in baixar_feed(pod["feed"]) if e["audio"]][:40]
+        if not eps:
+            info("Nenhum episódio com áudio nesse feed.")
+            return
+        while True:
+            i = escolher(pod["nome"], [f"{e['titulo'][:70]}  {DIM}{_quando_txt(e['data'])[:5]}{RST}" for e in eps])
+            if i is None:
+                return
+            ep = eps[i]
+            j = escolher(ep["titulo"][:60], ["Ouvir agora", "Baixar para ouvir offline", "Ver a descrição"])
+            if j == 0:
+                tocar_mpv([ep["audio"]])
+            elif j == 1:
+                nome = _slug(ep["titulo"]) + (Path(urllib.parse.urlsplit(ep["audio"]).path).suffix or ".mp3")
+                destino = pasta_saida("Podcasts", _slug(pod["nome"])) / nome
+                baixar_arquivo(ep["audio"], destino)
+                ok(f"Salvo: {destino}")
+            elif j == 2:
+                print(ep["resumo"][:2000] or "(sem descrição)")
+                pausar()
+
+    def buscar():
+        termo = perguntar("Buscar podcast (nome ou assunto)")
+        if not termo:
+            return
+        dados = pedir_json(url_com("https://itunes.apple.com/search", media="podcast", country="BR", term=termo,
+                                   limit=25))
+        resultados = [r for r in dados.get("results", []) if r.get("feedUrl")]
+        if not resultados:
+            info("Nada encontrado.")
+            return
+        i = escolher("Qual?", [f"{r['collectionName'][:50]}  {DIM}{r.get('artistName', '')[:30]}{RST}"
+                               for r in resultados])
+        if i is None:
+            return
+        pod = {"nome": resultados[i]["collectionName"], "feed": resultados[i]["feedUrl"]}
+        if not any(p["feed"] == pod["feed"] for p in c["podcasts"]) and confirmar("Seguir este podcast?", True):
+            c["podcasts"].append(pod)
+            salvar_cfg()
+        episodios(pod)
+
+    def meus():
+        if not c["podcasts"]:
+            info("Você não segue nenhum podcast ainda.")
+            return
+        i = escolher("Meus podcasts", [p["nome"] for p in c["podcasts"]] + ["Deixar de seguir..."])
+        if i is None:
+            return
+        if i < len(c["podcasts"]):
+            episodios(c["podcasts"][i])
+        else:
+            k = escolher("Deixar de seguir qual?", [p["nome"] for p in c["podcasts"]])
+            if k is not None:
+                c["podcasts"].pop(k)
+                salvar_cfg()
+
+    menu("🎙️ Podcasts", [
+        (lambda: f"Meus podcasts ({len(c['podcasts'])})", meus),
+        ("Buscar podcast", buscar),
+        ("Seguir pelo link do feed RSS", lambda: (c["podcasts"].append({"nome": perguntar("Nome"),
+                                                                        "feed": perguntar("Link do feed")}),
+                                                  salvar_cfg())),
+    ])
+
+
+# ── Arte ASCII, banner e tema do Termux ──────────────────────────────
+
+ARCO_IRIS = [196, 202, 208, 214, 220, 226, 190, 154, 118, 82, 46, 47, 48, 49, 50, 51, 45, 39, 33, 27, 21, 57, 93,
+             129, 165, 201, 200, 199, 198, 197]
+
+TEMAS_TERMUX = {
+    "Dracula": ("#282a36", "#f8f8f2", ["#21222c", "#ff5555", "#50fa7b", "#f1fa8c", "#bd93f9", "#ff79c6", "#8be9fd",
+                                       "#f8f8f2", "#6272a4", "#ff6e6e", "#69ff94", "#ffffa5", "#d6acff", "#ff92df",
+                                       "#a4ffff", "#ffffff"]),
+    "Gruvbox": ("#282828", "#ebdbb2", ["#282828", "#cc241d", "#98971a", "#d79921", "#458588", "#b16286", "#689d6a",
+                                       "#a89984", "#928374", "#fb4934", "#b8bb26", "#fabd2f", "#83a598", "#d3869b",
+                                       "#8ec07c", "#ebdbb2"]),
+    "Nord": ("#2e3440", "#d8dee9", ["#3b4252", "#bf616a", "#a3be8c", "#ebcb8b", "#81a1c1", "#b48ead", "#88c0d0",
+                                    "#e5e9f0", "#4c566a", "#bf616a", "#a3be8c", "#ebcb8b", "#81a1c1", "#b48ead",
+                                    "#8fbcbb", "#eceff4"]),
+    "Solarized escuro": ("#002b36", "#839496", ["#073642", "#dc322f", "#859900", "#b58900", "#268bd2", "#d33682",
+                                                "#2aa198", "#eee8d5", "#002b36", "#cb4b16", "#586e75", "#657b83",
+                                                "#839496", "#6c71c4", "#93a1a1", "#fdf6e3"]),
+    "Tokyo Night": ("#1a1b26", "#c0caf5", ["#15161e", "#f7768e", "#9ece6a", "#e0af68", "#7aa2f7", "#bb9af7",
+                                           "#7dcfff", "#a9b1d6", "#414868", "#f7768e", "#9ece6a", "#e0af68",
+                                           "#7aa2f7", "#bb9af7", "#7dcfff", "#c0caf5"]),
+    "Monokai": ("#272822", "#f8f8f2", ["#272822", "#f92672", "#a6e22e", "#f4bf75", "#66d9ef", "#ae81ff", "#a1efe4",
+                                       "#f8f8f2", "#75715e", "#f92672", "#a6e22e", "#f4bf75", "#66d9ef", "#ae81ff",
+                                       "#a1efe4", "#f9f8f5"]),
+}
+
+
+def arco_iris(texto: str) -> str:
+    if not _COR:
+        return texto
+    saida = []
+    for linha in texto.splitlines():
+        saida.append("".join(f"\033[38;5;{ARCO_IRIS[(i // 2) % len(ARCO_IRIS)]}m{ch}" if ch.strip() else ch
+                             for i, ch in enumerate(linha)) + RST)
+    return "\n".join(saida)
+
+
+def fontes_figlet() -> list:
+    pasta = saida(["figlet", "-I2"])
+    return sorted(p.stem for p in Path(pasta).glob("*.flf")) if pasta and Path(pasta).is_dir() else ["standard"]
+
+
+def figlet(texto: str, fonte: str = "standard", largura: int | None = None) -> str:
+    return saida(["figlet", "-f", fonte, "-w", str(largura or largura_tela()), texto]) or texto
+
+
+def imagem_em_blocos(caminho: Path, largura: int) -> list:
+    """Imagem colorida no terminal: cada caractere '▀' mostra 2 pixels (cores de 24 bits)."""
+    from PIL import Image, ImageOps
+    with Image.open(caminho) as img:
+        img = ImageOps.exif_transpose(img).convert("RGB")
+        altura = max(2, round(largura * img.height / img.width / 2) * 2)
+        img = img.resize((largura, altura))
+        px = img.load()
+    linhas = []
+    for y in range(0, altura, 2):
+        linha = []
+        for x in range(largura):
+            (r1, g1, b1), (r2, g2, b2) = px[x, y], px[x, y + 1]
+            linha.append(f"\033[38;2;{r1};{g1};{b1}m\033[48;2;{r2};{g2};{b2}m▀")
+        linhas.append("".join(linha) + RST)
+    return linhas
+
+
+@submenu
+def menu_arte():
+    c = cfg()
+
+    def texto_grande():
+        if not garantir_cmd("figlet"):
+            return
+        texto = perguntar("Texto", "Termux")
+        fontes = fontes_figlet()
+        i = escolher("Fonte", fontes, fontes.index("standard") + 1 if "standard" in fontes else None)
+        if i is None:
+            return
+        arte = figlet(texto, fontes[i])
+        colorido = confirmar("Colorir com arco-íris?", True)
+        print(arco_iris(arte) if colorido else arte)
+        j = escolher("E agora?", ["Copiar", "Salvar em arquivo", "Usar como banner do Termux-Toons", "Nada"])
+        if j == 0:
+            copiar_texto(arte)
+        elif j == 1:
+            destino = pasta_saida("Arte") / f"{_slug(texto)}.txt"
+            destino.write_text(arte + "\n", "utf-8")
+            ok(f"Salvo: {destino}")
+        elif j == 2:
+            c["banner_texto"], c["banner_fonte"] = texto, fontes[i]
+            salvar_cfg()
+            ok("Banner trocado (aparece no menu principal).")
+
+    def imagem():
+        arq = escolher_arquivo("Qual imagem?", EXT_IMAGEM)
+        if not arq:
+            return
+        largura = min(largura_tela() - 1, 120)
+        if tem("chafa"):
+            rodar(["chafa", "--size", f"{largura}x{largura}", str(arq)], mostrar=False)
+        elif garantir_modulo("PIL", pip_nome="pillow", pkg_nome="python-pillow"):
+            print("\n".join(imagem_em_blocos(arq, largura)))
+        if confirmar("Diminua a fonte (pinça) para ver mais detalhes. Salvar como arquivo de texto colorido?", False):
+            destino = pasta_saida("Arte") / f"{arq.stem}.ans"
+            destino.write_text("\n".join(imagem_em_blocos(arq, largura)) + "\n", "utf-8")
+            ok(f"Salvo: {destino} (veja com: cat '{destino}')")
+
+    def tema():
+        nomes = list(TEMAS_TERMUX) + ["Voltar ao tema padrão do Termux"]
+        i = escolher("Tema de cores do Termux", nomes)
+        if i is None:
+            return
+        arq = HOME / ".termux" / "colors.properties"
+        arq.parent.mkdir(exist_ok=True)
+        if arq.exists() and not (arq.parent / "colors.properties.antes-do-toons").exists():
+            shutil.copy2(arq, arq.parent / "colors.properties.antes-do-toons")
+        if i == len(TEMAS_TERMUX):
+            backup = arq.parent / "colors.properties.antes-do-toons"
+            if backup.exists():
+                shutil.copy2(backup, arq)
+            else:
+                arq.unlink(missing_ok=True)
+        else:
+            fundo, frente, cores = TEMAS_TERMUX[nomes[i]]
+            arq.write_text(f"# Tema {nomes[i]} (Termux-Toons)\nbackground={fundo}\nforeground={frente}\n"
+                           f"cursor={frente}\n" + "".join(f"color{k}={cor}\n" for k, cor in enumerate(cores)), "utf-8")
+        if tem("termux-reload-settings"):
+            rodar(["termux-reload-settings"], capturar=True, timeout=20)
+        ok("Tema aplicado." if tem("termux-reload-settings") else "Tema salvo: reabra o Termux para ver.")
+
+    def boas_vindas():
+        motd = Path(PREFIX or "/usr") / "etc" / "motd"
+        backup = motd.with_name("motd.antes-do-toons")
+        i = escolher("Mensagem ao abrir o Termux", ["Texto grande com o meu nome", "Uma frase minha",
+                                                    "Nenhuma mensagem", "Voltar a original"])
+        if i is None:
+            return
+        if motd.exists() and not backup.exists():
+            shutil.copy2(motd, backup)
+        if i == 0:
+            if not garantir_cmd("figlet"):
+                return
+            motd.write_text(arco_iris(figlet(perguntar("Nome", getpass.getuser()), "standard", 40)) + "\n", "utf-8")
+        elif i == 1:
+            motd.write_text(perguntar("Frase") + "\n", "utf-8")
+        elif i == 2:
+            motd.write_text("", "utf-8")
+        elif backup.exists():
+            shutil.copy2(backup, motd)
+        ok("Pronto: abra uma nova sessão do Termux para ver.")
+
+    menu("🎨 Arte ASCII e visual do Termux", [
+        ("Texto em letras grandes (figlet)", texto_grande),
+        ("Imagem no terminal (colorida)", imagem),
+        ("Tema de cores do Termux (Dracula, Nord...)", tema),
+        ("Mensagem de boas-vindas do Termux", boas_vindas),
+        ("Banner do Termux-Toons: voltar ao original",
+         lambda: (c.update(banner_texto=""), salvar_cfg(), ok("Banner original de volta."))),
+    ])
+
+
+@submenu
+def menu_diversao():
+    menu("🎮 Diversão e aprendizado", [
+        ("🎮 Jogos (2048, campo minado, sudoku, tetris...)", menu_jogos),
+        ("🎓 Aprender programação (Python, Bash, Git)", menu_aprender),
+        ("📖 Leitor de livros (EPUB, PDF) e audiolivro", menu_livros),
+        ("📻 Rádio online", menu_radio),
+        ("🎙️ Podcasts", menu_podcasts),
+        ("🎨 Arte ASCII, banner e tema do Termux", menu_arte),
+    ])
+
+
+# ════════════════════════════════════════════════════════════════════
+#  25. Programação e servidores
+# ════════════════════════════════════════════════════════════════════
+
+BANCOS_DIR = DATA_DIR / "bancos"
+MINECRAFT_DIR = HOME / "minecraft-servidor"
+
+
+# ── Banco de dados ───────────────────────────────────────────────────
+
+def _celula(valor) -> str:
+    if valor is None:
+        return "NULL"
+    if isinstance(valor, bytes):
+        return f"<{len(valor)} bytes>"
+    return str(valor).replace("\n", " ")
+
+
+def tabela_texto(colunas: list, linhas: list, largura_max: int = 24) -> list:
+    """Linhas de uma tabela alinhada para o terminal."""
+    larguras = [min(largura_max, max([len(str(c))] + [len(_celula(l[i])) for l in linhas]))
+                for i, c in enumerate(colunas)]
+    saida = [" │ ".join(f"{NEG}{str(c)[:w]:<{w}}{RST}" for c, w in zip(colunas, larguras)),
+             "─┼─".join("─" * w for w in larguras)]
+    for linha in linhas:
+        saida.append(" │ ".join(f"{_celula(v)[:w]:<{w}}" for v, w in zip(linha, larguras)))
+    return saida
+
+
+def rodar_sql(conexao, sql: str) -> tuple:
+    """(colunas, linhas, linhas afetadas). Vários comandos de uma vez rodam como script, sem resultado."""
+    import sqlite3
+    comandos = [c for c in re.split(r";\s*(?=\S|$)", sql.strip()) if c.strip()]
+    try:
+        if len(comandos) > 1:
+            conexao.executescript(sql)
+            conexao.commit()
+            return [], [], -1
+        cursor = conexao.execute(sql)
+        if cursor.description:
+            return [d[0] for d in cursor.description], cursor.fetchmany(500), -1
+        conexao.commit()
+        return [], [], cursor.rowcount
+    except sqlite3.Error as e:
+        raise ToonsError(f"SQL: {e}") from None
+
+
+def ver_tabela_paginada(nome: str, colunas: list, linhas: list) -> None:
+    if not linhas:
+        info("Nenhuma linha.")
+        return
+    if not setas_ativas():
+        print("\n".join(tabela_texto(colunas, linhas[:50])))
+        return
+    pagina = 0
+    with TelaCheia():
+        while True:
+            _, altura = shutil.get_terminal_size((60, 24))
+            por_pagina = max(3, altura - 5)
+            paginas = (len(linhas) - 1) // por_pagina + 1
+            pagina = max(0, min(pagina, paginas - 1))
+            trecho = linhas[pagina * por_pagina:(pagina + 1) * por_pagina]
+            desenhar([f" {NEG}{nome}{RST} {DIM}· {len(linhas)} linha(s) · página {pagina + 1}/{paginas}{RST}"]
+                     + [" " + l for l in tabela_texto(colunas, trecho)]
+                     + [f" {DIM}←→ página · Esc sai{RST}"])
+            tecla = ler_tecla()
+            if tecla in ("esc", "q"):
+                return
+            pagina += 1 if tecla in ("dir", "baixo", "pgdn", " ") else -1 if tecla in ("esq", "cima", "pgup") else 0
+
+
+@submenu
+def menu_banco_de_dados():
+    import sqlite3
+
+    def abrir_banco(caminho: Path):
+        conexao = sqlite3.connect(caminho)
+
+        def tabelas() -> list:
+            return [r[0] for r in conexao.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table','view') AND name NOT LIKE 'sqlite_%' ORDER BY 1")]
+
+        def ver():
+            nomes = tabelas()
+            if not nomes:
+                info("O banco não tem tabelas. Crie com SQL (veja os exemplos) ou importe um CSV.")
+                return
+            contagens = [conexao.execute(f'SELECT COUNT(*) FROM "{n}"').fetchone()[0] for n in nomes]
+            i = escolher("Qual tabela?", [f"{n}  {DIM}{q} linha(s){RST}" for n, q in zip(nomes, contagens)])
+            if i is not None:
+                colunas, linhas, _ = rodar_sql(conexao, f'SELECT * FROM "{nomes[i]}" LIMIT 500')
+                ver_tabela_paginada(nomes[i], colunas, linhas)
+
+        def sql():
+            info("Exemplo: SELECT * FROM clientes WHERE cidade = 'Recife';")
+            comando = ler_linhas("Digite o SQL")
+            if not comando.strip():
+                return
+            colunas, linhas, afetadas = rodar_sql(conexao, comando)
+            if colunas:
+                ver_tabela_paginada("Resultado", colunas, linhas)
+            else:
+                ok("Feito." + (f" {afetadas} linha(s) afetada(s)." if afetadas >= 0 else ""))
+
+        def esquema():
+            for (texto,) in conexao.execute("SELECT sql FROM sqlite_master WHERE sql IS NOT NULL"):
+                print(f"{CIANO}{texto};{RST}\n")
+
+        def importar_csv():
+            arq = escolher_arquivo("Qual planilha CSV?", (".csv",))
+            if not arq:
+                return
+            texto = arq.read_text("utf-8-sig", errors="replace")
+            try:
+                dialeto = csv.Sniffer().sniff(texto[:5000], delimiters=",;\t")
+            except csv.Error:
+                dialeto = csv.excel
+            linhas = list(csv.reader(io.StringIO(texto), dialeto))
+            if len(linhas) < 2:
+                raise ToonsError("O CSV precisa de um cabeçalho e pelo menos uma linha.")
+            colunas = [re.sub(r"\W+", "_", sem_acento(c).strip().lower()).strip("_") or f"coluna{k}"
+                       for k, c in enumerate(linhas[0], 1)]
+            nome = re.sub(r"\W+", "_", sem_acento(perguntar("Nome da tabela", arq.stem)).lower()).strip("_")
+            conexao.execute(f'CREATE TABLE IF NOT EXISTS "{nome}" ({", ".join(f"{chr(34)}{c}{chr(34)} TEXT" for c in colunas)})')
+            marcadores = ", ".join("?" * len(colunas))
+            dados = [(l + [""] * len(colunas))[:len(colunas)] for l in linhas[1:] if any(l)]
+            conexao.executemany(f'INSERT INTO "{nome}" VALUES ({marcadores})', dados)
+            conexao.commit()
+            ok(f"{len(dados)} linha(s) importada(s) na tabela '{nome}'.")
+
+        def exportar_csv():
+            nomes = tabelas()
+            i = escolher("Exportar qual tabela?", nomes) if nomes else None
+            if i is None:
+                return
+            cursor = conexao.execute(f'SELECT * FROM "{nomes[i]}"')
+            destino = pasta_saida() / f"{nomes[i]}.csv"
+            with open(destino, "w", newline="", encoding="utf-8-sig") as arq:
+                escritor = csv.writer(arq, delimiter=";")
+                escritor.writerow([d[0] for d in cursor.description])
+                escritor.writerows(cursor)
+            ok(f"Planilha salva: {destino}")
+
+        def exemplos():
+            print(f"""{CIANO}CREATE TABLE contatos (id INTEGER PRIMARY KEY, nome TEXT, telefone TEXT);
+INSERT INTO contatos (nome, telefone) VALUES ('Ana', '81 99999-0000');
+SELECT * FROM contatos WHERE nome LIKE 'A%' ORDER BY nome;
+UPDATE contatos SET telefone = '81 98888-0000' WHERE id = 1;
+DELETE FROM contatos WHERE id = 1;
+SELECT cidade, COUNT(*) FROM clientes GROUP BY cidade;{RST}""")
+
+        try:
+            menu(f"🗃️ {caminho.name}", [
+                ("Ver tabelas e dados", ver),
+                ("Rodar SQL", sql),
+                ("Estrutura (CREATE TABLE...)", esquema),
+                ("Importar planilha CSV", importar_csv),
+                ("Exportar tabela para CSV", exportar_csv),
+                ("Exemplos de SQL", exemplos),
+            ])
+        finally:
+            conexao.close()
+
+    def escolher_banco():
+        BANCOS_DIR.mkdir(parents=True, exist_ok=True)
+        bancos = sorted(BANCOS_DIR.glob("*.db"))
+        opcoes = [b.name for b in bancos] + ["➕ Criar banco novo", "📂 Abrir um arquivo .db do celular"]
+        i = escolher("Qual banco?", opcoes)
+        if i is None:
+            return
+        if i < len(bancos):
+            abrir_banco(bancos[i])
+        elif i == len(bancos):
+            nome = re.sub(r"\W+", "_", sem_acento(perguntar("Nome do banco", "meu_banco"))).strip("_") or "banco"
+            abrir_banco(BANCOS_DIR / f"{nome}.db")
+        else:
+            arq = escolher_arquivo("Qual arquivo?", (".db", ".sqlite", ".sqlite3", ".db3"))
+            if arq:
+                abrir_banco(arq)
+
+    def mariadb():
+        if not garantir_cmd("mariadbd-safe", "mariadb") and not tem("mysqld_safe"):
+            return
+        dados = Path(PREFIX or "/usr") / "var" / "lib" / "mysql"
+        if not (dados / "mysql").exists():
+            info("Preparando o MariaDB pela primeira vez...")
+            rodar(["mariadb-install-db" if tem("mariadb-install-db") else "mysql_install_db"])
+        i = escolher("MariaDB (MySQL)", ["Iniciar o servidor", "Abrir o console SQL", "Parar o servidor",
+                                         "Status e log"])
+        if i == 0:
+            iniciar_servico("mariadb", "mariadbd-safe" if tem("mariadbd-safe") else "mysqld_safe")
+            info(f"Conecte em localhost:3306 com o usuário '{getpass.getuser()}' (sem senha, só daqui do celular).")
+        elif i == 1:
+            rodar(["mariadb" if tem("mariadb") else "mysql", "-u", getpass.getuser()], mostrar=False)
+        elif i == 2:
+            parar_servico("mariadb")
+        elif i == 3:
+            status_servico("mariadb")
+
+    def postgres():
+        if not garantir_cmd("postgres", "postgresql"):
+            return
+        dados = Path(PREFIX or "/usr") / "var" / "lib" / "postgresql"
+        if not (dados / "PG_VERSION").exists():
+            info("Preparando o PostgreSQL pela primeira vez...")
+            dados.mkdir(parents=True, exist_ok=True)
+            rodar(["initdb", str(dados)], check=True)
+        i = escolher("PostgreSQL", ["Iniciar o servidor", "Abrir o console (psql)", "Criar um banco", "Parar",
+                                    "Status e log"])
+        if i == 0:
+            iniciar_servico("postgres", shlex.join(["postgres", "-D", str(dados)]))
+            time.sleep(2)
+            rodar(["createdb", getpass.getuser()], capturar=True)  # banco padrão do usuário (se já existir, tudo bem)
+            info(f"Conecte em localhost:5432 com o usuário '{getpass.getuser()}'.")
+        elif i == 1:
+            rodar(["psql", perguntar("Banco", getpass.getuser())], mostrar=False)
+        elif i == 2:
+            rodar(["createdb", perguntar("Nome do banco")])
+        elif i == 3:
+            parar_servico("postgres")
+        elif i == 4:
+            status_servico("postgres")
+
+    menu("🗃️ Banco de dados", [
+        ("SQLite: abrir ou criar um banco (leve, sem servidor)", escolher_banco),
+        ("MariaDB / MySQL (servidor)", mariadb),
+        ("PostgreSQL (servidor)", postgres),
+    ])
+
+
+# ── GitHub no celular ────────────────────────────────────────────────
+
+def repos_locais() -> list:
+    """Pastas com repositório git em ~, ~/projetos e ~/storage/shared (até 2 níveis)."""
+    achados = []
+    for base in (HOME, HOME / "projetos", HOME / "storage" / "shared"):
+        if not base.exists():
+            continue
+        for pasta in [base] + [p for p in base.iterdir() if p.is_dir() and not p.name.startswith(".")]:
+            with contextlib.suppress(OSError):
+                if (pasta / ".git").exists() and pasta not in achados:
+                    achados.append(pasta)
+    return achados
+
+
+def _garantir_identidade_git() -> None:
+    if not saida(["git", "config", "--global", "user.name"]):
+        rodar(["git", "config", "--global", "user.name", perguntar("Seu nome (aparece nos commits)")])
+    if not saida(["git", "config", "--global", "user.email"]):
+        rodar(["git", "config", "--global", "user.email", perguntar("Seu e-mail do GitHub")])
+
+
+@submenu
+def menu_github():
+    def gh_ok() -> bool:
+        if not (garantir_cmd("git") and garantir_cmd("gh")):
+            return False
+        if tem("termux-open-url"):
+            os.environ.setdefault("BROWSER", "termux-open-url")
+        if rodar(["gh", "auth", "status"], capturar=True, timeout=30).returncode != 0:
+            aviso("Você ainda não entrou na sua conta do GitHub.")
+            if confirmar("Entrar agora (abre o navegador com um código)?", True):
+                rodar(["gh", "auth", "login", "--web", "--git-protocol", "https"], mostrar=False)
+                rodar(["gh", "auth", "setup-git"], capturar=True)
+        return rodar(["gh", "auth", "status"], capturar=True, timeout=30).returncode == 0
+
+    def acoes_repo(repo: str):
+        while True:
+            i = escolher(repo, ["Clonar para o celular", "Ver issues", "Ver pull requests", "Criar issue",
+                                "Abrir no navegador", "Voltar"])
+            if i in (None, 5):
+                return
+            if i == 0:
+                destino = HOME / "projetos" / repo.split("/")[-1]
+                destino.parent.mkdir(exist_ok=True)
+                rodar(["gh", "repo", "clone", repo, str(destino)])
+                ok(f"Clonado em {destino}")
+            elif i == 1:
+                rodar(["gh", "issue", "list", "-R", repo, "--limit", "30"])
+            elif i == 2:
+                rodar(["gh", "pr", "list", "-R", repo, "--limit", "30"])
+            elif i == 3:
+                titulo_i = perguntar("Título da issue")
+                if titulo_i:
+                    corpo = editar_texto("", ".md") or ""
+                    rodar(["gh", "issue", "create", "-R", repo, "--title", titulo_i, "--body", corpo])
+            elif i == 4:
+                rodar(["gh", "repo", "view", repo, "--web"], capturar=True)
+            pausar()
+
+    def meus_repos():
+        if not gh_ok():
+            return
+        bruto = saida(["gh", "repo", "list", "--limit", "60", "--json", "nameWithOwner,description,isPrivate"], 60)
+        repos = json.loads(bruto or "[]")
+        if not repos:
+            info("Nenhum repositório (ou sem conexão).")
+            return
+        i = escolher("Meus repositórios", [f"{'🔒' if r['isPrivate'] else '🌐'} {r['nameWithOwner']}  "
+                                           f"{DIM}{(r.get('description') or '')[:40]}{RST}" for r in repos])
+        if i is not None:
+            acoes_repo(repos[i]["nameWithOwner"])
+
+    def outro_repo():
+        if gh_ok():
+            repo = perguntar("Repositório (dono/nome, ex.: termux/termux-app)")
+            if "/" in repo:
+                acoes_repo(repo.strip())
+
+    def escolher_repo_local() -> Path | None:
+        repos = repos_locais()
+        i = escolher("Qual projeto?", [str(r) for r in repos] + ["Digitar a pasta..."])
+        if i is None:
+            return None
+        pasta = repos[i] if i < len(repos) else Path(os.path.expanduser(perguntar("Pasta")))
+        if not pasta.is_dir():
+            raise ToonsError("Pasta não encontrada.")
+        return pasta
+
+    def commit_push():
+        if not garantir_cmd("git"):
+            return
+        pasta = escolher_repo_local()
+        if not pasta:
+            return
+        _garantir_identidade_git()
+        mudancas = saida(["git", "-C", str(pasta), "status", "--short"])
+        if not mudancas:
+            info("Nada mudou desde o último commit.")
+        else:
+            print(mudancas)
+            mensagem = perguntar("\nMensagem do commit (o que você mudou?)")
+            if mensagem and confirmar("Adicionar tudo e fazer o commit?", True):
+                rodar(["git", "-C", str(pasta), "add", "-A"], check=True, capturar=True)
+                rodar(["git", "-C", str(pasta), "commit", "-m", mensagem], check=True)
+        if confirmar("Enviar para o GitHub (push)?", True):
+            if rodar(["git", "-C", str(pasta), "push"]).returncode != 0:
+                rodar(["git", "-C", str(pasta), "push", "-u", "origin", "HEAD"])
+
+    def criar_repo():
+        if not gh_ok():
+            return
+        pasta = Path(os.path.expanduser(perguntar("Pasta do projeto", str(HOME / "projetos" / "meu-projeto"))))
+        pasta.mkdir(parents=True, exist_ok=True)
+        _garantir_identidade_git()
+        if not (pasta / ".git").exists():
+            rodar(["git", "-C", str(pasta), "init", "-b", "main"], capturar=True)
+            if not any(p.name != ".git" for p in pasta.iterdir()):
+                (pasta / "README.md").write_text(f"# {pasta.name}\n", "utf-8")
+            rodar(["git", "-C", str(pasta), "add", "-A"], capturar=True)
+            rodar(["git", "-C", str(pasta), "commit", "-m", "Primeiro commit"], capturar=True)
+        visibilidade = "--private" if confirmar("Repositório privado?", True) else "--public"
+        rodar(["gh", "repo", "create", perguntar("Nome no GitHub", pasta.name), visibilidade, "--source", str(pasta),
+               "--push"])
+
+    def atualizar():
+        pasta = escolher_repo_local()
+        if pasta:
+            rodar(["git", "-C", str(pasta), "pull", "--ff-only"])
+
+    menu("🐙 GitHub no celular", [
+        ("Meus repositórios (clonar, issues, PRs)", meus_repos),
+        ("Outro repositório (dono/nome)", outro_repo),
+        ("Commit e push de um projeto (assistente)", commit_push),
+        ("Baixar novidades de um projeto (pull)", atualizar),
+        ("Criar repositório no GitHub a partir de uma pasta", criar_repo),
+        ("Entrar / ver a conta do GitHub", lambda: gh_ok() and rodar(["gh", "auth", "status"])),
+    ])
+
+
+# ── Tarefas agendadas (cron) ─────────────────────────────────────────
+
+def crontab_atual() -> str:
+    proc = rodar(["crontab", "-l"], capturar=True, timeout=20, mostrar=False)
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+def tarefas_agendadas(texto: str) -> list:
+    """[(id, nome, expressão, comando)] das tarefas criadas pelo Termux-Toons no crontab."""
+    tarefas, linhas = [], texto.splitlines()
+    for i, linha in enumerate(linhas[:-1]):
+        m = re.match(r"# toons:(\w+) (.*)", linha)
+        if m:
+            partes = linhas[i + 1].split(None, 5)
+            if len(partes) == 6:
+                tarefas.append((m.group(1), m.group(2), " ".join(partes[:5]), partes[5]))
+    return tarefas
+
+
+def gravar_crontab(texto: str) -> None:
+    caminho = f"PATH={PREFIX}/bin:/usr/bin:/bin" if PREFIX else ""
+    if caminho and caminho not in texto:
+        texto = caminho + "\n" + texto
+    proc = rodar(["crontab", "-"], entrada=texto.rstrip("\n") + "\n", capturar=True, timeout=20, mostrar=False)
+    if proc.returncode != 0:
+        raise ToonsError(f"O crontab recusou: {(proc.stderr or '').strip()}")
+
+
+def descrever_cron(expressao: str) -> str:
+    minuto, hora, dia, mes, semana = expressao.split()
+    if expressao.startswith("*/") and hora == "*":
+        return f"a cada {minuto[2:]} min"
+    if minuto.isdigit() and hora == "*":
+        return f"toda hora, no minuto {minuto}"
+    if minuto.isdigit() and hora.isdigit():
+        quando = f"{int(hora):02d}:{int(minuto):02d}"
+        if dia == "*" and semana == "*":
+            return f"todo dia às {quando}"
+        if semana == "1-5":
+            return f"dias úteis às {quando}"
+        if semana.isdigit():
+            return f"{['domingo', *DIAS_SEMANA[:6]][int(semana) % 7]} às {quando}"
+        if dia.isdigit():
+            return f"todo dia {dia} às {quando}"
+    return expressao
+
+
+@submenu
+def menu_agendador():
+    def garantir_cron() -> bool:
+        return garantir_cmd("crontab", "cronie")
+
+    def nova():
+        if not garantir_cron():
+            return
+        modelos = [("Otimização rápida (limpa caches)", cmd_self("limpar")),
+                   ("Atualizar Termux, pacotes e o Termux-Toons", cmd_self("atualizar")),
+                   ("Backup da pasta do Termux em Downloads (.tar.gz)",
+                    f"tar -czf {shlex.quote(str(pasta_saida('Backups')))}/termux-$(date +%Y%m%d).tar.gz "
+                    f"-C {shlex.quote(str(HOME))} --exclude=./storage ."),
+                   ("Checar os monitores (preço, sites...) uma vez", cmd_self("monitor", "--uma-vez")),
+                   ("Comando que eu vou digitar", None)]
+        i = escolher("O que rodar?", [m for m, _ in modelos])
+        if i is None:
+            return
+        comando = modelos[i][1] or perguntar("Comando")
+        if not comando:
+            return
+        frequencias = ["A cada X minutos", "A cada hora", "Todo dia num horário", "Dias úteis num horário",
+                       "Uma vez por semana", "Uma vez por mês", "Expressão cron (avançado)"]
+        f = escolher("Quando?", frequencias, 3)
+        if f is None:
+            return
+        if f in (2, 3, 4, 5):
+            hora = perguntar("Horário (hh:mm)", "03:00").replace("h", ":")
+            m = re.fullmatch(r"(\d{1,2}):?(\d{2})?", hora)
+            if not m or int(m.group(1)) > 23:
+                raise ToonsError("Horário inválido.")
+            h, mi = int(m.group(1)), int(m.group(2) or 0)
+        if f == 0:
+            expressao = f"*/{perguntar_int('A cada quantos minutos', 30, 1, 59)} * * * *"
+        elif f == 1:
+            expressao = f"{perguntar_int('Em que minuto da hora', 0, 0, 59)} * * * *"
+        elif f == 2:
+            expressao = f"{mi} {h} * * *"
+        elif f == 3:
+            expressao = f"{mi} {h} * * 1-5"
+        elif f == 4:
+            dia = escolher("Dia da semana", [d.capitalize() for d in DIAS_SEMANA])
+            expressao = f"{mi} {h} * * {((dia or 0) + 1) % 7}"
+        elif f == 5:
+            expressao = f"{mi} {h} {perguntar_int('Dia do mês', 1, 1, 28)} * *"
+        else:
+            expressao = perguntar("Expressão (minuto hora dia mês dia-da-semana)", "0 3 * * *")
+            if len(expressao.split()) != 5:
+                raise ToonsError("A expressão tem 5 campos.")
+        ident = uuid.uuid4().hex[:6]
+        nome = perguntar("Nome da tarefa", modelos[i][0] if modelos[i][1] else comando[:30])
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        log_arq = shlex.quote(str(LOG_DIR / f"cron-{ident}.log"))
+        linha = f"{expressao} ({comando}) >> {log_arq} 2>&1".replace("%", "\\%")  # no cron, % vira quebra de linha
+        gravar_crontab(crontab_atual().rstrip("\n") + f"\n# toons:{ident} {nome}\n{linha}\n")
+        ok(f"Agendado: {nome} ({descrever_cron(expressao)}).")
+        if not servico_ativo("cron") and confirmar("O agendador (crond) está parado. Iniciar agora?", True):
+            iniciar_servico("cron", "crond -n", reiniciar=True)
+
+    def listar():
+        tarefas = tarefas_agendadas(crontab_atual())
+        if not tarefas:
+            info("Nenhuma tarefa agendada pelo Termux-Toons.")
+        for _, nome, expressao, comando in tarefas:
+            print(f"  {CIANO}•{RST} {NEG}{nome}{RST} · {descrever_cron(expressao)}\n    {DIM}{comando[:90]}{RST}")
+        print(f"\nAgendador: {'RODANDO' if servico_ativo('cron') else 'PARADO (nada roda!)'}")
+
+    def escolher_tarefa(msg: str):
+        tarefas = tarefas_agendadas(crontab_atual())
+        if not tarefas:
+            info("Nenhuma tarefa agendada.")
+            return None
+        i = escolher(msg, [f"{t[1]}  {DIM}{descrever_cron(t[2])}{RST}" for t in tarefas])
+        return None if i is None else tarefas[i]
+
+    def remover():
+        t = escolher_tarefa("Remover qual?")
+        if t and confirmar(f"Remover '{t[1]}'?", True):
+            linhas, saida_linhas, pular = crontab_atual().splitlines(), [], 0
+            for linha in linhas:
+                if pular:
+                    pular -= 1
+                    continue
+                if linha.startswith(f"# toons:{t[0]} "):
+                    pular = 1
+                    continue
+                saida_linhas.append(linha)
+            gravar_crontab("\n".join(saida_linhas))
+            ok("Removida.")
+
+    def rodar_agora():
+        t = escolher_tarefa("Rodar qual agora?")
+        if t:
+            rodar(t[3].replace("\\%", "%"))
+
+    def ver_log_tarefa():
+        t = escolher_tarefa("Ver o log de qual?")
+        if t:
+            arq = LOG_DIR / f"cron-{t[0]}.log"
+            print(arq.read_text("utf-8", errors="replace")[-4000:] if arq.exists() else "Ainda não rodou.")
+
+    menu("⏲️ Tarefas agendadas (cron)", [
+        ("Agendar uma tarefa", nova),
+        ("Ver tarefas agendadas", listar),
+        ("Rodar uma tarefa agora (teste)", rodar_agora),
+        ("Ver o log de uma tarefa", ver_log_tarefa),
+        ("Remover tarefa", remover),
+        ("Editar o crontab à mão", lambda: garantir_cron() and rodar(["crontab", "-e"], mostrar=False)),
+        *itens_servico("cron", "Agendador (crond)", lambda: garantir_cron() and
+                       iniciar_servico("cron", "crond -n", reiniciar=True)),
+    ], cabecalho=lambda: print(f"{DIM}O Android pode pausar o Termux: as tarefas rodam enquanto o agendador "
+                               f"estiver ativo (ele segura o wake-lock).{RST}"))
+
+
+# ── Servidores: Minecraft, Jellyfin, Navidrome ───────────────────────
+
+def instalar_minecraft() -> None:
+    info("Buscando a versão mais recente do servidor oficial (Java Edition)...")
+    manifesto = pedir_json("https://piston-meta.mojang.com/mc/game/version_manifest_v2.json")
+    versao = perguntar("Versão do Minecraft", manifesto["latest"]["release"])
+    entrada = next((v for v in manifesto["versions"] if v["id"] == versao), None)
+    if not entrada:
+        raise ToonsError(f"Versão '{versao}' não encontrada.")
+    detalhes = pedir_json(entrada["url"])
+    java = int(detalhes.get("javaVersion", {}).get("majorVersion", 21))
+    versao_java = re.search(r'version "(\d+)', (rodar(["java", "-version"], capturar=True, timeout=30).stderr or "")
+                            if tem("java") else "")
+    if not versao_java or int(versao_java.group(1)) < java:
+        info(f"Essa versão precisa do Java {java}.")
+        if not instalar_pkg(f"openjdk-{java}") and java < 21:
+            instalar_pkg("openjdk-21")
+    MINECRAFT_DIR.mkdir(parents=True, exist_ok=True)
+    baixar_arquivo(detalhes["downloads"]["server"]["url"], MINECRAFT_DIR / "server.jar")
+    print("\nPara rodar o servidor é preciso aceitar a EULA do Minecraft: https://aka.ms/MinecraftEULA")
+    if not confirmar("Você aceita a EULA?", False):
+        raise ToonsError("Sem aceitar a EULA o servidor não inicia.")
+    (MINECRAFT_DIR / "eula.txt").write_text("eula=true\n", "utf-8")
+    propriedades = MINECRAFT_DIR / "server.properties"
+    if not propriedades.exists():
+        jogadores = perguntar_int("Máximo de jogadores", 5, 1, 50)
+        original = confirmar("Exigir conta original do Minecraft (recomendado)?", True)
+        propriedades.write_text(f"motd=Servidor no Termux\nmax-players={jogadores}\nonline-mode={str(original).lower()}"
+                                "\nview-distance=6\nsimulation-distance=4\n", "utf-8")
+    ok(f"Servidor {versao} instalado em {MINECRAFT_DIR}.")
+
+
+def iniciar_minecraft() -> bool:
+    if not (MINECRAFT_DIR / "server.jar").exists():
+        instalar_minecraft()
+    memoria = cfg().get("minecraft_memoria", "1G")
+    cmd = f"cd {shlex.quote(str(MINECRAFT_DIR))} && java -Xms512M -Xmx{memoria} -jar server.jar nogui"
+    if iniciar_servico("minecraft", cmd):
+        info(f"Endereço para entrar (mesmo Wi-Fi): {NEG}{ip_local()}:25565{RST}. A primeira partida demora para "
+             "gerar o mundo.")
+        return True
+    return False
+
+
+def parar_minecraft() -> None:
+    if not servico_ativo("minecraft"):
+        info("O servidor não está rodando.")
+        return
+    info("Salvando o mundo e desligando...")
+    rodar(["tmux", "send-keys", "-t", "=" + sessao("minecraft"), "stop", "Enter"], capturar=True)
+    for _ in range(40):
+        time.sleep(1)
+        if not servico_ativo("minecraft"):
+            ok("Servidor desligado.")
+            return
+    parar_servico("minecraft")
+
+
+@submenu
+def menu_servidores():
+    c = cfg()
+
+    def jellyfin():
+        if not garantir_cmd("jellyfin", "jellyfin-server"):
+            return
+        garantir_storage()
+        if iniciar_servico("jellyfin", 'jellyfin --datadir "$HOME/.local/share/jellyfin" '
+                                       '--configdir "$HOME/.config/jellyfin"', reiniciar=True):
+            info(f"Abra http://{ip_local()}:8096 (ou http://localhost:8096 aqui) e siga o assistente.\n"
+                 "  Para a biblioteca, use pastas como /storage/emulated/0/Movies ou /storage/emulated/0/Download.")
+
+    def navidrome():
+        if not garantir_cmd("navidrome"):
+            return
+        garantir_storage()
+        dados = HOME / ".navidrome"
+        dados.mkdir(exist_ok=True)
+        cmd = shlex.join(["navidrome", "--musicfolder", str(pasta_musicas()), "--datafolder", str(dados),
+                          "--address", "0.0.0.0", "--port", "4533"])
+        if iniciar_servico("navidrome", cmd, reiniciar=True):
+            info(f"Abra http://{ip_local()}:4533 e crie o usuário administrador. Apps compatíveis: Tempo, "
+                 "Symfonium, Ultrasonic (protocolo Subsonic).")
+
+    menu("🖥️ Servidores no celular", [
+        ("⛏️ Minecraft (Java): instalar ou atualizar", instalar_minecraft),
+        ("⛏️ Minecraft: iniciar", iniciar_minecraft),
+        ("⛏️ Minecraft: console (comandos do servidor; Ctrl+b d sai)", lambda: abrir_sessao("minecraft")),
+        ("⛏️ Minecraft: desligar salvando o mundo", parar_minecraft),
+        (lambda: f"⛏️ Minecraft: memória ({c.get('minecraft_memoria', '1G')})",
+         lambda: (c.update(minecraft_memoria=perguntar("Memória máxima (ex.: 1G, 1536M, 2G)",
+                                                       c.get("minecraft_memoria", "1G")).upper()), salvar_cfg())),
+        ("🎬 Jellyfin: seus filmes e séries no navegador e na TV (porta 8096)", jellyfin),
+        ("🎬 Jellyfin: parar", lambda: parar_servico("jellyfin")),
+        ("🎵 Navidrome: sua música em qualquer app (porta 4533)", navidrome),
+        ("🎵 Navidrome: parar", lambda: parar_servico("navidrome")),
+    ], cabecalho=lambda: print(f"{DIM}Os servidores ficam no ar enquanto o Termux roda. Deixe o celular na tomada e "
+                               f"sem otimização de bateria para o Termux.{RST}"))
+
+
+@submenu
+def menu_programacao():
+    menu("🛠️ Programação e servidores", [
+        ("🗃️ Banco de dados (SQLite, MariaDB, PostgreSQL)", menu_banco_de_dados),
+        ("🐙 GitHub no celular (clonar, commit, push, issues)", menu_github),
+        ("⏲️ Tarefas agendadas (cron)", menu_agendador),
+        ("🖥️ Servidores (Minecraft, Jellyfin, Navidrome)", menu_servidores),
+        ("💻 Ambiente de desenvolvimento (Neovim, compiladores)", menu_dev),
+    ])
+
+
+# ════════════════════════════════════════════════════════════════════
 #  Configurações e diagnóstico
 # ════════════════════════════════════════════════════════════════════
 
@@ -10252,10 +17208,16 @@ FERRAMENTAS = [
     ("termux-x11", "termux-x11-nightly", "desktop da distro (x11-repo)"),
     ("7z", "p7zip", "extrair .7z e .rar"), ("proot-distro", "proot-distro", "Linux"),
     ("rclone", "rclone", "nuvem"), ("syncthing", "syncthing", "sincronização"),
+    ("qrencode", "libqrencode", "QR code"), ("zbarimg", "zbar", "ler QR code"), ("tesseract", "tesseract", "OCR"),
+    ("aria2c", "aria2", "downloads"), ("w3m", "w3m", "navegador texto"), ("browsh", "browsh", "Browsh (x11-repo)"),
+    ("figlet", "figlet", "arte ASCII"), ("qpdf", "qpdf", "PDF"), ("gs", "ghostscript", "comprimir PDF"),
+    ("pdftotext", "poppler", "PDF e livros"), ("gh", "gh", "GitHub"), ("crontab", "cronie", "tarefas agendadas"),
+    ("scrcpy", "scrcpy", "espelhar tela (x11-repo)"), ("java", "openjdk-21", "Minecraft"),
 ]
 MODULOS_OPCIONAIS = [("rich", "dashboard"), ("flask", "servidor web"), ("fastapi", "servidor web"),
                      ("uvicorn", "servidor web"), ("discord", "bot Discord"), ("mutagen", "capas de música"),
-                     ("textual", "apps TUI")]
+                     ("textual", "apps TUI"), ("PIL", "fotos e imagens"), ("cryptography", "cofre de senhas"),
+                     ("anthropic", "Claude (IA na nuvem)")]
 
 
 def diagnostico() -> None:
@@ -10304,7 +17266,10 @@ BANNER = [
 
 
 def cabecalho() -> None:
-    for linha in BANNER:
+    c = cfg()
+    banner = figlet(c["banner_texto"], c.get("banner_fonte") or "standard").splitlines() \
+        if c.get("banner_texto") and tem("figlet") else BANNER
+    for linha in banner:
         print(f"{MAG}{linha}{RST}")
     ambiente = "Termux" if IS_TERMUX else "fora do Termux"
     print(f"{DIM}v{VERSION} · {ambiente} · serviços: {', '.join(servicos_ativos()) or 'nenhum'}{RST}")
@@ -10327,6 +17292,12 @@ def menu_principal() -> None:
         ("🎬 Vídeos (TikTok, YouTube)", menu_videos),
         ("📺 Compartilhar filme por link", menu_midia),
         ("🧮 Calculadora científica", menu_calculadora),
+        ("🧰 Utilitários (notas, lembretes, agenda, senhas, tempo...)", menu_utilitarios),
+        ("📲 Celular e sistema (bateria, apps, fotos, automação...)", menu_celular),
+        ("🌐 Internet (e-mail, notícias, downloads, Browsh...)", menu_internet),
+        ("✨ Inteligência artificial (Claude, voz, OCR)", menu_ia),
+        ("🎮 Diversão e aprendizado (jogos, cursos, livros, rádio)", menu_diversao),
+        ("🛠️ Programação e servidores (SQL, GitHub, cron...)", menu_programacao),
         ("🔄 Atualização", menu_atualizar),
         ("🧹 Otimização e limpeza", menu_otimizacao),
         ("🔌 Depuração sem fio (ADB pelo Wi-Fi)", menu_adb),
@@ -10351,6 +17322,9 @@ def main(argv=None) -> int:
     p = sub.add_parser("monitor", help="roda os monitores de scraping")
     p.add_argument("--uma-vez", action="store_true", help="checa tudo uma vez e sai")
     sub.add_parser("dashboard", help="dashboard do sistema")
+    sub.add_parser("lembretes", help="serviço de lembretes e alarmes")
+    sub.add_parser("bateria-log", help="registra a bateria e avisa (80%%, baixa, quente)")
+    sub.add_parser("automacao", help="serviço de automação por eventos")
     sub.add_parser("tarefas", help="gerenciador de tarefas")
     sub.add_parser("snake", help="jogo da cobrinha")
     p = sub.add_parser("basic", help="interpretador BASIC")
@@ -10401,6 +17375,12 @@ def main(argv=None) -> int:
             rodar_monitores(args.uma_vez)
         elif args.comando == "dashboard":
             dashboard()
+        elif args.comando == "lembretes":
+            rodar_lembretes()
+        elif args.comando == "bateria-log":
+            rodar_bateria()
+        elif args.comando == "automacao":
+            rodar_automacoes()
         elif args.comando == "tarefas":
             tarefas_tui()
         elif args.comando == "snake":
