@@ -6,32 +6,29 @@ Termux-Toons — um canivete suíço em Python para o Termux.
 Reúne em um único menu:
    1. Servidor web/API pessoal (Flask, FastAPI ou só biblioteca padrão) + Cloudflare Tunnel
    2. Bots de Telegram e Discord rodando 24h (tmux + termux-wake-lock)
-   3. Automação com Termux:API (sensores, SMS, notificações, TTS, câmera, localização)
-   4. LLMs locais com llama.cpp compilado no próprio celular
-   5. Interfaces TUI (dashboard com rich, tarefas com curses)
-   6. Ambiente de desenvolvimento (Neovim + LSP, git, C/Rust/Go, code-server)
-   7. Scraping e monitoramento (preço, notícias/RSS, status de site)
-   8. Rede e segurança em equipamentos seus (nmap, SSH, WireGuard, velocidade, modem AT)
-   9. Retro: jogos ASCII, interpretador BASIC e template para criar seu jogo
-  10. Linux de verdade com proot-distro (Debian, Ubuntu, Arch...), com desktop no Termux:X11
-  11. Servidor de arquivos e backup (rclone, Syncthing, Samba, HTTP) e página HTML num link
-  12. "Spotify" no terminal: yt-dlp para baixar e mpv para tocar
-  13. Vídeos do TikTok, YouTube e outros sites com yt-dlp
-  14. Atualização do Termux e dos repositórios
-  15. Otimização e limpeza (caches, arquivos grandes/duplicados, processos)
-  16. Compartilhar filmes por link: arquivo do celular ou qualquer link de vídeo, com
-      player próprio, troca de trilha de áudio e conversão na hora (servidor de vídeo + túnel)
-  17. Depuração sem fio (ADB pelo Wi-Fi) do próprio celular, sem PC e sem root
-  18. Gerenciador de arquivos: copiar, mover, renomear, compactar e ver Android/data (ADB ou root)
-  19. Calculadora científica com botões (setas + Enter): trigonometria, fatorial, %, frações
-  20. Utilitários: notas, lembretes/alarmes, cronômetro/Pomodoro, agenda, conversor, gastos, senhas,
-      previsão do tempo, QR code (Wi-Fi, PIX) e tradutor
-  21. Celular e sistema: bateria, uso de dados/tempo de tela e apps (ADB), fotos, conversor de arquivos,
-      automação por eventos e espelhamento de tela
-  22. Internet: e-mail, notícias, downloads (aria2), chat na rede local, Browsh/w3m e encurtador/pastebin
-  23. Inteligência artificial: Claude/ChatGPT/Gemini, voz para texto (whisper.cpp) e OCR
-  24. Diversão e aprendizado: jogos, cursos de Python/Bash/Git, leitor de livros, rádio e podcasts, arte ASCII
-  25. Programação e servidores: SQLite/MariaDB/PostgreSQL, GitHub, cron, Minecraft, Jellyfin e Navidrome
+   3. Scraping e monitoramento (preço, notícias/RSS, status de site, chuva)
+   4. Rede e segurança em equipamentos seus (nmap, SSH, WireGuard, velocidade, modem AT)
+   5. Linux de verdade com proot-distro (Debian, Ubuntu, Arch...), com desktop no Termux:X11
+   6. Arquivos e backup: gerenciador de arquivos (ADB ou root para Android/data), rclone, Syncthing,
+      Samba, HTTP, backup e página HTML num link
+   7. Música, rádio e podcasts: yt-dlp para baixar, mpv para tocar, rádios online e podcasts
+   8. Vídeos do TikTok, YouTube e outros sites com yt-dlp
+   9. Compartilhar filmes por link: arquivo do celular ou qualquer link de vídeo, com player próprio,
+      troca de trilha de áudio e conversão na hora (servidor de vídeo + túnel)
+  10. Calculadora científica com botões (setas + Enter)
+  11. Utilitários: notas, tarefas, lembretes/alarmes, cronômetro/Pomodoro, agenda, conversor, gastos,
+      senhas, previsão do tempo, QR code (Wi-Fi, PIX) e tradutor
+  12. Celular e sistema: depuração sem fio (ADB), Termux:API, painel do sistema, bateria, uso de dados e
+      apps, fotos, conversor de arquivos, automação por eventos e espelhamento de tela
+  13. Internet: e-mail, notícias, downloads (aria2), chat na rede local, Browsh/w3m e encurtador/pastebin
+  14. Inteligência artificial: Claude/ChatGPT/Gemini, LLMs locais (llama.cpp), voz (whisper.cpp) e OCR
+  15. Diversão e aprendizado: jogos (incluindo os retrô), cursos de Python/Bash/Git, BASIC, leitor de
+      livros e arte ASCII
+  16. Programação e servidores: ambiente de desenvolvimento, SQLite/MariaDB/PostgreSQL, GitHub, cron,
+      Minecraft, Jellyfin e Navidrome
+  17. Atualização do Termux e dos repositórios
+  18. Otimização e limpeza (caches, arquivos grandes/duplicados, processos)
+  19. Configurações e diagnóstico
 
 Uso:
     python termux_toons.py            # menu interativo
@@ -1892,9 +1889,6 @@ def menu_termux_api():
         notificar(perguntar("Título", "Termux-Toons"), perguntar("Texto", "Olá do Python!"), som=True)
         ok("Notificação enviada.")
 
-    def tts():
-        falar(perguntar("Texto para falar", "Olá! Eu sou o Termux Toons."))
-
     def tirar_foto():
         cam = perguntar_int("Câmera (0 traseira, 1 frontal)", 0, 0, 5)
         destino = (DOWNLOADS if DOWNLOADS.exists() else DATA_DIR) / f"foto_{datetime.now():%Y%m%d_%H%M%S}.jpg"
@@ -1915,28 +1909,18 @@ def menu_termux_api():
             _tapi(["termux-clipboard-set"], 10, entrada=novo, json_saida=False)
             ok("Copiado.")
 
-    def alerta_bateria():
-        limite = perguntar_int("Avisar quando a bateria ficar abaixo de (%)", 20, 1, 99)
-        adicionar_monitor_dados({"nome": f"Bateria < {limite}%", "tipo": "bateria", "limite": limite,
-                                 "intervalo": 300})
-        info("Inicie o serviço de monitoramento no menu 'Scraping e monitoramento'.")
-
-    menu("📱 Automação com Termux:API", [
-        ("Status da bateria", lambda: mostrar_dados(bateria())),
+    menu("📱 Termux:API", [
         ("Listar sensores", listar_sensores),
         ("Ler um sensor", ler_sensor_menu),
         ("Enviar SMS", enviar_sms),
         ("Ler últimos SMS", ler_sms),
         ("Enviar notificação", notificacao),
-        ("Falar texto (TTS)", tts),
         ("Tirar foto", tirar_foto),
         ("Localização atual", local),
         ("Vibrar", lambda: vibrar(perguntar_int("Duração (ms)", 500, 50, 5000))),
         ("Lanterna liga/desliga", lambda: lanterna(confirmar("Ligar a lanterna?", True))),
         ("Área de transferência", clipboard),
-        ("Informações do Wi-Fi", lambda: mostrar_dados(_tapi(["termux-wifi-connectioninfo"], 15))),
         ("Volume do sistema", lambda: mostrar_dados(_tapi(["termux-volume"], 15))),
-        ("Criar alerta de bateria baixa", alerta_bateria),
         ("Instalar o pacote termux-api", lambda: instalar_pkg("termux-api")),
     ])
 
@@ -2440,18 +2424,9 @@ def tarefas_tui() -> None:
     curses.wrapper(app)
 
 
-@submenu
-def menu_tui():
-    def instalar_textual():
-        if garantir_modulo("textual"):
-            info("Teste com: python -m textual  (demonstração oficial do Textual)")
-
-    menu("📊 Interfaces TUI", [
-        ("Dashboard do sistema (rich)", dashboard),
-        ("Gerenciador de tarefas (curses)", tarefas_tui),
-        ("Player de música (yt-dlp + mpv)", menu_musica),
-        ("Instalar Textual para criar seus próprios apps TUI", instalar_textual),
-    ])
+def instalar_textual() -> None:
+    if garantir_modulo("textual"):
+        info("Teste com: python -m textual  (demonstração oficial do Textual)")
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -2631,6 +2606,7 @@ def menu_dev():
         ("code-server (VS Code no navegador): instalar", instalar_code_server),
         *itens_servico("code-server", "code-server", iniciar_code_server),
         ("code-server: mostrar senha", senha_code_server),
+        ("Textual: biblioteca para criar seus próprios apps de terminal", instalar_textual),
     ])
 
 
@@ -4240,29 +4216,21 @@ if __name__ == "__main__":
 '''
 
 
-@submenu
-def menu_retro():
-    def basic():
-        Basic().repl()
+def basic_repl() -> None:
+    Basic().repl()
 
-    def criar_jogo():
-        destino = Path(os.path.expanduser(perguntar("Salvar o template em", str(HOME / "meu_jogo.py"))))
-        if destino.exists() and not confirmar(f"{destino} já existe. Sobrescrever?"):
-            return
-        destino.write_text(TEMPLATE_JOGO, "utf-8")
-        destino.chmod(0o755)
-        ok(f"Template criado: {destino}")
-        info(f"Jogue com: python {destino}   |   Edite com: nvim {destino}")
-        if confirmar("Jogar agora?", True):
-            rodar([sys.executable, destino], mostrar=False)
 
-    menu("👾 Retro: jogos e BASIC", [
-        ("Snake (setas ou WASD)", snake),
-        ("Adivinhe o número", adivinhacao),
-        ("Interpretador BASIC (digite DEMO e RUN)", basic),
-        ("Criar meu próprio jogo (gera template em Python)", criar_jogo),
-        ("Ver recordes", lambda: mostrar_dados(ler_json(RECORDES_FILE, {}) or {"recordes": "nenhum ainda"})),
-    ])
+def criar_jogo() -> None:
+    """Gera um template de jogo em Python para a pessoa editar e jogar."""
+    destino = Path(os.path.expanduser(perguntar("Salvar o template em", str(HOME / "meu_jogo.py"))))
+    if destino.exists() and not confirmar(f"{destino} já existe. Sobrescrever?"):
+        return
+    destino.write_text(TEMPLATE_JOGO, "utf-8")
+    destino.chmod(0o755)
+    ok(f"Template criado: {destino}")
+    info(f"Jogue com: python {destino}   |   Edite com: nvim {destino}")
+    if confirmar("Jogar agora?", True):
+        rodar([sys.executable, destino], mostrar=False)
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -5175,12 +5143,14 @@ def menu_musica():
         salvar_cfg()
         ok(f"Músicas em {pasta_musicas()}")
 
-    menu("🎵 Música (yt-dlp + mpv)", [
+    menu("🎵 Música, rádio e podcasts", [
         ("Buscar e tocar (streaming)", buscar_tocar),
         ("Buscar e baixar (escolhe o formato: MP3, Opus, M4A, FLAC...)", buscar_baixar),
         ("Baixar por link (YouTube, SoundCloud, playlist...)", baixar_link),
         ("Baixar do Spotify (link → busca no YouTube)", baixar_spotify),
         ("Tocar mix/rádio por busca", mix),
+        ("📻 Rádio online (estações do Brasil e do mundo)", menu_radio),
+        ("🎙️ Podcasts (buscar, seguir, ouvir, baixar)", menu_podcasts),
         ("Biblioteca: escolher e tocar", biblioteca),
         ("Biblioteca: tocar tudo no aleatório", tudo_aleatorio),
         ("Playlists: criar", criar_playlist),
@@ -8089,7 +8059,6 @@ def menu_midia():
         ("🌐 Transmitir de um link da internet (sem baixar)", compartilhar_link),
         ("🍿 Catálogo do TorBox (todos os seus filmes e séries num link só)", menu_torbox),
         ("Meus links (copiar, enviar, assistir, apagar)", ver_links),
-        ("Assistir um link neste celular (VLC, MX Player...)", assistir_link_no_celular),
         ("Converter filme para MP4 compatível", converter),
         *itens_servico("midia", "Servidor de vídeo", iniciar_servidor),
         ("Túnel para a internet: ligar", iniciar_tunel),
@@ -8179,8 +8148,6 @@ def menu_atualizar():
         ("Trocar o espelho dos repositórios (termux-change-repo)", lambda: rodar(["termux-change-repo"])),
         ("Ativar repositórios extras (x11, root, tur)", ativar_repos),
         ("Atualizar pacotes Python opcionais (pip)", atualizar_pip),
-        ("Atualizar e recompilar o llama.cpp", compilar_llama),
-        ("Atualizar as distros do proot-distro", atualizar_distros),
         ("Atualizar repositórios git de uma pasta (git pull)", atualizar_gits),
         ("Atualizar o Termux-Toons", atualizar_toons),
         ("Limpar cache de pacotes", limpar_cache),
@@ -8936,7 +8903,6 @@ def menu_adb():
         ("Instalar APK", instalar_apk),
         ("Logcat (erros ou filtro)", logcat),
         ("Conceder permissão a um app (pm grant)", permissao),
-        ("Limpar o cache de todos os apps", lambda: ok(f"Liberado: {bytes_humanos(limpar_cache_apps('adb'))}")),
         ("Liberar ADB na porta 5555 para um computador", porta_5555),
         ("Desconectar", desconectar),
         ("Desligar a Depuração por Wi-Fi", desligar_depuracao),
@@ -11757,7 +11723,6 @@ def menu_senhas():
             ("Buscar", lambda: lista(perguntar("Procurar por"))),
             ("Guardar nova senha", adicionar),
             ("Verificar senhas fracas ou repetidas", auditoria),
-            ("Gerar senha forte", gerador),
             ("Trocar a senha mestra", trocar_mestra),
             ("Backup do cofre (arquivo criptografado)", backup),
         ], sair="Fechar o cofre")
@@ -12155,6 +12120,7 @@ def menu_tradutor():
 def menu_utilitarios():
     menu("🧰 Utilitários", [
         ("📝 Bloco de notas", menu_notas),
+        ("✅ Lista de tarefas", tarefas_tui),
         ("⏰ Lembretes e alarmes", menu_lembretes),
         ("⏱️ Cronômetro, timer e Pomodoro", menu_relogio),
         ("📅 Calendário e agenda (feriados)", menu_agenda),
@@ -12460,8 +12426,7 @@ def menu_uso_celular():
         ("Tempo de tela hoje", lambda: tempo_de_tela("daily")),
         ("Tempo de tela na semana", lambda: tempo_de_tela("weekly")),
         ("Internet gasta por app (móvel e Wi-Fi)", dados_por_app),
-        ("Conectar o ADB (depuração sem fio)", menu_adb),
-    ], cabecalho=lambda: print(f"{DIM}Precisa do ADB conectado ao próprio celular (menu 🔌 Depuração sem fio).{RST}"))
+    ], cabecalho=lambda: print(f"{DIM}Precisa do ADB conectado (🔌 Depuração sem fio, em Celular e sistema).{RST}"))
 
 
 # ── Gerenciador de apps (ADB) ────────────────────────────────────────
@@ -12566,8 +12531,7 @@ def menu_apps():
         ("Apps do sistema", lambda: listar("-s", "Apps do sistema")),
         ("Apps desativados (para reativar)", lambda: listar("-d", "Apps desativados")),
         ("Reinstalar app removido", reinstalar),
-        ("Conectar o ADB (depuração sem fio)", menu_adb),
-    ], cabecalho=lambda: print(f"{DIM}Precisa do ADB conectado ao próprio celular (menu 🔌 Depuração sem fio).{RST}"))
+    ], cabecalho=lambda: print(f"{DIM}Precisa do ADB conectado (🔌 Depuração sem fio, em Celular e sistema).{RST}"))
 
 
 # ── Organizador de fotos ─────────────────────────────────────────────
@@ -13290,13 +13254,15 @@ def menu_espelhar():
     menu("📲 Espelhar e controlar a tela (scrcpy)", [
         ("Ver e controlar OUTRO celular aqui (Termux:X11)", outro_celular),
         ("Ver e controlar ESTE celular num PC", num_pc),
-        ("Print e gravação da tela deste celular (menu ADB)", menu_adb),
     ])
 
 
 @submenu
 def menu_celular():
     menu("📲 Celular e sistema", [
+        ("🔌 Depuração sem fio (ADB pelo Wi-Fi, sem root)", menu_adb),
+        ("📱 Termux:API (sensores, SMS, câmera, localização...)", menu_termux_api),
+        ("📊 Painel do sistema ao vivo (CPU, RAM, bateria, serviços)", dashboard),
         ("🔋 Saúde da bateria (histórico e alertas de 80%)", menu_bateria),
         ("📊 Uso de dados e tempo de tela (ADB)", menu_uso_celular),
         ("📦 Gerenciador de apps (ADB, sem root)", menu_apps),
@@ -13779,7 +13745,6 @@ def menu_noticias():
         ("Favoritos", favoritos),
         ("Adicionar uma fonte (feed RSS)", adicionar_fonte),
         ("Remover uma fonte", remover_fonte),
-        ("Avisar de notícias novas (monitor RSS)", menu_monitor),
     ])
 
 
@@ -14879,16 +14844,6 @@ def menu_voz():
         if texto:
             falar(texto)
 
-    def ler_arquivo():
-        arq = escolher_arquivo("Qual arquivo?", (".txt", ".md", ".pdf", ".epub", ".html"))
-        if not arq:
-            return
-        texto = texto_de_arquivo(arq)
-        info(f"Lendo {len(texto)} caracteres em voz alta (Ctrl+C para parar)...")
-        with contextlib.suppress(KeyboardInterrupt):
-            for pedaco in fatiar(texto, 3000):
-                falar(pedaco)
-
     def configurar_voz():
         with contextlib.suppress(ToonsError):
             motores = _tapi(["termux-tts-engines"], 15)
@@ -14905,7 +14860,6 @@ def menu_voz():
         ("Transcrever um áudio (WhatsApp, gravações...)", transcrever_arquivo),
         ("Ditar uma nota (grava e transcreve)", ditar),
         ("Falar um texto", falar_texto),
-        ("Ler um arquivo em voz alta (audiolivro)", ler_arquivo),
         ("Configurar a voz (idioma e velocidade)", configurar_voz),
         (lambda: f"Instalar o whisper ({pronto()})", instalar),
         (lambda: f"Baixar/trocar modelo de voz ({c.get('whisper_modelo', 'base')})", baixar_modelo),
@@ -15824,11 +15778,12 @@ def menu_jogos():
         ("2048 (setas)", jogo_2048),
         ("Campo minado", campo_minado),
         ("Sudoku (gera um novo a cada partida)", sudoku),
+        ("Tetris", tetris),
+        ("Snake, a cobrinha (setas ou WASD)", snake),
         ("Forca", forca),
         ("Jogo da velha contra o celular", jogo_da_velha),
-        ("Tetris", tetris),
+        ("Adivinhe o número", adivinhacao),
         ("Quiz de conhecimentos gerais", quiz),
-        ("Snake e jogos retrô", menu_retro),
         ("Ver recordes", lambda: mostrar_dados(ler_json(RECORDES_FILE, {}) or {"recordes": "nenhum ainda"})),
     ])
 
@@ -16016,6 +15971,8 @@ def menu_aprender():
         (lambda: f"🐍 Python ({total('Python')})", lambda: curso("Python")),
         (lambda: f"🐚 Bash, o terminal ({total('Bash')})", lambda: curso("Bash")),
         (lambda: f"🌿 Git ({total('Git')})", lambda: curso("Git")),
+        ("👾 Interpretador BASIC retrô (digite DEMO e RUN)", basic_repl),
+        ("🕹️ Criar meu próprio jogo (gera um template em Python)", criar_jogo),
         ("🧪 Experimentar à vontade (Python ou Bash)", playground),
         ("Zerar o progresso", lambda: confirmar("Zerar todas as lições?", False) and gravar_json(APRENDER_FILE, {})),
     ])
@@ -16491,11 +16448,9 @@ def menu_arte():
 @submenu
 def menu_diversao():
     menu("🎮 Diversão e aprendizado", [
-        ("🎮 Jogos (2048, campo minado, sudoku, tetris...)", menu_jogos),
-        ("🎓 Aprender programação (Python, Bash, Git)", menu_aprender),
+        ("🎮 Jogos (2048, tetris, sudoku, snake, campo minado...)", menu_jogos),
+        ("🎓 Aprender programação (Python, Bash, Git e BASIC retrô)", menu_aprender),
         ("📖 Leitor de livros (EPUB, PDF) e audiolivro", menu_livros),
-        ("📻 Rádio online", menu_radio),
-        ("🎙️ Podcasts", menu_podcasts),
         ("🎨 Arte ASCII, banner e tema do Termux", menu_arte),
     ])
 
@@ -17164,10 +17119,6 @@ def menu_config():
         c["bot_permitir_shell"] = confirmar("Permitir o comando sh nos bots?", c["bot_permitir_shell"])
         salvar_cfg()
 
-    def tts_idioma():
-        c["tts_idioma"] = perguntar("Idioma do TTS (pt, en, es...; vazio = padrão do Android)", c["tts_idioma"])
-        salvar_cfg()
-
     def editar_json():
         editor = os.environ.get("EDITOR") or next((e for e in ("nvim", "nano", "vi") if tem(e)), None)
         if not editor:
@@ -17187,11 +17138,11 @@ def menu_config():
             salvar_cfg()
             ok("Configurações zeradas.")
 
-    menu("⚙️ Configurações", [
+    menu("⚙️ Configurações e diagnóstico", [
+        ("🩺 Diagnóstico (o que está instalado e funcionando)", diagnostico),
+        ("📦 Instalar os essenciais (python, tmux, termux-api, git)", instalar_essenciais),
         ("Ver configuração atual", mostrar),
-        ("Tokens e IDs dos bots (Telegram/Discord)", menu_bots),
         (lambda: f"Comando sh nos bots ({'permitido' if c['bot_permitir_shell'] else 'bloqueado'})", shell_bots),
-        (lambda: f"Idioma do TTS ({c['tts_idioma'] or 'padrão'})", tts_idioma),
         ("Editar config.json no editor", editar_json),
         ("Zerar configurações", resetar),
     ])
@@ -17279,32 +17230,23 @@ def menu_principal() -> None:
     menu("Menu principal", [
         ("🌐 Servidor web / API pessoal", menu_web),
         ("🤖 Bots Telegram / Discord 24h", menu_bots),
-        ("📱 Automação com Termux:API", menu_termux_api),
-        ("🧠 LLMs locais (llama.cpp)", menu_llm),
-        ("📊 Interfaces TUI (dashboard, tarefas)", menu_tui),
-        ("💻 Ambiente de desenvolvimento", menu_dev),
         ("🔎 Scraping e monitoramento", menu_monitor),
         ("🛡️ Rede e segurança", menu_rede),
-        ("👾 Retro: jogos e BASIC", menu_retro),
         ("🐧 Linux de verdade (proot-distro)", menu_proot),
-        ("🗄️ Arquivos e backup", menu_arquivos),
-        ("🎵 Música (yt-dlp + mpv)", menu_musica),
+        ("🗄️ Arquivos e backup (gerenciador, nuvem, site)", menu_arquivos),
+        ("🎵 Música, rádio e podcasts", menu_musica),
         ("🎬 Vídeos (TikTok, YouTube)", menu_videos),
         ("📺 Compartilhar filme por link", menu_midia),
         ("🧮 Calculadora científica", menu_calculadora),
-        ("🧰 Utilitários (notas, lembretes, agenda, senhas, tempo...)", menu_utilitarios),
-        ("📲 Celular e sistema (bateria, apps, fotos, automação...)", menu_celular),
+        ("🧰 Utilitários (notas, tarefas, lembretes, agenda, senhas...)", menu_utilitarios),
+        ("📲 Celular e sistema (ADB, Termux:API, bateria, apps, fotos...)", menu_celular),
         ("🌐 Internet (e-mail, notícias, downloads, Browsh...)", menu_internet),
-        ("✨ Inteligência artificial (Claude, voz, OCR)", menu_ia),
-        ("🎮 Diversão e aprendizado (jogos, cursos, livros, rádio)", menu_diversao),
-        ("🛠️ Programação e servidores (SQL, GitHub, cron...)", menu_programacao),
+        ("✨ Inteligência artificial (Claude, llama.cpp, voz, OCR)", menu_ia),
+        ("🎮 Diversão e aprendizado (jogos, retrô, BASIC, cursos, livros)", menu_diversao),
+        ("🛠️ Programação e servidores (dev, SQL, GitHub, cron...)", menu_programacao),
         ("🔄 Atualização", menu_atualizar),
         ("🧹 Otimização e limpeza", menu_otimizacao),
-        ("🔌 Depuração sem fio (ADB pelo Wi-Fi)", menu_adb),
-        ("📂 Gerenciador de arquivos (copiar, mover, renomear, Android/data...)", gerenciador_arquivos),
-        ("⚙️ Configurações", menu_config),
-        ("🩺 Diagnóstico", diagnostico),
-        ("📦 Instalar essenciais (python, tmux, termux-api, git)", instalar_essenciais),
+        ("⚙️ Configurações e diagnóstico", menu_config),
     ], sair="Sair", cabecalho=cabecalho)
 
 
