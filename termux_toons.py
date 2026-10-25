@@ -48,6 +48,7 @@ import calendar
 import contextlib
 import copy
 import csv
+import difflib
 import fnmatch
 import getpass
 import hashlib
@@ -18230,8 +18231,136 @@ def cabecalho() -> None:
     print(f"{DIM}v{VERSION} · {ambiente} · serviços: {', '.join(servicos_ativos()) or 'nenhum'}{RST}")
 
 
+# ── Busca no menu: acha uma opção pelo nome, mesmo com erro de digitação ──
+# Cada item é (rótulo mostrado, palavras de busca, função que abre). As palavras
+# extras cobrem o que não aparece no rótulo (ex.: "forca" dentro de 🎯 Jogos) e
+# apelidos/erros comuns. A comparação ignora acento e maiúscula e usa similaridade
+# (difflib), então "vdeos" encontra "vídeos" e "bateira" encontra "bateria".
+
+def _indice_busca() -> list:
+    return [
+        ("🌐 Servidor web / API pessoal", "api rest flask fastapi servidor http token endpoint", menu_web),
+        ("🤖 Bots Telegram / Discord 24h", "telegram discord bot chatbot robo", menu_bots),
+        ("🔎 Scraping e monitoramento", "scraping monitorar monitoramento site preco alerta mudanca", menu_monitor),
+        ("🛡️ Rede e segurança", "nmap ssh wireguard vpn porta firewall rede wifi scan seguranca", menu_rede),
+        ("🐧 Linux de verdade (proot-distro)", "debian ubuntu arch alpine kali linux distro proot gnu", menu_proot),
+        ("🖥️ Interface gráfica da distro (Termux:X11)", "x11 interface grafica desktop gui tela", menu_x11),
+        ("🗄️ Arquivos e backup", "gerenciador arquivos nuvem rclone backup pasta compartilhar", menu_arquivos),
+        ("🌐 Publicar página / site por link", "site html publicar pagina link servir web", publicar_site),
+        ("🎵 Música, rádio e podcasts", "musica mp3 audio tocar playlist som", menu_musica),
+        ("📻 Rádio online", "radio fm estacao radios ao vivo", menu_radio),
+        ("🎙️ Podcasts", "podcast podcasts episodio", menu_podcasts),
+        ("🎬 Vídeos (TikTok, YouTube)", "video videos youtube tiktok instagram baixar download yt-dlp", menu_videos),
+        ("📺 Compartilhar filme por link", "filme video streaming link assistir compartilhar serie", menu_midia),
+        ("🧮 Calculadora científica", "calcular calculadora conta matematica cientifica", menu_calculadora),
+        ("🧰 Utilitários", "utilitarios ferramentas notas tarefas lembretes agenda senhas", menu_utilitarios),
+        ("📝 Notas", "nota notas anotacao anotacoes bloco texto", menu_notas),
+        ("⏰ Lembretes", "lembrete lembretes lembrar reminder avisar", menu_lembretes),
+        ("⏱️ Relógio (alarme, cronômetro, timer)", "alarme cronometro timer temporizador despertador relogio", menu_relogio),
+        ("📅 Agenda", "agenda compromisso evento eventos calendario", menu_agenda),
+        ("📐 Conversor de unidades", "converter conversor unidade medida moeda temperatura peso distancia", menu_conversor),
+        ("💰 Controle de gastos", "gasto gastos despesa dinheiro orcamento financeiro conta", menu_gastos),
+        ("🔑 Cofre de senhas", "senha senhas password passwords cofre credencial login", menu_senhas),
+        ("🌦️ Previsão do tempo", "tempo clima previsao chuva temperatura meteorologia", menu_tempo),
+        ("🔳 QR code", "qr qrcode codigo ler gerar escanear", menu_qr),
+        ("🌍 Tradutor", "traduzir traducao tradutor idioma lingua", menu_tradutor),
+        ("📲 Celular e sistema", "celular sistema android adb bateria apps fotos", menu_celular),
+        ("🔌 Depuração sem fio (ADB)", "adb depuracao wifi wireless android shell signal 9 pareamento", menu_adb),
+        ("📳 Termux:API", "termux api sensor sms notificacao camera localizacao vibrar lanterna volume", menu_termux_api),
+        ("🔋 Saúde da bateria", "bateria carga ciclo saude temperatura energia percentual", menu_bateria),
+        ("📊 Tempo de tela e dados por app", "tempo de tela uso internet dados app consumo gasto rede", menu_uso_celular),
+        ("📦 Gerenciador de apps", "apps aplicativos bloatware desativar remover permissao apk abrir parar", menu_apps),
+        ("🖼️ Fotos", "foto fotos organizar duplicadas parecidas comprimir gps localizacao galeria", menu_fotos),
+        ("🔄 Conversor de arquivos", "converter imagem pdf video gif audio word excel powerpoint jpg png webp", menu_conversor_arquivos),
+        ("🤖 Automação por eventos (Tasker)", "automacao tasker evento gatilho horario wifi carregador bateria", menu_automacao),
+        ("📱 Espelhar a tela (scrcpy)", "espelhar scrcpy tela espelhamento mostrar", menu_espelhar),
+        ("📡 Modem (AT / 3GPP)", "modem at comando 3gpp sinal operadora", menu_modem),
+        ("🌐 Internet e comunicação", "internet email noticias downloads navegador chat links", menu_internet),
+        ("📧 E-mail", "email e-mail gmail outlook yahoo icloud caixa entrada enviar anexo", menu_email),
+        ("📰 Notícias (RSS)", "noticias noticia rss feed jornal g1 bbc folha", menu_noticias),
+        ("⬇️ Downloads (aria2, torrent)", "download downloads baixar aria2 torrent magnet fila", menu_downloads),
+        ("💬 Chat na rede local", "chat mensagem rede local lan conversar sem internet", menu_chat),
+        ("🌐 Navegador no terminal", "navegador browser browsh w3m web site pesquisar", menu_navegador),
+        ("🔗 Encurtador, pastebin e enviar arquivo", "encurtador link pastebin enviar arquivo url curto", menu_links),
+        ("✨ Inteligência artificial", "ia ai inteligencia artificial claude chatgpt gemini llama voz ocr", menu_ia),
+        ("💬 Assistente na nuvem (Claude, ChatGPT, Gemini)", "claude chatgpt gpt gemini assistente nuvem api conversar", menu_llm),
+        ("🎤 Voz para texto e texto para voz", "voz texto whisper ditado transcrever audio fala tts falar", menu_voz),
+        ("🔎 OCR: texto de foto ou print", "ocr texto foto imagem tesseract ler print extrair", menu_ocr),
+        ("🎮 Diversão e aprendizado", "diversao jogos retro basic cursos livros aprender", menu_diversao),
+        ("🎯 Jogos", "jogo jogos 2048 campo minado sudoku forca velha tetris snake adivinhe quiz recorde", menu_jogos),
+        ("🎓 Aprender programação", "aprender python bash git basic curso licao exercicio programar programacao", menu_aprender),
+        ("📖 Leitor de livros e audiolivro", "livro livros leitor epub pdf txt audiolivro ler", menu_livros),
+        ("🎨 Arte ASCII, banner e tema do Termux", "arte ascii figlet banner tema cores dracula nord gruvbox", menu_arte),
+        ("👻 Trote / pegadinha (screamer)", "trote pegadinha screamer susto brincadeira", menu_trote),
+        ("🛠️ Programação e servidores", "programacao dev sql github cron servidor banco de dados", menu_programacao),
+        ("💻 Ambiente de desenvolvimento", "dev desenvolvimento neovim nvim lsp code-server vscode clang rust go ide", menu_dev),
+        ("🗃️ Banco de dados (SQLite, MySQL, PostgreSQL)", "banco dados sqlite mariadb mysql postgresql sql csv", menu_banco_de_dados),
+        ("🐙 GitHub (gh)", "github gh repositorio repo commit push pr issue clonar", menu_github),
+        ("⏲️ Tarefas agendadas (cron)", "cron agendar tarefa agendada crontab horario periodico", menu_agendador),
+        ("🖥️ Servidores (Minecraft, Jellyfin, Navidrome)", "minecraft jellyfin navidrome servidor server jogo media", menu_servidores),
+        ("🔄 Atualização", "atualizar atualizacao upgrade pkg pip espelho repositorio", menu_atualizar),
+        ("🧹 Otimização e limpeza", "limpar limpeza cache espaco otimizar lixo duplicados temporarios", menu_otimizacao),
+        ("⚙️ Configurações e diagnóstico", "configuracao configuracoes diagnostico config token reset essenciais", menu_config),
+    ]
+
+
+_STOP_BUSCA = {"de", "da", "do", "e", "ou", "no", "na", "os", "as", "um", "uma", "por",
+               "com", "para", "the", "a", "o"}
+
+
+def _casa_palavra(palavra: str, token: str) -> float:
+    """0 a 1 para uma palavra da busca contra um termo. Casa exato, começo igual
+    (digitar o início: 'git'→'github', 'qr'→'qrcode') ou a palavra inteira dentro
+    do termo valem alto; o resto vai pela semelhança (difflib), que perdoa trocas
+    e letras faltando ('vdeos'→'videos')."""
+    if palavra == token:
+        return 1.0
+    curto, longo = sorted((palavra, token), key=len)
+    razao = len(curto) / len(longo)
+    if len(curto) >= 2 and (token.startswith(palavra) or palavra.startswith(token)):
+        return 0.82 + 0.18 * razao  # digitou o começo (evita casar só pela 1ª letra)
+    if len(palavra) >= 3 and palavra in token:  # 'foto' dentro de 'fotos'
+        return 0.74 + 0.16 * razao
+    return difflib.SequenceMatcher(None, palavra, token).ratio()
+
+
+def _pontua_busca(consulta: str, termos: str) -> float:
+    """0 a 1: o quanto a consulta (já sem acento/minúscula) casa com os termos do item.
+    Casa palavra a palavra; cada palavra vale pela melhor semelhança com um dos termos."""
+    # tira palavrinhas de ligação (de, e, por...) que casariam com quase tudo
+    tokens = {t for t in re.findall(r"[a-z0-9]+", termos) if len(t) >= 2 and t not in _STOP_BUSCA}
+    palavras = [p for p in consulta.split() if p not in _STOP_BUSCA] or consulta.split()
+    if not tokens or not palavras:
+        return 0.0
+    soma = 0.0
+    for palavra in palavras:
+        melhor = max(_casa_palavra(palavra, token) for token in tokens)
+        soma += melhor
+    return soma / len(palavras)
+
+
+@submenu
+def menu_busca():
+    termo = perguntar("🔍 Buscar opção (ex.: 'vdeos', 'senha', 'bateria')").strip()
+    if not termo:
+        return
+    consulta = sem_acento(termo).lower().strip()
+    pontuados = ((_pontua_busca(consulta, f"{sem_acento(rotulo).lower()} {termos}"), rotulo, func)
+                 for rotulo, termos, func in _indice_busca())
+    achados = sorted((e for e in pontuados if e[0] >= 0.6), key=lambda e: e[0], reverse=True)[:12]
+    if not achados:
+        info(f"Nada parecido com '{termo}'. Tente outra palavra (ex.: 'jogo', 'foto', 'pdf', 'rede').")
+        return
+    i = escolher(f"Resultados para '{termo}'", [rotulo for _, rotulo, _ in achados])
+    if i is None:
+        return
+    _, rotulo, func = achados[i]
+    executar(func, rotulo)
+
+
 def menu_principal() -> None:
     menu("Menu principal", [
+        ("🔍 Buscar opção (digite, mesmo com erro de digitação)", menu_busca),
         ("🌐 Servidor web / API pessoal", menu_web),
         ("🤖 Bots Telegram / Discord 24h", menu_bots),
         ("🔎 Scraping e monitoramento", menu_monitor),
