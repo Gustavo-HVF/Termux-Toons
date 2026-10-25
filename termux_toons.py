@@ -822,6 +822,25 @@ PADRAO_CFG = {
     "tela_token": "",
     "tela_controle": False,
     "tela_qualidade": "normal",
+    "trote_porta": 8099,
+    "trote_titulo": "Você caiu no trote! 👻",
+    "trote_mensagem": "EU TE PEGUEI!!!",
+    "trote_imagem": "",
+    "trote_som": "",
+    "trote_piscar": True,
+    "trote_vibrar": True,
+    "trote_notificacoes": True,
+    "trote_notif_textos": [
+        "👻 ele está atrás de você",
+        "😱 NÃO OLHE PARA TRÁS",
+        "🔪 estou te vendo...",
+        "💀 3... 2... 1...",
+        "📵 é tarde demais",
+        "🩸 você não devia ter clicado",
+    ],
+    "trote_cor": "#b10000",
+    "trote_atraso": 2,
+    "trote_volume": 1.0,
 }
 
 _CFG: dict | None = None
@@ -16853,6 +16872,410 @@ def menu_arte():
     ])
 
 
+# ── Trote / pegadinha (screamer): link que dá um susto em quem abrir ──
+
+TROTE_DIR = DATA_DIR / "trote"  # página gerada + imagem/som copiados
+
+# Rosto padrão (SVG) para quando a pessoa não escolhe uma imagem própria.
+_TROTE_ROSTO_SVG = """<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 600 800'>
+<rect width='600' height='800' fill='#040404'/>
+<radialGradient id='pele' cx='50%' cy='38%' r='62%'>
+  <stop offset='0%' stop-color='#aab2a6'/><stop offset='62%' stop-color='#3a423a'/>
+  <stop offset='100%' stop-color='#050605'/>
+</radialGradient>
+<ellipse cx='300' cy='380' rx='215' ry='305' fill='url(#pele)'/>
+<ellipse cx='210' cy='330' rx='72' ry='98' fill='#000'/>
+<ellipse cx='390' cy='330' rx='72' ry='98' fill='#000'/>
+<circle cx='210' cy='348' r='15' fill='#8b0000'/>
+<circle cx='390' cy='348' r='15' fill='#8b0000'/>
+<path d='M300 378 l-24 76 l48 0 Z' fill='#0a0c0a'/>
+<path d='M188 556 Q300 516 412 556 Q360 700 300 712 Q240 700 188 556 Z' fill='#060606'/>
+<g stroke='#15170f' stroke-width='7'>
+  <line x1='232' y1='558' x2='242' y2='648'/><line x1='272' y1='542' x2='277' y2='690'/>
+  <line x1='322' y1='542' x2='327' y2='690'/><line x1='366' y1='558' x2='360' y2='648'/>
+</g>
+<g stroke='#6b0000' stroke-width='3' fill='none' opacity='0.85'>
+  <path d='M208 248 l-28 -82 l9 40 l-24 -20'/><path d='M392 248 l34 -72 l-11 36 l27 -16'/>
+  <path d='M300 118 l-10 60 l16 -24 l-2 34'/>
+</g>
+</svg>"""
+
+# Página do trote. __CFG__ vira um objeto JSON com as opções escolhidas no Termux.
+_TROTE_HTML = """<!doctype html>
+<html lang='pt-br'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no'>
+<meta name='theme-color' content='#000000'>
+<title>Carregando…</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { height:100%; background:#0b0e12; color:#e8eef5; overflow:hidden;
+    font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif; }
+  #gate { min-height:100%; display:flex; flex-direction:column; justify-content:center;
+    align-items:center; text-align:center; padding:28px 20px 160px; gap:14px; }
+  #gate h1 { font-size:26px; font-weight:800; }
+  #gate p { opacity:.78; max-width:420px; line-height:1.5; }
+  .selo { font-size:52px; }
+  .cookie { position:fixed; left:0; right:0; bottom:0; background:#161b22;
+    border-top:1px solid #2a323c; padding:16px; display:flex; flex-direction:column;
+    gap:10px; align-items:center; }
+  .cookie span { font-size:13px; opacity:.82; max-width:520px; line-height:1.45; }
+  .cookie .botoes { display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
+  button { font-size:15px; font-weight:700; border:0; border-radius:10px; padding:13px 20px;
+    cursor:pointer; }
+  .ok { background:#2ea043; color:#fff; }
+  .alt { background:transparent; color:#9fb0c3; border:1px solid #2a323c; }
+  #espera { position:fixed; inset:0; display:none; flex-direction:column; gap:18px;
+    align-items:center; justify-content:center; background:#000; }
+  .spin { width:54px; height:54px; border:5px solid #1c2531; border-top-color:#4b9fff;
+    border-radius:50%; animation:gira .8s linear infinite; }
+  @keyframes gira { to { transform:rotate(360deg); } }
+  #cena { position:fixed; inset:0; display:none; background:#000; overflow:hidden; }
+  #rosto { position:absolute; inset:0; width:100%; height:100%; object-fit:cover;
+    animation:tremer .09s infinite; }
+  @keyframes tremer { 0%{transform:translate(0,0) scale(1.04)} 25%{transform:translate(-8px,6px) scale(1.07)}
+    50%{transform:translate(7px,-7px) scale(1.05)} 75%{transform:translate(-6px,-6px) scale(1.08)}
+    100%{transform:translate(6px,7px) scale(1.04)} }
+  #flash { position:fixed; inset:0; opacity:0; pointer-events:none; mix-blend-mode:screen; }
+  #msg { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    text-align:center; padding:16px; font-size:min(16vw,120px); font-weight:900;
+    color:#fff; text-shadow:0 0 18px #000, 0 0 40px #b10000; letter-spacing:1px;
+    pointer-events:none; animation:treme .12s infinite; }
+  @keyframes treme { 0%{transform:translate(0,0)} 50%{transform:translate(4px,-4px) skewX(2deg)}
+    100%{transform:translate(-4px,4px) skewX(-2deg)} }
+  #bandeja { position:fixed; top:0; left:0; right:0; padding:8px; display:flex;
+    flex-direction:column; gap:7px; pointer-events:none; z-index:50; }
+  .notif { display:flex; gap:10px; align-items:center; background:rgba(22,27,34,.97);
+    border:1px solid #2a323c; border-radius:12px; padding:10px 12px;
+    box-shadow:0 6px 18px rgba(0,0,0,.5); animation:entra .18s ease-out; }
+  @keyframes entra { from{transform:translateY(-120%); opacity:0} to{transform:none; opacity:1} }
+  .nicone { font-size:22px; }
+  .ncorpo { flex:1; text-align:left; min-width:0; }
+  .ntitulo { font-size:13px; font-weight:800; color:#fff; }
+  .ntexto { font-size:13px; color:#cdd7e2; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .nhora { font-size:11px; color:#8a97a6; }
+</style>
+</head>
+<body>
+<div id='gate'>
+  <div class='selo'>🔒</div>
+  <h1 id='nomeSite'>Verificação de segurança</h1>
+  <p>Para acessar o conteúdo, confirme que você não é um robô e aceite os cookies deste site.</p>
+  <div class='cookie'>
+    <span>🍪 Este site usa cookies e recursos do navegador (som, vibração e notificações)
+      para melhorar a sua experiência. Ao continuar, você concorda com tudo isso.</span>
+    <div class='botoes'>
+      <button class='ok' id='aceitar'>Aceitar e continuar</button>
+      <button class='alt' id='aceitar2'>Só os necessários</button>
+    </div>
+  </div>
+</div>
+<div id='espera'><div class='spin'></div><div>Carregando conteúdo…</div></div>
+<div id='cena'>
+  <img id='rosto' alt=''>
+  <div id='flash'></div>
+  <div id='msg'></div>
+</div>
+<div id='bandeja'></div>
+<audio id='som' loop></audio>
+<script>
+const CFG = __CFG__;
+const $ = s => document.querySelector(s);
+function escapar(t){ const d=document.createElement('div'); d.textContent=t==null?'':String(t); return d.innerHTML; }
+
+let actx=null, somEl=null, usarSintetico=false, loopSintetico=null;
+
+function prepararSom(){
+  try { actx = new (window.AudioContext||window.webkitAudioContext)(); if(actx.state==='suspended') actx.resume(); } catch(e){ actx=null; }
+  if (CFG.som) {
+    somEl = $('#som'); somEl.src = '/' + CFG.som; somEl.volume = CFG.volume;
+    somEl.play().then(()=>{ somEl.pause(); somEl.currentTime=0; }).catch(()=>{ usarSintetico=true; });
+  } else { usarSintetico = true; }
+}
+
+function umGrito(t0){
+  if(!actx) return; const dur=1.7;
+  const g=actx.createGain();
+  g.gain.setValueAtTime(0.0001,t0);
+  g.gain.exponentialRampToValueAtTime(Math.max(0.05,CFG.volume),t0+0.03);
+  g.gain.exponentialRampToValueAtTime(0.0001,t0+dur);
+  const ws=actx.createWaveShaper(); const n=1024, cv=new Float32Array(n);
+  for(let i=0;i<n;i++){ const x=i*2/n-1; cv[i]=Math.tanh(x*9); }
+  ws.curve=cv; g.connect(ws); ws.connect(actx.destination);
+  const len=Math.floor(actx.sampleRate*dur), buf=actx.createBuffer(1,len,actx.sampleRate), d=buf.getChannelData(0);
+  for(let i=0;i<len;i++) d[i]=Math.random()*2-1;
+  const ns=actx.createBufferSource(); ns.buffer=buf;
+  const bp=actx.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=1300; bp.Q.value=0.6;
+  ns.connect(bp); bp.connect(g); ns.start(t0); ns.stop(t0+dur);
+  [620,940,1500].forEach((f,idx)=>{
+    const o=actx.createOscillator(); o.type='sawtooth';
+    o.frequency.setValueAtTime(f,t0);
+    o.frequency.exponentialRampToValueAtTime(f*2.4,t0+0.22);
+    o.frequency.exponentialRampToValueAtTime(f*0.8,t0+dur);
+    const lfo=actx.createOscillator(); lfo.frequency.value=16+idx*5;
+    const lg=actx.createGain(); lg.gain.value=f*0.3;
+    lfo.connect(lg); lg.connect(o.frequency); lfo.start(t0); lfo.stop(t0+dur);
+    o.connect(g); o.start(t0); o.stop(t0+dur);
+  });
+}
+function gritoSintetico(){ if(!actx) return; umGrito(actx.currentTime+0.02);
+  loopSintetico=setInterval(()=>umGrito(actx.currentTime+0.02), 1700); }
+function tocarSom(){
+  if(!usarSintetico && somEl){ somEl.play().catch(()=>{ usarSintetico=true; gritoSintetico(); }); }
+  else gritoSintetico();
+}
+function tique(){ if(!actx) return; const t=actx.currentTime, o=actx.createOscillator(), g=actx.createGain();
+  o.type='square'; o.frequency.value=880; g.gain.setValueAtTime(0.0001,t);
+  g.gain.exponentialRampToValueAtTime(0.4,t+0.01); g.gain.exponentialRampToValueAtTime(0.0001,t+0.2);
+  o.connect(g); g.connect(actx.destination); o.start(t); o.stop(t+0.2); }
+
+function telaCheia(){ const e=document.documentElement;
+  const f=e.requestFullscreen||e.webkitRequestFullscreen; if(f){ try{ f.call(e); }catch(x){} } }
+
+function piscar(){ if(!CFG.piscar) return; const f=$('#flash'); let on=false; f.style.background=CFG.cor;
+  setInterval(()=>{ on=!on; f.style.opacity = on?'0.85':'0'; }, 90); }
+
+function vibrar(){ if(!CFG.vibrar || !navigator.vibrate) return; const p=[400,120,400,120,600,200,350,120];
+  navigator.vibrate(p); setInterval(()=>navigator.vibrate(p), 1600); }
+
+let ni=0;
+function soltarNotificacao(){
+  const lista = (CFG.notif_textos && CFG.notif_textos.length) ? CFG.notif_textos : [CFG.mensagem];
+  const txt = lista[ni % lista.length]; ni++;
+  const el=document.createElement('div'); el.className='notif';
+  el.innerHTML = "<div class='nicone'>⚠️</div><div class='ncorpo'><div class='ntitulo'>"+escapar(CFG.titulo)+
+    "</div><div class='ntexto'>"+escapar(txt)+"</div></div><div class='nhora'>agora</div>";
+  const b=$('#bandeja'); b.appendChild(el);
+  if(navigator.vibrate) navigator.vibrate(200); tique();
+  while(b.children.length>8) b.removeChild(b.firstChild);
+  setTimeout(()=>el.remove(), 6000);
+  if('Notification' in window && Notification.permission==='granted'){
+    try{ new Notification(CFG.titulo, {body:txt}); }catch(x){}
+  }
+}
+function notificacoes(){ if(!CFG.notificacoes) return; soltarNotificacao(); setInterval(soltarNotificacao, 700); }
+
+function titulo(){ const alt=['⚠ '+CFG.titulo,'😱😱😱',CFG.titulo,'👁 '+CFG.titulo+' 👁']; let k=0;
+  setInterval(()=>{ document.title = alt[k++ % alt.length]; }, 420); }
+
+function assustar(){
+  const e=$('#espera'); if(e) e.style.display='none';
+  $('#cena').style.display='block';
+  $('#rosto').src = '/' + CFG.imagem;
+  $('#msg').textContent = CFG.mensagem;
+  tocarSom(); piscar(); vibrar(); notificacoes(); titulo();
+}
+
+function comecar(){
+  const g=$('#gate'); if(g) g.remove();
+  telaCheia(); prepararSom();
+  if('Notification' in window && Notification.permission==='default'){ try{ Notification.requestPermission(); }catch(x){} }
+  if(CFG.atraso>0){ $('#espera').style.display='flex'; setTimeout(assustar, CFG.atraso*1000); }
+  else assustar();
+}
+
+$('#aceitar').addEventListener('click', comecar);
+$('#aceitar2').addEventListener('click', comecar);
+document.addEventListener('contextmenu', e=>e.preventDefault());
+window.addEventListener('beforeunload', e=>{ e.preventDefault(); e.returnValue=''; });
+</script>
+</body>
+</html>"""
+
+
+def montar_pagina_trote(c: dict, img_arquivo: str, som_arquivo: str) -> str:
+    opcoes = {
+        "titulo": c.get("trote_titulo") or "Trote",
+        "mensagem": c.get("trote_mensagem") or "",
+        "imagem": img_arquivo,
+        "som": som_arquivo,
+        "piscar": bool(c.get("trote_piscar", True)),
+        "vibrar": bool(c.get("trote_vibrar", True)),
+        "notificacoes": bool(c.get("trote_notificacoes", True)),
+        "notif_textos": [str(t) for t in (c.get("trote_notif_textos") or [])],
+        "cor": c.get("trote_cor") or "#b10000",
+        "atraso": max(0, int(c.get("trote_atraso", 0) or 0)),
+        "volume": min(1.0, max(0.0, float(c.get("trote_volume", 1.0) or 0.0))),
+    }
+    return _TROTE_HTML.replace("__CFG__", json.dumps(opcoes, ensure_ascii=False))
+
+
+def preparar_trote() -> dict:
+    """Gera a pasta do trote: copia (ou cria) a imagem e o som e escreve o index.html."""
+    c = cfg()
+    TROTE_DIR.mkdir(parents=True, exist_ok=True)
+    for antigo in list(TROTE_DIR.glob("imagem.*")) + list(TROTE_DIR.glob("som.*")):
+        antigo.unlink(missing_ok=True)
+
+    img_src = os.path.expanduser(c.get("trote_imagem") or "")
+    if img_src and Path(img_src).is_file():
+        ext = Path(img_src).suffix.lower() or ".img"
+        shutil.copy2(img_src, TROTE_DIR / f"imagem{ext}")
+        img_arquivo = f"imagem{ext}"
+    else:
+        (TROTE_DIR / "imagem.svg").write_text(_TROTE_ROSTO_SVG, "utf-8")
+        img_arquivo = "imagem.svg"
+
+    som_arquivo = ""
+    som_src = os.path.expanduser(c.get("trote_som") or "")
+    if som_src and Path(som_src).is_file():
+        ext = Path(som_src).suffix.lower() or ".audio"
+        shutil.copy2(som_src, TROTE_DIR / f"som{ext}")
+        som_arquivo = f"som{ext}"
+
+    (TROTE_DIR / "index.html").write_text(montar_pagina_trote(c, img_arquivo, som_arquivo), "utf-8")
+    return {"imagem": img_arquivo, "som": som_arquivo}
+
+
+def servir_trote(porta: int) -> None:
+    """Sobe a página do trote em primeiro plano (roda dentro do tmux)."""
+    preparar_trote()  # regenera a partir da config atual a cada (re)início
+    pasta = str(TROTE_DIR)
+    with ThreadingHTTPServer(("0.0.0.0", porta), lambda *a, **k: _HandlerSite(*a, directory=pasta, **k)) as servidor:
+        log(f"Trote no ar em http://{ip_local()}:{porta}  (Ctrl+C para parar)")
+        servidor.serve_forever()
+
+
+def links_trote() -> list:
+    c = cfg()
+    links = [("Mesma rede Wi-Fi", f"http://{ip_local()}:{c['trote_porta']}/")]
+    if servico_ativo("tunel-trote") and url_tunel("tunel-trote"):
+        links.append(("Internet", f"{url_tunel('tunel-trote')}/"))
+    return links
+
+
+def mostrar_links_trote() -> None:
+    if not servico_ativo("trote"):
+        info("O trote não está no ar. Use 'Preparar e publicar'.")
+        return
+    for onde, link in links_trote():
+        print(f"  {CIANO}{onde}:{RST}\n  {NEG}{link}{RST}")
+    if not servico_ativo("tunel-trote"):
+        print(f"  {DIM}Para quem está fora do seu Wi-Fi, use 'Liberar para a internet'.{RST}")
+
+
+def parar_trote() -> None:
+    parar_servico("tunel-trote")
+    parar_servico("trote")
+
+
+@submenu
+def menu_editar_trote():
+    c = cfg()
+
+    def _texto(chave, msg):
+        c[chave] = perguntar(msg, c.get(chave, ""))
+        salvar_cfg(); ok("Salvo.")
+
+    def _alternar(chave):
+        c[chave] = not c.get(chave, True)
+        salvar_cfg(); ok("Ligado." if c[chave] else "Desligado.")
+
+    def escolher_imagem():
+        if c.get("trote_imagem") and confirmar("Voltar à imagem padrão (rosto embutido)?", False):
+            c["trote_imagem"] = ""; salvar_cfg(); ok("Usando o rosto padrão."); return
+        arq = escolher_arquivo("Imagem do susto (fica em tela cheia)", EXT_IMAGEM)
+        if arq:
+            c["trote_imagem"] = str(arq); salvar_cfg(); ok(f"Imagem: {arq.name}")
+
+    def escolher_som():
+        if c.get("trote_som") and confirmar("Voltar ao grito sintético padrão?", False):
+            c["trote_som"] = ""; salvar_cfg(); ok("Usando o grito sintético."); return
+        arq = escolher_arquivo("Som do grito (toca em loop, volume máximo)", EXT_AUDIO)
+        if arq:
+            c["trote_som"] = str(arq); salvar_cfg(); ok(f"Som: {arq.name}")
+
+    def editar_cor():
+        cor = perguntar("Cor do pisca-pisca (hex, ex.: #b10000)", c.get("trote_cor", "#b10000")).strip()
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", cor):
+            raise ToonsError("Use um hex de 6 dígitos, como #b10000.")
+        c["trote_cor"] = cor; salvar_cfg(); ok("Cor salva.")
+
+    def editar_atraso():
+        c["trote_atraso"] = perguntar_int("Segundos de 'carregando' antes do susto (0 = na hora)",
+                                          c.get("trote_atraso", 2), 0, 30)
+        salvar_cfg(); ok("Salvo.")
+
+    def editar_volume():
+        c["trote_volume"] = round(min(1.0, max(0.0, perguntar_float("Volume (0.0 a 1.0)", c.get("trote_volume", 1.0)))), 2)
+        salvar_cfg(); ok("Salvo.")
+
+    def editar_notificacoes_texto():
+        atual = "\n".join(c.get("trote_notif_textos") or [])
+        novo = editar_texto(atual, ".txt")
+        if novo is None:
+            return
+        c["trote_notif_textos"] = [l.strip() for l in novo.splitlines() if l.strip()]
+        salvar_cfg(); ok(f"{len(c['trote_notif_textos'])} notificação(ões) salva(s).")
+
+    def img_rotulo():
+        v = c.get("trote_imagem")
+        return f"🖼️ Imagem do susto (atual: {Path(v).name if v else 'rosto padrão'})"
+
+    def som_rotulo():
+        v = c.get("trote_som")
+        return f"🔊 Som do grito (atual: {Path(v).name if v else 'grito sintético'})"
+
+    menu("✏️ Personalizar o trote", [
+        (lambda: f"📛 Nome/título do site (atual: {c.get('trote_titulo','')[:28]})",
+         lambda: _texto("trote_titulo", "Nome/título que aparece na aba e nas notificações")),
+        (lambda: f"💬 Mensagem do susto (atual: {c.get('trote_mensagem','')[:28]})",
+         lambda: _texto("trote_mensagem", "Mensagem gigante que aparece na tela")),
+        (img_rotulo, escolher_imagem),
+        (som_rotulo, escolher_som),
+        (lambda: f"✨ Piscar a tela: {'LIGADO' if c.get('trote_piscar', True) else 'desligado'}",
+         lambda: _alternar("trote_piscar")),
+        (lambda: f"📳 Vibrar o celular: {'LIGADO' if c.get('trote_vibrar', True) else 'desligado'}",
+         lambda: _alternar("trote_vibrar")),
+        (lambda: f"🔔 Notificações: {'LIGADAS' if c.get('trote_notificacoes', True) else 'desligadas'}",
+         lambda: _alternar("trote_notificacoes")),
+        ("📝 Editar os textos das notificações", editar_notificacoes_texto),
+        (lambda: f"🎨 Cor do pisca-pisca (atual: {c.get('trote_cor','#b10000')})", editar_cor),
+        (lambda: f"⏱️ Atraso até o susto (atual: {c.get('trote_atraso',2)}s)", editar_atraso),
+        (lambda: f"🔈 Volume (atual: {c.get('trote_volume',1.0)})", editar_volume),
+    ])
+
+
+@submenu
+def menu_trote():
+    c = cfg()
+
+    def iniciar():
+        aviso("Trote/screamer: a página dá um susto (grito alto, imagem em tela cheia, tela piscando, "
+              "vibração e notificações) em quem abrir o link. Use só com quem topa a brincadeira.")
+        info("A tela pisca forte e com som alto: NÃO envie para quem tem epilepsia fotossensível, "
+             "problema cardíaco ou está dirigindo.")
+        if not confirmar("Preparar e publicar o link do trote?", True):
+            return
+        preparar_trote()
+        if servico_ativo("trote"):
+            parar_servico("trote")
+        if not porta_livre(c["trote_porta"]):
+            raise ToonsError(f"A porta {c['trote_porta']} já está em uso. Troque 'trote_porta' em Configurações.")
+        if not iniciar_servico("trote", cmd_self("trote", "--porta", str(c["trote_porta"])), reiniciar=True):
+            return
+        if not servico_ativo("tunel-trote") and confirmar("Liberar o link para a internet (fora do seu Wi-Fi)?", True):
+            abrir_tunel("tunel-trote", c["trote_porta"])
+        print()
+        mostrar_links_trote()
+        links = links_trote()
+        if links and tem("termux-clipboard-set") and confirmar("Copiar o link?", True):
+            _tapi(["termux-clipboard-set"], 10, entrada=links[-1][1], json_saida=False)
+            ok("Link copiado. Mande para a vítima. 😈")
+        info("O link funciona enquanto o Termux estiver aberto. O endereço do túnel muda a cada vez que religa. "
+             "Depois de editar algo, publique de novo para aplicar.")
+
+    menu("👻 Trote / pegadinha (screamer)", [
+        ("😈 Preparar e publicar o link do trote", iniciar),
+        ("🔗 Ver o link", mostrar_links_trote),
+        ("🌍 Liberar para a internet (túnel)",
+         lambda: abrir_tunel("tunel-trote", cfg()["trote_porta"]) if servico_ativo("trote") else info("Publique o trote primeiro.")),
+        ("🛑 Tirar do ar", parar_trote),
+        ("✏️ Personalizar (som, imagem, mensagem, efeitos...)", menu_editar_trote),
+    ])
+
+
 @submenu
 def menu_diversao():
     menu("🎮 Diversão e aprendizado", [
@@ -16860,6 +17283,7 @@ def menu_diversao():
         ("🎓 Aprender programação (Python, Bash, Git e BASIC retrô)", menu_aprender),
         ("📖 Leitor de livros (EPUB, PDF) e audiolivro", menu_livros),
         ("🎨 Arte ASCII, banner e tema do Termux", menu_arte),
+        ("👻 Trote / pegadinha: link que dá um susto (screamer)", menu_trote),
     ])
 
 
@@ -17697,6 +18121,8 @@ def main(argv=None) -> int:
     p = sub.add_parser("site", help="publica uma pasta como site (página HTML) em primeiro plano")
     p.add_argument("pasta")
     p.add_argument("--porta", type=int)
+    p = sub.add_parser("trote", help="sobe a página do trote/screamer em primeiro plano")
+    p.add_argument("--porta", type=int)
     p = sub.add_parser("tela", help="transmite a tela do celular para o navegador (link secreto)")
     p.add_argument("--porta", type=int)
     p = sub.add_parser("compartilhar", help="cria um link para assistir a um vídeo e liga o servidor")
@@ -17766,6 +18192,8 @@ def main(argv=None) -> int:
             gerenciador_arquivos(args.pasta)
         elif args.comando == "site":
             servir_site(args.pasta, args.porta or cfg()["site_porta"])
+        elif args.comando == "trote":
+            servir_trote(args.porta or cfg()["trote_porta"])
         elif args.comando == "tela":
             servir_tela(args.porta or cfg()["tela_porta"])
         elif args.comando == "compartilhar":
