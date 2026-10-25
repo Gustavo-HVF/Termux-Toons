@@ -17013,7 +17013,7 @@ const somBaixado = (CFG.som && CFG.volume > 0)
   : Promise.resolve(null);
 
 let actx = null, saida = null, somPronto = Promise.resolve(null), ruido = null, curva = null;
-let acabou = false, notifSistema = null, ni = 0;
+let acabou = false, swReg = null, notifReal = false, ni = 0;
 
 // Tem que rodar dentro do toque no botão: é isso que libera o som (bloqueio de autoplay).
 // Tudo passa pelo Web Audio: o volume vale até no iPhone (que ignora o volume de <audio>) e o
@@ -17103,9 +17103,29 @@ function vibrar(){
   repetir(() => navigator.vibrate(VIBRACAO), VIBRACAO.reduce((a, b) => a + b, 0));
 }
 
+// Pede a permissão e registra o service worker. Notificação de verdade do Android só sai
+// com permissão E em contexto seguro (o link https do túnel; o localhost); no link http da
+// rede Wi-Fi o navegador bloqueia e o serviceWorker nem existe, então fica só a reserva.
+async function prepararNotificacoes(){
+  if (!CFG.notificacoes || !('Notification' in window)) return;
+  try { if (Notification.permission === 'default') await Notification.requestPermission(); } catch(e){}
+  if (Notification.permission !== 'granted' || !('serviceWorker' in navigator)) return;
+  try {
+    await navigator.serviceWorker.register('/sw.js');
+    swReg = await navigator.serviceWorker.ready;  // precisa estar ativo para o showNotification
+    notifReal = !!(swReg && swReg.showNotification);
+  } catch(e){ swReg = null; notifReal = false; }
+}
+
 function soltarNotificacao(){
   const lista = CFG.notif_textos.length ? CFG.notif_textos : [CFG.mensagem];
   const txt = lista[ni++ % lista.length];
+  tique();  // a vibração fica com vibrar(): aqui ela cortaria o padrão (ou tremeria com ela desligada)
+  if (notifReal){  // notificação de verdade do Android; renotify: toca/vibra de novo a cada uma
+    quieto(() => swReg.showNotification(CFG.titulo, {body: txt, tag: 'trote', renotify: true}));
+    return;  // com a de verdade na tela do celular, a barra imitada não entra
+  }
+  // Reserva (link http:// ou permissão negada): uma barra desenhada dentro do próprio site.
   const el = document.createElement('div'); el.className = 'notif';
   el.innerHTML = "<div class='nicone'>⚠️</div><div class='ncorpo'><div class='ntitulo'></div>" +
     "<div class='ntexto'></div></div><div class='nhora'>agora</div>";
@@ -17114,9 +17134,6 @@ function soltarNotificacao(){
   const b = $('#bandeja'); b.appendChild(el);
   while (b.children.length > 8) b.removeChild(b.firstChild);
   setTimeout(() => el.remove(), 6000);
-  tique();  // a vibração fica com vibrar(): aqui ela cortaria o padrão (ou tremeria com ela desligada)
-  if ('Notification' in window && Notification.permission === 'granted')  // tag: uma substitui a outra
-    quieto(() => { notifSistema = new Notification(CFG.titulo, {body: txt, tag: 'trote'}); });
 }
 
 function piscarTitulo(){
@@ -17139,7 +17156,7 @@ function revelar(){
   timers.forEach(t => clearTimeout(t));  // clearTimeout também cancela os setInterval
   if (navigator.vibrate) navigator.vibrate(0);
   if (actx) quieto(() => actx.close());
-  if (notifSistema) quieto(() => notifSistema.close());
+  if (swReg) quieto(() => swReg.getNotifications({tag: 'trote'}).then(ns => ns.forEach(n => n.close())));
   if (document.fullscreenElement || document.webkitFullscreenElement)
     quieto(() => (document.exitFullscreen || document.webkitExitFullscreen).call(document));
   $('#cena').style.display = 'none';
@@ -17148,14 +17165,15 @@ function revelar(){
   $('#fim').style.display = 'flex';
 }
 
-function comecar(){
+async function comecar(){
   $('#gate').remove();
+  // Tela cheia e áudio precisam sair aqui dentro do toque, antes de qualquer await.
   const raiz = document.documentElement, cheia = raiz.requestFullscreen || raiz.webkitRequestFullscreen;
   if (cheia) quieto(() => cheia.call(raiz));
   liberarAudio();
-  if (CFG.notificacoes && 'Notification' in window && Notification.permission === 'default')
-    quieto(() => Notification.requestPermission());
-  if (CFG.atraso > 0){ $('#espera').style.display = 'flex'; depois(assustar, CFG.atraso * 1000); }
+  if (CFG.atraso > 0) $('#espera').style.display = 'flex';
+  await prepararNotificacoes();  // espera a pessoa responder "Permitir?" antes do susto
+  if (CFG.atraso > 0) depois(assustar, CFG.atraso * 1000);
   else assustar();
 }
 
@@ -17167,6 +17185,13 @@ document.addEventListener('contextmenu', e => e.preventDefault());  // segurar a
 </html>"""
 
 TROTE_ROSTO = "rosto.svg"  # sempre gerado: a página volta para ele se a imagem escolhida não abrir
+
+# Service worker: no Android, só por aqui (showNotification) dá para disparar a notificação de
+# verdade do celular; o new Notification() da página não funciona lá. Toque na notificação só a fecha.
+_TROTE_SW = """self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+self.addEventListener('notificationclick', (e) => { e.notification.close(); });
+"""
 
 
 def _num_trote(c: dict, chave: str, minimo: float, maximo: float) -> float:
@@ -17210,6 +17235,7 @@ def preparar_trote() -> list:
     c = cfg()
     TROTE_DIR.mkdir(parents=True, exist_ok=True)
     (TROTE_DIR / TROTE_ROSTO).write_text(_TROTE_ROSTO_SVG, "utf-8")
+    (TROTE_DIR / "sw.js").write_text(_TROTE_SW, "utf-8")  # notificações de verdade no Android
     avisos, copiados = [], {}
     for chave, base, rotulo in (("trote_imagem", "imagem", "A imagem escolhida"),
                                 ("trote_som", "som", "O som escolhido")):
@@ -17407,6 +17433,10 @@ def menu_trote():
             ok("Link copiado. Mande para a vítima. 😈")
         info("O link funciona enquanto o Termux estiver aberto. O endereço do túnel muda a cada vez que religa. "
              "O que você muda em 'Personalizar' já vale no link publicado.")
+        if servico_ativo("trote"):
+            info("Notificações de VERDADE do Android só saem pelo link da internet (túnel) e se a pessoa "
+                 "tocar em 'Permitir'. No link da rede Wi-Fi o navegador bloqueia e aparece a imitação "
+                 "dentro do site. Para mandar as de verdade, use 'Liberar para a internet'.")
 
     menu("👻 Trote / pegadinha (screamer)", [
         ("😈 Preparar e publicar o link do trote", iniciar),
