@@ -44,6 +44,11 @@ Digitar o número da opção também funciona como atalho. Se preferir o modo an
 digitar números, rode com `TOONS_NUMEROS=1 toons` (ele também é usado automaticamente
 quando não há um terminal interativo, por exemplo em scripts).
 
+A primeira opção do menu, **🔍 Buscar**, acha qualquer função pelo nome sem você caçar
+submenu por submenu: digite o que procura (**ignora acento e perdoa erro de digitação** —
+`vdeos` encontra **Vídeos**, `bateira` encontra **Saúde da bateria**, `sudoko` leva aos
+**Jogos**), escolha na lista e ele abre a opção direto.
+
 ## O que tem no menu
 
 | # | Seção | O que faz |
