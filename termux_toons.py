@@ -840,6 +840,7 @@ PADRAO_CFG = {
     ],
     "trote_cor": "#b10000",
     "trote_atraso": 2,
+    "trote_duracao": 15,
     "trote_volume": 1.0,
 }
 
@@ -4726,7 +4727,7 @@ def publicar_site() -> None:
     salvar_cfg()
     if servico_ativo("site"):
         parar_servico("site")
-    if not porta_livre(c["site_porta"]):
+    if not porta_livre(c["site_porta"], espera=3):
         raise ToonsError(f"A porta {c['site_porta']} já está em uso. Troque 'site_porta' em Configurações.")
     if not iniciar_servico("site", cmd_self("site", str(pasta), "--porta", str(c["site_porta"])), reiniciar=True):
         return
@@ -7465,14 +7466,20 @@ def links_de(item: dict) -> list:
     return links
 
 
-def porta_livre(porta: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind(("0.0.0.0", porta))
-        except OSError:
-            return False
-    return True
+def porta_livre(porta: int, espera: float = 0) -> bool:
+    """Com `espera`, insiste por até tantos segundos: um servidor recém-parado leva um
+    instante para soltar a porta."""
+    limite = time.monotonic() + espera
+    while True:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(("0.0.0.0", porta))
+                return True
+            except OSError:
+                if time.monotonic() >= limite:
+                    return False
+        time.sleep(0.25)
 
 
 def _versao_servidor_midia(porta: int) -> str:
@@ -16912,10 +16919,11 @@ _TROTE_HTML = """<!doctype html>
   * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
   html, body { height:100%; background:#0b0e12; color:#e8eef5; overflow:hidden;
     font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif; }
-  #gate { min-height:100%; display:flex; flex-direction:column; justify-content:center;
+  #gate, #fim { min-height:100%; display:flex; flex-direction:column; justify-content:center;
     align-items:center; text-align:center; padding:28px 20px 160px; gap:14px; }
-  #gate h1 { font-size:26px; font-weight:800; }
-  #gate p { opacity:.78; max-width:420px; line-height:1.5; }
+  #gate h1, #fim h1 { font-size:26px; font-weight:800; }
+  #gate p, #fim p { opacity:.78; max-width:420px; line-height:1.5; }
+  #fim { position:fixed; inset:0; display:none; padding-bottom:28px; }
   .selo { font-size:52px; }
   .cookie { position:fixed; left:0; right:0; bottom:0; background:#161b22;
     border-top:1px solid #2a323c; padding:16px; display:flex; flex-direction:column;
@@ -16939,11 +16947,12 @@ _TROTE_HTML = """<!doctype html>
     100%{transform:translate(6px,7px) scale(1.04)} }
   #flash { position:fixed; inset:0; opacity:0; pointer-events:none; mix-blend-mode:screen; }
   #msg { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
-    text-align:center; padding:16px; font-size:min(16vw,120px); font-weight:900;
+    text-align:center; padding:16px; font-size:min(16vw,120px); font-weight:900; overflow-wrap:anywhere;
     color:#fff; text-shadow:0 0 18px #000, 0 0 40px #b10000; letter-spacing:1px;
     pointer-events:none; animation:treme .12s infinite; }
   @keyframes treme { 0%{transform:translate(0,0)} 50%{transform:translate(4px,-4px) skewX(2deg)}
     100%{transform:translate(-4px,4px) skewX(-2deg)} }
+  @media (prefers-reduced-motion: reduce) { #rosto, #msg { animation:none; } }
   #bandeja { position:fixed; top:0; left:0; right:0; padding:8px; display:flex;
     flex-direction:column; gap:7px; pointer-events:none; z-index:50; }
   .notif { display:flex; gap:10px; align-items:center; background:rgba(22,27,34,.97);
@@ -16960,7 +16969,7 @@ _TROTE_HTML = """<!doctype html>
 <body>
 <div id='gate'>
   <div class='selo'>🔒</div>
-  <h1 id='nomeSite'>Verificação de segurança</h1>
+  <h1>Verificação de segurança</h1>
   <p>Para acessar o conteúdo, confirme que você não é um robô e aceite os cookies deste site.</p>
   <div class='cookie'>
     <span>🍪 Este site usa cookies e recursos do navegador (som, vibração e notificações)
@@ -16978,159 +16987,256 @@ _TROTE_HTML = """<!doctype html>
   <div id='msg'></div>
 </div>
 <div id='bandeja'></div>
-<audio id='som' loop></audio>
+<div id='fim'>
+  <div class='selo'>😂</div>
+  <h1>Calma, era só um trote!</h1>
+  <p>Pode respirar: quem te mandou o link estava só brincando com você.</p>
+</div>
 <script>
 const CFG = __CFG__;
 const $ = s => document.querySelector(s);
-function escapar(t){ const d=document.createElement('div'); d.textContent=t==null?'':String(t); return d.innerHTML; }
+// Quem ativou "reduzir movimento" no celular não vê pisca-pisca nem tremedeira.
+const calmo = !!(window.matchMedia && matchMedia('(prefers-reduced-motion: reduce)').matches);
+const timers = [];  // tudo o que repete, para o fim do susto parar de uma vez
+function depois(fn, ms){ timers.push(setTimeout(fn, ms)); }
+function repetir(fn, ms){ timers.push(setInterval(fn, ms)); }
+// Recursos do navegador que podem faltar, dar erro ou devolver uma Promise rejeitada.
+function quieto(fn){ try { const p = fn(); if (p && p.catch) p.catch(() => {}); } catch(e){} }
 
-let actx=null, somEl=null, usarSintetico=false, loopSintetico=null;
+// A imagem e o som já começam a baixar enquanto a pessoa lê o aviso de cookies.
+const rosto = $('#rosto');
+rosto.addEventListener('error', function padrao(){  // formato que o navegador não abre (HEIC...)
+  rosto.removeEventListener('error', padrao); rosto.src = '/' + CFG.rosto; });
+rosto.src = '/' + CFG.imagem;
+const somBaixado = (CFG.som && CFG.volume > 0)
+  ? fetch('/' + CFG.som).then(r => r.ok ? r.arrayBuffer() : null).catch(() => null)
+  : Promise.resolve(null);
 
-function prepararSom(){
-  try { actx = new (window.AudioContext||window.webkitAudioContext)(); if(actx.state==='suspended') actx.resume(); } catch(e){ actx=null; }
-  if (CFG.som) {
-    somEl = $('#som'); somEl.src = '/' + CFG.som; somEl.volume = CFG.volume;
-    somEl.play().then(()=>{ somEl.pause(); somEl.currentTime=0; }).catch(()=>{ usarSintetico=true; });
-  } else { usarSintetico = true; }
+let actx = null, saida = null, somPronto = Promise.resolve(null), ruido = null, curva = null;
+let acabou = false, notifSistema = null, ni = 0;
+
+// Tem que rodar dentro do toque no botão: é isso que libera o som (bloqueio de autoplay).
+// Tudo passa pelo Web Audio: o volume vale até no iPhone (que ignora o volume de <audio>) e o
+// arquivo não precisa de HTTP Range para tocar.
+function liberarAudio(){
+  if (CFG.volume <= 0) return;
+  quieto(() => { if (navigator.audioSession) navigator.audioSession.type = 'playback'; });  // iPhone no silencioso
+  try {
+    actx = new (window.AudioContext || window.webkitAudioContext)();
+    quieto(() => actx.resume());
+    const mudo = actx.createBufferSource();  // iOS antigo só libera depois de tocar algo no toque
+    mudo.buffer = actx.createBuffer(1, 1, 22050); mudo.connect(actx.destination); mudo.start(0);
+    saida = actx.createGain(); saida.gain.value = CFG.volume; saida.connect(actx.destination);
+  } catch(e){ actx = null; return; }
+  somPronto = somBaixado.then(dados => new Promise(pronto => {
+    if (!dados) return pronto(null);
+    try {  // com callbacks: também funciona no Safari antigo, que não devolve Promise
+      const p = actx.decodeAudioData(dados, pronto, () => pronto(null));
+      if (p && p.catch) p.catch(() => pronto(null));
+    } catch(e){ pronto(null); }
+  }));
 }
 
-function umGrito(t0){
-  if(!actx) return; const dur=1.7;
-  const g=actx.createGain();
-  g.gain.setValueAtTime(0.0001,t0);
-  g.gain.exponentialRampToValueAtTime(Math.max(0.05,CFG.volume),t0+0.03);
-  g.gain.exponentialRampToValueAtTime(0.0001,t0+dur);
-  const ws=actx.createWaveShaper(); const n=1024, cv=new Float32Array(n);
-  for(let i=0;i<n;i++){ const x=i*2/n-1; cv[i]=Math.tanh(x*9); }
-  ws.curve=cv; g.connect(ws); ws.connect(actx.destination);
-  const len=Math.floor(actx.sampleRate*dur), buf=actx.createBuffer(1,len,actx.sampleRate), d=buf.getChannelData(0);
-  for(let i=0;i<len;i++) d[i]=Math.random()*2-1;
-  const ns=actx.createBufferSource(); ns.buffer=buf;
-  const bp=actx.createBiquadFilter(); bp.type='bandpass'; bp.frequency.value=1300; bp.Q.value=0.6;
-  ns.connect(bp); bp.connect(g); ns.start(t0); ns.stop(t0+dur);
-  [620,940,1500].forEach((f,idx)=>{
-    const o=actx.createOscillator(); o.type='sawtooth';
-    o.frequency.setValueAtTime(f,t0);
-    o.frequency.exponentialRampToValueAtTime(f*2.4,t0+0.22);
-    o.frequency.exponentialRampToValueAtTime(f*0.8,t0+dur);
-    const lfo=actx.createOscillator(); lfo.frequency.value=16+idx*5;
-    const lg=actx.createGain(); lg.gain.value=f*0.3;
-    lfo.connect(lg); lg.connect(o.frequency); lfo.start(t0); lfo.stop(t0+dur);
-    o.connect(g); o.start(t0); o.stop(t0+dur);
+function umGrito(){
+  const t0 = actx.currentTime + 0.02, dur = 1.7, n = Math.floor(actx.sampleRate * dur);
+  if (!curva){  // distorção (tanh) e ruído: calculados uma vez só
+    curva = new Float32Array(1024);
+    for (let i = 0; i < 1024; i++) curva[i] = Math.tanh((i / 512 - 1) * 9);
+    ruido = actx.createBuffer(1, n, actx.sampleRate);
+    const d = ruido.getChannelData(0);
+    for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+  }
+  const env = actx.createGain(), ws = actx.createWaveShaper();
+  env.gain.setValueAtTime(0.0001, t0);
+  env.gain.exponentialRampToValueAtTime(1, t0 + 0.03);
+  env.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  ws.curve = curva; env.connect(ws); ws.connect(saida);
+  const ns = actx.createBufferSource(), bp = actx.createBiquadFilter();
+  ns.buffer = ruido; bp.type = 'bandpass'; bp.frequency.value = 1300; bp.Q.value = 0.6;
+  ns.connect(bp); bp.connect(env); ns.start(t0); ns.stop(t0 + dur);
+  [620, 940, 1500].forEach((f, i) => {
+    const o = actx.createOscillator(), lfo = actx.createOscillator(), lg = actx.createGain();
+    o.type = 'sawtooth';
+    o.frequency.setValueAtTime(f, t0);
+    o.frequency.exponentialRampToValueAtTime(f * 2.4, t0 + 0.22);
+    o.frequency.exponentialRampToValueAtTime(f * 0.8, t0 + dur);
+    lfo.frequency.value = 16 + i * 5; lg.gain.value = f * 0.3;  // o tremido da voz
+    lfo.connect(lg); lg.connect(o.frequency); o.connect(env);
+    lfo.start(t0); lfo.stop(t0 + dur); o.start(t0); o.stop(t0 + dur);
   });
 }
-function gritoSintetico(){ if(!actx) return; umGrito(actx.currentTime+0.02);
-  loopSintetico=setInterval(()=>umGrito(actx.currentTime+0.02), 1700); }
-function tocarSom(){
-  if(!usarSintetico && somEl){ somEl.play().catch(()=>{ usarSintetico=true; gritoSintetico(); }); }
-  else gritoSintetico();
+
+function gritar(){
+  if (!actx) return;
+  let decidido = false;
+  const sintetico = () => { if (decidido || acabou) return; decidido = true; umGrito(); repetir(umGrito, 1700); };
+  depois(sintetico, 1500);  // o arquivo não chegou a tempo (túnel lento): grita assim mesmo
+  somPronto.then(buf => {
+    if (!buf) return sintetico();  // sem arquivo, ou num formato que o navegador não toca
+    if (decidido || acabou) return;
+    decidido = true;
+    const f = actx.createBufferSource(); f.buffer = buf; f.loop = true; f.connect(saida); f.start();
+  });
 }
-function tique(){ if(!actx) return; const t=actx.currentTime, o=actx.createOscillator(), g=actx.createGain();
-  o.type='square'; o.frequency.value=880; g.gain.setValueAtTime(0.0001,t);
-  g.gain.exponentialRampToValueAtTime(0.4,t+0.01); g.gain.exponentialRampToValueAtTime(0.0001,t+0.2);
-  o.connect(g); g.connect(actx.destination); o.start(t); o.stop(t+0.2); }
 
-function telaCheia(){ const e=document.documentElement;
-  const f=e.requestFullscreen||e.webkitRequestFullscreen; if(f){ try{ f.call(e); }catch(x){} } }
+function tique(){
+  if (!actx) return;
+  const t = actx.currentTime, o = actx.createOscillator(), g = actx.createGain();
+  o.type = 'square'; o.frequency.value = 880;
+  g.gain.setValueAtTime(0.0001, t); g.gain.exponentialRampToValueAtTime(0.4, t + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.2);
+  o.connect(g); g.connect(saida); o.start(t); o.stop(t + 0.2);
+}
 
-function piscar(){ if(!CFG.piscar) return; const f=$('#flash'); let on=false; f.style.background=CFG.cor;
-  setInterval(()=>{ on=!on; f.style.opacity = on?'0.85':'0'; }, 90); }
+// 2 piscadas por segundo: abaixo do limite de 3 por segundo (WCAG 2.3.1) que pode provocar
+// crise em quem tem epilepsia fotossensível.
+function piscar(){
+  if (!CFG.piscar || calmo) return;
+  const f = $('#flash'); let aceso = false; f.style.background = CFG.cor;
+  repetir(() => { aceso = !aceso; f.style.opacity = aceso ? '0.85' : '0'; }, 250);
+}
 
-function vibrar(){ if(!CFG.vibrar || !navigator.vibrate) return; const p=[400,120,400,120,600,200,350,120];
-  navigator.vibrate(p); setInterval(()=>navigator.vibrate(p), 1600); }
+const VIBRACAO = [400, 120, 400, 120, 600, 200, 350, 120];
+function vibrar(){
+  if (!CFG.vibrar || !navigator.vibrate) return;
+  navigator.vibrate(VIBRACAO);  // repete só quando o padrão inteiro termina
+  repetir(() => navigator.vibrate(VIBRACAO), VIBRACAO.reduce((a, b) => a + b, 0));
+}
 
-let ni=0;
 function soltarNotificacao(){
-  const lista = (CFG.notif_textos && CFG.notif_textos.length) ? CFG.notif_textos : [CFG.mensagem];
-  const txt = lista[ni % lista.length]; ni++;
-  const el=document.createElement('div'); el.className='notif';
-  el.innerHTML = "<div class='nicone'>⚠️</div><div class='ncorpo'><div class='ntitulo'>"+escapar(CFG.titulo)+
-    "</div><div class='ntexto'>"+escapar(txt)+"</div></div><div class='nhora'>agora</div>";
-  const b=$('#bandeja'); b.appendChild(el);
-  if(navigator.vibrate) navigator.vibrate(200); tique();
-  while(b.children.length>8) b.removeChild(b.firstChild);
-  setTimeout(()=>el.remove(), 6000);
-  if('Notification' in window && Notification.permission==='granted'){
-    try{ new Notification(CFG.titulo, {body:txt}); }catch(x){}
-  }
+  const lista = CFG.notif_textos.length ? CFG.notif_textos : [CFG.mensagem];
+  const txt = lista[ni++ % lista.length];
+  const el = document.createElement('div'); el.className = 'notif';
+  el.innerHTML = "<div class='nicone'>⚠️</div><div class='ncorpo'><div class='ntitulo'></div>" +
+    "<div class='ntexto'></div></div><div class='nhora'>agora</div>";
+  el.querySelector('.ntitulo').textContent = CFG.titulo;
+  el.querySelector('.ntexto').textContent = txt;
+  const b = $('#bandeja'); b.appendChild(el);
+  while (b.children.length > 8) b.removeChild(b.firstChild);
+  setTimeout(() => el.remove(), 6000);
+  tique();  // a vibração fica com vibrar(): aqui ela cortaria o padrão (ou tremeria com ela desligada)
+  if ('Notification' in window && Notification.permission === 'granted')  // tag: uma substitui a outra
+    quieto(() => { notifSistema = new Notification(CFG.titulo, {body: txt, tag: 'trote'}); });
 }
-function notificacoes(){ if(!CFG.notificacoes) return; soltarNotificacao(); setInterval(soltarNotificacao, 700); }
 
-function titulo(){ const alt=['⚠ '+CFG.titulo,'😱😱😱',CFG.titulo,'👁 '+CFG.titulo+' 👁']; let k=0;
-  setInterval(()=>{ document.title = alt[k++ % alt.length]; }, 420); }
+function piscarTitulo(){
+  const alt = ['⚠ ' + CFG.titulo, '😱😱😱', CFG.titulo, '👁 ' + CFG.titulo + ' 👁']; let k = 0;
+  repetir(() => { document.title = alt[k++ % alt.length]; }, 420);
+}
 
 function assustar(){
-  const e=$('#espera'); if(e) e.style.display='none';
-  $('#cena').style.display='block';
-  $('#rosto').src = '/' + CFG.imagem;
+  $('#espera').style.display = 'none';
+  $('#cena').style.display = 'block';
   $('#msg').textContent = CFG.mensagem;
-  tocarSom(); piscar(); vibrar(); notificacoes(); titulo();
+  gritar(); piscar(); vibrar(); piscarTitulo();
+  if (CFG.notificacoes){ soltarNotificacao(); repetir(soltarNotificacao, 700); }
+  if (CFG.duracao > 0) depois(revelar, CFG.duracao * 1000);
+}
+
+// Fim do susto: para som, vibração e efeitos e conta que era brincadeira.
+function revelar(){
+  acabou = true;
+  timers.forEach(t => clearTimeout(t));  // clearTimeout também cancela os setInterval
+  if (navigator.vibrate) navigator.vibrate(0);
+  if (actx) quieto(() => actx.close());
+  if (notifSistema) quieto(() => notifSistema.close());
+  if (document.fullscreenElement || document.webkitFullscreenElement)
+    quieto(() => (document.exitFullscreen || document.webkitExitFullscreen).call(document));
+  $('#cena').style.display = 'none';
+  $('#bandeja').textContent = '';
+  document.title = '😂 Era só um trote!';
+  $('#fim').style.display = 'flex';
 }
 
 function comecar(){
-  const g=$('#gate'); if(g) g.remove();
-  telaCheia(); prepararSom();
-  if('Notification' in window && Notification.permission==='default'){ try{ Notification.requestPermission(); }catch(x){} }
-  if(CFG.atraso>0){ $('#espera').style.display='flex'; setTimeout(assustar, CFG.atraso*1000); }
+  $('#gate').remove();
+  const raiz = document.documentElement, cheia = raiz.requestFullscreen || raiz.webkitRequestFullscreen;
+  if (cheia) quieto(() => cheia.call(raiz));
+  liberarAudio();
+  if (CFG.notificacoes && 'Notification' in window && Notification.permission === 'default')
+    quieto(() => Notification.requestPermission());
+  if (CFG.atraso > 0){ $('#espera').style.display = 'flex'; depois(assustar, CFG.atraso * 1000); }
   else assustar();
 }
 
 $('#aceitar').addEventListener('click', comecar);
 $('#aceitar2').addEventListener('click', comecar);
-document.addEventListener('contextmenu', e=>e.preventDefault());
-window.addEventListener('beforeunload', e=>{ e.preventDefault(); e.returnValue=''; });
+document.addEventListener('contextmenu', e => e.preventDefault());  // segurar a imagem não abre menu
 </script>
 </body>
 </html>"""
 
+TROTE_ROSTO = "rosto.svg"  # sempre gerado: a página volta para ele se a imagem escolhida não abrir
+
+
+def _num_trote(c: dict, chave: str, minimo: float, maximo: float) -> float:
+    """Número da config dentro do intervalo; um valor inválido (editado à mão) vira o padrão."""
+    try:
+        return min(maximo, max(minimo, float(c.get(chave))))
+    except (TypeError, ValueError):
+        return PADRAO_CFG[chave]
+
 
 def montar_pagina_trote(c: dict, img_arquivo: str, som_arquivo: str) -> str:
+    textos = c.get("trote_notif_textos") or []
+    if isinstance(textos, str):  # config editada à mão: um texto por linha
+        textos = textos.splitlines()
+    elif not isinstance(textos, list):
+        textos = []
+    cor = str(c.get("trote_cor") or "")
     opcoes = {
-        "titulo": c.get("trote_titulo") or "Trote",
-        "mensagem": c.get("trote_mensagem") or "",
-        "imagem": img_arquivo,
+        "titulo": str(c.get("trote_titulo") or "Trote"),
+        "mensagem": str(c.get("trote_mensagem") or ""),
+        "imagem": img_arquivo or TROTE_ROSTO,
+        "rosto": TROTE_ROSTO,
         "som": som_arquivo,
         "piscar": bool(c.get("trote_piscar", True)),
         "vibrar": bool(c.get("trote_vibrar", True)),
         "notificacoes": bool(c.get("trote_notificacoes", True)),
-        "notif_textos": [str(t) for t in (c.get("trote_notif_textos") or [])],
-        "cor": c.get("trote_cor") or "#b10000",
-        "atraso": max(0, int(c.get("trote_atraso", 0) or 0)),
-        "volume": min(1.0, max(0.0, float(c.get("trote_volume", 1.0) or 0.0))),
+        "notif_textos": [str(t).strip() for t in textos if str(t).strip()],
+        "cor": cor if re.fullmatch(r"#[0-9a-fA-F]{6}", cor) else PADRAO_CFG["trote_cor"],
+        "atraso": _num_trote(c, "trote_atraso", 0, 30),
+        "duracao": _num_trote(c, "trote_duracao", 0, 600),
+        "volume": _num_trote(c, "trote_volume", 0, 1),
     }
-    return _TROTE_HTML.replace("__CFG__", json.dumps(opcoes, ensure_ascii=False))
+    # Escapa < > &: um "</script>" na mensagem não pode fechar o <script> da página.
+    dados = json.dumps(opcoes).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    return _TROTE_HTML.replace("__CFG__", dados)
 
 
-def preparar_trote() -> dict:
-    """Gera a pasta do trote: copia (ou cria) a imagem e o som e escreve o index.html."""
+def preparar_trote() -> list:
+    """Gera a pasta do trote: index.html, o rosto padrão e cópias da imagem e do som escolhidos.
+    Devolve avisos para quem publica (por exemplo, um arquivo escolhido que não existe mais)."""
     c = cfg()
     TROTE_DIR.mkdir(parents=True, exist_ok=True)
-    for antigo in list(TROTE_DIR.glob("imagem.*")) + list(TROTE_DIR.glob("som.*")):
-        antigo.unlink(missing_ok=True)
-
-    img_src = os.path.expanduser(c.get("trote_imagem") or "")
-    if img_src and Path(img_src).is_file():
-        ext = Path(img_src).suffix.lower() or ".img"
-        shutil.copy2(img_src, TROTE_DIR / f"imagem{ext}")
-        img_arquivo = f"imagem{ext}"
-    else:
-        (TROTE_DIR / "imagem.svg").write_text(_TROTE_ROSTO_SVG, "utf-8")
-        img_arquivo = "imagem.svg"
-
-    som_arquivo = ""
-    som_src = os.path.expanduser(c.get("trote_som") or "")
-    if som_src and Path(som_src).is_file():
-        ext = Path(som_src).suffix.lower() or ".audio"
-        shutil.copy2(som_src, TROTE_DIR / f"som{ext}")
-        som_arquivo = f"som{ext}"
-
-    (TROTE_DIR / "index.html").write_text(montar_pagina_trote(c, img_arquivo, som_arquivo), "utf-8")
-    return {"imagem": img_arquivo, "som": som_arquivo}
+    (TROTE_DIR / TROTE_ROSTO).write_text(_TROTE_ROSTO_SVG, "utf-8")
+    avisos, copiados = [], {}
+    for chave, base, rotulo in (("trote_imagem", "imagem", "A imagem escolhida"),
+                                ("trote_som", "som", "O som escolhido")):
+        escolhido = os.path.expanduser(str(c.get(chave) or ""))
+        copiados[base] = ""
+        if escolhido and Path(escolhido).is_file():
+            copiados[base] = base + (Path(escolhido).suffix.lower() or ".bin")
+            # copyfile (e não copy2): a cópia fica com a data de agora, e quem já abriu o link não
+            # recebe do cache a imagem/som de antes (o servidor compara a data com If-Modified-Since).
+            with contextlib.suppress(shutil.SameFileError):
+                shutil.copyfile(escolhido, TROTE_DIR / copiados[base])
+        elif escolhido:
+            avisos.append(f"{rotulo} não existe mais ({escolhido}); usando o padrão.")
+        for antigo in TROTE_DIR.glob(base + ".*"):  # sobras de uma escolha anterior
+            if antigo.name != copiados[base]:
+                antigo.unlink(missing_ok=True)
+    # Troca atômica: quem abre o link enquanto você edita não recebe a página pela metade.
+    tmp = TROTE_DIR / ".index.html.tmp"
+    tmp.write_text(montar_pagina_trote(c, copiados["imagem"], copiados["som"]), "utf-8")
+    tmp.replace(TROTE_DIR / "index.html")
+    return avisos
 
 
 def servir_trote(porta: int) -> None:
     """Sobe a página do trote em primeiro plano (roda dentro do tmux)."""
-    preparar_trote()  # regenera a partir da config atual a cada (re)início
+    for texto in preparar_trote():  # regenera a partir da config atual a cada (re)início
+        log(texto)
     pasta = str(TROTE_DIR)
     with ThreadingHTTPServer(("0.0.0.0", porta), lambda *a, **k: _HandlerSite(*a, directory=pasta, **k)) as servidor:
         log(f"Trote no ar em http://{ip_local()}:{porta}  (Ctrl+C para parar)")
@@ -17164,42 +17270,72 @@ def parar_trote() -> None:
 def menu_editar_trote():
     c = cfg()
 
+    def salvar(msg="Salvo."):
+        salvar_cfg()
+        if servico_ativo("trote"):  # o servidor lê os arquivos a cada acesso: basta gerar de novo
+            for texto in preparar_trote():
+                aviso(texto)
+            msg += " Já vale no link publicado."
+        ok(msg)
+
+    def avisar_se_grande(arq):
+        tamanho_arq = arq.stat().st_size
+        if tamanho_arq > 8 * 1024 * 1024:
+            aviso(f"Arquivo grande ({bytes_humanos(tamanho_arq)}): demora para carregar no celular de quem "
+                  "abrir, principalmente pela internet. Prefira um arquivo curto.")
+
     def _texto(chave, msg):
         c[chave] = perguntar(msg, c.get(chave, ""))
-        salvar_cfg(); ok("Salvo.")
+        salvar()
 
     def _alternar(chave):
         c[chave] = not c.get(chave, True)
-        salvar_cfg(); ok("Ligado." if c[chave] else "Desligado.")
+        salvar("Ligado." if c[chave] else "Desligado.")
 
     def escolher_imagem():
         if c.get("trote_imagem") and confirmar("Voltar à imagem padrão (rosto embutido)?", False):
-            c["trote_imagem"] = ""; salvar_cfg(); ok("Usando o rosto padrão."); return
-        arq = escolher_arquivo("Imagem do susto (fica em tela cheia)", EXT_IMAGEM)
+            c["trote_imagem"] = ""
+            salvar("Usando o rosto padrão.")
+            return
+        # Sem HEIC: o Chrome do Android não abre (a página cairia no rosto padrão).
+        arq = escolher_arquivo("Imagem do susto (fica em tela cheia)", tuple(e for e in EXT_IMAGEM if e != ".heic"))
         if arq:
-            c["trote_imagem"] = str(arq); salvar_cfg(); ok(f"Imagem: {arq.name}")
+            avisar_se_grande(arq)
+            c["trote_imagem"] = str(arq)
+            salvar(f"Imagem: {arq.name}")
 
     def escolher_som():
         if c.get("trote_som") and confirmar("Voltar ao grito sintético padrão?", False):
-            c["trote_som"] = ""; salvar_cfg(); ok("Usando o grito sintético."); return
-        arq = escolher_arquivo("Som do grito (toca em loop, volume máximo)", EXT_AUDIO)
+            c["trote_som"] = ""
+            salvar("Usando o grito sintético.")
+            return
+        # Sem AMR e WMA: os navegadores não tocam (a página cairia no grito sintético).
+        arq = escolher_arquivo("Som do grito (toca em loop)", tuple(e for e in EXT_AUDIO if e not in (".amr", ".wma")))
         if arq:
-            c["trote_som"] = str(arq); salvar_cfg(); ok(f"Som: {arq.name}")
+            avisar_se_grande(arq)
+            c["trote_som"] = str(arq)
+            salvar(f"Som: {arq.name}")
 
     def editar_cor():
         cor = perguntar("Cor do pisca-pisca (hex, ex.: #b10000)", c.get("trote_cor", "#b10000")).strip()
         if not re.fullmatch(r"#[0-9a-fA-F]{6}", cor):
             raise ToonsError("Use um hex de 6 dígitos, como #b10000.")
-        c["trote_cor"] = cor; salvar_cfg(); ok("Cor salva.")
+        c["trote_cor"] = cor
+        salvar("Cor salva.")
 
     def editar_atraso():
         c["trote_atraso"] = perguntar_int("Segundos de 'carregando' antes do susto (0 = na hora)",
                                           c.get("trote_atraso", 2), 0, 30)
-        salvar_cfg(); ok("Salvo.")
+        salvar()
+
+    def editar_duracao():
+        c["trote_duracao"] = perguntar_int("Segundos de susto até a página revelar que era trote "
+                                           "(0 = só para quando fechar a página)", c.get("trote_duracao", 15), 0, 600)
+        salvar()
 
     def editar_volume():
         c["trote_volume"] = round(min(1.0, max(0.0, perguntar_float("Volume (0.0 a 1.0)", c.get("trote_volume", 1.0)))), 2)
-        salvar_cfg(); ok("Salvo.")
+        salvar()
 
     def editar_notificacoes_texto():
         atual = "\n".join(c.get("trote_notif_textos") or [])
@@ -17207,7 +17343,7 @@ def menu_editar_trote():
         if novo is None:
             return
         c["trote_notif_textos"] = [l.strip() for l in novo.splitlines() if l.strip()]
-        salvar_cfg(); ok(f"{len(c['trote_notif_textos'])} notificação(ões) salva(s).")
+        salvar(f"{len(c['trote_notif_textos'])} notificação(ões) salva(s).")
 
     def img_rotulo():
         v = c.get("trote_imagem")
@@ -17216,6 +17352,10 @@ def menu_editar_trote():
     def som_rotulo():
         v = c.get("trote_som")
         return f"🔊 Som do grito (atual: {Path(v).name if v else 'grito sintético'})"
+
+    def duracao_rotulo():
+        d = c.get("trote_duracao", 15)
+        return f"⏳ Duração do susto (atual: {f'{d}s' if d else 'até fechar a página'})"
 
     menu("✏️ Personalizar o trote", [
         (lambda: f"📛 Nome/título do site (atual: {c.get('trote_titulo','')[:28]})",
@@ -17233,6 +17373,7 @@ def menu_editar_trote():
         ("📝 Editar os textos das notificações", editar_notificacoes_texto),
         (lambda: f"🎨 Cor do pisca-pisca (atual: {c.get('trote_cor','#b10000')})", editar_cor),
         (lambda: f"⏱️ Atraso até o susto (atual: {c.get('trote_atraso',2)}s)", editar_atraso),
+        (duracao_rotulo, editar_duracao),
         (lambda: f"🔈 Volume (atual: {c.get('trote_volume',1.0)})", editar_volume),
     ])
 
@@ -17248,23 +17389,24 @@ def menu_trote():
              "problema cardíaco ou está dirigindo.")
         if not confirmar("Preparar e publicar o link do trote?", True):
             return
-        preparar_trote()
+        porta = c["trote_porta"]
         if servico_ativo("trote"):
             parar_servico("trote")
-        if not porta_livre(c["trote_porta"]):
-            raise ToonsError(f"A porta {c['trote_porta']} já está em uso. Troque 'trote_porta' em Configurações.")
-        if not iniciar_servico("trote", cmd_self("trote", "--porta", str(c["trote_porta"])), reiniciar=True):
+        for texto in preparar_trote():
+            aviso(texto)
+        if not porta_livre(porta, espera=3):
+            raise ToonsError(f"A porta {porta} já está em uso. Troque 'trote_porta' em Configurações.")
+        if not iniciar_servico("trote", cmd_self("trote", "--porta", str(porta)), reiniciar=True):
             return
         if not servico_ativo("tunel-trote") and confirmar("Liberar o link para a internet (fora do seu Wi-Fi)?", True):
-            abrir_tunel("tunel-trote", c["trote_porta"])
+            abrir_tunel("tunel-trote", porta)
         print()
         mostrar_links_trote()
-        links = links_trote()
-        if links and tem("termux-clipboard-set") and confirmar("Copiar o link?", True):
-            _tapi(["termux-clipboard-set"], 10, entrada=links[-1][1], json_saida=False)
+        if tem("termux-clipboard-set") and confirmar("Copiar o link?", True):
+            _tapi(["termux-clipboard-set"], 10, entrada=links_trote()[-1][1], json_saida=False)
             ok("Link copiado. Mande para a vítima. 😈")
         info("O link funciona enquanto o Termux estiver aberto. O endereço do túnel muda a cada vez que religa. "
-             "Depois de editar algo, publique de novo para aplicar.")
+             "O que você muda em 'Personalizar' já vale no link publicado.")
 
     menu("👻 Trote / pegadinha (screamer)", [
         ("😈 Preparar e publicar o link do trote", iniciar),
