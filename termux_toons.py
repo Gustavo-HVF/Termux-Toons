@@ -747,6 +747,20 @@ def garantir_storage() -> bool:
     return (HOME / "storage").exists()
 
 
+def pasta_download() -> Path:
+    """A pasta Download do celular, com o caminho que a pessoa reconhece.
+    ~/storage/downloads é um atalho para /storage/emulated/0/Download; o Android mostra
+    o atalho como se estivesse dentro do Termux (/data/data/com.termux/...), então aqui
+    resolvemos para o caminho real. Cai em alternativas quando o atalho ainda não existe."""
+    for p in (HOME / "storage" / "downloads", Path("/storage/emulated/0/Download"), Path("/sdcard/Download")):
+        try:
+            if p.exists():
+                return p.resolve()
+        except OSError:
+            continue
+    return HOME / "storage" / "downloads"
+
+
 def bytes_humanos(n: float) -> str:
     for unidade in ("B", "KB", "MB", "GB", "TB"):
         if abs(n) < 1024 or unidade == "TB":
@@ -4695,7 +4709,23 @@ def publicar_site() -> None:
     """Escolhe um .html (ou a pasta de um site), sobe o servidor e, se quiser, o túnel para a internet."""
     info("Publica uma página HTML (ou um site com imagens, CSS e JS) num link. Na mesma rede Wi-Fi funciona "
          "na hora; para quem está longe, o túnel da Cloudflare cria um endereço na internet.")
-    alvo = Path(os.path.expanduser(perguntar("Arquivo .html ou pasta do site", str(DOWNLOADS))))
+    garantir_storage()
+    # Lista os .html que estão no celular (Download, Documentos, DCIM...) para escolher na hora,
+    # em vez de a pessoa ter que digitar o caminho da pasta Download.
+    htmls = listar_arquivos((".html", ".htm"))
+    alvo = None
+    if htmls:
+        rotulos = [_rotulo_arquivo(a) for a in htmls] + ["✍️  Digitar o caminho (arquivo .html ou pasta do site)..."]
+        i = escolher("Página .html encontrada no celular (Download, Documentos...)", rotulos)
+        if i is None:
+            return
+        if i < len(htmls):
+            alvo = htmls[i]
+    if alvo is None:
+        resp = perguntar("Arquivo .html ou pasta do site", str(pasta_download())).strip().strip("'\"")
+        if not resp:
+            return
+        alvo = Path(os.path.expanduser(resp))
     if alvo.is_dir():
         pasta, pagina = alvo, ""
         if not (alvo / "index.html").is_file():
