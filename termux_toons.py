@@ -132,12 +132,14 @@ USER_AGENT = (
 _COR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
 
 
-def _c(codigo: int) -> str:
+def _c(codigo: int | str) -> str:
     return f"\033[{codigo}m" if _COR else ""
 
 
 RST, NEG, DIM, INV = _c(0), _c(1), _c(2), _c(7)
 VERM, VERD, AMAR, AZUL, MAG, CIANO = _c(31), _c(32), _c(33), _c(34), _c(35), _c(36)
+# opção selecionada: preto (38;5;16, que o negrito não clareia) sobre o ciano do tema
+DESTAQUE = _c("1;38;5;16;46")
 
 
 class ToonsError(Exception):
@@ -179,11 +181,21 @@ def _centralizar(texto: str, largura: int) -> str:
     return " " * (sobra // 2) + texto + " " * (sobra - sobra // 2)
 
 
+def _no_centro(texto: str, colunas: int) -> str:
+    """Recua o texto para ele ficar no meio da tela (sem espaços à direita)."""
+    return " " * max(0, (colunas - _largura(texto)) // 2) + texto
+
+
+def _faixa_titulo(texto: str, largura: int) -> str:
+    """Título numa linha só, ═══ texto ═══, com `largura` colunas."""
+    texto = f" {texto} "
+    sobra = max(0, largura - _largura(texto))
+    return f"{CIANO}{'═' * (sobra // 2)}{RST}{NEG}{texto}{RST}{CIANO}{'═' * (sobra - sobra // 2)}{RST}"
+
+
 def titulo(texto: str) -> None:
-    largura = max(20, min(largura_tela(), 70))
-    print(f"{CIANO}{'═' * largura}{RST}")
-    print(f"{NEG}{_centralizar(texto, largura)}{RST}")
-    print(f"{CIANO}{'═' * largura}{RST}")
+    colunas = largura_tela()
+    print(_no_centro(_faixa_titulo(texto, max(20, min(colunas, 70))), colunas))
 
 
 def perguntar(msg: str, padrao=None) -> str:
@@ -320,10 +332,12 @@ def _cortar(texto: str, largura: int) -> str:
     return "".join(partes) + "…" + RST
 
 
-def _linha_opcao(texto: str, selecionada: bool, colunas: int) -> str:
+def _linha_opcao(texto: str, selecionada: bool, largura: int) -> str:
+    """Uma opção da lista; a selecionada vira uma faixa colorida de `largura` colunas de texto."""
     if selecionada:
-        return f"{CIANO}❯{RST} {INV}{NEG} {_cortar(_sem_ansi(texto), colunas - 5)} {RST}"
-    return "   " + _cortar(texto, colunas - 4)
+        texto = _cortar(_sem_ansi(texto), largura)  # o corte termina em RST: o destaque volta logo depois
+        return f"{CIANO}❯{RST} {DESTAQUE} {texto}{DESTAQUE}{' ' * (largura - _largura(texto))} {RST}"
+    return "   " + _cortar(texto, largura)
 
 
 def _mover(tecla: str, sel: int, total: int, pagina: int) -> int:
@@ -357,16 +371,18 @@ def _lista_inline(msg: str, opcoes: list, sel: int = 0, multipla: bool = False):
     dica = "↑↓ · Espaço marca · a todas · Enter" if multipla else "↑↓ e Enter · Esc cancela"
     print(f"{AMAR}?{RST} {msg} {DIM}({dica}){RST}")
     marcadas, topo, desenhadas, resultado = set(), 0, 0, None
+    maior = max(_largura(str(op)) for op in opcoes) + (4 if multipla else 0)
     _cursor(False)
     try:
         while True:
             colunas, linhas_tela = shutil.get_terminal_size((60, 24))
             altura = max(1, min(len(opcoes), linhas_tela - 3))
             topo = _janela(sel, topo, altura, len(opcoes))
+            largura = max(1, min(maior, colunas - 5))
             linhas = []
             for i in range(topo, topo + altura):
                 caixa = ("[x] " if i in marcadas else "[ ] ") if multipla else ""
-                linhas.append(_linha_opcao(caixa + str(opcoes[i]), i == sel, colunas))
+                linhas.append(_linha_opcao(caixa + str(opcoes[i]), i == sel, largura))
             if len(opcoes) > altura:
                 linhas.append(f"{DIM}   {sel + 1}/{len(opcoes)}{RST}")
             if desenhadas:
@@ -413,7 +429,7 @@ def confirmar(msg: str, padrao: bool = False) -> bool:
     _cursor(False)
     try:
         while True:
-            botoes = (f"{INV}{NEG} Sim {RST}  Não " if sim else f" Sim  {INV}{NEG} Não {RST}") if _COR \
+            botoes = (f"{DESTAQUE} Sim {RST}  Não " if sim else f" Sim  {DESTAQUE} Não {RST}") if _COR \
                 else ("[Sim]  Não " if sim else " Sim  [Não]")
             sys.stdout.write(f"\r   {botoes}  {DIM}(←→ e Enter){RST}\033[K")
             sys.stdout.flush()
@@ -538,8 +554,16 @@ def executar(func, rotulo: str = "") -> None:
         pausar()
 
 
+def _quebrar(linha: str, colunas: int) -> list:
+    """Quebra por palavras uma linha que não cabe na tela, mantendo a cor do começo."""
+    if _largura(linha) <= colunas:
+        return [linha]
+    cor = re.match(f"(?:{_ANSI.pattern})*", linha).group()
+    return [cor + parte + RST for parte in textwrap.wrap(_sem_ansi(linha), max(10, colunas - 4))] or [linha]
+
+
 def _menu_setas(titulo_menu: str, itens: list, sair: str, cabecalho, sel: int):
-    """Desenha o menu em tela cheia e devolve o índice escolhido (None = voltar)."""
+    """Desenha o menu em tela cheia, no centro da tela, e devolve o índice escolhido (None = voltar)."""
     linhas_cab = []
     if cabecalho:
         buffer = io.StringIO()
@@ -554,20 +578,27 @@ def _menu_setas(titulo_menu: str, itens: list, sair: str, cabecalho, sel: int):
             colunas, linhas_tela = shutil.get_terminal_size((60, 24))
             rotulos = [r() if callable(r) else r for r, _ in itens] + [f"↩  {sair}"]
             total = len(rotulos)
-            cab = linhas_cab
-            disponivel = linhas_tela - len(cab) - 5
+            cab = [parte for linha in linhas_cab for parte in _quebrar(linha, colunas)]
+            if cab:
+                cab.append("")
+            disponivel = linhas_tela - len(cab) - 4  # título, linha vazia, linha vazia e rodapé
             if disponivel < min(total, 6):  # tela pequena: esconde o cabeçalho
-                cab, disponivel = [], linhas_tela - 5
+                cab, disponivel = [], linhas_tela - 4
             altura = max(1, min(total, disponivel))
             topo = _janela(sel, topo, altura, total)
-            largura = max(20, min(colunas, 70))
-            linhas = [*cab, f"{CIANO}{'═' * largura}{RST}", f"{NEG}{_centralizar(titulo_menu, largura)}{RST}",
-                      f"{CIANO}{'═' * largura}{RST}"]
-            linhas += [_linha_opcao(rotulos[i], i == sel, colunas) for i in range(topo, topo + altura)]
+            # as opções formam um bloco alinhado à esquerda (emojis um embaixo do outro) e o bloco vai para o meio
+            largura = max(1, min(max(map(_largura, rotulos)), colunas - 4))
+            recuo = " " * max(0, (colunas - largura - 4) // 2)
+            linhas = [_no_centro(linha, colunas) for linha in cab]
+            linhas += [_no_centro(_faixa_titulo(titulo_menu, max(20, min(colunas, 70))), colunas), ""]
+            for i in range(topo, topo + altura):
+                rotulo = f"{DIM}{rotulos[i]}{RST}" if i == total - 1 and i != sel else rotulos[i]  # "Voltar" apagado
+                linhas.append(recuo + _linha_opcao(rotulo, i == sel, largura))
             rodape = "↑↓ mover · Enter abre · Esc volta"
             if total > altura:
                 rodape += f" · {sel + 1}/{total}"
-            linhas += ["", f"{DIM}{rodape}{RST}"]
+            linhas += ["", _no_centro(f"{DIM}{rodape}{RST}", colunas)]
+            linhas = [""] * max(0, (linhas_tela - len(linhas)) // 2) + linhas  # sobrando espaço, centraliza na altura
             sys.stdout.write("\033[H" + "\n".join(_cortar(linha, colunas) + "\033[K" for linha in linhas)
                              + "\033[J")
             sys.stdout.flush()
@@ -18251,12 +18282,21 @@ BANNER = [
 ]
 
 
+GRADIENTE_BANNER = [205, 170, 141, 111, 81]  # rosa → lilás → azul-claro (256 cores), de cima para baixo
+
+
 def cabecalho() -> None:
     c = cfg()
-    banner = figlet(c["banner_texto"], c.get("banner_fonte") or "standard").splitlines() \
+    banner = [linha.rstrip() for linha in figlet(c["banner_texto"], c.get("banner_fonte") or "standard").splitlines()] \
         if c.get("banner_texto") and tem("figlet") else BANNER
-    for linha in banner:
-        print(f"{MAG}{linha}{RST}")
+    largura = max(map(_largura, banner), default=0)
+    if largura > largura_tela():  # tela estreita demais para o desenho: só o nome
+        banner = ["T E R M U X · T O O N S"]
+        largura = _largura(banner[0])
+    for i, linha in enumerate(banner):
+        cor = GRADIENTE_BANNER[i * (len(GRADIENTE_BANNER) - 1) // max(1, len(banner) - 1)]
+        # todas as linhas com a mesma largura: centralizadas pelo menu, o desenho não entorta
+        print(f"{_c(f'38;5;{cor}')}{linha}{' ' * (largura - _largura(linha))}{RST}")
     ambiente = "Termux" if IS_TERMUX else "fora do Termux"
     print(f"{DIM}v{VERSION} · {ambiente} · serviços: {', '.join(servicos_ativos()) or 'nenhum'}{RST}")
 
@@ -18390,23 +18430,23 @@ def menu_busca():
 
 def menu_principal() -> None:
     menu("Menu principal", [
-        ("🔍 Buscar opção (digite, mesmo com erro de digitação)", menu_busca),
+        ("🔍 Buscar opção", menu_busca),
         ("🌐 Servidor web / API pessoal", menu_web),
         ("🤖 Bots Telegram / Discord 24h", menu_bots),
         ("🔎 Scraping e monitoramento", menu_monitor),
         ("🛡️ Rede e segurança", menu_rede),
-        ("🐧 Linux de verdade (proot-distro)", menu_proot),
-        ("🗄️ Arquivos e backup (gerenciador, nuvem, site)", menu_arquivos),
+        ("🐧 Linux de verdade", menu_proot),
+        ("🗄️ Arquivos e backup", menu_arquivos),
         ("🎵 Música, rádio e podcasts", menu_musica),
-        ("🎬 Vídeos (TikTok, YouTube)", menu_videos),
+        ("🎬 Vídeos", menu_videos),
         ("📺 Compartilhar filme por link", menu_midia),
         ("🧮 Calculadora científica", menu_calculadora),
-        ("🧰 Utilitários (notas, tarefas, lembretes, agenda, senhas...)", menu_utilitarios),
-        ("📲 Celular e sistema (ADB, Termux:API, bateria, apps, fotos...)", menu_celular),
-        ("🌐 Internet (e-mail, notícias, downloads, Browsh...)", menu_internet),
-        ("✨ Inteligência artificial (Claude, llama.cpp, voz, OCR)", menu_ia),
-        ("🎮 Diversão e aprendizado (jogos, retrô, BASIC, cursos, livros)", menu_diversao),
-        ("🛠️ Programação e servidores (dev, SQL, GitHub, cron...)", menu_programacao),
+        ("🧰 Utilitários", menu_utilitarios),
+        ("📲 Celular e sistema", menu_celular),
+        ("🌐 Internet", menu_internet),
+        ("✨ Inteligência artificial", menu_ia),
+        ("🎮 Diversão e aprendizado", menu_diversao),
+        ("🛠️ Programação e servidores", menu_programacao),
         ("🔄 Atualização", menu_atualizar),
         ("🧹 Otimização e limpeza", menu_otimizacao),
         ("⚙️ Configurações e diagnóstico", menu_config),
