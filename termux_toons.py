@@ -4736,6 +4736,26 @@ def mostrar_links_do_site() -> None:
         print(f"  {DIM}Para quem está fora da sua rede Wi-Fi, use 'Página publicada: liberar para a internet'.{RST}")
 
 
+def qr_do_site() -> None:
+    """Mostra na tela o QR code do link da página publicada e oferece baixar a imagem (.png)."""
+    if not servico_ativo("site"):
+        info("Publique uma página primeiro.")
+        return
+    links = links_do_site()
+    i = len(links) - 1  # o da internet, quando o túnel está ligado
+    if len(links) > 1:
+        i = escolher("QR code de qual link?", [f"{onde}: {link}" for onde, link in links], len(links))
+        if i is None:
+            return
+    onde, link = links[i]
+    if not garantir_cmd("qrencode", "libqrencode"):
+        return
+    mostrar_qr(link, salvar=False)
+    print(f"  {CIANO}{onde}:{RST} {NEG}{link}{RST}")
+    if confirmar("Baixar o QR code (imagem .png na pasta Download)?", True) and not salvar_qr(link, "site"):
+        raise ToonsError("Não consegui salvar a imagem do QR code.")
+
+
 def publicar_site() -> None:
     """Escolhe um .html (ou a pasta de um site), sobe o servidor e, se quiser, o túnel para a internet."""
     info("Publica uma página HTML (ou um site com imagens, CSS e JS) num link. Na mesma rede Wi-Fi funciona "
@@ -4801,6 +4821,8 @@ def publicar_site() -> None:
     if tem("termux-clipboard-set") and confirmar("Copiar o link?", True):
         _tapi(["termux-clipboard-set"], 10, entrada=link, json_saida=False)
         ok("Link copiado.")
+    if confirmar("Gerar o QR code do link (e baixar a imagem)?", True):
+        qr_do_site()
     info("O link funciona enquanto o celular estiver ligado com o Termux aberto. O endereço do túnel muda "
          "toda vez que ele é religado.")
 
@@ -4934,6 +4956,7 @@ def menu_arquivos():
         ("📂 Gerenciador de arquivos (copiar, mover, renomear, Android/data...)", gerenciador_arquivos),
         ("🌍 Publicar página/site HTML num link", publicar_site),
         ("Página publicada: ver o link", mostrar_links_do_site),
+        ("Página publicada: QR code do link (gerar e baixar)", qr_do_site),
         ("Página publicada: liberar para a internet (túnel)",
          lambda: abrir_tunel("tunel-site", cfg()["site_porta"]) if servico_ativo("site") else info("Publique uma página primeiro.")),
         ("Página publicada: tirar do ar", parar_site),
@@ -11999,10 +12022,15 @@ def wifi_qr(ssid: str, senha: str, seguranca: str = "WPA", oculta: bool = False)
         ("H:true;" if oculta else "") + ";"
 
 
-def mostrar_qr(conteudo: str, nome_arquivo: str = "qrcode") -> Path | None:
+def mostrar_qr(conteudo: str, nome_arquivo: str = "qrcode", salvar: bool = True) -> Path | None:
     if not garantir_cmd("qrencode", "libqrencode"):
         return None
     rodar(["qrencode", "-t", "ansiutf8", "-m", "2"], entrada=conteudo, mostrar=False)
+    return salvar_qr(conteudo, nome_arquivo) if salvar else None
+
+
+def salvar_qr(conteudo: str, nome_arquivo: str = "qrcode") -> Path | None:
+    """Grava o QR code como imagem .png em Download/Termux-Toons/QR codes."""
     destino = pasta_saida("QR codes") / f"{_slug(nome_arquivo)}_{datetime.now():%H%M%S}.png"
     rodar(["qrencode", "-o", str(destino), "-s", "10", "-m", "3"], entrada=conteudo, mostrar=False)
     if destino.exists():
