@@ -828,7 +828,7 @@ PADRAO_CFG = {
     "midia_porta": 8095,
     "midia_transmissoes": 3,
     "site_porta": 8097,
-    "site_pagina": "",
+    "sites": {},
     "adb_endereco": "",
     "x11_usuarios": {},
     "x11_gpu": False,
@@ -4679,7 +4679,8 @@ def _caminho_termux() -> Path:
 
 # ── Publicar página/site HTML num link ───────────────────────────────
 
-SITE_DIR = DATA_DIR / "site"  # cópia do arquivo quando você publica só uma página
+MAX_SITES = 5  # quantos sites podem ficar no ar ao mesmo tempo
+SITES_DIR = DATA_DIR / "sites"  # cópia do arquivo quando você publica só uma página (uma pasta por site)
 
 
 class _HandlerSite(SimpleHTTPRequestHandler):
@@ -4716,32 +4717,99 @@ def servir_site(pasta: str, porta: int) -> None:
         servidor.serve_forever()
 
 
-def links_do_site() -> list:
-    """[(onde funciona, link)] da página publicada: rede local e, com o túnel ligado, a internet."""
+def _servico_site(n: int) -> str:
+    """Serviço tmux do site n (o 1º mantém o nome de antes, 'site')."""
+    return "site" if n == 1 else f"site-{n}"
+
+
+def _tunel_site(n: int) -> str:
+    return "tunel-" + _servico_site(n)
+
+
+def _dados_site(n: int) -> dict:
+    """O que está publicado no site n: nome, página que abre primeiro e porta."""
     c = cfg()
-    caminho = "/" + urllib.parse.quote(c["site_pagina"])
-    links = [("Mesma rede Wi-Fi", f"http://{ip_local()}:{c['site_porta']}{caminho}")]
-    if servico_ativo("tunel-site") and url_tunel("tunel-site"):
-        links.append(("Internet", f"{url_tunel('tunel-site')}{caminho}"))
+    padrao = {"nome": f"Site {n}", "pagina": c.get("site_pagina", "") if n == 1 else "", "porta": c["site_porta"]}
+    return {**padrao, **c["sites"].get(str(n), {})}
+
+
+def sites_no_ar() -> list:
+    """Números (1 a MAX_SITES) dos sites publicados agora."""
+    ativos = set(servicos_ativos())
+    return [n for n in range(1, MAX_SITES + 1) if _servico_site(n) in ativos]
+
+
+def _porta_do_site(n: int, preferida: int) -> int:
+    """A porta que o site n já usava, se estiver livre; senão a primeira livre que nenhum outro site usa."""
+    ocupadas = {_dados_site(k)["porta"] for k in sites_no_ar() if k != n}
+    if preferida not in ocupadas and porta_livre(preferida, espera=3):
+        return preferida
+    # Depois da site_porta, pula para 8111 em diante: 8098 e 8099 são do chat e do trote.
+    for porta in (cfg()["site_porta"], *range(8111, 8131)):
+        if porta not in ocupadas and porta_livre(porta):
+            return porta
+    raise ToonsError("Não achei uma porta livre para o site. Troque 'site_porta' em Configurações.")
+
+
+def links_do_site(n: int) -> list:
+    """[(onde funciona, link)] do site n: rede local e, com o túnel ligado, a internet."""
+    site = _dados_site(n)
+    caminho = "/" + urllib.parse.quote(site["pagina"])
+    links = [("Mesma rede Wi-Fi", f"http://{ip_local()}:{site['porta']}{caminho}")]
+    tunel = _tunel_site(n)
+    if servico_ativo(tunel) and url_tunel(tunel):
+        links.append(("Internet", f"{url_tunel(tunel)}{caminho}"))
     return links
 
 
+def _rotulo_site(n: int) -> str:
+    return f"{n}. {_dados_site(n)['nome']}  {DIM}{links_do_site(n)[-1][1]}{RST}"
+
+
+def _mostrar_links(n: int) -> None:
+    print(f"  {NEG}{n}. {_dados_site(n)['nome']}{RST}")
+    for onde, link in links_do_site(n):
+        print(f"  {CIANO}{onde}:{RST}\n  {NEG}{link}{RST}")
+    if not servico_ativo(_tunel_site(n)):
+        print(f"  {DIM}Para quem está fora da sua rede Wi-Fi, use 'Site publicado: liberar para a internet'.{RST}")
+
+
 def mostrar_links_do_site() -> None:
-    if not servico_ativo("site"):
+    no_ar = sites_no_ar()
+    if not no_ar:
         info("Nenhuma página publicada agora.")
         return
-    for onde, link in links_do_site():
-        print(f"  {CIANO}{onde}:{RST}\n  {NEG}{link}{RST}")
-    if not servico_ativo("tunel-site"):
-        print(f"  {DIM}Para quem está fora da sua rede Wi-Fi, use 'Página publicada: liberar para a internet'.{RST}")
+    info(f"{len(no_ar)} de {MAX_SITES} sites no ar.")
+    for n in no_ar:
+        print()
+        _mostrar_links(n)
 
 
-def qr_do_site() -> None:
-    """Mostra na tela o QR code do link da página publicada e oferece baixar a imagem (.png)."""
-    if not servico_ativo("site"):
-        info("Publique uma página primeiro.")
+def _escolher_site(msg: str) -> int | None:
+    """Qual site publicado usar (só pergunta se houver mais de um no ar)."""
+    no_ar = sites_no_ar()
+    if not no_ar:
+        info("Nenhuma página publicada agora. Use 'Publicar página/site HTML num link'.")
+        return None
+    if len(no_ar) == 1:
+        return no_ar[0]
+    i = escolher(msg, [_rotulo_site(n) for n in no_ar])
+    return None if i is None else no_ar[i]
+
+
+def liberar_site() -> None:
+    """Liga o túnel da Cloudflare de um site publicado (para quem está fora do Wi-Fi)."""
+    n = _escolher_site("Liberar qual site para a internet?")
+    if n is not None:
+        abrir_tunel(_tunel_site(n), _dados_site(n)["porta"])
+
+
+def qr_do_site(n: int | None = None) -> None:
+    """Mostra na tela o QR code do link de um site publicado e oferece baixar a imagem (.png)."""
+    n = n or _escolher_site("QR code de qual site?")
+    if n is None:
         return
-    links = links_do_site()
+    links = links_do_site(n)
     i = len(links) - 1  # o da internet, quando o túnel está ligado
     if len(links) > 1:
         i = escolher("QR code de qual link?", [f"{onde}: {link}" for onde, link in links], len(links))
@@ -4752,14 +4820,30 @@ def qr_do_site() -> None:
         return
     mostrar_qr(link, salvar=False)
     print(f"  {CIANO}{onde}:{RST} {NEG}{link}{RST}")
-    if confirmar("Baixar o QR code (imagem .png na pasta Download)?", True) and not salvar_qr(link, "site"):
+    if confirmar("Baixar o QR code (imagem .png na pasta Download)?", True) \
+            and not salvar_qr(link, f"site {_dados_site(n)['nome']}"):
         raise ToonsError("Não consegui salvar a imagem do QR code.")
 
 
 def publicar_site() -> None:
     """Escolhe um .html (ou a pasta de um site), sobe o servidor e, se quiser, o túnel para a internet."""
     info("Publica uma página HTML (ou um site com imagens, CSS e JS) num link. Na mesma rede Wi-Fi funciona "
-         "na hora; para quem está longe, o túnel da Cloudflare cria um endereço na internet.")
+         f"na hora; para quem está longe, o túnel da Cloudflare cria um endereço na internet. Até {MAX_SITES} "
+         "sites ficam no ar ao mesmo tempo, cada um com o seu link.")
+    no_ar = sites_no_ar()
+    if len(no_ar) >= MAX_SITES:
+        i = escolher(f"Já há {MAX_SITES} sites no ar (o máximo). Qual substituir?", [_rotulo_site(k) for k in no_ar])
+        if i is None:
+            return
+        n = no_ar[i]
+    elif no_ar:
+        i = escolher("Onde publicar?", [f"➕ Mais um site ({len(no_ar)} de {MAX_SITES} no ar)"]
+                     + [f"Substituir {_rotulo_site(k)}" for k in no_ar], 1)
+        if i is None:
+            return
+        n = next(k for k in range(1, MAX_SITES + 1) if k not in no_ar) if i == 0 else no_ar[i - 1]
+    else:
+        n = 1
     garantir_storage()
     # Lista os .html que estão no celular (Download, Documentos, DCIM...) para escolher na hora,
     # em vez de a pessoa ter que digitar o caminho da pasta Download.
@@ -4793,10 +4877,11 @@ def publicar_site() -> None:
         if i is None:
             return
         if i == 0:
-            shutil.rmtree(SITE_DIR, ignore_errors=True)
-            SITE_DIR.mkdir(parents=True)
-            shutil.copy2(alvo, SITE_DIR / "index.html")
-            pasta, pagina = SITE_DIR, ""
+            copia = SITES_DIR / str(n)
+            shutil.rmtree(copia, ignore_errors=True)
+            copia.mkdir(parents=True)
+            shutil.copy2(alvo, copia / "index.html")
+            pasta, pagina = copia, ""
         else:
             aviso(f"Todos os arquivos de {alvo.parent} ficam acessíveis para quem tiver o link.")
             if not confirmar("Continuar?", True):
@@ -4804,32 +4889,47 @@ def publicar_site() -> None:
             pasta, pagina = alvo.parent, "" if alvo.name == "index.html" else alvo.name
     else:
         raise ToonsError(f"Escolha um arquivo .html ou uma pasta: {alvo}")
-    c = cfg()
-    c["site_pagina"] = pagina
+    servico, tunel = _servico_site(n), _tunel_site(n)
+    anterior = _dados_site(n)["porta"]
+    if servico_ativo(servico):
+        parar_servico(servico)
+    porta = _porta_do_site(n, anterior)
+    if porta != anterior and servico_ativo(tunel):
+        parar_servico(tunel)  # apontava para a porta antiga
+    cfg()["sites"][str(n)] = {"nome": alvo.name, "pagina": pagina, "porta": porta}
     salvar_cfg()
-    if servico_ativo("site"):
-        parar_servico("site")
-    if not porta_livre(c["site_porta"], espera=3):
-        raise ToonsError(f"A porta {c['site_porta']} já está em uso. Troque 'site_porta' em Configurações.")
-    if not iniciar_servico("site", cmd_self("site", str(pasta), "--porta", str(c["site_porta"])), reiniciar=True):
+    if not iniciar_servico(servico, cmd_self("site", str(pasta), "--porta", str(porta)), reiniciar=True):
         return
-    if not servico_ativo("tunel-site") and confirmar("Liberar para a internet (pessoas fora do seu Wi-Fi)?", True):
-        abrir_tunel("tunel-site", c["site_porta"])
+    if not servico_ativo(tunel) and confirmar("Liberar para a internet (pessoas fora do seu Wi-Fi)?", True):
+        abrir_tunel(tunel, porta)
     print()
-    mostrar_links_do_site()
-    _, link = links_do_site()[-1]
+    _mostrar_links(n)
+    _, link = links_do_site(n)[-1]
     if tem("termux-clipboard-set") and confirmar("Copiar o link?", True):
         _tapi(["termux-clipboard-set"], 10, entrada=link, json_saida=False)
         ok("Link copiado.")
     if confirmar("Gerar o QR code do link (e baixar a imagem)?", True):
-        qr_do_site()
+        qr_do_site(n)
     info("O link funciona enquanto o celular estiver ligado com o Termux aberto. O endereço do túnel muda "
          "toda vez que ele é religado.")
 
 
 def parar_site() -> None:
-    parar_servico("tunel-site")
-    parar_servico("site")
+    """Tira do ar um dos sites publicados (ou todos)."""
+    no_ar = sites_no_ar()
+    if not no_ar:
+        info("Nenhuma página publicada agora.")
+        return
+    alvos = no_ar
+    if len(no_ar) > 1:
+        i = escolher("Tirar qual site do ar?", [_rotulo_site(n) for n in no_ar] + [f"Todos ({len(no_ar)})"])
+        if i is None:
+            return
+        alvos = no_ar if i == len(no_ar) else [no_ar[i]]
+    for n in alvos:
+        if servico_ativo(_tunel_site(n)):
+            parar_servico(_tunel_site(n))
+        parar_servico(_servico_site(n))
 
 
 @submenu
@@ -4954,12 +5054,11 @@ def menu_arquivos():
 
     menu("🗄️ Servidor de arquivos e backup", [
         ("📂 Gerenciador de arquivos (copiar, mover, renomear, Android/data...)", gerenciador_arquivos),
-        ("🌍 Publicar página/site HTML num link", publicar_site),
-        ("Página publicada: ver o link", mostrar_links_do_site),
-        ("Página publicada: QR code do link (gerar e baixar)", qr_do_site),
-        ("Página publicada: liberar para a internet (túnel)",
-         lambda: abrir_tunel("tunel-site", cfg()["site_porta"]) if servico_ativo("site") else info("Publique uma página primeiro.")),
-        ("Página publicada: tirar do ar", parar_site),
+        (f"🌍 Publicar página/site HTML num link (até {MAX_SITES} ao mesmo tempo)", publicar_site),
+        ("Sites publicados: ver os links", mostrar_links_do_site),
+        ("Site publicado: QR code do link (gerar e baixar)", qr_do_site),
+        ("Site publicado: liberar para a internet (túnel)", liberar_site),
+        ("Site publicado: tirar do ar", parar_site),
         *itens_servico("http-arquivos", "Compartilhar pasta via HTTP", http_iniciar),
         ("rclone: instalar e configurar nuvem (Drive, Dropbox, OneDrive...)", rclone_config),
         ("rclone: copiar/sincronizar pasta com a nuvem", rclone_copiar),
@@ -18200,7 +18299,7 @@ def menu_config():
 
     def mostrar():
         for chave, valor in c.items():
-            if chave in ("monitores", "compartilhamentos"):
+            if chave in ("monitores", "compartilhamentos", "sites"):
                 valor = f"{len(valor)} item(ns)"
             elif chave.endswith(("token", "_chave", "_catalogo")):
                 valor = mascarar(valor)
