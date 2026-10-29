@@ -19,7 +19,8 @@ Reúne em um único menu:
   11. Utilitários: notas, tarefas, lembretes/alarmes, cronômetro/Pomodoro, agenda, conversor, gastos,
       senhas, previsão do tempo, QR code (Wi-Fi, PIX) e tradutor
   12. Celular e sistema: depuração sem fio (ADB), Termux:API, painel do sistema, bateria, uso de dados e
-      apps, fotos, conversor de arquivos, automação por eventos, espelhamento e transmissão da tela por link
+      apps, resolução da tela (inteira ou por app), fotos, conversor de arquivos, automação por eventos,
+      espelhamento e transmissão da tela por link
   13. Internet: e-mail, notícias, downloads (aria2), chat na rede local, Browsh/w3m e encurtador/pastebin
   14. Inteligência artificial: Claude/ChatGPT/Gemini, LLMs locais (llama.cpp), voz (whisper.cpp) e OCR
   15. Diversão e aprendizado: jogos (incluindo os retrô), cursos de Python/Bash/Git, BASIC, leitor de
@@ -418,6 +419,12 @@ def _lista_inline(msg: str, opcoes: list, sel: int = 0, multipla: bool = False):
     return resultado
 
 
+def _botoes_sim_nao(sim: bool) -> str:
+    if not _COR:
+        return "[Sim]  Não " if sim else " Sim  [Não]"
+    return f"{DESTAQUE} Sim {RST}  Não " if sim else f" Sim  {DESTAQUE} Não {RST}"
+
+
 def confirmar(msg: str, padrao: bool = False) -> bool:
     if not setas_ativas():
         resp = perguntar(f"{msg} ({'S/n' if padrao else 's/N'})").lower()
@@ -429,9 +436,7 @@ def confirmar(msg: str, padrao: bool = False) -> bool:
     _cursor(False)
     try:
         while True:
-            botoes = (f"{DESTAQUE} Sim {RST}  Não " if sim else f" Sim  {DESTAQUE} Não {RST}") if _COR \
-                else ("[Sim]  Não " if sim else " Sim  [Não]")
-            sys.stdout.write(f"\r   {botoes}  {DIM}(←→ e Enter){RST}\033[K")
+            sys.stdout.write(f"\r   {_botoes_sim_nao(sim)}  {DIM}(←→ e Enter){RST}\033[K")
             sys.stdout.flush()
             tecla = ler_tecla()
             if tecla in ("esq", "dir", "cima", "baixo", "\t"):
@@ -447,6 +452,42 @@ def confirmar(msg: str, padrao: bool = False) -> bool:
     finally:
         _cursor(True)
     sys.stdout.write(f"\r   {VERD}✔{RST} {'Sim' if sim else 'Não'}\033[K\n")
+    return sim
+
+
+def confirmar_no_prazo(msg: str, prazo: float) -> bool:
+    """Sim/Não com contagem regressiva até `prazo` (um time.time()). Começa no Não e o tempo esgotado conta
+    como Não: quem não consegue ler a tela (ex.: resolução que deu errado) só precisa esperar ou dar Enter."""
+    print(f"{AMAR}?{RST} {msg}")
+    if not setas_ativas():
+        print(f"   Digite s e Enter em até {max(0, round(prazo - time.time()))} s para manter.")
+        pronto = select.select([sys.stdin], [], [], max(0.0, prazo - time.time()))[0]
+        sim = bool(pronto) and sys.stdin.readline().strip().lower() in ("s", "sim", "y", "yes")
+        print(f"   {VERD}✔{RST} {'Sim' if sim else 'Não'}" if pronto else f"   {DIM}tempo esgotado{RST}")
+        return sim
+    fd = sys.stdin.fileno()
+    antigo = termios.tcgetattr(fd)
+    sim, esgotou = False, True
+    _cursor(False)
+    try:
+        tty.setcbreak(fd)  # o tempo todo, para o select ver cada tecla sem esperar Enter
+        while (resta := prazo - time.time()) > 0:
+            sys.stdout.write(f"\r   {_botoes_sim_nao(sim)}  {AMAR}volta sozinho em {math.ceil(resta)} s{RST}\033[K")
+            sys.stdout.flush()
+            if not select.select([fd], [], [], min(1.0, resta))[0]:
+                continue
+            tecla = ler_tecla()
+            if tecla in ("esq", "dir", "cima", "baixo", "\t"):
+                sim = not sim
+            elif tecla.lower() in ("s", "y", "n") or tecla in ("esc", "enter"):
+                sim = tecla.lower() in ("s", "y") or (tecla == "enter" and sim)
+                esgotou = False
+                break
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
+        _cursor(True)
+    fim = f"{DIM}tempo esgotado{RST}" if esgotou else f"{VERD}✔{RST} {'Sim' if sim else 'Não'}"
+    sys.stdout.write(f"\r   {fim}\033[K\n")
     return sim
 
 
@@ -12754,6 +12795,238 @@ def menu_apps():
     ], cabecalho=lambda: print(f"{DIM}Precisa do ADB conectado (🔌 Depuração sem fio, em Celular e sistema).{RST}"))
 
 
+# ── Resolução da tela (root ou ADB) ──────────────────────────────────
+# Menos pixels deixam jogos mais leves e gastam menos bateria. A tela inteira muda com 'wm size', e a
+# densidade ('wm density') muda na mesma proporção para ícones e letras continuarem do mesmo tamanho. Um
+# app sozinho muda no Android 12+ pelas mudanças de compatibilidade DOWNSCALED/DOWNSCALE_xx (qualquer app,
+# mas alguns celulares só deixam em apps de teste) ou, no Android 13+, pelo modo de jogo (só jogos).
+# Toda mudança volta sozinha se não for confirmada em TEMPO_CONFIRMAR segundos: um vigia em outro processo
+# desfaz mesmo que o Termux-Toons feche ou a tela fique impossível de usar.
+
+RESOLUCAO_FILE = DATA_DIR / "resolucao_pendente.json"
+TEMPO_CONFIRMAR = 60
+_RECUSA_ANDROID = re.compile(r"exception|error|denied|denial|not allowed|cannot|unknown|invalid|not a game|usage:",
+                             re.I)
+
+
+def acesso_shell_android() -> tuple:
+    """('root', None) ou ('adb', serial): quem dá a permissão de 'shell'. Conecta a depuração sem fio se precisar."""
+    modo = modo_cache_apps()
+    if modo is None:
+        info("Precisa de root ou da depuração sem fio (ADB pelo Wi-Fi), que dá ao Termux a permissão de 'shell'. "
+             "Ligue a 'Depuração por Wi-Fi' nas Opções do desenvolvedor, se estiver desligada.")
+        if not adb_conectar():
+            raise ToonsError("Sem conexão. Primeira vez? Use 'Depuração sem fio → Parear este celular' e volte aqui.")
+        modo = "adb"
+    return modo, (adb_alvo() if modo == "adb" else None)
+
+
+def shell_android(comando: str, modo: str, serial: str | None = None, timeout: float = 60) -> tuple:
+    """(código de saída, texto) de um comando rodado com a permissão de 'shell' do Android."""
+    cmd = ["su", "-c", comando] if modo == "root" else ["adb", *(["-s", serial] if serial else []), "shell", comando]
+    proc = rodar(cmd, capturar=True, timeout=timeout, mostrar=False)
+    return proc.returncode, ((proc.stdout or "") + (proc.stderr or "")).strip()
+
+
+def tela_android(modo: str, serial: str | None) -> dict:
+    """Resolução e densidade de fábrica ('fisica') e as que valem agora ('atual')."""
+    tamanho = shell_android("wm size", modo, serial)[1]
+    densidade = shell_android("wm density", modo, serial)[1]
+    fisica = re.search(r"Physical size:\s*(\d+)x(\d+)", tamanho)
+    dpi_fisica = re.search(r"Physical density:\s*(\d+)", densidade)
+    if not fisica or not dpi_fisica:
+        raise ToonsError(f"O Android não informou a tela: {(tamanho or densidade)[:200] or 'sem resposta'}")
+    atual = re.search(r"Override size:\s*(\d+)x(\d+)", tamanho) or fisica
+    dpi_atual = re.search(r"Override density:\s*(\d+)", densidade) or dpi_fisica
+    return {"fisica": (int(fisica[1]), int(fisica[2])), "atual": (int(atual[1]), int(atual[2])),
+            "dpi_fisica": int(dpi_fisica[1]), "dpi_atual": int(dpi_atual[1]),
+            "mudou_tamanho": atual is not fisica, "mudou_dpi": dpi_atual is not dpi_fisica}
+
+
+def desfazer_resolucao(vigia: str | None = None) -> bool:
+    """Desfaz a mudança de resolução que espera confirmação. O vigia (outro processo, com o id da mudança) espera
+    o prazo acabar e só desfaz se ninguém confirmou. True se desfez."""
+    estado = ler_json(RESOLUCAO_FILE, {})
+    if vigia:
+        while estado.get("id") == vigia and time.time() < estado["prazo"] + 3:  # folga: quem confirma no fim ganha
+            time.sleep(1)
+            estado = ler_json(RESOLUCAO_FILE, {})
+        if estado.get("id") != vigia:
+            return False  # confirmada ou já desfeita
+    if not estado:
+        return False
+    codigo, texto = shell_android(estado["desfazer"], estado["modo"], estado.get("serial"))
+    if codigo != 0:  # fica anotada: 'toons resolucao' ou a próxima mudança pelo menu tentam de novo
+        aviso(f"Não consegui desfazer ({estado['descricao']}): {texto[-200:] or f'código {codigo}'}. "
+              "Rode: toons resolucao")
+        return False
+    RESOLUCAO_FILE.unlink(missing_ok=True)
+    if vigia:
+        log(f"Sem confirmação em {TEMPO_CONFIRMAR} s: desfeito ({estado['descricao']}).")
+    return True
+
+
+def mudar_com_prazo(descricao: str, tentativas: list, desfazer: str, modo: str, serial: str | None,
+                    depois=None) -> bool:
+    """Aplica a primeira forma (comando) que o Android aceitar e pede confirmação; sem ela, desfaz."""
+    if ler_json(RESOLUCAO_FILE, {}):  # sobrou uma mudança sem confirmar que não deu para desfazer antes
+        desfazer_resolucao()
+    estado = {"id": secrets.token_hex(4), "prazo": time.time() + TEMPO_CONFIRMAR, "modo": modo, "serial": serial,
+              "desfazer": desfazer, "descricao": descricao}
+    gravar_json(RESOLUCAO_FILE, estado)  # antes de mudar: se algo cair no meio, o vigia já sabe desfazer
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOG_DIR / "resolucao.log", "a") as arq_log:
+        subprocess.Popen([sys.executable, str(SCRIPT), "resolucao", "--vigiar", estado["id"]],
+                         stdin=subprocess.DEVNULL, stdout=arq_log, stderr=subprocess.STDOUT, start_new_session=True)
+    manter = False
+    try:
+        for comando in tentativas:
+            codigo, texto = shell_android(comando, modo, serial)
+            if codigo == 0 and not _RECUSA_ANDROID.search(texto):
+                break
+        else:
+            raise ToonsError(f"O Android não deixou: {texto[-300:] or f'código {codigo}'}")
+        ok(f"Mudou: {descricao}.")
+        if depois:
+            depois()
+        manter = confirmar_no_prazo("Ficou bom? Manter assim?", estado["prazo"])
+    finally:
+        if manter:
+            RESOLUCAO_FILE.unlink(missing_ok=True)
+            ok("Mantido.")
+        elif desfazer_resolucao():
+            info("Desfeito: voltou ao que era.")
+    return manter
+
+
+def _par(valor: float) -> int:
+    return max(2, round(valor / 2) * 2)
+
+
+def mudar_resolucao_tela() -> None:
+    modo, serial = acesso_shell_android()
+    tela = tela_android(modo, serial)
+    (lf, af), (la, aa) = tela["fisica"], tela["atual"]
+    print(f"  De fábrica: {NEG}{lf}×{af}{RST} · {tela['dpi_fisica']} dpi")
+    if tela["mudou_tamanho"] or tela["mudou_dpi"]:
+        print(f"  Agora:      {NEG}{la}×{aa}{RST} · {tela['dpi_atual']} dpi")
+    fatores = [0.9, 0.75, 2 / 3, 0.5]
+    dicas = {0.9: " (quase igual, um pouco mais leve)", 0.5: " (bem mais leve, perde nitidez)"}
+    opcoes = [f"{round(f * 100)}% · {_par(lf * f)}×{_par(af * f)}{dicas.get(f, '')}" for f in fatores]
+    i = escolher("Nova resolução", opcoes + ["Digitar a largura em pixels"])
+    if i is None:
+        return
+    if i < len(fatores):
+        largura = _par(lf * fatores[i])
+    else:
+        largura = _par(perguntar_int(f"Largura em pixels ({_par(lf * 0.3)} a {lf})", _par(lf * 0.75),
+                                     _par(lf * 0.3), lf))
+    altura = _par(af * largura / lf)
+    # densidade na mesma proporção da largura: ícones e letras ficam do tamanho que estavam (e o 'Tamanho da
+    # exibição' escolhido nas configurações continua valendo)
+    dpi = round(tela["dpi_atual"] * largura / la)
+    aviso(f"Se a tela ficar estranha, não precisa fazer nada: em {TEMPO_CONFIRMAR} s ela volta sozinha.")
+    desfazer = "; ".join([f"wm size {la}x{aa}" if tela["mudou_tamanho"] else "wm size reset",
+                          f"wm density {tela['dpi_atual']}" if tela["mudou_dpi"] else "wm density reset"])
+    mudar_com_prazo(f"tela em {largura}×{altura} ({dpi} dpi)", [f"wm size {largura}x{altura} && wm density {dpi}"],
+                    desfazer, modo, serial)
+
+
+def resolucao_original(modo: str | None = None, serial: str | None = None) -> None:
+    """Volta a tela à resolução de fábrica, com a densidade na proporção de volta (mantém o 'Tamanho da exibição')."""
+    if modo is None:
+        modo, serial = acesso_shell_android()
+    tela = tela_android(modo, serial)
+    dpi = round(tela["dpi_atual"] * tela["fisica"][0] / tela["atual"][0])
+    densidade = "wm density reset" if abs(dpi - tela["dpi_fisica"]) <= 2 else f"wm density {dpi}"
+    codigo, texto = shell_android(f"wm size reset; {densidade}", modo, serial)
+    if codigo != 0:
+        raise ToonsError(f"O Android não deixou: {texto[-300:] or f'código {codigo}'}")
+    ok(f"Tela de volta a {tela['fisica'][0]}×{tela['fisica'][1]}.")
+
+
+def _sdk_android(modo: str, serial: str | None) -> int:
+    texto = shell_android("getprop ro.build.version.sdk", modo, serial)[1]
+    return int(texto) if texto.isdigit() else 0
+
+
+def _escalas_app(sdk: int) -> list:
+    """Porcentagens que o Android aceita para um app (o 12 só tem de 10 em 10)."""
+    return [90, 85, 80, 75, 70, 65, 60, 55, 50, 45, 40, 35, 30] if sdk >= 33 else [90, 80, 70, 60, 50]
+
+
+def _desfazer_app(pacote: str, sdk: int) -> str:
+    q = shlex.quote(pacote)
+    comandos = [f"am compat reset DOWNSCALED {q}"] + [f"am compat reset DOWNSCALE_{e} {q}" for e in _escalas_app(sdk)]
+    return "; ".join(comandos + ([f"cmd game reset {q}"] if sdk >= 33 else []))
+
+
+def _escolher_app_android(modo: str, serial: str | None) -> str | None:
+    pacotes = sorted(l.split(":", 1)[1].strip() for l in shell_android("pm list packages -3", modo, serial)[1]
+                     .splitlines() if l.startswith("package:"))
+    filtro = perguntar("Filtrar por nome (ex.: freefire; Enter = todos)", "").replace(" ", "").lower()
+    pacotes = [p for p in pacotes if filtro in p.lower()]
+    if not pacotes:
+        info("Nenhum app encontrado.")
+        return None
+    i = escolher(f"Qual app? ({len(pacotes)})", pacotes)
+    return None if i is None else pacotes[i]
+
+
+def mudar_resolucao_app() -> None:
+    modo, serial = acesso_shell_android()
+    sdk = _sdk_android(modo, serial)
+    if sdk < 31:
+        raise ToonsError("Mudar a resolução de um app só existe no Android 12 ou mais novo. "
+                         "Use 'Diminuir a resolução da tela inteira'.")
+    pacote = _escolher_app_android(modo, serial)
+    if not pacote:
+        return
+    escalas = _escalas_app(sdk)
+    i = escolher(f"Resolução do {pacote}", [f"{e}%" + (" (bem mais leve, perde nitidez)" if e == 50 else "")
+                                            for e in escalas])
+    if i is None:
+        return
+    escala, q = escalas[i], shlex.quote(pacote)
+    shell_android(_desfazer_app(pacote, sdk), modo, serial)  # tira uma escala anterior (o Android usaria a maior)
+    tentativas = [f"am compat enable DOWNSCALED {q} && am compat enable DOWNSCALE_{escala} {q} && am force-stop {q}"]
+    if sdk >= 33:  # sem permissão para a forma acima: o modo de jogo (só funciona em jogos)
+        modo_jogo = "" if sdk >= 34 else "--mode 2 "
+        tentativas.append(f"cmd game set {modo_jogo}--downscale {escala / 100:g} {q}"
+                          + ("" if sdk >= 34 else f" && cmd game mode 2 {q}") + f" && am force-stop {q}")
+
+    def abrir_app():
+        info(f"Abrindo o app para você ver. Volte ao Termux e confirme em até {TEMPO_CONFIRMAR} s; "
+             "sem confirmação o app volta ao normal (se estiver aberto, pode fechar).")
+        time.sleep(2)
+        shell_android(f"monkey -p {q} -c android.intent.category.LAUNCHER 1", modo, serial)
+
+    mudar_com_prazo(f"{pacote} em {escala}%", tentativas, _desfazer_app(pacote, sdk), modo, serial, abrir_app)
+
+
+def app_resolucao_normal() -> None:
+    modo, serial = acesso_shell_android()
+    sdk = _sdk_android(modo, serial)
+    if sdk < 31:
+        info("Antes do Android 12 não existe resolução por app: nada para desfazer.")
+        return
+    pacote = _escolher_app_android(modo, serial)
+    if pacote:
+        shell_android(_desfazer_app(pacote, sdk), modo, serial)
+        ok(f"{pacote} de volta à resolução normal (vale na próxima vez que ele abrir).")
+
+
+@submenu
+def menu_resolucao():
+    menu("🖥️ Resolução da tela", [
+        ("Diminuir a resolução da tela inteira", mudar_resolucao_tela),
+        ("Diminuir a resolução de um app (Android 12+)", mudar_resolucao_app),
+        ("Voltar a tela à resolução de fábrica", resolucao_original),
+        ("Voltar um app à resolução normal", app_resolucao_normal),
+    ], cabecalho=lambda: print(f"{DIM}Precisa de root ou da depuração sem fio (🔌). Toda mudança volta sozinha se "
+                               f"você não confirmar em {TEMPO_CONFIRMAR} s.{RST}"))
+
+
 # ── Organizador de fotos ─────────────────────────────────────────────
 
 EXT_IMAGEM = (".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".gif")
@@ -13889,6 +14162,7 @@ def menu_celular():
         ("🔋 Saúde da bateria (histórico e alertas de 80%)", menu_bateria),
         ("📊 Uso de dados e tempo de tela (ADB)", menu_uso_celular),
         ("📦 Gerenciador de apps (ADB, sem root)", menu_apps),
+        ("🖥️ Resolução da tela (inteira ou de um app)", menu_resolucao),
         ("📸 Organizador de fotos", menu_fotos),
         ("🔁 Conversor de arquivos (imagem, vídeo, áudio, PDF)", menu_conversor_arquivos),
         ("🤖 Automação por eventos (Wi-Fi, carregador, horário)", menu_automacao),
@@ -18471,6 +18745,8 @@ def _indice_busca() -> list:
         ("🔄 Conversor de arquivos", "converter imagem pdf video gif audio word excel powerpoint jpg png webp", menu_conversor_arquivos),
         ("🤖 Automação por eventos (Tasker)", "automacao tasker evento gatilho horario wifi carregador bateria", menu_automacao),
         ("📱 Espelhar a tela (scrcpy)", "espelhar scrcpy tela espelhamento mostrar", menu_espelhar),
+        ("🖥️ Resolução da tela", "resolucao tela dpi densidade pixel diminuir baixar jogo app leve desempenho fps "
+                                 "lag travando wm size", menu_resolucao),
         ("📡 Modem (AT / 3GPP)", "modem at comando 3gpp sinal operadora", menu_modem),
         ("🌐 Internet e comunicação", "internet email noticias downloads navegador chat links", menu_internet),
         ("📧 E-mail", "email e-mail gmail outlook yahoo icloud caixa entrada enviar anexo", menu_email),
@@ -18636,6 +18912,8 @@ def main(argv=None) -> int:
     sub.add_parser("atualizar", help="atualiza Termux, pacotes Python, distros e o Termux-Toons")
     sub.add_parser("limpar", help="otimização rápida: limpa caches e temporários com segurança")
     sub.add_parser("doctor", help="diagnóstico do ambiente")
+    p = sub.add_parser("resolucao", help="desfaz a última mudança de resolução ou volta a tela à de fábrica")
+    p.add_argument("--vigiar", metavar="ID", help=argparse.SUPPRESS)  # o vigia que desfaz sem confirmação
     args = parser.parse_args(argv)
 
     try:
@@ -18713,6 +18991,13 @@ def main(argv=None) -> int:
             atualizar_tudo()
         elif args.comando == "doctor":
             diagnostico()
+        elif args.comando == "resolucao":
+            if args.vigiar:
+                desfazer_resolucao(args.vigiar)
+            elif desfazer_resolucao():
+                ok("Mudança de resolução sem confirmação desfeita.")
+            else:
+                resolucao_original()
     except (ToonsError, BasicErro) as e:
         erro(str(e))
         return 1
