@@ -603,8 +603,9 @@ def _quebrar(linha: str, colunas: int) -> list:
     return [cor + parte + RST for parte in textwrap.wrap(_sem_ansi(linha), max(10, colunas - 4))] or [linha]
 
 
-def _menu_setas(titulo_menu: str, itens: list, sair: str, cabecalho, sel: int):
-    """Desenha o menu em tela cheia, no centro da tela, e devolve o índice escolhido (None = voltar)."""
+def _menu_setas(titulo_menu: str, itens: list, sair: str, cabecalho, sel: int, descricoes=None):
+    """Desenha o menu em tela cheia, no centro da tela, e devolve o índice escolhido (None = voltar).
+    Com `descricoes` (um texto por item), a da opção selecionada aparece embaixo da lista."""
     linhas_cab = []
     if cabecalho:
         buffer = io.StringIO()
@@ -622,9 +623,16 @@ def _menu_setas(titulo_menu: str, itens: list, sair: str, cabecalho, sel: int):
             cab = [parte for linha in linhas_cab for parte in _quebrar(linha, colunas)]
             if cab:
                 cab.append("")
-            disponivel = linhas_tela - len(cab) - 4  # título, linha vazia, linha vazia e rodapé
+            # descrições: guarda o espaço da maior (até 6 linhas) para a lista não pular ao mudar de opção
+            largura_desc = max(20, min(colunas - 4, 64))
+            quebradas = [textwrap.wrap(d or "", largura_desc) for d in descricoes or []]
+            reserva = min(max(map(len, quebradas), default=0), 6)
+            fixas = 4 + (reserva + 1 if reserva else 0)  # título, linhas vazias, rodapé (+ descrição)
+            disponivel = linhas_tela - len(cab) - fixas
             if disponivel < min(total, 6):  # tela pequena: esconde o cabeçalho
-                cab, disponivel = [], linhas_tela - 4
+                cab, disponivel = [], linhas_tela - fixas
+            if disponivel < min(total, 4) and reserva > 2:  # tela bem baixa: descrição em 2 linhas
+                disponivel, reserva = disponivel + reserva - 2, 2
             altura = max(1, min(total, disponivel))
             topo = _janela(sel, topo, altura, total)
             # as opções formam um bloco alinhado à esquerda (emojis um embaixo do outro) e o bloco vai para o meio
@@ -635,6 +643,12 @@ def _menu_setas(titulo_menu: str, itens: list, sair: str, cabecalho, sel: int):
             for i in range(topo, topo + altura):
                 rotulo = f"{DIM}{rotulos[i]}{RST}" if i == total - 1 and i != sel else rotulos[i]  # "Voltar" apagado
                 linhas.append(recuo + _linha_opcao(rotulo, i == sel, largura))
+            if reserva:
+                texto = quebradas[sel] if sel < len(quebradas) else []
+                if len(texto) > reserva:
+                    texto = texto[:reserva - 1] + [_cortar(texto[reserva - 1] + " …", largura_desc)]
+                recuo_desc = " " * max(0, (colunas - largura_desc) // 2)
+                linhas += [""] + [f"{recuo_desc}{CIANO}{t}{RST}" for t in texto] + [""] * (reserva - len(texto))
             rodape = "↑↓ mover · Enter abre · Esc volta"
             if total > altura:
                 rodape += f" · {sel + 1}/{total}"
@@ -662,12 +676,12 @@ def _menu_setas(titulo_menu: str, itens: list, sair: str, cabecalho, sel: int):
         _cursor(True)
 
 
-def menu(titulo_menu: str, itens: list, sair: str = "Voltar", cabecalho=None) -> None:
+def menu(titulo_menu: str, itens: list, sair: str = "Voltar", cabecalho=None, descricoes=None) -> None:
     if setas_ativas():
         sel = 0
         while True:
             try:
-                escolha = _menu_setas(titulo_menu, itens, sair, cabecalho, sel)
+                escolha = _menu_setas(titulo_menu, itens, sair, cabecalho, sel, descricoes)
             except KeyboardInterrupt:
                 return
             if escolha is None:
@@ -682,6 +696,9 @@ def menu(titulo_menu: str, itens: list, sair: str = "Voltar", cabecalho=None) ->
         titulo(titulo_menu)
         for i, (rotulo, _) in enumerate(itens, 1):
             print(f"  {CIANO}{i:>2}{RST}) {rotulo() if callable(rotulo) else rotulo}")
+            if descricoes and i <= len(descricoes) and descricoes[i - 1]:
+                for linha in textwrap.wrap(descricoes[i - 1], max(20, min(largura_tela(), 80) - 8)):
+                    print(f"      {DIM}{linha}{RST}")
         print(f"  {CIANO}{0:>2}{RST}) {sair}")
         try:
             esc = perguntar("Escolha")
@@ -9154,6 +9171,7 @@ def menu_adb():
         ("Desfazer: limite padrão de processos", desfazer_morte),
         ("Shell do Android (adb shell)", shell),
         ("Rodar um comando", comando),
+        ("📖 Comandos do ADB: lista com a descrição de cada um", menu_comandos_adb),
         ("Tirar print da tela", print_tela),
         ("Gravar a tela", gravar_tela),
         ("Instalar APK", instalar_apk),
@@ -9164,6 +9182,292 @@ def menu_adb():
         ("Desligar a Depuração por Wi-Fi", desligar_depuracao),
         ("Instalar o adb (android-tools)", garantir_adb),
     ])
+
+
+# ── Comandos do ADB com descrição ────────────────────────────────────
+# Baseado na documentação oficial (developer.android.com/tools/adb). Cada comando é
+# (como aparece, descrição, o que rodar, marca). O que rodar vai depois de "adb -s <aparelho>":
+# "shell ..." roda dentro do Android e {nome} é perguntado na hora (PARAMETROS_ADB); None = só para
+# consultar (precisa de root, de um app de teste, apaga dados ou tem opção melhor no menu).
+# Marcas: "local" não precisa de aparelho conectado; "perigoso" pede confirmação já marcada em Não.
+
+COMANDOS_ADB = {
+    "🔌 Aparelhos e conexão": ("Ver os aparelhos, parear e conectar pelo Wi-Fi e reiniciar o servidor do adb.", [
+        ("adb devices -l", "Lista os aparelhos conectados com o número de série, o estado (device = pronto, offline = "
+         "sem resposta, unauthorized = falta aceitar no celular) e a descrição (produto, modelo, aparelho).",
+         "devices -l", "local"),
+        ("adb pair <ip:porta> <código>", "Pareia com o celular pela Depuração por Wi-Fi (Android 11+) usando o IP, a "
+         "porta e o código de 6 dígitos da tela 'Parear dispositivo com código de pareamento'. Feito uma vez só.",
+         "pair {endereco} {codigo}", "local"),
+        ("adb connect <ip:porta>", "Conecta ao celular pelo Wi-Fi. No Android 11+ use o IP e a porta da tela "
+         "'Depuração por Wi-Fi' (a porta muda cada vez que ela é ligada); no Android 10 ou anterior, a porta 5555 "
+         "liberada pelo adb tcpip.", "connect {endereco}", "local"),
+        ("adb mdns services", "Lista os aparelhos que se anunciam na rede (mDNS): o celular com a Depuração por Wi-Fi "
+         "ligada aparece como _adb-tls-connect, com IP e porta. Nas versões novas do adb a documentação usa "
+         "adb mdns track-services --proto-text.", "mdns services", "local"),
+        ("adb server-status", "Mostra a configuração do servidor do adb: versão, se o mDNS está ligado e onde fica o "
+         "log. Só existe nas versões novas do adb (a documentação pede a 37 ou mais nova).", "server-status", "local"),
+        ("adb kill-server", "Encerra o servidor do adb; o próximo comando abre outro sozinho. Resolve conexões "
+         "travadas ou aparelho que sumiu da lista.", "kill-server", "local"),
+        ("adb start-server", "Abre o servidor do adb (se já estiver aberto, não faz nada).", "start-server", "local"),
+        ("adb tcpip 5555", "Deixa o celular aceitando o adb na porta 5555 até reiniciar: o jeito do Android 10 ou "
+         "anterior, depois de uma conexão USB. Enquanto isso, qualquer aparelho na mesma rede pode pedir para depurar.",
+         "tcpip 5555", "perigoso"),
+        ("adb -s <série> <comando>", "Escolhe o aparelho quando há mais de um conectado (a série vem do adb devices). "
+         "-d escolhe o único aparelho USB, -e o único emulador, e a variável ANDROID_SERIAL define um padrão. Aqui o "
+         "Termux-Toons já faz isso sozinho.", None, ""),
+        ("adb help", "Lista todos os comandos que o adb aceita, com as opções de cada um.", "help", "local"),
+    ]),
+    "📂 Arquivos e shell": ("Copiar arquivos entre o Termux e o celular e usar o shell do Android.", [
+        ("adb push <no Termux> <no celular>", "Copia um arquivo ou pasta daqui para o celular (ex.: foto.jpg para "
+         "/sdcard/foto.jpg). Com a permissão de 'shell' dá para escrever onde o Termux sozinho não alcança, como "
+         "/data/local/tmp.", "push {no_termux} {no_celular}", ""),
+        ("adb pull <no celular> <no Termux>", "Copia um arquivo ou pasta do celular para cá. Serve para pastas "
+         "protegidas, como Android/data, que o Termux sozinho não lê.", "pull {no_celular} {no_termux}", ""),
+        ("adb shell", "Abre um shell interativo dentro do Android, com a permissão de 'shell'. Sai com exit ou Ctrl+D.",
+         "shell", ""),
+        ("adb shell ls /system/bin", "Lista as ferramentas de linha de comando do Android (a maioria responde a "
+         "--help).", "shell ls /system/bin", ""),
+        ("adb shell toybox --help", "Ajuda do toybox, que fornece a maioria dos comandos básicos do Android (ls, cp, "
+         "grep...).", "shell toybox --help", ""),
+    ]),
+    "📦 Instalar apps": ("Instalar APKs, inclusive divididos em vários arquivos e de teste.", [
+        ("adb install <apk>", "Instala um APK no celular.", "install {apk}", ""),
+        ("adb install -t <apk>", "Instala um APK de teste (android:testOnly), como os gerados com uma versão de "
+         "prévia do SDK.", "install -t {apk}", ""),
+        ("adb install-multiple <apks>", "Instala de uma vez um app dividido em vários APKs (split APK: o base.apk e "
+         "os split_*.apk).", "install-multiple {apks}", ""),
+        ("pm install: opções", "Dentro do shell, pm install aceita: -r reinstala mantendo os dados, -t aceita APK de "
+         "teste, -d deixa voltar para uma versão mais antiga, -g concede todas as permissões do app, -i define quem "
+         "instalou, --user escolhe o usuário, --install-location 0/1/2 (automático, interno, externo), --fastdeploy "
+         "envia só o que mudou e --incremental abre o app antes de terminar de instalar.", None, ""),
+    ]),
+    "📋 Gerenciador de pacotes (pm)": ("Listar apps, permissões e recursos; limpar, desativar e dar permissões.", [
+        ("adb shell pm list packages", "Lista todos os apps instalados. Opções: -f mostra o APK, -d só desativados, -e "
+         "só ativados, -s só do sistema, -3 só os de terceiros, -i quem instalou, -u inclui os desinstalados; um texto "
+         "no fim filtra.", "shell pm list packages", ""),
+        ("adb shell pm list packages -3", "Só os apps que você instalou (de terceiros).", "shell pm list packages -3",
+         ""),
+        ("adb shell pm list packages -s", "Só os apps do sistema.", "shell pm list packages -s", ""),
+        ("adb shell pm list packages -d", "Só os apps desativados.", "shell pm list packages -d", ""),
+        ("adb shell pm list packages -f <texto>", "Apps com o texto no nome, junto com o caminho do APK de cada um.",
+         "shell pm list packages -f {filtro}", ""),
+        ("adb shell pm list permission-groups", "Lista os grupos de permissões (câmera, localização, contatos...).",
+         "shell pm list permission-groups", ""),
+        ("adb shell pm list permissions -g -d", "Lista as permissões perigosas (-d) por grupo (-g). Outras opções: -f "
+         "tudo sobre cada uma, -s resumo, -u só as que aparecem para o usuário.", "shell pm list permissions -g -d",
+         ""),
+        ("adb shell pm list features", "Lista os recursos do aparelho (câmera, NFC, sensores, Wi-Fi...).",
+         "shell pm list features", ""),
+        ("adb shell pm list libraries", "Lista as bibliotecas compartilhadas que o aparelho oferece aos apps.",
+         "shell pm list libraries", ""),
+        ("adb shell pm list users", "Lista os usuários do aparelho (o principal, perfil de trabalho, convidado...).",
+         "shell pm list users", ""),
+        ("adb shell pm path <pacote>", "Mostra onde fica o APK de um app.", "shell pm path {pacote}", ""),
+        ("adb shell pm clear <pacote>", "Apaga TODOS os dados de um app (login, arquivos, configurações), como se ele "
+         "tivesse acabado de ser instalado.", "shell pm clear {pacote}", "perigoso"),
+        ("adb shell pm disable-user --user 0 <pacote>", "Desativa (congela) um app para o seu usuário, sem "
+         "desinstalar. Volta com pm enable.", "shell pm disable-user --user 0 {pacote}", "perigoso"),
+        ("adb shell pm enable <pacote>", "Reativa um app ou componente desativado.", "shell pm enable {pacote}", ""),
+        ("adb shell pm grant <pacote> <permissão>", "Concede uma permissão a um app (ex.: "
+         "android.permission.WRITE_SECURE_SETTINGS para apps de automação).", "shell pm grant {pacote} {permissao}",
+         ""),
+        ("adb shell pm revoke <pacote> <permissão>", "Tira uma permissão de um app.",
+         "shell pm revoke {pacote} {permissao}", ""),
+        ("adb shell pm uninstall -k --user 0 <pacote>", "Remove o app só para o seu usuário (bom para bloatware); -k "
+         "guarda os dados e o cache. Volta com cmd package install-existing <pacote>.",
+         "shell pm uninstall -k --user 0 {pacote}", "perigoso"),
+        ("adb shell pm get-install-location", "Mostra onde os apps novos são instalados: 0 automático, 1 memória "
+         "interna, 2 externa.", "shell pm get-install-location", ""),
+        ("adb shell pm set-install-location <0|1|2>", "Muda o local padrão de instalação. A documentação avisa que é "
+         "só para depuração e pode quebrar apps.", None, ""),
+        ("adb shell pm trim-caches <espaço>", "Apaga arquivos de cache dos apps até sobrar o espaço livre pedido "
+         "(ex.: 2G).", "shell pm trim-caches {espaco}", ""),
+        ("adb shell pm get-max-users", "Mostra quantos usuários o aparelho aceita.", "shell pm get-max-users", ""),
+        ("adb shell pm get-app-links <pacote>", "Mostra os links de sites que um app abre direto (App Links) e se estão "
+         "verificados.", "shell pm get-app-links {pacote}", ""),
+        ("adb shell pm create-user / remove-user", "Cria um usuário novo no aparelho, ou apaga um usuário com TODOS "
+         "os dados dele. Prefira as configurações do Android.", None, ""),
+        ("adb shell pm set-permission-enforced", "Liga ou desliga a exigência de uma permissão no sistema todo. Só "
+         "para testes.", None, ""),
+    ]),
+    "🚀 Gerenciador de atividades (am)": ("Abrir telas e links, parar apps, mandar avisos e ver travamentos.", [
+        ("adb shell am start -a VIEW -d <link>", "Abre um link (site, mapa, tel:, mailto:...) no app padrão: é o "
+         "exemplo da documentação, am start -a android.intent.action.VIEW.",
+         "shell am start -a android.intent.action.VIEW -d {link}", ""),
+        ("adb shell am start -W -n <componente>", "Abre uma tela específica de um app pelo componente "
+         "(pacote/.Atividade). Opções: -W espera abrir, -S força a parada antes, -R <n> repete, -D liga a depuração, "
+         "--user escolhe o usuário.", "shell am start -W -n {componente}", ""),
+        ("adb shell am force-stop <pacote>", "Força a parada de tudo o que é de um app.",
+         "shell am force-stop {pacote}", ""),
+        ("adb shell am kill <pacote>", "Encerra só os processos do app que podem ser encerrados sem atrapalhar, como "
+         "o Android faz para liberar memória.", "shell am kill {pacote}", ""),
+        ("adb shell am kill-all", "Encerra todos os processos em segundo plano (apps abertos em segundo plano "
+         "recomeçam do zero).", "shell am kill-all", "perigoso"),
+        ("adb shell am broadcast -a <ação>", "Manda um aviso (broadcast) para os apps; por padrão vai para todos os "
+         "usuários. Os avisos do sistema são protegidos e o Android recusa.", "shell am broadcast -a {acao}", ""),
+        ("adb shell am monitor", "Acompanha ao vivo os travamentos (crash) e os 'não está respondendo' (ANR) dos apps. "
+         "Ctrl+C para sair.", "shell am monitor", ""),
+        ("adb shell am to-uri -a VIEW -d <link>", "Mostra um intent escrito como URI (bom para atalhos e automação).",
+         "shell am to-uri -a android.intent.action.VIEW -d {link}", ""),
+        ("adb shell am to-intent-uri -a VIEW -d <link>", "Igual ao anterior, no formato intent: (o que as páginas "
+         "usam para abrir apps).", "shell am to-intent-uri -a android.intent.action.VIEW -d {link}", ""),
+        ("adb shell am clear-debug-app", "Desfaz o set-debug-app (o app volta a abrir sem esperar o depurador).",
+         "shell am clear-debug-app", ""),
+        ("adb shell am set-debug-app -w <pacote>", "Marca um app para depuração: -w faz ele parar esperando o "
+         "depurador ao abrir e --persistent mantém a marcação. Sem um depurador o app fica travado na abertura.",
+         None, ""),
+        ("adb shell am display-size / display-density", "Muda a resolução ou a densidade da tela. Use 🖥️ Resolução "
+         "da tela (Celular e sistema): ela volta sozinha em 1 minuto se ficar ruim.", None, ""),
+        ("adb shell am screen-compat on|off <pacote>", "Liga ou desliga o modo de compatibilidade de tela de apps "
+         "antigos.", None, ""),
+        ("adb shell am startservice <intent>", "Inicia um serviço de um app (precisa saber o componente do serviço).",
+         None, ""),
+        ("adb shell am instrument <componente>", "Roda os testes instrumentados de um app (pacote_de_teste/runner). "
+         "Opções: -w espera terminar, -r resultado bruto, -e nome valor, -p arquivo de perfil.", None, ""),
+        ("adb shell am profile start|stop <processo>", "Liga e desliga o profiler de um processo, gravando num "
+         "arquivo.", None, ""),
+        ("adb shell am dumpheap <processo> <arquivo>", "Salva a memória (heap) de um processo num arquivo; -n salva a "
+         "memória nativa.", None, ""),
+        ("adb shell am dumpbitmaps", "Mostra os bitmaps na memória dos apps (Android 16+); -d salva as imagens num "
+         ".zip.", None, ""),
+        ("adb shell am memory-limiter", "Ajusta os limites de memória dos apps (Android 17+).", None, ""),
+        ("Argumentos de intent (-a, -d, -n, --es...)", "start, startservice, broadcast, to-uri e to-intent-uri "
+         "aceitam: -a ação, -d endereço (URI), -t tipo MIME, -c categoria, -n componente, -f flags, extras como --es "
+         "chave texto, --ez chave true/false, --ei chave número, e flags como --activity-clear-top.", None, ""),
+    ]),
+    "🏢 Política do dispositivo (dpm)": ("Comandos para apps de administração (empresas e testes): só consulta.", [
+        ("adb shell dpm set-active-admin <componente>", "Define um app como administrador ativo do aparelho.", None,
+         ""),
+        ("adb shell dpm set-profile-owner <componente>", "Define um app como dono do perfil (perfil de trabalho).",
+         None, ""),
+        ("adb shell dpm set-device-owner <componente>", "Define um app como dono do aparelho (controle total, usado "
+         "por empresas). Difícil de desfazer.", None, ""),
+        ("adb shell dpm remove-active-admin <componente>", "Remove um administrador (e o dono do aparelho ou do "
+         "perfil). Só funciona se o app tiver android:testOnly.", None, ""),
+        ("adb shell dpm clear-freeze-period-record", "Apaga o registro dos períodos de congelamento de atualizações "
+         "do sistema (Android 9+).", None, ""),
+        ("adb shell dpm force-network-logs", "Libera os registros de rede para o app administrador (Android 9+), com "
+         "limite de uso.", None, ""),
+        ("adb shell dpm force-security-logs", "Libera os registros de segurança para o app administrador "
+         "(Android 9+), com limite de uso.", None, ""),
+    ]),
+    "📸 Print e gravação da tela": ("Tirar print e gravar vídeo da tela (vão para a pasta Download).", [
+        ("adb shell screencap <arquivo.png>", "Tira um print da tela. Aqui ele vai para a pasta Download do celular "
+         "(print_<data>.png).", "shell screencap -p /sdcard/Download/print_{agora}.png", ""),
+        ("adb shell screenrecord --time-limit <s> <arquivo>", "Grava a tela em vídeo, sem som, pelo tempo pedido "
+         "(até 180 s), na pasta Download. Outras opções: --size LxA, --bit-rate (padrão 20 Mbps), --rotate e "
+         "--verbose.", "shell screenrecord --time-limit {segundos} /sdcard/Download/tela_{agora}.mp4", ""),
+        ("adb shell screenrecord --help", "Mostra todas as opções do gravador de tela.", "shell screenrecord --help",
+         ""),
+    ]),
+    "🔧 Portas, diagnóstico e testes": ("Encaminhar portas, ler o log, o estado do sistema e perfis de apps.", [
+        ("adb forward tcp:<porta> tcp:<porta>", "Encaminha uma porta daqui para uma porta do celular (ex.: tcp:6100 "
+         "tcp:7100). Com local:logd no lugar da segunda, o que chegar vai para o log do sistema.",
+         "forward tcp:{porta} tcp:{porta_celular}", ""),
+        ("adb forward --list", "Lista os encaminhamentos de porta ativos.", "forward --list", "local"),
+        ("adb forward --remove-all", "Desfaz todos os encaminhamentos de porta.", "forward --remove-all", "local"),
+        ("adb logcat -d -t 200", "Mostra as últimas 200 linhas do log do sistema (o logcat tem uma página própria na "
+         "documentação).", "logcat -d -t 200", ""),
+        ("adb shell dumpsys <serviço>", "Mostra o estado de um serviço do sistema: battery (bateria), wifi, meminfo "
+         "(memória), cpuinfo, display... A lista completa sai com dumpsys -l.", "shell dumpsys {servico}", ""),
+        ("adb shell cmd package dump-profiles <pacote>", "Gera em texto o perfil ART de um app "
+         "(/data/misc/profman/<pacote>.prof.txt). Para copiar o arquivo depois, precisa de root.",
+         "shell cmd package dump-profiles {pacote}", ""),
+        ("adb shell cmd testharness enable", "Modo de teste: APAGA o aparelho e o deixa como novo (só mantém a chave "
+         "de depuração), pula o assistente inicial e desliga a tela de bloqueio, as atualizações e a sincronização.",
+         None, ""),
+        ("adb shell sqlite3 <banco.db>", "Abre um banco SQLite de um app (em /data/data/<pacote>/databases); .dump "
+         "mostra o conteúdo e .schema as tabelas. Precisa de root.", None, ""),
+    ]),
+    "💡 Dicas e variáveis": ("Aspas, variáveis de ambiente e opções avançadas do adb.", [
+        ("Aspas nos comandos do shell", "Desde as Platform Tools 23 o adb trata os argumentos como o ssh: o que vai "
+         "para o shell do Android leva aspas duplas por fora e simples por dentro. Ex.: adb shell setprop chave "
+         "\"'duas palavras'\" (sem as de fora, falha).", None, ""),
+        ("ANDROID_SERIAL", "Variável com a série do aparelho padrão; o -s passa por cima dela.", None, ""),
+        ("ADB_TRACE=all", "Liga o registro detalhado do adb, para relatar problemas.", None, ""),
+        ("ADB_MDNS=1 e ADB_MDNS_OPENSCREEN=0", "Ligam o mDNS (achar aparelhos na rede) e escolhem o backend "
+         "libadbmdns, que é o padrão.", None, ""),
+        ("ADB_LIBUSB", "Escolhe o backend USB (nativo ou libusb); desde o adb 34 o libusb é o padrão, menos no "
+         "Windows.", None, ""),
+        ("ADB_BURST_MODE=1", "Liga o modo Burst, experimental (adb 36+).", None, ""),
+    ]),
+}
+
+# {nome} nos comandos: (pergunta, resposta sugerida). pacote, apk e apks abrem uma lista para escolher.
+PARAMETROS_ADB = {
+    "endereco": ("IP e porta (ex.: 192.168.0.10:41235)", None),
+    "codigo": ("Código de pareamento (6 dígitos)", None),
+    "no_termux": ("Arquivo ou pasta aqui no Termux", "~/storage/downloads"),
+    "no_celular": ("Caminho no celular", "/sdcard/Download/"),
+    "filtro": ("Texto no nome do app", "google"),
+    "permissao": ("Permissão", "android.permission.POST_NOTIFICATIONS"),
+    "espaco": ("Espaço livre desejado (ex.: 2G, 500M)", "2G"),
+    "link": ("Link", "https://developer.android.com/tools/adb"),
+    "componente": ("Componente (pacote/.Atividade)", "com.android.settings/.Settings"),
+    "acao": ("Ação do aviso", "com.exemplo.TESTE"),
+    "segundos": ("Duração em segundos (1 a 180)", "30"),
+    "porta": ("Porta aqui no Termux", "8080"),
+    "porta_celular": ("Porta no celular", "8080"),
+    "servico": ("Serviço (battery, wifi, meminfo, cpuinfo, display...)", "battery"),
+}
+
+
+def _valor_parametro_adb(nome: str, serial: str | None):
+    """Pergunta um {nome} do comando: texto, ou uma lista (apks). None = cancelou."""
+    if nome == "agora":
+        return datetime.now().strftime("%Y%m%d_%H%M%S")
+    if nome == "pacote":
+        return _escolher_app_android("adb", serial, todos=True)
+    if nome == "apk":
+        apk = escolher_arquivo("Qual APK?", (".apk",))
+        return str(apk) if apk else None
+    if nome == "apks":
+        return [str(p) for p in escolher_arquivos("Quais APKs? (Espaço marca)", (".apk", ".apks"))] or None
+    pergunta, sugestao = PARAMETROS_ADB[nome]
+    valor = perguntar(pergunta, sugestao).strip()
+    return os.path.expanduser(valor) if nome == "no_termux" else (valor or None)
+
+
+def comando_adb(comando: str, descricao: str, modelo: str | None, marca: str) -> None:
+    """Tela de um comando: a descrição e, se dá para rodar daqui, roda perguntando o que faltar."""
+    for linha in textwrap.wrap(descricao, max(20, min(largura_tela(), 80) - 2)):
+        print(linha)
+    print(f"\n{DIM}Comando:{RST} {NEG}{comando}{RST}")
+    if modelo is None:
+        info("Este fica só para consulta: não roda por aqui.")
+        return
+    if "perigoso" in marca:
+        aviso("Leia a descrição acima antes: esse comando muda o celular.")
+    if not confirmar("Rodar agora?", "perigoso" not in marca) or not garantir_adb():
+        return
+    serial = None if "local" in marca else adb_alvo()
+    valores = {}
+    for _, nome, _, _ in string.Formatter().parse(modelo):
+        if nome and nome not in valores:
+            valores[nome] = _valor_parametro_adb(nome, serial)
+            if valores[nome] is None:
+                return
+    preenchido = modelo.format(**{nome: " ".join(map(shlex.quote, v)) if isinstance(v, list) else shlex.quote(v)
+                                  for nome, v in valores.items()})
+    # "shell ..." vai inteiro para o shell do Android, com as aspas: assim um valor com espaço não se parte
+    argumentos = ["shell", preenchido[6:]] if preenchido.startswith("shell ") else shlex.split(preenchido)
+    rodar(["adb", *(["-s", serial] if serial else []), *argumentos])
+
+
+def _menu_categoria_adb(nome: str) -> None:
+    _, comandos = COMANDOS_ADB[nome]
+    menu(nome, [(cmd, lambda e=(cmd, desc, modelo, marca): comando_adb(*e)) for cmd, desc, modelo, marca in comandos],
+         descricoes=[desc for _, desc, _, _ in comandos])
+
+
+@submenu
+def menu_comandos_adb():
+    menu("📖 Comandos do ADB", [(f"{nome} ({len(cmds)})", submenu(lambda n=nome: _menu_categoria_adb(n)))
+                               for nome, (_, cmds) in COMANDOS_ADB.items()],
+         descricoes=[desc for desc, _ in COMANDOS_ADB.values()],
+         cabecalho=lambda: print(f"{DIM}Da documentação oficial do adb. Escolha um para ver a descrição e rodar "
+                                 f"(precisa estar conectado pela depuração sem fio).{RST}"))
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -12961,9 +13265,10 @@ def _desfazer_app(pacote: str, sdk: int) -> str:
     return "; ".join(comandos + ([f"cmd game reset {q}"] if sdk >= 33 else []))
 
 
-def _escolher_app_android(modo: str, serial: str | None) -> str | None:
-    pacotes = sorted(l.split(":", 1)[1].strip() for l in shell_android("pm list packages -3", modo, serial)[1]
-                     .splitlines() if l.startswith("package:"))
+def _escolher_app_android(modo: str, serial: str | None, todos: bool = False) -> str | None:
+    """Pacote escolhido entre os apps instalados pela pessoa (ou todos, com os do sistema)."""
+    lista = shell_android("pm list packages" + ("" if todos else " -3"), modo, serial)[1]
+    pacotes = sorted(l.split(":", 1)[1].strip() for l in lista.splitlines() if l.startswith("package:"))
     filtro = perguntar("Filtrar por nome (ex.: freefire; Enter = todos)", "").replace(" ", "").lower()
     pacotes = [p for p in pacotes if filtro in p.lower()]
     if not pacotes:
@@ -17247,6 +17552,156 @@ def imagem_em_blocos(caminho: Path, largura: int) -> list:
     return linhas
 
 
+# ── Fonte do terminal ────────────────────────────────────────────────
+# O Termux usa ~/.termux/font.ttf (TTF ou OTF, sempre com esse nome) e recarrega com termux-reload-settings.
+# A fonte vem do celular: .ttf/.otf soltos (Download, Documents, Fonts...) ou dentro de um .zip baixado (Google
+# Fonts e Nerd Fonts vêm assim), além das monoespaçadas do próprio Android. No terminal ela precisa ser
+# monoespaçada (todas as letras da mesma largura), senão colunas e menus ficam tortos.
+
+FONTE_TERMUX = HOME / ".termux" / "font.ttf"
+FONTE_ANTES = FONTE_TERMUX.with_name("font.ttf.antes-do-toons")
+EXT_FONTE = (".ttf", ".otf")
+
+
+def info_fonte(dados: bytes) -> tuple:
+    """(nome, monoespaçada) de uma fonte TTF/OTF, lidos das tabelas name, post e hmtx. (None, None) se não for."""
+    try:
+        if dados[:4] not in (b"\x00\x01\x00\x00", b"OTTO", b"true"):
+            return None, None
+        tabelas = {}
+        for i in range(struct.unpack(">H", dados[4:6])[0]):
+            tag, _, inicio, tamanho = struct.unpack(">4sIII", dados[12 + 16 * i:28 + 16 * i])
+            tabelas[tag] = inicio
+        nomes = {}
+        if b"name" in tabelas:
+            t = tabelas[b"name"]
+            _, total, textos = struct.unpack(">HHH", dados[t:t + 6])
+            for i in range(total):
+                plataforma, _, _, id_nome, tamanho, pos = struct.unpack(">6H", dados[t + 6 + 12 * i:t + 18 + 12 * i])
+                if id_nome in (1, 4) and (id_nome not in nomes or plataforma == 3):  # 4 = nome completo, 1 = família
+                    bruto = dados[t + textos + pos:t + textos + pos + tamanho]
+                    nomes[id_nome] = bruto.decode("utf-16-be" if plataforma in (0, 3) else "latin-1", "replace")
+        mono = False
+        if b"post" in tabelas:  # isFixedPitch: a própria fonte diz que é monoespaçada
+            mono = struct.unpack(">I", dados[tabelas[b"post"] + 12:tabelas[b"post"] + 16])[0] != 0
+        if not mono and b"hhea" in tabelas and b"hmtx" in tabelas:  # senão: quase todas as larguras iguais
+            quantas = struct.unpack(">H", dados[tabelas[b"hhea"] + 34:tabelas[b"hhea"] + 36])[0]
+            larguras = [struct.unpack(">H", dados[tabelas[b"hmtx"] + 4 * i:tabelas[b"hmtx"] + 4 * i + 2])[0]
+                        for i in range(quantas)]
+            larguras = [w for w in larguras if w]
+            mono = bool(larguras) and max(map(larguras.count, set(larguras))) >= 0.9 * len(larguras)
+        return (nomes.get(4) or nomes.get(1) or "?").strip(), mono
+    except (struct.error, IndexError):
+        return None, None
+
+
+def fontes_do_celular() -> list:
+    """[(rótulo, arquivo, nome dentro do .zip ou None)]: fontes soltas e em .zip, mais novas primeiro, e as
+    monoespaçadas do Android no fim."""
+    achados = []
+    for arq in listar_arquivos(EXT_FONTE + (".zip",), limite=400):
+        if arq.suffix.lower() != ".zip":
+            achados.append((f"{arq.name}  {DIM}{arq.parent.name}{RST}", arq, None))
+            continue
+        with contextlib.suppress(OSError, zipfile.BadZipFile):
+            with zipfile.ZipFile(arq) as z:
+                achados += [(f"{Path(m).name}  {DIM}em {arq.name}{RST}", arq, m) for m in sorted(z.namelist())
+                            if m.lower().endswith(EXT_FONTE) and not m.startswith("__MACOSX")
+                            and not Path(m).name.startswith(".")]
+    with contextlib.suppress(OSError):
+        achados += [(f"{p.name}  {DIM}do Android{RST}", p, None) for p in sorted(Path("/system/fonts").glob("*"))
+                    if "mono" in p.name.lower() and p.suffix.lower() in EXT_FONTE]
+    return achados
+
+
+def _recarregar_termux() -> bool:
+    if not tem("termux-reload-settings"):
+        return False
+    rodar(["termux-reload-settings"], capturar=True, timeout=20)
+    return True
+
+
+def _gravar_fonte(dados: bytes | None) -> None:
+    """Põe a fonte no Termux (None = volta à padrão) e recarrega."""
+    if dados is None:
+        FONTE_TERMUX.unlink(missing_ok=True)
+    else:
+        FONTE_TERMUX.parent.mkdir(parents=True, exist_ok=True)
+        FONTE_TERMUX.write_bytes(dados)
+    _recarregar_termux()
+
+
+def trocar_fonte_terminal() -> None:
+    fontes = fontes_do_celular()
+    if not fontes:
+        info("Nenhuma fonte (.ttf, .otf ou .zip com fontes) encontrada no Download, Documents ou Fonts. Baixe uma "
+             "monoespaçada (ex.: JetBrains Mono, Fira Code ou uma 'Mono' das Nerd Fonts) e volte aqui.")
+    elif len(fontes) > 15:
+        filtro = sem_acento(perguntar("Filtrar por nome (ex.: mono, jetbrains; Enter = todas)", "")).lower()
+        fontes = [f for f in fontes if filtro in sem_acento(_sem_ansi(f[0])).lower()] or fontes
+    i = escolher(f"Qual fonte? ({len(fontes)})", [rotulo for rotulo, _, _ in fontes]
+                 + ["Digitar o caminho do arquivo (.ttf, .otf ou .zip)..."])
+    if i is None:
+        return
+    if i < len(fontes):
+        _, arquivo, membro = fontes[i]
+    else:
+        arquivo = Path(os.path.expanduser(perguntar("Caminho da fonte").strip().strip("'\"")))
+        if not arquivo.is_file():
+            raise ToonsError(f"Arquivo não encontrado: {arquivo}")
+        membro = None
+        if arquivo.suffix.lower() == ".zip":
+            with zipfile.ZipFile(arquivo) as z:
+                dentro = [m for m in sorted(z.namelist()) if m.lower().endswith(EXT_FONTE)]
+            if not dentro:
+                raise ToonsError("Esse .zip não tem nenhuma fonte .ttf ou .otf.")
+            j = escolher("Qual fonte do .zip?", [Path(m).name for m in dentro])
+            if j is None:
+                return
+            membro = dentro[j]
+    try:
+        if membro:
+            with zipfile.ZipFile(arquivo) as z:
+                dados = z.read(membro)
+        else:
+            dados = arquivo.read_bytes()
+    except (OSError, zipfile.BadZipFile, KeyError) as e:
+        raise ToonsError(f"Não consegui ler a fonte: {e}") from None
+    nome, mono = info_fonte(dados)
+    if nome is None:
+        raise ToonsError("Esse arquivo não é uma fonte TTF/OTF que o Termux consiga usar.")
+    print(f"  Fonte: {NEG}{nome}{RST} · {'monoespaçada ✔' if mono else f'{AMAR}não é monoespaçada{RST}'}")
+    if not mono:
+        aviso("No terminal as letras dela ficam desalinhadas (colunas e menus tortos). Prefira uma com 'Mono' no nome.")
+        if not confirmar("Usar mesmo assim?", False):
+            return
+    anterior = FONTE_TERMUX.read_bytes() if FONTE_TERMUX.exists() else None
+    if anterior is not None and not FONTE_ANTES.exists():  # guarda a fonte que a pessoa tinha antes do Toons
+        FONTE_ANTES.write_bytes(anterior)
+    _gravar_fonte(dados)
+    if not IS_TERMUX or not tem("termux-reload-settings"):
+        ok(f"Fonte salva em {FONTE_TERMUX}: reabra o Termux para ver.")
+        return
+    manter = False
+    try:
+        manter = confirmar_no_prazo("A fonte ficou boa? Manter assim?", time.time() + TEMPO_CONFIRMAR)
+    finally:
+        if manter:
+            ok(f"Fonte trocada: {nome}.")
+        else:
+            _gravar_fonte(anterior)
+            info("Voltou à fonte de antes.")
+
+
+def fonte_original_terminal() -> None:
+    if FONTE_ANTES.exists():
+        _gravar_fonte(FONTE_ANTES.read_bytes())
+        ok("Voltou à fonte que você usava antes do Termux-Toons.")
+    else:
+        _gravar_fonte(None)
+        ok("Voltou à fonte padrão do Termux.")
+
+
 @submenu
 def menu_arte():
     c = cfg()
@@ -17336,6 +17791,8 @@ def menu_arte():
         ("Texto em letras grandes (figlet)", texto_grande),
         ("Imagem no terminal (colorida)", imagem),
         ("Tema de cores do Termux (Dracula, Nord...)", tema),
+        ("🔤 Fonte do terminal (uma fonte baixada no celular)", trocar_fonte_terminal),
+        ("Fonte do terminal: voltar à original", fonte_original_terminal),
         ("Mensagem de boas-vindas do Termux", boas_vindas),
         ("Banner do Termux-Toons: voltar ao original",
          lambda: (c.update(banner_texto=""), salvar_cfg(), ok("Banner original de volta."))),
@@ -18737,6 +19194,8 @@ def _indice_busca() -> list:
         ("🌍 Tradutor", "traduzir traducao tradutor idioma lingua", menu_tradutor),
         ("📲 Celular e sistema", "celular sistema android adb bateria apps fotos", menu_celular),
         ("🔌 Depuração sem fio (ADB)", "adb depuracao wifi wireless android shell signal 9 pareamento", menu_adb),
+        ("📖 Comandos do ADB (com descrição)", "comandos adb lista ajuda pm am dpm shell screencap screenrecord "
+                                              "logcat dumpsys install push pull forward", menu_comandos_adb),
         ("📳 Termux:API", "termux api sensor sms notificacao camera localizacao vibrar lanterna volume", menu_termux_api),
         ("🔋 Saúde da bateria", "bateria carga ciclo saude temperatura energia percentual", menu_bateria),
         ("📊 Tempo de tela e dados por app", "tempo de tela uso internet dados app consumo gasto rede", menu_uso_celular),
@@ -18764,6 +19223,8 @@ def _indice_busca() -> list:
         ("🎓 Aprender programação", "aprender python bash git basic curso licao exercicio programar programacao", menu_aprender),
         ("📖 Leitor de livros e audiolivro", "livro livros leitor epub pdf txt audiolivro ler", menu_livros),
         ("🎨 Arte ASCII, banner e tema do Termux", "arte ascii figlet banner tema cores dracula nord gruvbox", menu_arte),
+        ("🔤 Fonte do terminal", "fonte fontes letra font ttf otf tipografia mono nerd font jetbrains terminal",
+         trocar_fonte_terminal),
         ("👻 Trote / pegadinha (screamer)", "trote pegadinha screamer susto brincadeira", menu_trote),
         ("🛠️ Programação e servidores", "programacao dev sql github cron servidor banco de dados", menu_programacao),
         ("💻 Ambiente de desenvolvimento", "dev desenvolvimento neovim nvim lsp code-server vscode clang rust go ide", menu_dev),
