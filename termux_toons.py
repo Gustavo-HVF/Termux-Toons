@@ -11,7 +11,8 @@ Reúne em um único menu:
    5. Linux de verdade com proot-distro (Debian, Ubuntu, Arch...), com desktop no Termux:X11
    6. Arquivos e backup: gerenciador de arquivos (ADB ou root para Android/data), rclone, Syncthing,
       Samba, HTTP, backup e página HTML num link
-   7. Música, rádio e podcasts: yt-dlp para baixar, mpv para tocar, rádios online e podcasts
+   7. Música, rádio e podcasts: yt-dlp para baixar; player com tela 'Tocando agora' e notificação com botões;
+      rádios do mundo todo com legenda automática (whisper.cpp); podcasts
    8. Vídeos do TikTok, YouTube e outros sites com yt-dlp
    9. Compartilhar filmes por link: arquivo do celular ou qualquer link de vídeo, com player próprio,
       troca de trilha de áudio e conversão na hora (servidor de vídeo + túnel)
@@ -5231,28 +5232,518 @@ def escolher_resultado(termo: str) -> dict | None:
     return None if i is None else resultados[i]
 
 
-def tocar_mpv(alvos: list, aleatorio: bool = False, playlist: Path | None = None,
-              stream: bool = False, perguntar_fundo: bool = True) -> None:
+# ── Player: mpv controlado pelo socket JSON ──────────────────────────
+# O mpv toca destacado (continua fora do menu) e recebe comandos por um socket (--input-ipc-server). A tela
+# "Tocando agora" lê dele o que está tocando e manda os comandos das teclas. Um vigia em outro processo fica
+# junto com o mpv: mantém a notificação do Android com os botões (anterior, pausar, tocar, próxima, +30 s,
+# parar), anuncia por voz a música que começou (se a pessoa ligar) e some com a notificação quando acaba.
+# Na rádio, próxima/anterior trocam de estação e a legenda automática transcreve a fala (LegendaRadio).
+
+MPV_SOCKET = Path(os.environ.get("TMPDIR") or "/tmp") / f"toons-mpv-{getattr(os, 'getuid', lambda: 0)()}.sock"
+NOTIFICACAO_PLAYER = "toons-player"
+
+
+class Mpv:
+    """Conversa com o mpv que está tocando, pelo socket. OSError se não houver nenhum."""
+
+    def __init__(self, espera: float = 0.0, timeout: float = 2.0):
+        fim = time.time() + espera
+        while True:
+            self._s = socket.socket(socket.AF_UNIX)
+            self._s.settimeout(timeout)
+            try:
+                self._s.connect(str(MPV_SOCKET))
+                break
+            except OSError:
+                self._s.close()
+                if time.time() >= fim:
+                    raise
+                time.sleep(0.2)
+        self._buf, self._n = b"", 0
+
+    def __call__(self, *comando):
+        """Manda um comando e devolve o 'data' da resposta (None se o mpv recusar)."""
+        self._n += 1
+        self._s.sendall(json.dumps({"command": list(comando), "request_id": self._n}).encode() + b"\n")
+        while True:
+            while b"\n" not in self._buf:
+                parte = self._s.recv(65536)
+                if not parte:
+                    raise ConnectionError("o mpv fechou")
+                self._buf += parte
+            linha, self._buf = self._buf.split(b"\n", 1)
+            resposta = json.loads(linha or b"{}")
+            if resposta.get("request_id") == self._n:  # as outras linhas são eventos do mpv
+                return resposta.get("data") if resposta.get("error") == "success" else None
+
+    def get(self, propriedade: str, padrao=None):
+        valor = self("get_property", propriedade)
+        return padrao if valor is None else valor
+
+    def fechar(self) -> None:
+        self._s.close()
+
+
+def player_ativo() -> bool:
+    try:
+        Mpv(timeout=0.5).fechar()
+        return True
+    except OSError:
+        return False
+
+
+def parar_player() -> bool:
+    """Para a música que estiver tocando. True se havia uma."""
+    try:
+        mpv = Mpv(timeout=1)
+    except OSError:
+        MPV_SOCKET.unlink(missing_ok=True)  # sobra de um mpv que caiu
+        return False
+    with contextlib.suppress(OSError, ValueError):
+        mpv("quit")
+    mpv.fechar()
+    for _ in range(30):
+        if not player_ativo():
+            break
+        time.sleep(0.1)
+    return True
+
+
+def _opcoes_mpv(alvos: list, aleatorio: bool, playlist: Path | None, stream: bool, inicio: int) -> list:
+    return [*(["--ytdl-format=bestaudio"] if stream else []), *(["--shuffle"] if aleatorio else []),
+            *([f"--playlist={playlist}"] if playlist else []), *([f"--playlist-start={inicio}"] if inicio else []),
+            *map(str, alvos)]
+
+
+def iniciar_player(alvos: list, aleatorio: bool = False, playlist: Path | None = None, stream: bool = False,
+                   inicio: int = 0, tipo: str = "musica") -> None:
+    """Abre o mpv destacado, com o socket de controle, e o vigia da notificação."""
+    parar_player()
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    cmd = ["mpv", "--no-video", "--input-terminal=no", "--msg-level=all=warn", "--idle=no",
+           f"--input-ipc-server={MPV_SOCKET}", f"--script-opts=toons-tipo={tipo}",
+           *_opcoes_mpv(alvos, aleatorio, playlist, stream, inicio)]
+    with open(log_de("player"), "w") as arq_log:
+        proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=arq_log, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    try:
+        Mpv(espera=15).fechar()
+    except OSError:
+        proc.kill()
+        detalhe = log_de("player").read_text("utf-8", errors="replace").strip().splitlines()[-3:]
+        raise ToonsError("O mpv não abriu. " + " ".join(detalhe)) from None
+    if tem("termux-wake-lock"):  # com a tela apagada o Android pausaria o som
+        rodar(["termux-wake-lock"], mostrar=False, timeout=10)
+    subprocess.Popen([sys.executable, str(SCRIPT), "player", "--vigiar"], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def faixa_atual(mpv: Mpv) -> dict:
+    """O que está tocando, pronto para mostrar. Na rádio o título é a estação e o subtítulo o que ela diz
+    estar tocando (metadado ICY)."""
+    meta = {k.lower(): v for k, v in (mpv.get("metadata") or {}).items()}
+    pos, total = mpv.get("playlist-pos", -1), mpv.get("playlist-count", 0)
+    caminho = mpv.get("path") or mpv.get(f"playlist/{pos}/filename") or ""
+    tipo = (mpv.get("script-opts") or {}).get("toons-tipo", "musica")
+    if tipo == "radio":
+        titulo = mpv.get(f"playlist/{pos}/title") or meta.get("icy-name") or caminho
+        subtitulo = str(meta.get("icy-title") or "").strip()
+    else:
+        titulo = str(meta.get("title") or mpv.get("media-title") or Path(caminho).name)
+        if Path(titulo).suffix.lower() in EXTENSOES_AUDIO:  # sem a etiqueta de título: o nome do arquivo
+            titulo = Path(titulo).stem
+        artista = meta.get("artist") or meta.get("album_artist") or meta.get("uploader") or ""
+        subtitulo = " · ".join(str(x) for x in (artista, meta.get("album")) if x)
+    return {"tipo": tipo, "titulo": str(titulo).strip() or "?", "subtitulo": subtitulo, "pos": pos, "total": total,
+            "caminho": caminho, "tempo": mpv.get("time-pos"),
+            "duracao": None if tipo == "radio" else mpv.get("duration"),  # rádio é ao vivo: sem barra de tempo
+            "pausado": bool(mpv.get("pause", False)), "volume": mpv.get("volume", 100),
+            "repetir": "música" if mpv.get("loop-file") not in (False, "no", None) else
+                       "fila" if mpv.get("loop-playlist") not in (False, "no", None) else ""}
+
+
+def _acao_mpv(*comando) -> str:
+    """Linha de shell para um botão da notificação: manda `comando` ao mpv pelo socket (rápido, sem abrir o
+    Termux-Toons inteiro)."""
+    pedido = (json.dumps({"command": list(comando)}) + "\n").encode()
+    codigo = f"import socket;s=socket.socket(socket.AF_UNIX);s.connect({str(MPV_SOCKET)!r});s.sendall({pedido!r})"
+    return shlex.join([sys.executable, "-c", codigo])
+
+
+def notificar_player(f: dict) -> None:
+    """Notificação de mídia com os botões: ⏮ ⏸ ▶ ⏭ e, abaixo, +30 s (música) e Parar."""
+    if not tem("termux-notification"):
+        return
+    radio = f["tipo"] == "radio"
+    texto = ("⏸ Pausado · " if f["pausado"] else "") + (
+        f["subtitulo"] or ("Rádio ao vivo" if radio else f"Música {f['pos'] + 1} de {f['total']}"))
+    cmd = ["termux-notification", "--id", NOTIFICACAO_PLAYER, "--type", "media", "--alert-once", "--ongoing",
+           "--icon", "radio" if radio else "music_note", "--title", ("📻 " if radio else "🎵 ") + f["titulo"],
+           "--content", texto, "--media-previous", _acao_mpv("playlist-prev"),
+           "--media-pause", _acao_mpv("set_property", "pause", True),
+           "--media-play", _acao_mpv("set_property", "pause", False), "--media-next", _acao_mpv("playlist-next")]
+    botoes = ([] if radio else [("⏩ +30 s", _acao_mpv("seek", 30))]) + [("⏹ Parar", _acao_mpv("quit"))]
+    for n, (rotulo, acao) in enumerate(botoes, 1):
+        cmd += [f"--button{n}", rotulo, f"--button{n}-action", acao]
+    rodar(cmd, capturar=True, timeout=15, mostrar=False)
+
+
+def vigiar_player() -> None:
+    """Roda junto com o mpv até ele fechar: notificação em dia e, se ligado, anuncia cada música por voz."""
+    try:
+        mpv = Mpv(espera=15)
+    except OSError:
+        return
+    notificada, anunciada, candidata, vezes = None, None, None, 0
+    try:
+        while True:
+            try:
+                f = faixa_atual(mpv)
+            except (OSError, ValueError):
+                break  # o mpv fechou: acabou a fila ou alguém mandou parar
+            if (f["titulo"], f["subtitulo"], f["pausado"]) != notificada:
+                notificar_player(f)
+                notificada = (f["titulo"], f["subtitulo"], f["pausado"])
+            # o que anunciar: a música (na rádio, o que a estação diz que está tocando); espera o título firmar,
+            # porque o mpv mostra o nome do arquivo antes de ler as etiquetas
+            faixa = f["subtitulo"] if f["tipo"] == "radio" else f["titulo"]
+            vezes = vezes + 1 if faixa == candidata else 0
+            candidata = faixa
+            if faixa and faixa != anunciada and vezes >= 1:
+                anunciada = faixa
+                if ler_json(CONFIG_FILE, {}).get("player_anunciar") and tem("termux-tts-speak"):
+                    quem = f" de {f['subtitulo'].split(' · ')[0]}" if f["tipo"] != "radio" and f["subtitulo"] else ""
+                    with contextlib.suppress(ToonsError):
+                        falar(f"Tocando agora: {faixa}{quem}")
+            time.sleep(1)
+    finally:
+        mpv.fechar()
+        if tem("termux-notification-remove"):
+            rodar(["termux-notification-remove", NOTIFICACAO_PLAYER], capturar=True, timeout=15, mostrar=False)
+        if not servicos_ativos() and tem("termux-wake-unlock"):
+            rodar(["termux-wake-unlock"], mostrar=False, timeout=10)
+
+
+def titulo_tocando() -> str:
+    """'título' do que está tocando agora (para o cabeçalho do menu), ou ''."""
+    try:
+        mpv = Mpv(timeout=0.5)
+    except OSError:
+        return ""
+    try:
+        f = faixa_atual(mpv)
+        return f"{f['titulo']}{' · ' + f['subtitulo'] if f['subtitulo'] else ''}{' (pausado)' if f['pausado'] else ''}"
+    except (OSError, ValueError):
+        return ""
+    finally:
+        mpv.fechar()
+
+
+class LegendaRadio:
+    """Legenda automática da rádio: o ffmpeg grava pedaços de SEGUNDOS segundos do mesmo endereço, o whisper.cpp
+    transcreve cada pedaço no próprio celular (idioma detectado sozinho) e o texto aparece com alguns segundos de
+    atraso em relação ao som. Com `traduzir`, cada trecho vai para o português."""
+
+    SEGUNDOS = 8
+
+    def __init__(self, url: str, traduzir: bool = False):
+        self.url, self.traduzir = url, traduzir
+        self.linhas: list = []
+        self.estado = "ouvindo os primeiros segundos..."
+        self._parar = threading.Event()
+        self._limpar_sobras()
+        self._pasta = DATA_DIR / "tmp" / f"legenda-{os.getpid()}"
+        shutil.rmtree(self._pasta, ignore_errors=True)
+        self._pasta.mkdir(parents=True)
+        # -segment_wrap reaproveita 12 nomes de arquivo (o disco nunca enche) e a lista diz quais pedaços já
+        # fecharam. Sem sessão própria, o ffmpeg morre junto quando a sessão do Termux fecha.
+        self._ffmpeg = subprocess.Popen(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", url, "-vn", "-ac", "1", "-ar", "16000",
+             "-f", "segment", "-segment_time", str(self.SEGUNDOS), "-segment_wrap", "12",
+             "-segment_list", str(self._pasta / "prontos.csv"), "-segment_list_type", "csv",
+             "-c:a", "pcm_s16le", str(self._pasta / "p%02d.wav")],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        (self._pasta / "ffmpeg.pid").write_text(str(self._ffmpeg.pid))
+        threading.Thread(target=self._transcrever, daemon=True).start()
+
+    @staticmethod
+    def _limpar_sobras() -> None:
+        """Apaga a pasta (e encerra o ffmpeg) de legendas de um Termux-Toons que morreu sem fechar."""
+        for velha in (DATA_DIR / "tmp").glob("legenda-*"):
+            with contextlib.suppress(OSError, ValueError):
+                if Path(f"/proc/{int(velha.name.split('-')[1])}").exists():
+                    continue  # o dono ainda está vivo
+                pid = int((velha / "ffmpeg.pid").read_text())
+                if b"ffmpeg" in Path(f"/proc/{pid}/cmdline").read_bytes():  # o pid pode ter sido reaproveitado
+                    os.kill(pid, 15)
+            shutil.rmtree(velha, ignore_errors=True)
+
+    def _transcrever(self) -> None:
+        lidos = 0
+        while not self._parar.is_set():
+            try:
+                fechados = (self._pasta / "prontos.csv").read_text("utf-8").splitlines()
+            except OSError:
+                fechados = []
+            novos, lidos = fechados[lidos:], len(fechados)
+            if not novos:
+                if self._ffmpeg.poll() is not None:
+                    self.estado = "a rádio parou de mandar som"
+                    return
+                self._parar.wait(0.5)
+                continue
+            if len(novos) > 1:  # o celular ficou para trás: pula para o trecho mais novo
+                self.estado = "pulando trechos: o modelo de voz é pesado para o celular (tente o tiny)"
+            texto = self._whisper(self._pasta / novos[-1].split(",")[0])
+            if not texto or (texto == "♪" and self.linhas[-1:] == ["♪"]):
+                continue
+            self.linhas = (self.linhas + [texto])[-8:]  # aparece já; a tradução troca a linha quando chegar
+            if not self.estado.startswith("pulando"):
+                self.estado = "ao vivo"
+            if self.traduzir and texto != "♪":
+                try:
+                    traducao, idioma = traduzir(texto, "pt")
+                except Exception:  # noqa: BLE001 — sem internet ou tradutor fora do ar: fica o original
+                    continue
+                if not str(idioma).startswith("pt") and self.linhas[-1:] == [texto]:
+                    self.linhas = self.linhas[:-1] + [traducao]
+
+    def _whisper(self, wav: Path) -> str:
+        proc = rodar([str(whisper_bin()), "-m", str(modelo_whisper()), "-f", str(wav), "-l", "auto", "-nt", "-np",
+                      "-t", str(min(4, os.cpu_count() or 4))], capturar=True, timeout=120, mostrar=False)
+        texto = " ".join((proc.stdout or "").split())
+        # só música ou silêncio: o whisper escreve [Música], (music), [BLANK_AUDIO]...
+        return "♪" if re.fullmatch(r"(\s*[\[(][^\])]*[\])]\s*|♪+)*", texto) and texto else texto
+
+    def fechar(self) -> None:
+        self._parar.set()
+        self._ffmpeg.terminate()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            self._ffmpeg.wait(3)
+        shutil.rmtree(self._pasta, ignore_errors=True)
+
+
+def _barra_tempo(f: dict, largura: int) -> list:
+    if not f["duracao"]:  # rádio ou transmissão ao vivo
+        return [f"{VERM}●{RST} {NEG}AO VIVO{RST}  {DIM}{fmt_relogio(f['tempo'] or 0)}{RST}"]
+    fracao = min(1.0, max(0.0, (f["tempo"] or 0) / f["duracao"]))
+    feito = round(fracao * (largura - 1))
+    barra = f"{CIANO}{'━' * feito}{RST}{NEG}●{RST}{DIM}{'─' * (largura - 1 - feito)}{RST}"
+    tempos = f"{fmt_relogio(f['tempo'] or 0)}{' ' * max(1, largura - 10)}{fmt_relogio(f['duracao'])}"
+    return [barra, f"{DIM}{tempos[:largura]}{RST}"]
+
+
+def _fila_player(mpv: Mpv, f: dict, antes: int = 1, depois: int = 4) -> list:
+    """[(número, nome, é a atual)] em volta da música atual."""
+    fila = []
+    for i in range(max(0, f["pos"] - antes), min(f["total"], f["pos"] + depois + 1)):
+        nome = mpv.get(f"playlist/{i}/title") or Path(str(mpv.get(f"playlist/{i}/filename", "?"))).stem
+        if str(nome).startswith(("ytdl://", "http")) and i != f["pos"]:
+            nome = "(próxima da busca)"
+        fila.append((i + 1, str(nome), i == f["pos"]))
+    return fila
+
+
+def _desenhar_player(f: dict, fila: list, legenda: LegendaRadio | None, recado: str, anunciar: bool) -> None:
+    colunas, linhas_tela = shutil.get_terminal_size((60, 24))
+    largura = max(20, min(colunas - 4, 56))
+    radio = f["tipo"] == "radio"
+    linhas = [_no_centro(_faixa_titulo("📻 Rádio ao vivo" if radio else "🎵 Tocando agora", max(20, min(colunas, 70))),
+                         colunas), ""]
+    for parte in textwrap.wrap(f["titulo"], largura)[:2]:
+        linhas.append(_no_centro(f"{NEG}{parte}{RST}", colunas))
+    if f["subtitulo"]:
+        rotulo = f"{AMAR}♪ {f['subtitulo']}{RST}" if radio else f"{DIM}{f['subtitulo']}{RST}"
+        linhas.append(_no_centro(_cortar(rotulo, largura), colunas))
+    elif radio:
+        linhas.append(_no_centro(f"{DIM}(a rádio não informa a música){RST}", colunas))
+    linhas.append("")
+    linhas += [_no_centro(parte, colunas) for parte in _barra_tempo(f, largura)]
+    estado = [f"{AMAR}⏸ pausado{RST}" if f["pausado"] else f"{VERD}▶ tocando{RST}", f"🔊 {round(f['volume'])}%"]
+    if f["repetir"]:
+        estado.append(f"{'🔂' if f['repetir'] == 'música' else '🔁'} {f['repetir']}")
+    if anunciar:
+        estado.append("🗣 voz")
+    linhas += ["", _no_centro("   ".join(estado), colunas), ""]
+    if f["total"] > 1:
+        linhas.append(_no_centro(f"{DIM}{'Rádios' if radio else 'Fila'}: {f['pos'] + 1} de {f['total']}{RST}", colunas))
+        recuo = " " * max(0, (colunas - largura) // 2)
+        for numero, nome, atual in fila:
+            texto = f"{numero:>3}  {nome}"
+            linhas.append(recuo + (f"{CIANO}▶{RST}{NEG}{_cortar(texto, largura - 1)}{RST}" if atual
+                                   else f" {DIM}{_cortar(texto, largura - 1)}{RST}"))
+    if legenda:
+        linhas += ["", _no_centro(f"{CIANO}💬 Legenda automática{' em português' if legenda.traduzir else ''}{RST}",
+                                  colunas), _no_centro(f"{DIM}{_cortar(legenda.estado, largura)}{RST}", colunas)]
+        quebradas = []
+        for trecho in reversed(legenda.linhas):  # só trechos inteiros, dos mais novos para trás, até 4 linhas
+            partes = textwrap.wrap(trecho, largura)
+            if len(quebradas) + len(partes) > 4:
+                break
+            quebradas = partes + quebradas
+        recuo = " " * max(0, (colunas - largura) // 2)
+        linhas += [recuo + t for t in quebradas] + [""] * (4 - len(quebradas))
+    if recado:
+        linhas += ["", _no_centro(f"{AMAR}{recado}{RST}", colunas)]
+    teclas = (["Espaço ⏯", "↑↓ volume", "n/p troca de rádio", "f favoritar", "l legenda", "t traduzir"] if radio
+              else ["Espaço ⏯", "←→ 10 s", "↑↓ volume", "n próxima", "p anterior", "s embaralhar", "r repetir"])
+    dicas = [""]
+    for tecla in teclas + ["a anunciar", "Esc sai e continua tocando", "q para"]:  # quebra na largura da tela
+        junto = f"{dicas[-1]} · {tecla}" if dicas[-1] else tecla
+        if _largura(junto) > colunas - 2 and dicas[-1]:
+            dicas.append(tecla)
+        else:
+            dicas[-1] = junto
+    linhas += [""] + [_no_centro(f"{DIM}{d}{RST}", colunas) for d in dicas]
+    linhas = [""] * max(0, (linhas_tela - len(linhas)) // 2) + linhas
+    sys.stdout.write("\033[H" + "\n".join(_cortar(linha, colunas) + "\033[K" for linha in linhas[:linhas_tela])
+                     + "\033[J")
+    sys.stdout.flush()
+
+
+def _favoritar_radio(pos: int) -> str:
+    """Põe ou tira das favoritas a estação `pos` da lista que está tocando. Devolve o recado para a tela."""
+    radios = ler_json(RADIO_ATUAL_FILE, [])
+    if not 0 <= pos < len(radios):
+        return "Não sei qual é esta rádio."
+    r, favoritas = radios[pos], cfg().setdefault("radios_favoritas", [])
+    url = r.get("url_resolved") or r.get("url")
+    ja = [i for i, fav in enumerate(favoritas) if (fav.get("url_resolved") or fav.get("url")) == url]
+    if ja:
+        favoritas.pop(ja[0])
+        recado = "Tirada das favoritas."
+    else:
+        favoritas.append({k: r.get(k, "") for k in ("name", "url_resolved", "codec", "bitrate", "tags",
+                                                     "countrycode", "stationuuid")})
+        recado = "★ Guardada nas favoritas."
+    salvar_cfg()
+    return recado
+
+
+@submenu
+def tela_player() -> None:
+    """'Tocando agora': a música, o tempo, a fila e os controles. Esc sai deixando tocar; q para a música."""
+    try:
+        mpv = Mpv(espera=3)
+    except OSError:
+        info("Nada tocando agora.")
+        return
+    if not setas_ativas():  # sem terminal interativo: só conta o que está tocando
+        print(f"♪ {titulo_tocando() or '?'}")
+        mpv.fechar()
+        return
+    c = cfg()
+    legenda, recado, parar = None, "", False
+    fd = sys.stdin.fileno()
+    antigo = termios.tcgetattr(fd)
+    limpar()
+    _cursor(False)
+    try:
+        tty.setcbreak(fd)  # o tempo todo: o select vê cada tecla sem esperar Enter
+        while True:
+            try:
+                f = faixa_atual(mpv)
+                fila = _fila_player(mpv, f)
+            except (OSError, ValueError):
+                break  # o mpv fechou: acabou a fila ou alguém parou pela notificação
+            if legenda and legenda.url != f["caminho"] and f["caminho"]:  # trocou de estação
+                traduzir_legenda = legenda.traduzir
+                legenda.fechar()
+                legenda = LegendaRadio(f["caminho"], traduzir_legenda)
+            _desenhar_player(f, fila, legenda, recado, bool(c.get("player_anunciar")))
+            if not select.select([fd], [], [], 0.5)[0]:
+                continue
+            tecla, recado, radio = ler_tecla(), "", f["tipo"] == "radio"
+            try:
+                if tecla == " ":
+                    mpv("cycle", "pause")
+                elif tecla in ("dir", "esq") and not radio:
+                    mpv("seek", 10 if tecla == "dir" else -10)
+                elif tecla in ("cima", "baixo", "+", "-", "9", "0"):
+                    mpv("add", "volume", 5 if tecla in ("cima", "+", "0") else -5)
+                elif tecla in ("n", ">", "pgdn"):
+                    if f["pos"] + 1 >= f["total"] and not f["repetir"]:
+                        recado = "Esta é a última da fila."
+                    else:
+                        mpv("playlist-next")
+                elif tecla in ("p", "<", "pgup"):
+                    mpv("playlist-prev")
+                elif tecla == "s" and not radio:
+                    mpv("playlist-shuffle")
+                    recado = "Fila embaralhada."
+                elif tecla == "r" and not radio:  # nada → repetir a fila → repetir a música → nada
+                    if f["repetir"] == "música":
+                        mpv("set_property", "loop-file", "no")
+                    elif f["repetir"] == "fila":
+                        mpv("set_property", "loop-playlist", "no")
+                        mpv("set_property", "loop-file", "inf")
+                    else:
+                        mpv("set_property", "loop-playlist", "inf")
+                elif tecla == "a":
+                    c["player_anunciar"] = not c.get("player_anunciar")
+                    salvar_cfg()
+                    recado = ("🗣 Vou falar o nome de cada música que começar." if c["player_anunciar"]
+                              else "Anúncio por voz desligado.")
+                    if c["player_anunciar"] and not tem("termux-tts-speak"):
+                        recado = "Para falar, instale o termux-api (pkg install termux-api) e o app Termux:API."
+                elif tecla == "f" and radio:
+                    recado = _favoritar_radio(f["pos"])
+                elif tecla == "l" and radio:
+                    if legenda:
+                        legenda.fechar()
+                        legenda = None
+                    elif not whisper_bin() or not modelo_whisper().exists():
+                        recado = "A legenda usa o whisper.cpp: instale em ✨ IA → 🎤 Voz para texto."
+                    elif not tem("ffmpeg"):
+                        recado = "A legenda precisa do ffmpeg (pkg install ffmpeg)."
+                    else:
+                        legenda = LegendaRadio(f["caminho"], bool(c.get("legenda_traduzir")))
+                elif tecla == "t" and radio:
+                    c["legenda_traduzir"] = not c.get("legenda_traduzir")
+                    salvar_cfg()
+                    if legenda:
+                        legenda.traduzir = c["legenda_traduzir"]
+                    recado = "Legenda traduzida para o português." if c["legenda_traduzir"] else \
+                        "Legenda no idioma da rádio."
+                elif tecla == "q":
+                    parar = True
+                    break
+                elif tecla in ("esc", "backspace", "enter"):
+                    break
+            except (OSError, ValueError):
+                break
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
+        _cursor(True)
+        if legenda:
+            legenda.fechar()
+        mpv.fechar()
+    limpar()
+    if parar:
+        parar_player()  # espera o mpv fechar de verdade
+        ok("Música parada.")
+    elif player_ativo():
+        ok("A música continua tocando: use os botões da notificação ou volte em 🎵 Tocando agora.")
+    else:
+        info("A música parou.")
+
+
+def tocar_mpv(alvos: list, aleatorio: bool = False, playlist: Path | None = None, stream: bool = False,
+              inicio: int = 0, tipo: str = "musica") -> None:
+    """Toca no player do Termux-Toons (tela 'Tocando agora' e notificação com botões). Sem terminal interativo,
+    toca no próprio terminal com os controles do mpv."""
     if not tem("mpv") and not garantir_deps_musica():
         return
-    cmd = ["mpv", "--no-video", "--term-osd-bar"]
-    if stream:
-        cmd.append("--ytdl-format=bestaudio")
-    if aleatorio:
-        cmd.append("--shuffle")
-    if playlist:
-        cmd.append(f"--playlist={playlist}")
-    cmd += [str(a) for a in alvos]
     if not alvos and not playlist:
         raise ToonsError("Nada para tocar.")
-    if perguntar_fundo and confirmar("Tocar em segundo plano (continua tocando fora do menu)?", False):
-        if servico_ativo("musica"):
-            parar_servico("musica")
-        if iniciar_servico("musica", shlex.join(cmd), com_log=False):
-            info("Controle a música em 'Abrir player em segundo plano' (Ctrl+b d para sair).")
+    if not setas_ativas():
+        print(CONTROLES_MPV)
+        rodar(["mpv", "--no-video", "--term-osd-bar", *_opcoes_mpv(alvos, aleatorio, playlist, stream, inicio)],
+              mostrar=False)
         return
-    print(CONTROLES_MPV)
-    rodar(cmd, mostrar=False)
+    info("Abrindo o player...")
+    iniciar_player(alvos, aleatorio, playlist, stream, inicio, tipo)
+    tela_player()
 
 
 def _mais_novos_primeiro(arquivos) -> list:
@@ -5410,7 +5901,15 @@ def menu_musica():
         salvar_cfg()
         ok(f"Músicas em {pasta_musicas()}")
 
+    def parar():
+        if parar_player():
+            ok("Música parada.")
+        else:
+            info("Nada tocando agora.")
+
     menu("🎵 Música, rádio e podcasts", [
+        (lambda: "🎵 Tocando agora (abrir o player)" if player_ativo() else "🎵 Tocando agora (nada tocando)",
+         tela_player),
         ("Buscar e tocar (streaming)", buscar_tocar),
         ("Buscar e baixar (escolhe o formato: MP3, Opus, M4A, FLAC...)", buscar_baixar),
         ("Baixar por link (YouTube, SoundCloud, playlist...)", baixar_link),
@@ -5422,8 +5921,7 @@ def menu_musica():
         ("Biblioteca: tocar tudo no aleatório", tudo_aleatorio),
         ("Playlists: criar", criar_playlist),
         ("Playlists: tocar", tocar_playlist),
-        ("Abrir player em segundo plano", lambda: abrir_sessao("musica")),
-        ("Parar player em segundo plano", lambda: parar_servico("musica")),
+        ("⏹ Parar a música", parar),
         (lambda: f"Pasta das músicas ({c['pasta_musicas']})", mudar_pasta),
         ("Instalar dependências (yt-dlp, ffmpeg, mpv, mutagen)", garantir_deps_musica),
     ])
@@ -17337,69 +17835,175 @@ def menu_livros():
 
 
 # ── Rádio e podcasts ─────────────────────────────────────────────────
+# As rádios vêm do radio-browser.info: mais de 50 mil estações do mundo todo, grátis e sem chave. A lista
+# escolhida vira a fila do player, então próxima/anterior trocam de estação; a legenda automática e as
+# favoritas ficam na tela do player (LegendaRadio, _favoritar_radio).
 
 RADIO_SERVIDORES = ["https://de1.api.radio-browser.info", "https://nl1.api.radio-browser.info",
                     "https://at1.api.radio-browser.info"]
+RADIO_ATUAL_FILE = DATA_DIR / "radio_atual.json"  # as estações que estão na fila do player agora
+
+# nomes em português para achar e mostrar os países e idiomas (a API devolve em inglês)
+PAISES_PT = {
+    "BR": "Brasil", "PT": "Portugal", "US": "Estados Unidos", "AR": "Argentina", "MX": "México", "ES": "Espanha",
+    "FR": "França", "DE": "Alemanha", "IT": "Itália", "GB": "Reino Unido", "JP": "Japão", "KR": "Coreia do Sul",
+    "CN": "China", "IN": "Índia", "RU": "Rússia", "CA": "Canadá", "AU": "Austrália", "NL": "Holanda",
+    "BE": "Bélgica", "CH": "Suíça", "AT": "Áustria", "SE": "Suécia", "NO": "Noruega", "DK": "Dinamarca",
+    "FI": "Finlândia", "PL": "Polônia", "GR": "Grécia", "TR": "Turquia", "IE": "Irlanda", "CL": "Chile",
+    "CO": "Colômbia", "PE": "Peru", "UY": "Uruguai", "PY": "Paraguai", "VE": "Venezuela", "BO": "Bolívia",
+    "EC": "Equador", "CU": "Cuba", "AO": "Angola", "MZ": "Moçambique", "CV": "Cabo Verde", "ZA": "África do Sul",
+    "EG": "Egito", "NG": "Nigéria", "MA": "Marrocos", "IL": "Israel", "SA": "Arábia Saudita", "ID": "Indonésia",
+    "PH": "Filipinas", "TH": "Tailândia", "VN": "Vietnã", "UA": "Ucrânia", "RO": "Romênia", "HU": "Hungria",
+    "CZ": "Tchéquia", "NZ": "Nova Zelândia", "JM": "Jamaica", "DO": "República Dominicana",
+}
+IDIOMAS_PT = {
+    "portuguese": "português", "spanish": "espanhol", "english": "inglês", "french": "francês",
+    "german": "alemão", "italian": "italiano", "japanese": "japonês", "korean": "coreano", "chinese": "chinês",
+    "russian": "russo", "arabic": "árabe", "hindi": "hindi", "dutch": "holandês", "greek": "grego",
+    "turkish": "turco", "polish": "polonês", "swedish": "sueco", "ukrainian": "ucraniano",
+}
+GENEROS_PT = {"pop": "pop", "rock": "rock", "news": "notícias", "music": "música", "talk": "conversa",
+              "classical": "clássica", "jazz": "jazz", "dance": "dance", "electronic": "eletrônica",
+              "oldies": "antigas", "country": "country", "hits": "sucessos", "christian": "cristã",
+              "folk": "folk", "religion": "religião", "sports": "esportes", "chillout": "chillout",
+              "ambient": "ambiente", "hiphop": "hip-hop", "latin": "latina", "lounge": "lounge", "80s": "anos 80",
+              "90s": "anos 90", "70s": "anos 70", "60s": "anos 60", "reggae": "reggae", "blues": "blues",
+              "metal": "metal", "soul": "soul", "funk": "funk", "lofi": "lo-fi", "house": "house"}
 
 
-def buscar_radios(**filtros) -> list:
-    """Estações do radio-browser.info (gratuito, sem chave)."""
-    params = {"limit": 60, "order": "clickcount", "reverse": "true", "hidebroken": "true", **filtros}
+def radio_api(caminho: str, **params):
+    """Uma consulta ao radio-browser.info, tentando os outros servidores se um falhar."""
     ultimo_erro = None
     for servidor in RADIO_SERVIDORES:
         try:
-            return pedir_json(url_com(f"{servidor}/json/stations/search", **params), timeout=20) or []
+            return pedir_json(url_com(f"{servidor}/json/{caminho}", **params), timeout=20) or []
         except ToonsError as e:
             ultimo_erro = e
     raise ultimo_erro or ToonsError("Rádios indisponíveis agora.")
+
+
+def buscar_radios(**filtros) -> list:
+    """Estações (as mais ouvidas primeiro, sem as quebradas)."""
+    return radio_api("stations/search", **{"limit": 100, "order": "clickcount", "reverse": "true",
+                                           "hidebroken": "true", **filtros})
+
+
+def bandeira(pais: str) -> str:
+    """'BR' → 🇧🇷 (as duas letras viram os símbolos regionais que o Android desenha como bandeira)."""
+    pais = (pais or "").upper()
+    return "".join(chr(0x1F1E6 + ord(ch) - ord("A")) for ch in pais) if re.fullmatch(r"[A-Z]{2}", pais) else "📻"
+
+
+def tocar_radios(radios: list, inicio: int = 0) -> None:
+    """Toca a lista de estações a partir de `inicio`: no player, próxima e anterior trocam de rádio."""
+    radios = [r for r in radios if r.get("url_resolved") or r.get("url")]
+    if not radios:
+        raise ToonsError("Nenhuma rádio com endereço para tocar.")
+    inicio = min(max(0, inicio), len(radios) - 1)
+    lista = DATA_DIR / "radio_atual.m3u"
+    lista.parent.mkdir(parents=True, exist_ok=True)
+    lista.write_text("#EXTM3U\n" + "".join(  # o #EXTINF dá o nome da estação na fila do player
+        f"#EXTINF:-1,{' '.join(str(r.get('name') or '?').split())}\n{r.get('url_resolved') or r.get('url')}\n"
+        for r in radios), "utf-8")
+    gravar_json(RADIO_ATUAL_FILE, radios)
+    uuid_estacao = radios[inicio].get("stationuuid")
+
+    def contar_clique():  # ajuda a ordem de "mais ouvidas" do radio-browser; ninguém espera a resposta
+        with contextlib.suppress(Exception):
+            pedir_bytes(f"{RADIO_SERVIDORES[0]}/json/url/{uuid_estacao}", timeout=5)
+
+    if uuid_estacao:
+        threading.Thread(target=contar_clique, daemon=True).start()
+    tocar_mpv([], playlist=lista, inicio=inicio, tipo="radio")
+
+
+def _escolher_radio(radios: list, titulo_lista: str = "Qual rádio?") -> None:
+    if not radios:
+        info("Nenhuma rádio encontrada.")
+        return
+    i = escolher(f"{titulo_lista} ({len(radios)})", [
+        f"{bandeira(r.get('countrycode'))} {str(r.get('name') or '?').strip()[:42]}  {DIM}"
+        f"{r.get('state') or r.get('country') or ''} · {r.get('codec', '')} {r.get('bitrate') or ''}{RST}"
+        for r in radios])
+    if i is not None:
+        tocar_radios(radios, i)
+
+
+def _filtrar_por_nome(itens: list, nome_de, pergunta: str) -> list:
+    """Filtra uma lista longa pelo texto digitado (sem acento); Enter mostra tudo."""
+    filtro = sem_acento(perguntar(pergunta, "")).lower().strip()
+    if not filtro:
+        return itens
+    achados = [x for x in itens if filtro in sem_acento(nome_de(x)).lower()]
+    if not achados:
+        info(f"Nada com '{filtro}'; mostrando tudo.")
+    return achados or itens
 
 
 @submenu
 def menu_radio():
     c = cfg()
 
-    def tocar_radio(r: dict):
-        url = r.get("url_resolved") or r.get("url")
-        print(f"\n{NEG}📻 {r.get('name', '').strip()}{RST} {DIM}{r.get('codec', '')} {r.get('bitrate', '')} kbps · "
-              f"{r.get('tags', '')[:60]}{RST}")
-        if r.get("stationuuid"):
-            with contextlib.suppress(ToonsError):
-                pedir_bytes(f"{RADIO_SERVIDORES[0]}/json/url/{r['stationuuid']}", timeout=5)  # conta o clique
-        favoritas = c.setdefault("radios_favoritas", [])
-        if not any(f.get("url") == url for f in favoritas) and confirmar("Guardar nas favoritas?", False):
-            favoritas.append({"name": r.get("name", "").strip(), "url_resolved": url, "codec": r.get("codec", ""),
-                              "bitrate": r.get("bitrate", ""), "tags": r.get("tags", "")})
-            salvar_cfg()
-        tocar_mpv([url])
-
-    def lista(radios: list):
-        if not radios:
-            info("Nenhuma rádio encontrada.")
-            return
-        i = escolher("Qual rádio?", [f"{r.get('name', '?').strip()[:45]}  {DIM}{r.get('state') or r.get('country', '')}"
-                                     f" · {r.get('codec', '')} {r.get('bitrate', '')}{RST}" for r in radios])
+    def por_pais():
+        paises = [p for p in radio_api("countries", order="stationcount", reverse="true")
+                  if p.get("iso_3166_1") and p.get("stationcount")]
+        nome = lambda p: f"{PAISES_PT.get(p['iso_3166_1'].upper(), '')} {p['name']} {p['iso_3166_1']}"  # noqa: E731
+        paises = _filtrar_por_nome(paises, nome, "País (ex.: japão, portugal, argentina; Enter = todos)")
+        i = escolher(f"País ({len(paises)})", [
+            f"{bandeira(p['iso_3166_1'])} {PAISES_PT.get(p['iso_3166_1'].upper()) or p['name']}  "
+            f"{DIM}{p['stationcount']} rádios{RST}" for p in paises])
         if i is not None:
-            tocar_radio(radios[i])
+            iso = paises[i]["iso_3166_1"]
+            _escolher_radio(buscar_radios(countrycode=iso),
+                            f"Rádios de {PAISES_PT.get(iso.upper()) or paises[i]['name']}")
 
-    def generos():
-        nomes = [("Sertanejo", "sertanejo"), ("Pop", "pop"), ("Rock", "rock"), ("MPB", "mpb"), ("Samba e pagode", "samba"),
-                 ("Gospel", "gospel"), ("Notícias", "news"), ("Funk", "funk"), ("Forró", "forro"),
-                 ("Clássica", "classical"), ("Jazz", "jazz"), ("Eletrônica", "electronic"), ("Lo-fi", "lofi")]
+    def por_idioma():
+        idiomas = [x for x in radio_api("languages", order="stationcount", reverse="true", limit=150)
+                   if x.get("name") and x.get("stationcount", 0) >= 5]
+        idiomas = _filtrar_por_nome(idiomas, lambda x: f"{IDIOMAS_PT.get(x['name'], '')} {x['name']}",
+                                    "Idioma (ex.: inglês, japonês, francês; Enter = todos)")
+        i = escolher(f"Idioma ({len(idiomas)})", [f"{IDIOMAS_PT.get(x['name'], x['name']).capitalize()}  "
+                                                  f"{DIM}{x['stationcount']} rádios{RST}" for x in idiomas])
+        if i is not None:
+            _escolher_radio(buscar_radios(language=idiomas[i]["name"]), "Rádios em "
+                            + IDIOMAS_PT.get(idiomas[i]["name"], idiomas[i]["name"]))
+
+    def generos_mundo():
+        tags = [t for t in radio_api("tags", order="stationcount", reverse="true", limit=60, hidebroken="true")
+                if t.get("name") and len(t["name"]) <= 20]
+        i = escolher(f"Gênero ({len(tags)})", [f"{GENEROS_PT.get(t['name'], t['name']).capitalize()}  "
+                                               f"{DIM}{t['stationcount']} rádios{RST}" for t in tags])
+        if i is not None:
+            _escolher_radio(buscar_radios(tag=tags[i]["name"]), GENEROS_PT.get(tags[i]["name"], tags[i]["name"]))
+
+    def generos_brasil():
+        nomes = [("Sertanejo", "sertanejo"), ("Pop", "pop"), ("Rock", "rock"), ("MPB", "mpb"),
+                 ("Samba e pagode", "samba"), ("Gospel", "gospel"), ("Notícias", "news"), ("Funk", "funk"),
+                 ("Forró", "forro")]
         i = escolher("Gênero", [n for n, _ in nomes])
         if i is not None:
-            lista(buscar_radios(tag=nomes[i][1], **({} if nomes[i][1] in ("classical", "jazz", "lofi", "electronic")
-                                                    else {"countrycode": "BR"})))
+            _escolher_radio(buscar_radios(tag=nomes[i][1], countrycode="BR"), nomes[i][0])
+
+    def surpresa():
+        radios = buscar_radios(order="random", limit=30)
+        if not radios:
+            raise ToonsError("Nenhuma rádio agora.")
+        r = radios[0]
+        info(f"Sorteada: {bandeira(r.get('countrycode'))} {r.get('name', '').strip()} "
+             f"({PAISES_PT.get(str(r.get('countrycode')).upper()) or r.get('country') or '?'})")
+        tocar_radios(radios)  # as outras sorteadas ficam na fila: "próxima" sorteia de novo
 
     def favoritas():
         favs = c.get("radios_favoritas", [])
         if not favs:
-            info("Nenhuma favorita ainda (ela é oferecida quando você toca uma rádio).")
+            info("Nenhuma favorita ainda: no player da rádio, aperte f para guardar a que estiver tocando.")
             return
-        i = escolher("Favoritas", [f["name"] for f in favs] + ["Remover uma favorita..."])
+        i = escolher("Favoritas", [f"{bandeira(f.get('countrycode'))} {f['name']}" for f in favs]
+                     + ["Remover uma favorita..."])
         if i is None:
             return
         if i < len(favs):
-            tocar_radio(favs[i])
+            tocar_radios(favs, i)
         else:
             k = escolher("Remover qual?", [f["name"] for f in favs])
             if k is not None:
@@ -17407,13 +18011,20 @@ def menu_radio():
                 salvar_cfg()
 
     menu("📻 Rádio online", [
-        ("Mais ouvidas do Brasil", lambda: lista(buscar_radios(countrycode="BR"))),
-        ("Buscar pelo nome (ex.: CBN, Jovem Pan)", lambda: lista(buscar_radios(name=perguntar("Nome da rádio")))),
-        ("Por gênero", generos),
-        ("Rádios de uma cidade/estado", lambda: lista(buscar_radios(countrycode="BR",
-                                                                     state=perguntar("Estado (ex.: Bahia)")))),
-        ("Favoritas", favoritas),
-    ])
+        (lambda: f"⭐ Favoritas ({len(c.get('radios_favoritas', []))})", favoritas),
+        ("🌍 Rádios do mundo por país", por_pais),
+        ("🗣️ Por idioma", por_idioma),
+        ("🎶 Por gênero (mundo todo)", generos_mundo),
+        ("🔥 Mais ouvidas do mundo", lambda: _escolher_radio(buscar_radios(), "Mais ouvidas do mundo")),
+        ("🎲 Rádio surpresa de qualquer país", surpresa),
+        ("🇧🇷 Mais ouvidas do Brasil", lambda: _escolher_radio(buscar_radios(countrycode="BR"), "Mais ouvidas do Brasil")),
+        ("🇧🇷 Gêneros do Brasil (sertanejo, MPB, funk...)", generos_brasil),
+        ("🇧🇷 Rádios de um estado", lambda: _escolher_radio(buscar_radios(countrycode="BR",
+                                                                           state=perguntar("Estado (ex.: Bahia)")))),
+        ("🔎 Buscar pelo nome (ex.: CBN, BBC, Jovem Pan)", lambda: _escolher_radio(
+            buscar_radios(name=perguntar("Nome da rádio")))),
+    ], cabecalho=lambda: print(f"{DIM}Mais de 50 mil rádios do mundo. No player: n/p troca de rádio, f favorita, "
+                               f"l liga a legenda automática e t traduz para o português.{RST}"))
 
 
 @submenu
@@ -19157,6 +19768,9 @@ def cabecalho() -> None:
         print(f"{_c(f'38;5;{cor}')}{linha}{' ' * (largura - _largura(linha))}{RST}")
     ambiente = "Termux" if IS_TERMUX else "fora do Termux"
     print(f"{DIM}v{VERSION} · {ambiente} · serviços: {', '.join(servicos_ativos()) or 'nenhum'}{RST}")
+    tocando = titulo_tocando()
+    if tocando:
+        print(f"{CIANO}♪ {tocando}{RST}")
 
 
 # ── Busca no menu: acha uma opção pelo nome, mesmo com erro de digitação ──
@@ -19176,8 +19790,11 @@ def _indice_busca() -> list:
         ("🗄️ Arquivos e backup", "gerenciador arquivos nuvem rclone backup pasta compartilhar", menu_arquivos),
         ("🌐 Publicar página / site por link", "site html publicar pagina link servir web", publicar_site),
         ("🎵 Música, rádio e podcasts", "musica mp3 audio tocar playlist som", menu_musica),
-        ("📻 Rádio online", "radio fm estacao radios ao vivo", menu_radio),
+        ("📻 Rádio online (mundo todo)", "radio fm estacao radios ao vivo mundo pais internacional idioma legenda",
+         menu_radio),
         ("🎙️ Podcasts", "podcast podcasts episodio", menu_podcasts),
+        ("🎵 Tocando agora (player)", "player tocando agora pausar pular proxima musica atual notificacao fila",
+         tela_player),
         ("🎬 Vídeos (TikTok, YouTube)", "video videos youtube tiktok instagram baixar download yt-dlp", menu_videos),
         ("📺 Compartilhar filme por link", "filme video streaming link assistir compartilhar serie", menu_midia),
         ("🧮 Calculadora científica", "calcular calculadora conta matematica cientifica", menu_calculadora),
@@ -19370,6 +19987,9 @@ def main(argv=None) -> int:
     p.add_argument("--escolher", action="store_true", help="mostra a lista de apps em vez de abrir o VLC")
     p = sub.add_parser("tocar", help="toca a biblioteca (sem argumentos) ou um mix por busca")
     p.add_argument("busca", nargs="*")
+    p = sub.add_parser("player", help="controla a música que está tocando (abrir, pausar, próxima...)")
+    p.add_argument("acao", nargs="?", default="abrir", choices=["abrir", "pausar", "proxima", "anterior", "parar"])
+    p.add_argument("--vigiar", action="store_true", help=argparse.SUPPRESS)  # o vigia da notificação
     sub.add_parser("atualizar", help="atualiza Termux, pacotes Python, distros e o Termux-Toons")
     sub.add_parser("limpar", help="otimização rápida: limpa caches e temporários com segurança")
     sub.add_parser("doctor", help="diagnóstico do ambiente")
@@ -19443,9 +20063,24 @@ def main(argv=None) -> int:
             abrir_no_android(endereco_para_assistir(args.link), None if args.escolher else VLC_ANDROID)
         elif args.comando == "tocar":
             if args.busca:
-                tocar_mpv([f"ytdl://ytsearch15:{' '.join(args.busca)}"], stream=True, perguntar_fundo=False)
+                tocar_mpv([f"ytdl://ytsearch15:{' '.join(args.busca)}"], stream=True)
             else:
-                tocar_mpv(musicas_locais(), aleatorio=True, perguntar_fundo=False)
+                tocar_mpv(musicas_locais(), aleatorio=True)
+        elif args.comando == "player":
+            if args.vigiar:
+                vigiar_player()
+            elif args.acao == "abrir":
+                tela_player()
+            elif args.acao == "parar":
+                parar_player()
+            else:
+                try:
+                    mpv = Mpv(timeout=2)
+                except OSError:
+                    raise ToonsError("Nada tocando agora.") from None
+                mpv(*{"pausar": ["cycle", "pause"], "proxima": ["playlist-next"],
+                      "anterior": ["playlist-prev"]}[args.acao])
+                mpv.fechar()
         elif args.comando == "limpar":
             otimizacao_rapida(interativo=False)
         elif args.comando == "atualizar":
