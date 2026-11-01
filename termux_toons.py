@@ -12,7 +12,7 @@ Reúne em um único menu:
    6. Arquivos e backup: gerenciador de arquivos (ADB ou root para Android/data), rclone, Syncthing,
       Samba, HTTP, backup e página HTML num link
    7. Música, rádio e podcasts: yt-dlp para baixar; player com tela 'Tocando agora' e notificação com botões;
-      rádios do mundo todo com legenda automática (whisper.cpp); podcasts
+      equalizador de 10 bandas; rádios do mundo todo com legenda automática (whisper.cpp); podcasts
    8. Vídeos do TikTok, YouTube e outros sites com yt-dlp
    9. Compartilhar filmes por link: arquivo do celular ou qualquer link de vídeo, com player próprio,
       troca de trilha de áudio e conversão na hora (servidor de vídeo + túnel)
@@ -882,6 +882,7 @@ PADRAO_CFG = {
     "pasta_musicas": "~/storage/downloads",
     "pasta_videos": "~/storage/downloads",
     "formato_musica": "opus",
+    "equalizador": {"ligado": False, "pre": 0, "bandas": [0] * 10, "preset": "Plano"},
     "formato_video": "mp4",
     "qualidade_video": "melhor",
     "midia_porta": 8095,
@@ -5214,13 +5215,158 @@ FORMATOS_MUSICA = {
 }
 
 
-def comando_ytdlp(alvo: str, formato: str | None = None) -> list:
-    """Melhor áudio, convertido para o formato escolhido, com capa (quando o formato aceita) e metadados."""
+# ── Equalizador ──────────────────────────────────────────────────────
+# 10 bandas como as do VLC (de -12 a +12 dB) e o pré-amplificador. Cada banda mexida vira um filtro
+# 'equalizer' do ffmpeg (um pico de 1 oitava em volta da frequência). A mesma cadeia serve para tocar (o mpv
+# recebe --af=lavfi=[...] e muda na hora pelo socket) e para gravar no arquivo baixado: depois do yt-dlp, o
+# ffmpeg converte o arquivo final de novo com o filtro (o yt-dlp pula a conversão quando o áudio já vem no
+# formato pedido, e aí um filtro passado a ele não seria aplicado).
+
+FREQUENCIAS_EQ = [31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
+LIMITE_EQ = 12
+PRESETS_EQ = {  # dB de 31 Hz a 16 kHz
+    "Plano": [0] * 10,
+    "Graves": [7, 6, 5, 3, 1, 0, 0, 0, 0, 0],
+    "Agudos": [0, 0, 0, 0, 0, 1, 3, 5, 6, 7],
+    "Graves e agudos": [6, 5, 3, 0, -2, -2, 0, 3, 5, 6],
+    "Rock": [5, 4, -3, -4, -1, 2, 4, 5, 5, 5],
+    "Pop": [-1, 3, 5, 5, 3, 0, -1, -1, -1, -1],
+    "Eletrônica": [6, 5, 2, 0, 0, -3, -4, -3, 0, 1],
+    "Reggae": [0, 0, 0, -3, 0, 4, 4, 0, 0, 0],
+    "Clássica": [0, 0, 0, 0, 0, 0, -3, -3, -3, -4],
+    "Voz e podcast": [-3, -3, -1, 1, 4, 5, 4, 2, 0, -1],
+    "Fone de ouvido": [3, 6, 3, -2, -1, 1, 3, 5, 6, 7],
+    "Volume baixo": [6, 5, 2, 0, 0, 0, 0, 2, 4, 5],
+}
+
+
+def equalizador() -> dict:
+    """O equalizador salvo: ligado, pré-amplificador e as 10 bandas (em dB) e o nome do preset."""
+    eq = cfg().setdefault("equalizador", {})
+    eq.setdefault("ligado", False)
+    eq.setdefault("pre", 0)
+    eq.setdefault("preset", "Plano")
+    bandas = [int(g) for g in (eq.get("bandas") or [])][:10]
+    eq["bandas"] = bandas + [0] * (10 - len(bandas))
+    return eq
+
+
+def nome_eq(eq: dict) -> str:
+    return eq["preset"] if PRESETS_EQ.get(eq["preset"]) == eq["bandas"] else "personalizado"
+
+
+def cadeia_eq(eq: dict) -> str:
+    """Filtros do ffmpeg do equalizador ('' se estiver tudo em 0 dB)."""
+    partes = [f"equalizer=f={f}:t=o:w=1:g={g}" for f, g in zip(FREQUENCIAS_EQ, eq["bandas"]) if g]
+    if eq["pre"]:
+        partes.append(f"volume={eq['pre']}dB")
+    return ",".join(partes)
+
+
+def filtro_mpv_eq(eq: dict | None = None) -> str:
+    """O --af do mpv com o equalizador, se ele estiver ligado ('' se desligado ou plano)."""
+    eq = eq or equalizador()
+    cadeia = cadeia_eq(eq) if eq["ligado"] else ""
+    return f"@toons-eq:lavfi=[{cadeia}]" if cadeia else ""
+
+
+def aplicar_eq_no_player(eq: dict) -> bool:
+    """Troca o equalizador da música que está tocando. True se havia uma."""
+    try:
+        mpv = Mpv(timeout=1)
+    except OSError:
+        return False
+    try:
+        filtro = filtro_mpv_eq(eq)
+        mpv("af", "set", filtro) if filtro else mpv("af", "clr", "")
+        return True
+    except (OSError, ValueError):
+        return False
+    finally:
+        mpv.fechar()
+
+
+def perguntar_eq_download():
+    """Para baixar: o equalizador a gravar no arquivo, None = sem alteração, False = cancelou. Sem nada mexido
+    no equalizador, nem pergunta."""
+    eq = equalizador()
+    if not cadeia_eq(eq):
+        return None
+    i = escolher("Equalizador no arquivo?", ["Sem alteração (o áudio como veio)",
+                                             f"Com o equalizador ({nome_eq(eq)}): fica gravado no arquivo"],
+                 "2" if eq["ligado"] else "1")
+    return False if i is None else (dict(eq, bandas=list(eq["bandas"])) if i == 1 else None)
+
+
+# codificação ao gravar o equalizador, pela extensão do arquivo (qualidade alta: é a segunda conversão)
+CODEC_EQ = {".mp3": ["-c:a", "libmp3lame", "-b:a", "320k"], ".opus": ["-c:a", "libopus", "-b:a", "192k"],
+            ".ogg": ["-c:a", "libvorbis", "-q:a", "8"], ".m4a": ["-c:a", "aac", "-b:a", "256k"],
+            ".flac": ["-c:a", "flac"], ".wav": ["-c:a", "pcm_s16le"]}
+
+
+def _etiquetas_audio(arq: Path) -> dict:
+    proc = rodar(["ffprobe", "-v", "error", "-show_entries", "format_tags:stream_tags", "-of", "json", str(arq)],
+                 capturar=True, timeout=60, mostrar=False)
+    try:
+        dados = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return {}
+    etiquetas = {k.lower(): v for k, v in (dados.get("format", {}).get("tags") or {}).items()}
+    for fluxo in dados.get("streams") or []:
+        etiquetas.update({k.lower(): v for k, v in (fluxo.get("tags") or {}).items()})
+    return etiquetas
+
+
+def equalizar_arquivo(arq: Path, cadeia: str) -> bool:
+    """Grava o equalizador num arquivo de áudio: converte de novo com o filtro, na mesma extensão, mantendo as
+    etiquetas e a capa. Marca o arquivo (etiqueta toons_eq) para não equalizar duas vezes."""
+    codec = CODEC_EQ.get(arq.suffix.lower())
+    if not codec:
+        aviso(f"Não sei regravar {arq.suffix} com o equalizador: ficou sem ({arq.name}).")
+        return False
+    if _etiquetas_audio(arq).get("toons_eq") == cadeia:
+        return True  # já está equalizado assim (ex.: o yt-dlp achou o arquivo já baixado)
+    capa = arq.suffix.lower() in (".mp3", ".m4a", ".flac")  # nesses a capa é um fluxo de imagem
+    tmp = arq.with_name(f".eq-{arq.name}")
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(arq), "-map", "0:a:0",
+           *(["-map", "0:v?", "-c:v", "copy"] if capa else []), "-map_metadata", "0",
+           "-map_metadata:s:a:0", "0:s:a:0", "-af", cadeia, *codec, "-metadata", f"toons_eq={cadeia}",
+           *(["-movflags", "+use_metadata_tags"] if arq.suffix.lower() == ".m4a" else []), str(tmp)]
+    # no Opus/Ogg a capa é uma etiqueta que o ffmpeg vira imagem e não consegue regravar: o mutagen devolve
+    fotos = None
+    if arq.suffix.lower() in (".opus", ".ogg"):
+        with contextlib.suppress(Exception):
+            from mutagen import File as ArquivoMutagen
+            fotos = (ArquivoMutagen(arq).tags or {}).get("metadata_block_picture")
+    info(f"Gravando o equalizador em {arq.name}...")
+    if rodar(cmd, capturar=True, timeout=1800, mostrar=False).returncode != 0 or not tmp.exists():
+        tmp.unlink(missing_ok=True)
+        aviso(f"O ffmpeg não conseguiu equalizar {arq.name}: ficou o áudio original.")
+        return False
+    tmp.replace(arq)
+    if fotos:
+        with contextlib.suppress(Exception):
+            novo = ArquivoMutagen(arq)
+            novo["metadata_block_picture"] = fotos
+            novo.save()
+    return True
+
+
+def comando_ytdlp(alvo: str, formato: str | None = None, eq: dict | None = None,
+                  lista: Path | None = None) -> list:
+    """Melhor áudio, convertido para o formato escolhido, com capa (quando o formato aceita) e metadados. Com
+    `eq` o nome do arquivo ganha '(EQ preset)' (quem grava o filtro é baixar_musica); `lista` recebe o caminho
+    final de cada arquivo baixado."""
     formato = formato if formato in FORMATOS_MUSICA else cfg().get("formato_musica", "opus")
+    cadeia = cadeia_eq(eq) if eq else ""
+    if cadeia and formato == "original":  # o original pode vir num formato que não sei regravar
+        formato = "opus"
     _, opcoes, capa = FORMATOS_MUSICA.get(formato, FORMATOS_MUSICA["opus"])
     selecao = "bestaudio[ext=m4a]/bestaudio/best" if formato == "m4a" else "bestaudio/best"
+    nome = "%(title)s" + (f" (EQ {nome_eq(eq)})" if cadeia else "")
     return ["yt-dlp", "-f", selecao, "--extract-audio", *opcoes, *(["--embed-thumbnail"] if capa else []),
-            "--add-metadata", "-o", str(pasta_musicas() / "%(title)s.%(ext)s"), alvo]
+            *(["--print-to-file", "after_move:filepath", str(lista)] if lista else []),
+            "--add-metadata", "-o", str(pasta_musicas() / f"{nome}.%(ext)s"), alvo]
 
 
 def escolher_formato_musica() -> str | None:
@@ -5258,12 +5404,23 @@ def garantir_deps_musica(com_player: bool = True, capa: bool | None = None) -> b
     return tem("yt-dlp") and tem("ffmpeg") and (not com_player or tem("mpv"))
 
 
-def baixar_musica(alvo: str, formato: str | None = None) -> bool:
+def baixar_musica(alvo: str, formato: str | None = None, eq: dict | None = None) -> bool:
     if not garantir_deps_musica(com_player=False, capa=True):  # baixar não precisa do player
         return False
     garantir_storage()
     pasta_musicas().mkdir(parents=True, exist_ok=True)
-    return rodar(comando_ytdlp(alvo, formato)).returncode == 0
+    cadeia = cadeia_eq(eq) if eq else ""
+    if not cadeia:
+        return rodar(comando_ytdlp(alvo, formato)).returncode == 0
+    if (formato or cfg().get("formato_musica")) == "original":
+        info("Para gravar o equalizador o áudio precisa ser convertido: vai em Opus.")
+    lista = DATA_DIR / "tmp" / f"baixados-{os.getpid()}.txt"
+    lista.parent.mkdir(parents=True, exist_ok=True)
+    lista.unlink(missing_ok=True)
+    deu_certo = rodar(comando_ytdlp(alvo, formato, eq, lista)).returncode == 0
+    arquivos = [Path(l.strip()) for l in (lista.read_text("utf-8").splitlines() if lista.exists() else []) if l.strip()]
+    lista.unlink(missing_ok=True)
+    return all([equalizar_arquivo(arq, cadeia) for arq in arquivos if arq.exists()]) and deu_certo
 
 
 def buscar_youtube(termo: str, n: int = 10) -> list:
@@ -5366,7 +5523,9 @@ def parar_player() -> bool:
 
 
 def _opcoes_mpv(alvos: list, aleatorio: bool, playlist: Path | None, stream: bool, inicio: int) -> list:
-    return [*(["--ytdl-format=bestaudio"] if stream else []), *(["--shuffle"] if aleatorio else []),
+    filtro_eq = filtro_mpv_eq()  # equalizador ligado: tudo o que tocar passa por ele
+    return [*([f"--af={filtro_eq}"] if filtro_eq else []),
+            *(["--ytdl-format=bestaudio"] if stream else []), *(["--shuffle"] if aleatorio else []),
             *([f"--playlist={playlist}"] if playlist else []), *([f"--playlist-start={inicio}"] if inicio else []),
             *map(str, alvos)]
 
@@ -5620,6 +5779,9 @@ def _desenhar_player(f: dict, fila: list, legenda: LegendaRadio | None, recado: 
         estado.append(f"{'🔂' if f['repetir'] == 'música' else '🔁'} {f['repetir']}")
     if anunciar:
         estado.append("🗣 voz")
+    eq = equalizador()
+    if eq["ligado"] and cadeia_eq(eq):
+        estado.append(f"🎚 {nome_eq(eq)}")
     linhas += ["", _no_centro("   ".join(estado), colunas), ""]
     if f["total"] > 1:
         linhas.append(_no_centro(f"{DIM}{'Rádios' if radio else 'Fila'}: {f['pos'] + 1} de {f['total']}{RST}", colunas))
@@ -5644,7 +5806,7 @@ def _desenhar_player(f: dict, fila: list, legenda: LegendaRadio | None, recado: 
     teclas = (["Espaço ⏯", "↑↓ volume", "n/p troca de rádio", "f favoritar", "l legenda", "t traduzir"] if radio
               else ["Espaço ⏯", "←→ 10 s", "↑↓ volume", "n próxima", "p anterior", "s embaralhar", "r repetir"])
     dicas = [""]
-    for tecla in teclas + ["a anunciar", "Esc sai e continua tocando", "q para"]:  # quebra na largura da tela
+    for tecla in teclas + ["e equalizador", "a anunciar", "Esc sai e continua tocando", "q para"]:  # quebra na tela
         junto = f"{dicas[-1]} · {tecla}" if dicas[-1] else tecla
         if _largura(junto) > colunas - 2 and dicas[-1]:
             dicas.append(tecla)
@@ -5744,6 +5906,9 @@ def tela_player() -> None:
                         recado = "Para falar, instale o termux-api (pkg install termux-api) e o app Termux:API."
                 elif tecla == "f" and radio:
                     recado = _favoritar_radio(f["pos"])
+                elif tecla == "e":
+                    tela_equalizador()  # a música segue tocando; ele muda o som na hora
+                    limpar()
                 elif tecla == "l" and radio:
                     if legenda:
                         legenda.fechar()
@@ -5782,6 +5947,145 @@ def tela_player() -> None:
         ok("A música continua tocando: use os botões da notificação ou volte em 🎵 Tocando agora.")
     else:
         info("A música parou.")
+
+
+LARANJA, MARROM = _c("38;5;208"), _c("38;5;94")  # as cores do equalizador (barra cheia e trilho)
+ROTULOS_EQ = ["31", "63", "125", "250", "500", "1k", "2k", "4k", "8k", "16k"]
+
+
+def _barra_pre(pre: int, largura: int, ligado: bool) -> str:
+    """O pré-amplificador como um controle deitado: cheio até a bolinha."""
+    pos = round((pre + LIMITE_EQ) / (2 * LIMITE_EQ) * (largura - 1))
+    cheio, trilho = (LARANJA, MARROM) if ligado else (DIM, DIM)
+    return f"{cheio}{'━' * pos}{NEG}●{RST}{trilho}{'─' * (largura - 1 - pos)}{RST}"
+
+
+def _desenhar_eq(eq: dict, sel: int, recado: str) -> None:
+    colunas, linhas_tela = shutil.get_terminal_size((60, 24))
+    largura_col = max(4, min(6, (colunas - 6) // 10))
+    recuo = " " * max(0, (colunas - 10 * largura_col) // 2)
+    ligado = eq["ligado"]
+    linhas = [_no_centro(_faixa_titulo("🎚️ Equalizador", max(20, min(colunas, 70))), colunas), ""]
+    estado = f"{VERD}● Ligado{RST}" if ligado else f"{DIM}○ Desligado{RST}"
+    linhas += [_no_centro(f"{estado}   Preset: {NEG}{nome_eq(eq)}{RST}", colunas), ""]
+    rotulo_pre = f"{DESTAQUE} Pré-amplificador {RST}" if sel == 0 else " Pré-amplificador "
+    largura_pre = max(8, min(30, colunas - 32))
+    linhas += [_no_centro(f"{rotulo_pre} {_barra_pre(eq['pre'], largura_pre, ligado)} {eq['pre']:+d} dB", colunas), ""]
+    # controles em pé: trilho acima da bolinha, cheio (laranja) abaixo, como no VLC
+    altura = max(5, min(13, linhas_tela - 20))
+    linhas.append(recuo + "".join((f"{g:+d}" if g else "0").center(largura_col) for g in eq["bandas"]) + f"{DIM} dB{RST}")
+    for r in range(altura):
+        linha = ""
+        for b, g in enumerate(eq["bandas"]):
+            pos = round((LIMITE_EQ - g) / (2 * LIMITE_EQ) * (altura - 1))
+            if r < pos:
+                ch = f"{MARROM if ligado else DIM}│{RST}"
+            elif r > pos:
+                ch = f"{LARANJA if ligado else DIM}┃{RST}"
+            else:
+                ch = f"{DESTAQUE}●{RST}" if b + 1 == sel else f"{NEG}{LARANJA if ligado else ''}●{RST}"
+            esquerda = (largura_col - 1) // 2
+            linha += " " * esquerda + ch + " " * (largura_col - 1 - esquerda)
+        escala = {0: f"+{LIMITE_EQ}", (altura - 1) // 2: "0", altura - 1: f"-{LIMITE_EQ}"}.get(r, "")
+        linhas.append(recuo + linha + f"{DIM} {escala}{RST}")
+    rotulos = ""
+    for b, rotulo in enumerate(ROTULOS_EQ):
+        texto = rotulo.center(largura_col)
+        rotulos += f"{DESTAQUE}{texto}{RST}" if b + 1 == sel else texto
+    linhas += [recuo + rotulos + f"{DIM} Hz{RST}", ""]
+    linhas.append(_no_centro(f"{AMAR}{recado}{RST}" if recado else "", colunas))
+    teclas = ["←→ escolhe a banda", "↑↓ ajusta 1 dB", "p/P troca o preset", "Espaço liga e desliga",
+              "0 zera a banda", "z zera tudo", "Enter sai"]
+    dicas = [""]
+    for tecla in teclas:
+        junto = f"{dicas[-1]} · {tecla}" if dicas[-1] else tecla
+        if _largura(junto) > colunas - 2 and dicas[-1]:
+            dicas.append(tecla)
+        else:
+            dicas[-1] = junto
+    linhas += [""] + [_no_centro(f"{DIM}{d}{RST}", colunas) for d in dicas]
+    linhas = [""] * max(0, (linhas_tela - len(linhas)) // 2) + linhas
+    sys.stdout.write("\033[H" + "\n".join(_cortar(linha, colunas) + "\033[K" for linha in linhas[:linhas_tela])
+                     + "\033[J")
+    sys.stdout.flush()
+
+
+def _usar_preset(eq: dict, nome: str) -> None:
+    eq["bandas"], eq["preset"] = list(PRESETS_EQ[nome]), nome
+    eq["pre"] = -(max(0, *PRESETS_EQ[nome]) // 2)  # baixa o pré quando o preset reforça: evita distorcer
+    eq["ligado"] = nome != "Plano"
+
+
+def _equalizador_numerico(eq: dict) -> None:
+    """Sem terminal interativo: liga/desliga e escolhe um preset."""
+    nomes = list(PRESETS_EQ)
+    i = escolher(f"Equalizador ({'ligado' if eq['ligado'] else 'desligado'}, {nome_eq(eq)})",
+                 ["Desligar" if eq["ligado"] else "Ligar"] + [f"Preset: {n}" for n in nomes])
+    if i is None:
+        return
+    if i == 0:
+        eq["ligado"] = not eq["ligado"]
+    else:
+        _usar_preset(eq, nomes[i - 1])
+    salvar_cfg()
+    aplicar_eq_no_player(eq)
+    ok(f"Equalizador {'ligado' if eq['ligado'] else 'desligado'} ({nome_eq(eq)}).")
+
+
+@submenu
+def tela_equalizador() -> None:
+    """Equalizador de 10 bandas: ←→ escolhe a banda (ou o pré-amplificador), ↑↓ sobe e desce 1 dB. Fica salvo,
+    vale para tudo o que tocar e muda na hora a música que está tocando."""
+    eq = equalizador()
+    if not setas_ativas():
+        _equalizador_numerico(eq)
+        return
+    sel, recado, nomes = 1, "", list(PRESETS_EQ)
+    fd = sys.stdin.fileno()
+    antigo = termios.tcgetattr(fd)
+    limpar()
+    _cursor(False)
+    try:
+        tty.setcbreak(fd)
+        while True:
+            _desenhar_eq(eq, sel, recado)
+            tecla, recado, mudou = ler_tecla(), "", True
+            if tecla in ("esq", "dir"):
+                sel, mudou = (sel + (1 if tecla == "dir" else -1)) % 11, False
+            elif tecla in ("cima", "baixo", "+", "-"):
+                passo = 1 if tecla in ("cima", "+") else -1
+                if sel == 0:
+                    eq["pre"] = max(-LIMITE_EQ, min(LIMITE_EQ, eq["pre"] + passo))
+                else:
+                    eq["bandas"][sel - 1] = max(-LIMITE_EQ, min(LIMITE_EQ, eq["bandas"][sel - 1] + passo))
+                eq["ligado"] = True  # mexer já liga
+            elif tecla in ("p", "P"):
+                atual = nomes.index(nome_eq(eq)) if nome_eq(eq) in nomes else 0
+                _usar_preset(eq, nomes[(atual + (1 if tecla == "p" else -1)) % len(nomes)])
+            elif tecla in (" ", "l"):
+                eq["ligado"] = not eq["ligado"]
+            elif tecla == "0":
+                if sel == 0:
+                    eq["pre"] = 0
+                else:
+                    eq["bandas"][sel - 1] = 0
+            elif tecla == "z":
+                _usar_preset(eq, "Plano")
+                eq["pre"] = 0
+            elif tecla in ("enter", "esc", "q", "backspace"):
+                break
+            else:
+                mudou = False
+            if mudou:
+                if nome_eq(eq) == "personalizado":
+                    eq["preset"] = "personalizado"
+                salvar_cfg()
+                if aplicar_eq_no_player(eq):
+                    recado = "♪ Já está valendo na música que está tocando."
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
+        _cursor(True)
+    limpar()
 
 
 def tocar_mpv(alvos: list, aleatorio: bool = False, playlist: Path | None = None, stream: bool = False,
@@ -5866,18 +6170,18 @@ def spotify_para_buscas(url: str) -> list:
     return buscas
 
 
-def baixar_alvo(alvo: str, formato: str | None = None) -> None:
-    """Baixa link do YouTube/SoundCloud/etc., link do Spotify ou termo de busca."""
+def baixar_alvo(alvo: str, formato: str | None = None, eq: dict | None = None) -> None:
+    """Baixa link do YouTube/SoundCloud/etc., link do Spotify ou termo de busca (com `eq`, equalizado)."""
     if "open.spotify.com/" in alvo:
         buscas = spotify_para_buscas(alvo)
         ok(f"{len(buscas)} música(s) encontrada(s). Procurando no YouTube...")
         for busca in buscas:
             info(busca)
-            baixar_musica(f"ytsearch1:{busca} audio", formato)
+            baixar_musica(f"ytsearch1:{busca} audio", formato, eq)
     elif alvo.startswith(("http://", "https://")):
-        baixar_musica(alvo, formato)
+        baixar_musica(alvo, formato, eq)
     else:
-        baixar_musica(f"ytsearch1:{alvo}", formato)
+        baixar_musica(f"ytsearch1:{alvo}", formato, eq)
 
 
 @submenu
@@ -5889,23 +6193,29 @@ def menu_musica():
         if r:
             tocar_mpv([r["url"]], stream=True)
 
+    def formato_e_eq():
+        """Formato e equalizador para baixar; (None, None) se a pessoa cancelar."""
+        formato = escolher_formato_musica()
+        eq = perguntar_eq_download() if formato else False
+        return (None, None) if eq is False else (formato, eq)
+
     def buscar_baixar():
         r = escolher_resultado(perguntar("Música ou artista"))
-        formato = escolher_formato_musica() if r else None
-        if formato and baixar_musica(r["url"], formato):
+        formato, eq = formato_e_eq() if r else (None, None)
+        if formato and baixar_musica(r["url"], formato, eq):
             ok(f"Salvo em {pasta_musicas()}")
 
     def baixar_link():
         alvo = perguntar("Link (YouTube, YT Music, SoundCloud, playlist...)")
-        formato = escolher_formato_musica() if alvo else None
+        formato, eq = formato_e_eq() if alvo else (None, None)
         if formato:
-            baixar_alvo(alvo, formato)
+            baixar_alvo(alvo, formato, eq)
 
     def baixar_spotify():
         url = perguntar("Link do Spotify (música, álbum ou playlist pública)")
-        formato = escolher_formato_musica() if url else None
+        formato, eq = formato_e_eq() if url else (None, None)
         if formato:
-            baixar_alvo(url, formato)
+            baixar_alvo(url, formato, eq)
 
     def mix():
         termo = perguntar("Tocar mix de (artista, gênero, 'lofi'...)")
@@ -5966,6 +6276,8 @@ def menu_musica():
     menu("🎵 Música, rádio e podcasts", [
         (lambda: "🎵 Tocando agora (abrir o player)" if player_ativo() else "🎵 Tocando agora (nada tocando)",
          tela_player),
+        (lambda: f"🎚️ Equalizador ({nome_eq(equalizador()) if equalizador()['ligado'] else 'desligado'})",
+         tela_equalizador),
         ("Buscar e tocar (streaming)", buscar_tocar),
         ("Buscar e baixar (escolhe o formato: MP3, Opus, M4A, FLAC...)", buscar_baixar),
         ("Baixar por link (YouTube, SoundCloud, playlist...)", baixar_link),
@@ -19839,6 +20151,8 @@ def _indice_busca() -> list:
         ("📻 Rádio online (mundo todo)", "radio fm estacao radios ao vivo mundo pais internacional idioma legenda",
          menu_radio),
         ("🎙️ Podcasts", "podcast podcasts episodio", menu_podcasts),
+        ("🎚️ Equalizador", "equalizador eq graves agudos bass treble grave pre amplificador som hz db preset",
+         tela_equalizador),
         ("🎵 Tocando agora (player)", "player tocando agora pausar pular proxima musica atual notificacao fila",
          tela_player),
         ("🎬 Vídeos (TikTok, YouTube)", "video videos youtube tiktok instagram baixar download yt-dlp", menu_videos),
@@ -20004,6 +20318,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("baixar", help="baixa áudio (link do YouTube/Spotify ou termo de busca)")
     p.add_argument("alvos", nargs="+")
     p.add_argument("--formato", choices=list(FORMATOS_MUSICA), help="padrão: o último escolhido no menu")
+    p.add_argument("--equalizador", action="store_true", help="grava no arquivo o equalizador ajustado no menu")
     p = sub.add_parser("video", help="baixa vídeos (links do TikTok/YouTube ou termo de busca)")
     p.add_argument("alvos", nargs="+")
     p.add_argument("--formato", choices=list(FORMATOS_VIDEO), help="padrão: o último escolhido no menu")
@@ -20075,7 +20390,7 @@ def main(argv=None) -> int:
                 interpretador.repl()
         elif args.comando == "baixar":
             for alvo in args.alvos:
-                baixar_alvo(alvo, args.formato)
+                baixar_alvo(alvo, args.formato, equalizador() if args.equalizador else None)
         elif args.comando == "video":
             falhas = sum(not baixar_video(alvo, args.formato, args.qualidade) for alvo in args.alvos)
             if falhas:
