@@ -218,6 +218,18 @@ Boas práticas e limites:
 - Compartilhe só o que você pode distribuir: vídeos seus, de domínio público, de licença livre ou com autorização
   de quem tem os direitos.
 
+## Compilar o whisper.cpp e o llama.cpp no celular
+
+A voz para texto, a legenda da rádio e a IA local compilam o código no próprio celular (`clang` + `cmake`). Erro
+`redefinition of 'vcvtnq_s32_f32'` no Termux de **32 bits** (`uname -m` mostra `armv7l` ou `armv8l`)? É uma
+incompatibilidade do ggml, a base dos dois projetos, com o `arm_neon.h` do clang quando ele compila para um
+processador ARMv8: o ggml declara a sua própria versão de funções que o clang também declara. O Termux-Toons
+corrige isso sozinho antes de compilar e, se ainda assim falhar, compila de novo com `-DGGML_NATIVE=OFF` (sem as
+otimizações específicas do processador). Basta atualizar o Termux-Toons e mandar instalar de novo.
+
+À mão, sem atualizar: `cd ~/whisper.cpp && cmake -B build -DGGML_NATIVE=OFF && cmake --build build -j 4 --target
+whisper-cli`.
+
 ## Depuração sem fio (ADB pelo Wi-Fi)
 
 1. Ative as **Opções do desenvolvedor** (Configurações → Sobre o telefone → toque 7 vezes em *Número da versão*).

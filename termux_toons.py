@@ -2289,27 +2289,83 @@ def menu_llm():
     ])
 
 
-def compilar_llama() -> None:
+# ── Compilar projetos do ggml (llama.cpp e whisper.cpp) no Termux ────
+# No bloco "32-bit ARM compatibility" o ggml escreve a sua própria versão de intrinsics NEON que só existem no
+# ARM de 64 bits. Quando o compilador mira um ARMv8 (o -mcpu=native num celular de 64 bits com o Termux de
+# 32 bits), o arm_neon.h do clang já declara uma delas (vcvtnq_s32_f32) e a compilação para com
+# "redefinition of 'vcvtnq_s32_f32'". corrigir_ggml_arm32 renomeia as versões do ggml; se ainda assim não
+# compilar, compilar_ggml tenta de novo sem -mcpu=native (GGML_NATIVE=OFF).
+
+GGML_IMPL = Path("ggml") / "src" / "ggml-cpu" / "ggml-cpu-impl.h"
+
+
+def corrigir_ggml_arm32(repo: Path) -> int:
+    """As funções do bloco de 32 bits viram ggml_<nome>, com um #define levando o nome antigo até elas: o código
+    continua o mesmo de sempre e não bate mais com o arm_neon.h. Devolve quantas trocou (0 = já corrigido)."""
+    arq = repo / GGML_IMPL
+    try:
+        texto = arq.read_text("utf-8")
+    except OSError:
+        return 0
+    inicio = texto.find("#if !defined(__aarch64__)")
+    fim = texto.find("#endif // !defined(__aarch64__)", inicio)
+    if inicio < 0 or fim < 0:
+        return 0
+    marca = "// Termux-Toons: nome próprio, não bate com o arm_neon.h"
+    bloco, trocas = re.subn(r"^inline static ([\w ]+?) (v\w+)\(",
+                            lambda m: f"#define {m[2]} ggml_{m[2]}  {marca}\ninline static {m[1]} ggml_{m[2]}(",
+                            texto[inicio:fim], flags=re.M)
+    if trocas:
+        arq.write_text(texto[:inicio] + bloco + texto[fim:], "utf-8")
+    return trocas
+
+
+def atualizar_repo_ggml(repo: Path, url: str) -> None:
+    """Clona, ou atualiza tirando antes a correção (senão o git pull recusa o arquivo mexido)."""
     for cmd, pacote in (("git", "git"), ("cmake", "cmake"), ("clang", "clang"), ("make", "make")):
         if not garantir_cmd(cmd, pacote):
             raise ToonsError(f"'{cmd}' é necessário para compilar.")
-    if (LLAMA_DIR / ".git").exists():
-        info("Atualizando o código do llama.cpp...")
-        rodar(["git", "-C", LLAMA_DIR, "pull", "--ff-only"])
+    if (repo / ".git").exists():
+        info(f"Atualizando o código do {repo.name}...")
+        rodar(["git", "-C", repo, "checkout", "--", str(GGML_IMPL)], capturar=True)
+        rodar(["git", "-C", repo, "pull", "--ff-only"])
     else:
-        rodar(["git", "clone", "--depth", "1", "https://github.com/ggml-org/llama.cpp", LLAMA_DIR], check=True)
-    build = LLAMA_DIR / "build"
-    configurar = ["cmake", "-S", LLAMA_DIR, "-B", build, "-DCMAKE_BUILD_TYPE=Release"]
+        rodar(["git", "clone", "--depth", "1", url, repo], check=True)
+    if corrigir_ggml_arm32(repo) and platform.machine().startswith("arm"):  # armv7l/armv8l = Termux de 32 bits
+        info("Ajustei o ggml para compilar com o clang no ARM de 32 bits.")
+
+
+def compilar_ggml(repo: Path, alvos: list, pergunta_jobs: str = "", extras_se_falhar: list | None = None) -> Path:
+    """Configura (com `extras_se_falhar` numa segunda tentativa) e compila; se a compilação falhar, tenta uma vez
+    sem -mcpu=native. Devolve a pasta build."""
+    build = repo / "build"
+    configurar = ["cmake", "-S", repo, "-B", build, "-DCMAKE_BUILD_TYPE=Release"]
     if rodar(configurar).returncode != 0:
-        # Versões novas usam OpenSSL e as antigas libcurl só para baixar modelos: dá para desligar.
-        aviso("Configuração falhou; tentando de novo sem suporte a HTTPS embutido...")
-        rodar(configurar + ["-DLLAMA_OPENSSL=OFF", "-DLLAMA_CURL=OFF"], check=True)
+        if not extras_se_falhar:
+            raise ToonsError("A configuração do cmake falhou (veja as mensagens acima).")
+        aviso("A configuração falhou; tentando de novo com opções mais simples...")
+        configurar += extras_se_falhar
+        rodar(configurar, check=True)
     nucleos = os.cpu_count() or 4
-    jobs = perguntar_int("Compilar com quantos processos paralelos? (menos = menos RAM)", min(4, nucleos), 1, nucleos)
-    info("Compilando... isso pode levar de 10 a 30 minutos. Deixe a tela ligada.")
+    jobs = perguntar_int(pergunta_jobs or "Compilar com quantos processos paralelos?", min(4, nucleos), 1, nucleos)
+    compilar = ["cmake", "--build", build, "--config", "Release", "-j", str(jobs), "--target", *alvos]
+    if rodar(compilar).returncode == 0:
+        return build
+    aviso("A compilação falhou. Tentando de novo sem as otimizações específicas deste processador "
+          "(GGML_NATIVE=OFF: fica um pouco mais lento, mas funciona em mais celulares)...")
+    rodar(configurar + ["-DGGML_NATIVE=OFF"], check=True)
+    rodar(compilar, check=True)
+    return build
+
+
+def compilar_llama() -> None:
+    atualizar_repo_ggml(LLAMA_DIR, "https://github.com/ggml-org/llama.cpp")
+    info("A compilação leva de 10 a 30 minutos. Deixe a tela ligada.")
     t0 = time.time()
-    rodar(["cmake", "--build", build, "--config", "Release", "-j", str(jobs),
-           "--target", "llama-cli", "llama-server"], check=True)
+    # se a configuração falhar: versões novas usam OpenSSL e as antigas libcurl só para baixar modelos
+    build = compilar_ggml(LLAMA_DIR, ["llama-cli", "llama-server"],
+                          "Compilar com quantos processos paralelos? (menos = menos RAM)",
+                          ["-DLLAMA_OPENSSL=OFF", "-DLLAMA_CURL=OFF"])
     ok(f"Compilado em {(time.time() - t0) / 60:.1f} min: {build / 'bin'}")
 
 
@@ -16419,19 +16475,9 @@ def whisper_bin() -> Path | None:
 
 
 def compilar_whisper() -> None:
-    for cmd, pacote in (("git", "git"), ("cmake", "cmake"), ("clang", "clang"), ("make", "make")):
-        if not garantir_cmd(cmd, pacote):
-            raise ToonsError(f"'{cmd}' é necessário para compilar.")
-    if (WHISPER_DIR / ".git").exists():
-        rodar(["git", "-C", WHISPER_DIR, "pull", "--ff-only"])
-    else:
-        rodar(["git", "clone", "--depth", "1", "https://github.com/ggml-org/whisper.cpp", WHISPER_DIR], check=True)
-    build = WHISPER_DIR / "build"
-    rodar(["cmake", "-S", WHISPER_DIR, "-B", build, "-DCMAKE_BUILD_TYPE=Release"], check=True)
-    nucleos = os.cpu_count() or 4
-    jobs = perguntar_int("Compilar com quantos processos paralelos?", min(4, nucleos), 1, nucleos)
-    info("Compilando o whisper.cpp (uns 5 a 15 minutos)...")
-    rodar(["cmake", "--build", build, "--config", "Release", "-j", str(jobs), "--target", "whisper-cli"], check=True)
+    atualizar_repo_ggml(WHISPER_DIR, "https://github.com/ggml-org/whisper.cpp")
+    info("A compilação do whisper.cpp leva uns 5 a 15 minutos.")
+    compilar_ggml(WHISPER_DIR, ["whisper-cli"])
     ok(f"Pronto: {whisper_bin()}")
 
 
