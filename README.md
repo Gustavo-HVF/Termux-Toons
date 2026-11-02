@@ -303,9 +303,11 @@ Em *Música → 🔎 Descobrir a música de um arquivo*: escolha um áudio ou v�
 
 ### Equalizador
 
-Em *Música → 🎚️ Equalizador* (ou `e` no player): 10 bandas, de 31 Hz a 16 kHz, e o pré-amplificador, de -12 a +12 dB, como o do VLC.
+Em *Música → 🎚️ Equalizador* (ou `e` no player): 10 bandas, de 31 Hz a 16 kHz, e o pré-amplificador, de -20 a +20 dB, como o do VLC.
 
-- `←` `→` escolhem a banda (o pré-amplificador fica antes da de 31 Hz) e `↑` `↓` sobem ou descem 1 dB.
+- **Com o dedo**: arraste para cima ou para baixo numa banda (ou no pré-amplificador) para subir ou descer, 1 dB por linha arrastada. Tocar escolhe a banda, e tocar numa altura do controle já põe aquele valor.
+- Pelo teclado: `←` `→` escolhem a banda (o pré-amplificador fica antes da de 31 Hz) e `↑` `↓` sobem ou descem 1 dB.
+- Com muito reforço (mais de +9 dB somando o pré-amplificador), a tela avisa para baixar o pré-amplificador se o som distorcer.
 - `p`/`P` trocam o preset (Graves, Agudos, Graves e agudos, Rock, Pop, Eletrônica, Reggae, Clássica, Voz e podcast, Fone de ouvido, Volume baixo). Os presets que reforçam baixam um pouco o pré-amplificador para não distorcer.
 - `Espaço` liga e desliga, `0` zera a banda escolhida, `z` zera tudo e `Enter` sai. Fica salvo.
 - **Ligado, tudo o que tocar passa por ele** (músicas, playlists, rádio, podcast), e a mudança vale na hora na música que está tocando.
