@@ -276,6 +276,10 @@ def ler_tecla() -> str:
                 espera = 0.05
                 if len(seq) >= 2 and (seq[-1:].isalpha() or seq.endswith(b"~")):
                     break
+            if seq.startswith(b"[<") and seq[-1:] in (b"M", b"m"):  # toque na tela (com o mouse ligado: \033[?1000h)
+                botao, x, y = (seq[2:-1].split(b";") + [b"", b"", b""])[:3]
+                return f"toque:{int(x)}:{int(y)}" if seq.endswith(b"M") and botao == b"0" and x.isdigit() and \
+                    y.isdigit() else ""
             return _SEQUENCIAS.get(seq, "" if seq else "esc")
         if ch in (b"\r", b"\n"):
             return "enter"
@@ -298,6 +302,16 @@ def _cursor(visivel: bool) -> None:
 
 
 atexit.register(_cursor, True)
+
+
+def _mouse(ligado: bool) -> None:
+    """Liga ou desliga os toques na tela (o Termux os manda como cliques do mouse)."""
+    if sys.stdout.isatty():
+        sys.stdout.write("\033[?1000h\033[?1006h" if ligado else "\033[?1000l\033[?1006l")
+        sys.stdout.flush()
+
+
+atexit.register(_mouse, False)  # se algo der errado no meio, o terminal não fica mandando cliques
 
 
 def _sem_ansi(texto: str) -> str:
@@ -5585,21 +5599,73 @@ def _acao_mpv(*comando) -> str:
     return shlex.join([sys.executable, "-c", codigo])
 
 
-def notificar_player(f: dict) -> None:
-    """Notificação de mídia com os botões: ⏮ ⏸ ▶ ⏭ e, abaixo, +30 s (música) e Parar."""
+CAPAS_DIR = DATA_DIR / "capas"
+
+
+def capa_da_faixa(caminho: str, radio: dict | None = None) -> Path | None:
+    """Capa quadrada de 256 px, guardada em ~/.termux_toons/capas: a embutida no arquivo, a miniatura do YouTube
+    ou o ícone da rádio. None se não houver (um arquivo vazio no cache lembra que não tem)."""
+    if not caminho:
+        return None
+    destino = CAPAS_DIR / f"{hashlib.sha1(caminho.encode()).hexdigest()[:16]}.jpg"
+    if destino.exists():
+        return destino if destino.stat().st_size else None
+    video = re.search(r"(?:youtube\.com/(?:watch\?v=|shorts/)|youtu\.be/)([\w-]{11})", caminho)
+    if radio and radio.get("favicon"):
+        origem = radio["favicon"]
+    elif video:
+        origem = f"https://i.ytimg.com/vi/{video[1]}/hqdefault.jpg"
+    else:
+        origem = "" if "://" in caminho else caminho  # arquivo do celular: a capa vem embutida nele
+    CAPAS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = destino.with_name(f".{os.getpid()}-{destino.name}")  # o vigia e a tela podem buscar a mesma capa juntos
+    if origem:
+        rodar(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", origem, "-map", "0:v:0", "-frames:v", "1",
+               "-update", "1", "-vf", "scale=256:256:force_original_aspect_ratio=increase,crop=256:256", str(tmp)],
+              capturar=True, timeout=30, mostrar=False)
+    if not tmp.exists():
+        tmp.write_bytes(b"")
+    tmp.replace(destino)
+    for velha in sorted(CAPAS_DIR.glob("*.jpg"), key=lambda c: c.stat().st_mtime)[:-300]:  # guarda as 300 últimas
+        velha.unlink(missing_ok=True)
+    return destino if destino.stat().st_size else None
+
+
+def _radio_da_fila(f: dict) -> dict | None:
+    """A estação que está tocando (com o ícone dela), se for rádio."""
+    radios = ler_json(RADIO_ATUAL_FILE, []) if f["tipo"] == "radio" else []
+    return radios[f["pos"]] if 0 <= f["pos"] < len(radios) else None
+
+
+def _texto_notificacao(f: dict) -> tuple:
+    """(título, texto) como no cartão de mídia do Android: a música em cima e o artista embaixo, com uma barra de
+    progresso em texto (a barra de verdade o Android só desenha para apps com sessão de mídia)."""
+    if f["tipo"] == "radio":
+        titulo, texto = (f["subtitulo"], f"{f['titulo']} · ao vivo") if f["subtitulo"] else (f["titulo"],
+                                                                                             "Rádio ao vivo")
+    else:
+        titulo = f["titulo"]
+        texto = f["subtitulo"].split(" · ")[0] or f"Música {f['pos'] + 1} de {f['total']}"
+        if f["duracao"]:  # 10 casas: a notificação só é refeita quando a bolinha anda uma casa
+            feito = min(9, int((f["tempo"] or 0) / f["duracao"] * 10))
+            texto += f"   {'━' * feito}●{'─' * (9 - feito)} {fmt_relogio(f['duracao'])}"
+    return titulo, ("⏸ " if f["pausado"] else "") + texto
+
+
+def notificar_player(f: dict, capa: Path | None = None) -> None:
+    """Notificação de mídia parecida com a do Android: capa, música, artista e os botões ⏮ ⏸ ▶ ⏭ e +10 s.
+    Tocando, ela fica presa; pausada, arrastar para o lado para a música."""
     if not tem("termux-notification"):
         return
-    radio = f["tipo"] == "radio"
-    texto = ("⏸ Pausado · " if f["pausado"] else "") + (
-        f["subtitulo"] or ("Rádio ao vivo" if radio else f"Música {f['pos'] + 1} de {f['total']}"))
-    cmd = ["termux-notification", "--id", NOTIFICACAO_PLAYER, "--type", "media", "--alert-once", "--ongoing",
-           "--icon", "radio" if radio else "music_note", "--title", ("📻 " if radio else "🎵 ") + f["titulo"],
-           "--content", texto, "--media-previous", _acao_mpv("playlist-prev"),
-           "--media-pause", _acao_mpv("set_property", "pause", True),
-           "--media-play", _acao_mpv("set_property", "pause", False), "--media-next", _acao_mpv("playlist-next")]
-    botoes = ([] if radio else [("⏩ +30 s", _acao_mpv("seek", 30))]) + [("⏹ Parar", _acao_mpv("quit"))]
-    for n, (rotulo, acao) in enumerate(botoes, 1):
-        cmd += [f"--button{n}", rotulo, f"--button{n}-action", acao]
+    titulo, texto = _texto_notificacao(f)
+    cmd = ["termux-notification", "--id", NOTIFICACAO_PLAYER, "--type", "media", "--alert-once",
+           *([] if f["pausado"] else ["--ongoing"]), "--title", titulo, "--content", texto,
+           *(["--image-path", str(capa)] if capa else []),
+           "--media-previous", _acao_mpv("playlist-prev"), "--media-pause", _acao_mpv("set_property", "pause", True),
+           "--media-play", _acao_mpv("set_property", "pause", False), "--media-next", _acao_mpv("playlist-next"),
+           "--on-delete", _acao_mpv("quit")]
+    if f["tipo"] != "radio":  # no estilo de mídia o Termux:API desenha botão extra como um "+": cabe o "+10 s"
+        cmd += ["--button1", "+10 s", "--button1-action", _acao_mpv("seek", 10)]
     rodar(cmd, capturar=True, timeout=15, mostrar=False)
 
 
@@ -5609,16 +5675,22 @@ def vigiar_player() -> None:
         mpv = Mpv(espera=15)
     except OSError:
         return
-    notificada, anunciada, candidata, vezes = None, None, None, 0
+    notificada, anunciada, candidata, vezes, faixa_da_capa, capa = None, None, None, 0, None, None
     try:
         while True:
             try:
                 f = faixa_atual(mpv)
             except (OSError, ValueError):
                 break  # o mpv fechou: acabou a fila ou alguém mandou parar
-            if (f["titulo"], f["subtitulo"], f["pausado"]) != notificada:
-                notificar_player(f)
-                notificada = (f["titulo"], f["subtitulo"], f["pausado"])
+            trocou = f["caminho"] != faixa_da_capa
+            if trocou:  # a notificação nova sai já, sem esperar a capa (que pode vir da internet)
+                faixa_da_capa, capa = f["caminho"], None
+            chave = (*_texto_notificacao(f), f["pausado"], capa)
+            if chave != notificada:
+                notificar_player(f, capa)
+                notificada = chave
+            if trocou:
+                capa = capa_da_faixa(f["caminho"], _radio_da_fila(f))  # na próxima volta ela entra
             # o que anunciar: a música (na rádio, o que a estação diz que está tocando); espera o título firmar,
             # porque o mpv mostra o nome do arquivo antes de ler as etiquetas
             faixa = f["subtitulo"] if f["tipo"] == "radio" else f["titulo"]
@@ -5759,20 +5831,61 @@ def _fila_player(mpv: Mpv, f: dict, antes: int = 1, depois: int = 4) -> list:
     return fila
 
 
-def _desenhar_player(f: dict, fila: list, legenda: LegendaRadio | None, recado: str, anunciar: bool) -> None:
+_CAPA_TERMINAL: dict = {}  # (capa, largura) → linhas coloridas: desenhar a imagem a cada quadro seria desperdício
+
+
+def _capa_no_terminal(capa: Path | None, largura: int) -> list:
+    """A capa em blocos coloridos (cada '▀' mostra 2 pixels); [] sem capa, sem cores ou sem o Pillow."""
+    if not capa or not _COR or not modulo_existe("PIL"):
+        return []
+    if (capa, largura) not in _CAPA_TERMINAL:
+        try:
+            _CAPA_TERMINAL[(capa, largura)] = imagem_em_blocos(capa, largura)
+        except Exception:  # noqa: BLE001 — imagem estranha: fica sem capa
+            _CAPA_TERMINAL[(capa, largura)] = []
+    return _CAPA_TERMINAL[(capa, largura)]
+
+
+def _desenhar_player(f: dict, fila: list, legenda: LegendaRadio | None, recado: str, anunciar: bool,
+                     capa: Path | None = None) -> dict:
+    """Desenha a tela e devolve onde ficaram os botões e a barra, para os toques: {"botoes": (linha,
+    [(x0, x1, tecla)]), "barra": (linha, x0, x1)} (linhas e colunas contadas a partir de 1, como os toques)."""
     colunas, linhas_tela = shutil.get_terminal_size((60, 24))
     largura = max(20, min(colunas - 4, 56))
+    margem = max(0, (colunas - largura) // 2)
     radio = f["tipo"] == "radio"
     linhas = [_no_centro(_faixa_titulo("📻 Rádio ao vivo" if radio else "🎵 Tocando agora", max(20, min(colunas, 70))),
                          colunas), ""]
-    for parte in textwrap.wrap(f["titulo"], largura)[:2]:
-        linhas.append(_no_centro(f"{NEG}{parte}{RST}", colunas))
-    if f["subtitulo"]:
-        rotulo = f"{AMAR}♪ {f['subtitulo']}{RST}" if radio else f"{DIM}{f['subtitulo']}{RST}"
-        linhas.append(_no_centro(_cortar(rotulo, largura), colunas))
-    elif radio:
-        linhas.append(_no_centro(f"{DIM}(a rádio não informa a música){RST}", colunas))
+    # o cartão: capa à esquerda e, ao lado, a música e o artista (na rádio: a estação e o que ela diz tocar)
+    desenho = _capa_no_terminal(capa, 16) if largura >= 36 else []
+    largura_texto = largura - 18 if desenho else largura
+    textos = [f"{NEG}{p}{RST}" for p in textwrap.wrap(f["titulo"], largura_texto)[:2 if radio else 3]]
+    if radio:
+        textos.append(f"{AMAR}♪ {f['subtitulo']}{RST}" if f["subtitulo"] else f"{DIM}(a rádio não informa a música){RST}")
+    elif f["subtitulo"]:
+        textos.append(f"{DIM}{f['subtitulo']}{RST}")
+    textos = [_cortar(texto, largura_texto) for texto in textos]
+    if desenho:
+        inicio = max(0, (len(desenho) - len(textos)) // 2)
+        for i, bloco in enumerate(desenho):
+            texto = textos[i - inicio] if 0 <= i - inicio < len(textos) else ""
+            linhas.append(" " * margem + bloco + "  " + texto)
+    else:
+        linhas += [_no_centro(texto, colunas) for texto in textos]
     linhas.append("")
+    # os botões, como os do Android, em casas iguais (a casa toda aceita o toque)
+    pausa = "▶" if f["pausado"] else "⏸"
+    botoes = ([("⏮", "p"), (pausa, " "), ("⏭", "n")] if radio else
+              [("⏮", "p"), ("↺10", "esq"), (pausa, " "), ("10↻", "dir"), ("⏭", "n")])
+    casa = largura // len(botoes)
+    linha_botoes, areas = "", []
+    for i, (simbolo, tecla) in enumerate(botoes):
+        rotulo = simbolo.center(casa)
+        linha_botoes += f"{NEG}{CIANO}{rotulo}{RST}" if tecla == " " else f"{NEG}{rotulo}{RST}"
+        areas.append((margem + i * casa + 1, margem + (i + 1) * casa, tecla))
+    indice_botoes = len(linhas)
+    linhas += [" " * margem + linha_botoes, ""]
+    indice_barra = len(linhas)
     linhas += [_no_centro(parte, colunas) for parte in _barra_tempo(f, largura)]
     estado = [f"{AMAR}⏸ pausado{RST}" if f["pausado"] else f"{VERD}▶ tocando{RST}", f"🔊 {round(f['volume'])}%"]
     if f["repetir"]:
@@ -5813,10 +5926,13 @@ def _desenhar_player(f: dict, fila: list, legenda: LegendaRadio | None, recado: 
         else:
             dicas[-1] = junto
     linhas += [""] + [_no_centro(f"{DIM}{d}{RST}", colunas) for d in dicas]
-    linhas = [""] * max(0, (linhas_tela - len(linhas)) // 2) + linhas
+    acima = max(0, (linhas_tela - len(linhas)) // 2)
+    linhas = [""] * acima + linhas
     sys.stdout.write("\033[H" + "\n".join(_cortar(linha, colunas) + "\033[K" for linha in linhas[:linhas_tela])
                      + "\033[J")
     sys.stdout.flush()
+    return {"botoes": (acima + indice_botoes + 1, areas),
+            "barra": (acima + indice_barra + 1, margem + 1, margem + largura) if f["duracao"] else None}
 
 
 def _favoritar_radio(pos: int) -> str:
@@ -5832,7 +5948,7 @@ def _favoritar_radio(pos: int) -> str:
         recado = "Tirada das favoritas."
     else:
         favoritas.append({k: r.get(k, "") for k in ("name", "url_resolved", "codec", "bitrate", "tags",
-                                                     "countrycode", "stationuuid")})
+                                                     "countrycode", "stationuuid", "favicon")})
         recado = "★ Guardada nas favoritas."
     salvar_cfg()
     return recado
@@ -5852,10 +5968,12 @@ def tela_player() -> None:
         return
     c = cfg()
     legenda, recado, parar = None, "", False
+    capas: dict = {}  # caminho → capa; buscada em segundo plano (pode vir da internet)
     fd = sys.stdin.fileno()
     antigo = termios.tcgetattr(fd)
     limpar()
     _cursor(False)
+    _mouse(True)
     try:
         tty.setcbreak(fd)  # o tempo todo: o select vê cada tecla sem esperar Enter
         while True:
@@ -5864,14 +5982,30 @@ def tela_player() -> None:
                 fila = _fila_player(mpv, f)
             except (OSError, ValueError):
                 break  # o mpv fechou: acabou a fila ou alguém parou pela notificação
+            if f["caminho"] and f["caminho"] not in capas:
+                capas[f["caminho"]] = None
+
+                def buscar_capa(caminho=f["caminho"], radio_atual=_radio_da_fila(f)):
+                    capas[caminho] = capa_da_faixa(caminho, radio_atual)
+
+                threading.Thread(target=buscar_capa, daemon=True).start()
             if legenda and legenda.url != f["caminho"] and f["caminho"]:  # trocou de estação
                 traduzir_legenda = legenda.traduzir
                 legenda.fechar()
                 legenda = LegendaRadio(f["caminho"], traduzir_legenda)
-            _desenhar_player(f, fila, legenda, recado, bool(c.get("player_anunciar")))
+            areas = _desenhar_player(f, fila, legenda, recado, bool(c.get("player_anunciar")), capas.get(f["caminho"]))
             if not select.select([fd], [], [], 0.5)[0]:
                 continue
             tecla, recado, radio = ler_tecla(), "", f["tipo"] == "radio"
+            if tecla.startswith("toque:"):  # um toque nos botões vira a tecla deles; na barra, pula para o ponto
+                x, y = map(int, tecla.split(":")[1:])
+                linha_botoes, casas = areas["botoes"]
+                tecla = next((t for x0, x1, t in casas if y == linha_botoes and x0 <= x <= x1), "")
+                if areas["barra"] and y == areas["barra"][0] and areas["barra"][1] <= x <= areas["barra"][2]:
+                    fracao = (x - areas["barra"][1]) / max(1, areas["barra"][2] - areas["barra"][1])
+                    with contextlib.suppress(OSError, ValueError):
+                        mpv("seek", round(fracao * f["duracao"], 1), "absolute")
+                    continue
             try:
                 if tecla == " ":
                     mpv("cycle", "pause")
@@ -5934,6 +6068,7 @@ def tela_player() -> None:
             except (OSError, ValueError):
                 break
     finally:
+        _mouse(False)
         termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
         _cursor(True)
         if legenda:

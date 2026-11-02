@@ -274,9 +274,11 @@ Para voltar depois: **Voltar a tela à resolução de fábrica** / **Voltar um a
 
 Tudo o que você manda tocar (busca, mix, biblioteca, playlist, rádio, podcast) abre a tela **🎵 Tocando agora**:
 
-- O **nome da música** (das etiquetas do arquivo ou do título do vídeo), o artista e o álbum, a barra de tempo, o volume e a fila com a que está tocando marcada.
+- Como o cartão de mídia do Android: a **capa** (a embutida no arquivo, a miniatura do YouTube ou o ícone da rádio, desenhada em cores no terminal com o Pillow), o **nome da música**, o artista e o álbum, os botões ⏮ ↺10 ⏸ 10↻ ⏭ e a barra de tempo; embaixo, o volume e a fila com a que está tocando marcada.
+- **Dá para tocar na tela**: nos botões e na barra de tempo (o toque leva a música até aquele ponto).
 - Teclas: `Espaço` pausa · `←` `→` voltam/avançam 10 s · `↑` `↓` volume · `n`/`p` próxima/anterior · `s` embaralha · `r` repete a fila ou a música · `e` abre o equalizador · `a` liga o **anúncio por voz** ("Tocando agora: Aquarela, de Toquinho") · `Esc` sai e **continua tocando** · `q` para.
-- Fora da tela, a música segue com uma **notificação de mídia** do Android: ⏮ ⏸ ▶ ⏭ e, embaixo, ⏩ +30 s e ⏹ Parar (precisa do pacote `termux-api` e do app Termux:API). Volte à tela em *Música → 🎵 Tocando agora*; o menu principal mostra o que está tocando.
+- Fora da tela, a música segue com uma **notificação de mídia** do Android (precisa do pacote `termux-api` e do app Termux:API): a capa, a música em cima e o artista embaixo, uma barra de progresso em texto (`━━━●────── 3:57`) e os botões ⏮ ⏸ ▶ ⏭ e +10 s (o Termux:API desenha esse 5º botão com um ícone de "+"). Tocando, ela fica presa; **pausada, arraste para o lado para parar** a música. Volte à tela em *Música → 🎵 Tocando agora*; o menu principal mostra o que está tocando.
+- O cartão de mídia completo do Android (barra de progresso de arrastar, *Saída de mídia*, nome do fone e o player nas configurações rápidas) só aparece para apps com uma *sessão de mídia*, e o `termux-notification` não cria uma. Por isso a notificação chega perto, mas não fica idêntica.
 
 Na **rádio** a lista escolhida vira a fila, então `n`/`p` (e ⏭/⏮ da notificação) trocam de estação. A tela mostra a música que a rádio informa (quando informa), `f` guarda nas favoritas e:
 
