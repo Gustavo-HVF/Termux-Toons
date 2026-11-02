@@ -5545,12 +5545,14 @@ def _opcoes_mpv(alvos: list, aleatorio: bool, playlist: Path | None, stream: boo
 
 
 def iniciar_player(alvos: list, aleatorio: bool = False, playlist: Path | None = None, stream: bool = False,
-                   inicio: int = 0, tipo: str = "musica") -> None:
-    """Abre o mpv destacado, com o socket de controle, e o vigia da notificação."""
+                   inicio: int = 0, tipo: str = "musica", titulo: str | None = None) -> None:
+    """Abre o mpv destacado, com o socket de controle, e o vigia da notificação. `titulo` ("Música — Artista")
+    passa por cima das etiquetas do arquivo (ex.: o nome descoberto pelo som)."""
     parar_player()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     cmd = ["mpv", "--no-video", "--input-terminal=no", "--msg-level=all=warn", "--idle=no",
-           f"--input-ipc-server={MPV_SOCKET}", f"--script-opts=toons-tipo={tipo}",
+           f"--input-ipc-server={MPV_SOCKET}", f"--script-opts=toons-tipo={tipo}{',toons-titulo=sim' if titulo else ''}",
+           *([f"--force-media-title={titulo}"] if titulo else []),
            *_opcoes_mpv(alvos, aleatorio, playlist, stream, inicio)]
     with open(log_de("player"), "w") as arq_log:
         proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=arq_log, stderr=subprocess.STDOUT,
@@ -5573,8 +5575,11 @@ def faixa_atual(mpv: Mpv) -> dict:
     meta = {k.lower(): v for k, v in (mpv.get("metadata") or {}).items()}
     pos, total = mpv.get("playlist-pos", -1), mpv.get("playlist-count", 0)
     caminho = mpv.get("path") or mpv.get(f"playlist/{pos}/filename") or ""
-    tipo = (mpv.get("script-opts") or {}).get("toons-tipo", "musica")
-    if tipo == "radio":
+    opcoes = mpv.get("script-opts") or {}
+    tipo = opcoes.get("toons-tipo", "musica")
+    if opcoes.get("toons-titulo"):  # nome dado ao tocar ("Música — Artista"), por cima das etiquetas
+        titulo, _, subtitulo = str(mpv.get("media-title") or caminho).partition(" — ")
+    elif tipo == "radio":
         titulo = mpv.get(f"playlist/{pos}/title") or meta.get("icy-name") or caminho
         subtitulo = str(meta.get("icy-title") or "").strip()
     else:
@@ -6224,7 +6229,7 @@ def tela_equalizador() -> None:
 
 
 def tocar_mpv(alvos: list, aleatorio: bool = False, playlist: Path | None = None, stream: bool = False,
-              inicio: int = 0, tipo: str = "musica") -> None:
+              inicio: int = 0, tipo: str = "musica", titulo: str | None = None) -> None:
     """Toca no player do Termux-Toons (tela 'Tocando agora' e notificação com botões). Sem terminal interativo,
     toca no próprio terminal com os controles do mpv."""
     if not tem("mpv") and not garantir_deps_musica():
@@ -6233,11 +6238,11 @@ def tocar_mpv(alvos: list, aleatorio: bool = False, playlist: Path | None = None
         raise ToonsError("Nada para tocar.")
     if not setas_ativas():
         print(CONTROLES_MPV)
-        rodar(["mpv", "--no-video", "--term-osd-bar", *_opcoes_mpv(alvos, aleatorio, playlist, stream, inicio)],
-              mostrar=False)
+        rodar(["mpv", "--no-video", "--term-osd-bar", *([f"--force-media-title={titulo}"] if titulo else []),
+               *_opcoes_mpv(alvos, aleatorio, playlist, stream, inicio)], mostrar=False)
         return
     info("Abrindo o player...")
-    iniciar_player(alvos, aleatorio, playlist, stream, inicio, tipo)
+    iniciar_player(alvos, aleatorio, playlist, stream, inicio, tipo, titulo)
     tela_player()
 
 
@@ -6317,6 +6322,178 @@ def baixar_alvo(alvo: str, formato: str | None = None, eq: dict | None = None) -
         baixar_musica(alvo, formato, eq)
     else:
         baixar_musica(f"ytsearch1:{alvo}", formato, eq)
+
+
+# ── Descobrir a música pelo som (Chromaprint + AcoustID) ─────────────
+# O Chromaprint tira a "impressão digital" do som (os 2 primeiros minutos, como o fpcalc) e o AcoustID, um
+# serviço aberto e gratuito para uso não comercial, devolve a gravação do MusicBrainz com título, artista e
+# álbum. O Termux não tem o Chromaprint pronto: compilamos só a biblioteca (pequena; a transformada de Fourier
+# vem do FFmpeg do Termux) e o ffmpeg decodifica qualquer arquivo (mp3, mp4, opus...) para ela pelo ctypes.
+
+CHROMAPRINT_DIR = HOME / "chromaprint"
+ACOUSTID_NOVA_CHAVE = "https://acoustid.org/new-application"
+
+
+def biblioteca_chromaprint() -> str | None:
+    """A libchromaprint que o Termux-Toons compilou, ou uma que já exista no sistema."""
+    compilada = CHROMAPRINT_DIR / "build" / "src" / "libchromaprint.so"
+    if compilada.exists():
+        return str(compilada)
+    import ctypes.util
+    return ctypes.util.find_library("chromaprint")
+
+
+def compilar_chromaprint() -> None:
+    for cmd, pacote in (("git", "git"), ("cmake", "cmake"), ("clang", "clang"), ("make", "make"), ("ffmpeg", "ffmpeg")):
+        if not garantir_cmd(cmd, pacote):
+            raise ToonsError(f"'{cmd}' é necessário para compilar.")
+    if (CHROMAPRINT_DIR / ".git").exists():
+        rodar(["git", "-C", CHROMAPRINT_DIR, "pull", "--ff-only"])
+    else:
+        rodar(["git", "clone", "--depth", "1", "https://github.com/acoustid/chromaprint", CHROMAPRINT_DIR], check=True)
+    build = CHROMAPRINT_DIR / "build"
+    configurar = ["cmake", "-S", CHROMAPRINT_DIR, "-B", build, "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_SHARED_LIBS=ON",
+                  "-DBUILD_TOOLS=OFF", "-DBUILD_TESTS=OFF"]
+    if rodar(configurar).returncode != 0:  # a transformada de Fourier vem do FFmpeg; sem ela, da FFTW
+        aviso("A configuração não achou a transformada de Fourier do FFmpeg; tentando com a FFTW...")
+        instalar_pkg("fftw")
+        rodar(configurar + ["-DFFT_LIB=fftw3"], check=True)
+    rodar(["cmake", "--build", build, "-j", str(min(4, os.cpu_count() or 4))], check=True)
+    if not biblioteca_chromaprint():
+        raise ToonsError("O Chromaprint compilou, mas a biblioteca não apareceu em ~/chromaprint/build/src.")
+    ok("Chromaprint pronto.")
+
+
+def impressao_digital(arquivo: Path) -> tuple:
+    """(duração em segundos, impressão digital) do som do arquivo: os 2 primeiros minutos em 11 kHz mono,
+    como o fpcalc faz."""
+    import ctypes
+    lib = ctypes.CDLL(biblioteca_chromaprint())
+    lib.chromaprint_new.restype = ctypes.c_void_p
+    lib.chromaprint_new.argtypes = [ctypes.c_int]
+    lib.chromaprint_start.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    lib.chromaprint_feed.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+    lib.chromaprint_finish.argtypes = [ctypes.c_void_p]
+    lib.chromaprint_get_fingerprint.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p)]
+    lib.chromaprint_dealloc.argtypes = [ctypes.c_void_p]
+    lib.chromaprint_free.argtypes = [ctypes.c_void_p]
+    sonda = rodar(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(arquivo)],
+                  capturar=True, timeout=60, mostrar=False)
+    try:
+        duracao = int(float(sonda.stdout.strip()))
+    except ValueError:
+        raise ToonsError("Não consegui ler esse arquivo (é mesmo um áudio ou vídeo?).") from None
+    pcm = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(arquivo), "-vn", "-ac", "1",
+                          "-ar", "11025", "-t", "120", "-f", "s16le", "-"], capture_output=True, timeout=300).stdout
+    if len(pcm) < 11025 * 2 * 5:
+        raise ToonsError("O arquivo não tem som suficiente (pelo menos 5 segundos) para reconhecer.")
+    contexto = lib.chromaprint_new(1)  # CHROMAPRINT_ALGORITHM_DEFAULT: o que o AcoustID usa
+    try:
+        if not (lib.chromaprint_start(contexto, 11025, 1) and lib.chromaprint_feed(contexto, pcm, len(pcm) // 2)
+                and lib.chromaprint_finish(contexto)):
+            raise ToonsError("O Chromaprint não conseguiu processar o som.")
+        saida = ctypes.c_char_p()
+        if not lib.chromaprint_get_fingerprint(contexto, ctypes.byref(saida)):
+            raise ToonsError("O Chromaprint não devolveu a impressão digital.")
+        impressao = saida.value.decode()
+        lib.chromaprint_dealloc(saida)
+    finally:
+        lib.chromaprint_free(contexto)
+    return duracao, impressao
+
+
+def consultar_acoustid(chave: str, duracao: int, impressao: str) -> list:
+    """Gravações que batem com a impressão digital: [{"certeza", "titulo", "artista", "album"}], da mais
+    provável para a menos."""
+    corpo = urllib.parse.urlencode({"client": chave, "duration": duracao, "fingerprint": impressao,
+                                    "meta": "recordings releasegroups compress", "format": "json"}).encode()
+    try:
+        bruto = pedir_bytes("https://api.acoustid.org/v2/lookup", corpo,
+                            {"Content-Type": "application/x-www-form-urlencoded"}, 40)
+    except ToonsError as e:
+        if "API key" in str(e) or '"code": 4' in str(e):
+            cfg().pop("acoustid_chave", None)  # a próxima vez pergunta de novo
+            salvar_cfg()
+            raise ToonsError("O AcoustID não aceitou a chave. Confira em acoustid.org (a 'API key' do aplicativo) "
+                             "e tente de novo.") from None
+        raise
+    dados = json.loads(bruto.decode("utf-8", errors="replace") or "{}")
+    if dados.get("status") != "ok":
+        raise ToonsError(f"O AcoustID respondeu: {(dados.get('error') or {}).get('message', 'erro')}")
+    achados = {}
+    for resultado in dados.get("results") or []:
+        for gravacao in resultado.get("recordings") or []:
+            if not gravacao.get("title"):
+                continue
+            artistas = "".join(a.get("name", "") + a.get("joinphrase", ", ") for a in gravacao.get("artists") or [])
+            grupos = gravacao.get("releasegroups") or [{}]
+            album = next((g["title"] for g in grupos if g.get("type") == "Album" and not g.get("secondarytypes")),
+                         grupos[0].get("title", ""))
+            item = {"certeza": float(resultado.get("score", 0)), "titulo": gravacao["title"],
+                    "artista": artistas.rstrip(", "), "album": album}
+            chave_item = (item["titulo"].lower(), item["artista"].lower())
+            if chave_item not in achados or achados[chave_item]["certeza"] < item["certeza"]:
+                achados[chave_item] = item
+    return sorted(achados.values(), key=lambda a: a["certeza"], reverse=True)
+
+
+def chave_acoustid() -> str | None:
+    """A chave de aplicativo do AcoustID (grátis); na primeira vez explica como criar e pergunta."""
+    c = cfg()
+    if c.get("acoustid_chave"):
+        return c["acoustid_chave"]
+    info("O AcoustID é gratuito, mas pede uma chave de aplicativo (uma vez só): entre em "
+         f"{ACOUSTID_NOVA_CHAVE} com a conta do MusicBrainz ou do Google, registre um aplicativo com qualquer nome "
+         "(ex.: Termux-Toons) e copie a 'API key'.")
+    if tem("termux-open-url") and confirmar("Abrir a página agora?", True):
+        rodar(["termux-open-url", ACOUSTID_NOVA_CHAVE], capturar=True, timeout=20)
+    chave = perguntar("Cole a API key do AcoustID (Enter cancela)", "").strip()
+    if not chave:
+        return None
+    c["acoustid_chave"] = chave
+    salvar_cfg()
+    return chave
+
+
+def descobrir_musica() -> None:
+    """Escolhe um áudio ou vídeo, descobre a música pelo som e pergunta se quer tocar."""
+    arquivo = escolher_arquivo("Qual música ou vídeo?", tuple(EXTENSOES_AUDIO | EXTENSOES_VIDEO))
+    if not arquivo or not garantir_cmd("ffmpeg"):
+        return
+    if not biblioteca_chromaprint():
+        info("Para reconhecer pelo som o Termux-Toons usa o Chromaprint, que precisa ser compilado uma vez "
+             "(uns 2 minutos).")
+        if not confirmar("Compilar agora?", True):
+            return
+        compilar_chromaprint()
+    chave = chave_acoustid()
+    if not chave:
+        return
+    info(f"Ouvindo {arquivo.name}...")
+    duracao, impressao = impressao_digital(arquivo)
+    info("Procurando no AcoustID...")
+    achados = [a for a in consultar_acoustid(chave, duracao, impressao) if a["certeza"] >= 0.4]
+    titulo_forcado = None
+    if achados:
+        melhor = achados[0]
+        print(f"\n  🎵 {NEG}{melhor['titulo']}{RST}")
+        print(f"     {melhor['artista']}" + (f" {DIM}· {melhor['album']}{RST}" if melhor["album"] else ""))
+        print(f"     {DIM}{round(melhor['certeza'] * 100)}% de certeza{RST}")
+        if len(achados) > 1:
+            print(f"\n  {DIM}Também pode ser:{RST}")
+            for outro in achados[1:4]:
+                print(f"   {DIM}·{RST} {outro['titulo']} — {outro['artista']} {DIM}({round(outro['certeza'] * 100)}%){RST}")
+        titulo_forcado = f"{melhor['titulo']} — {melhor['artista']}"
+    else:
+        aviso("Não reconheci essa música. O AcoustID conhece as músicas inteiras de discos e lançamentos: trechos "
+              "curtos, gravações com barulho, ao vivo e remixes costumam não aparecer.")
+        etiquetas = _etiquetas_audio(arquivo)
+        if etiquetas.get("title"):
+            info(f"As etiquetas do arquivo dizem: {etiquetas['title']}"
+                 + (f" — {etiquetas['artist']}" if etiquetas.get("artist") else ""))
+    print()
+    if confirmar("Deseja tocar?", True):
+        tocar_mpv([arquivo], titulo=titulo_forcado)
 
 
 @submenu
@@ -6413,6 +6590,7 @@ def menu_musica():
          tela_player),
         (lambda: f"🎚️ Equalizador ({nome_eq(equalizador()) if equalizador()['ligado'] else 'desligado'})",
          tela_equalizador),
+        ("🔎 Descobrir a música de um arquivo (pelo som)", descobrir_musica),
         ("Buscar e tocar (streaming)", buscar_tocar),
         ("Buscar e baixar (escolhe o formato: MP3, Opus, M4A, FLAC...)", buscar_baixar),
         ("Baixar por link (YouTube, SoundCloud, playlist...)", baixar_link),
@@ -17121,6 +17299,246 @@ def menu_ocr():
     ])
 
 
+# ── Remover o fundo (deixar só a pessoa) ─────────────────────────────
+# Um modelo de recorte de pessoas roda no próprio celular pelo onnxruntime do Termux (python-onnxruntime):
+# para cada pixel ele diz o quanto é pessoa (0 a 1), e isso vira a transparência. Foto: PNG sem fundo (ou com
+# outro fundo). Vídeo: o ffmpeg tira os quadros, cada um é recortado e o ffmpeg monta o vídeo de novo com o
+# som original. Nada sai do celular; só o modelo é baixado, uma vez.
+
+# nome: (descrição, arquivo, de onde baixar)
+MODELOS_RECORTE = {
+    "u2net": ("Preciso (U²-Net para pessoas, 176 MB)", "u2net_human_seg.onnx",
+              "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net_human_seg.onnx"),
+    "modnet": ("Rápido, bom para vídeo (MODNet, 25 MB)", "modnet.onnx",
+               "https://huggingface.co/Xenova/modnet/resolve/main/onnx/model.onnx"),
+}
+CORES_FUNDO = {"verde": (0, 177, 64), "branco": (255, 255, 255), "preto": (0, 0, 0)}
+
+
+class Recortador:
+    """Acha a pessoa numa imagem: a máscara (0 = fundo, 1 = pessoa) do tamanho da imagem."""
+
+    def __init__(self, modelo: str):
+        import numpy as np
+        import onnxruntime as ort
+        self.np, self.modelo = np, modelo
+        opcoes = ort.SessionOptions()
+        opcoes.intra_op_num_threads = min(4, os.cpu_count() or 4)
+        self.sessao = ort.InferenceSession(str(DATA_DIR / "modelos" / MODELOS_RECORTE[modelo][1]), opcoes,
+                                           providers=["CPUExecutionProvider"])
+        self.entrada = self.sessao.get_inputs()[0].name
+
+    def mascara(self, imagem):
+        """`imagem` em RGB (Pillow) → matriz float32 de 0 a 1, do mesmo tamanho."""
+        from PIL import Image
+        np = self.np
+        largura, altura = imagem.size
+        if self.modelo == "u2net":  # entrada fixa de 320 × 320, normalizada como no ImageNet
+            x = np.asarray(imagem.resize((320, 320), Image.BILINEAR), dtype=np.float32) / 255
+            x = (x - np.array([0.485, 0.456, 0.406], np.float32)) / np.array([0.229, 0.224, 0.225], np.float32)
+        else:  # MODNet: o lado menor com 512 px, os dois múltiplos de 32, valores de -1 a 1
+            escala = 512 / min(largura, altura)
+            tamanho = (max(32, round(largura * escala / 32) * 32), max(32, round(altura * escala / 32) * 32))
+            x = np.asarray(imagem.resize(tamanho, Image.BILINEAR), dtype=np.float32) / 127.5 - 1
+        saida = np.squeeze(self.sessao.run(None, {self.entrada: x.transpose(2, 0, 1)[None]})[0]).astype(np.float32)
+        if self.modelo == "u2net":  # o U²-Net devolve um mapa que precisa ser esticado de 0 a 1
+            saida = (saida - saida.min()) / max(1e-6, float(saida.max() - saida.min()))
+        return np.clip(np.asarray(Image.fromarray(saida).resize((largura, altura), Image.BILINEAR)), 0, 1)
+
+
+def preparar_recorte() -> Recortador | None:
+    """Instala o que falta (onnxruntime, numpy, Pillow), baixa o modelo na primeira vez e o carrega."""
+    if not (garantir_modulo("numpy", pkg_nome="python-numpy")
+            and garantir_modulo("PIL", pip_nome="pillow", pkg_nome="python-pillow")
+            and garantir_modulo("onnxruntime", pkg_nome="python-onnxruntime")):
+        return None
+    c = cfg()
+    if c.get("recorte_modelo") not in MODELOS_RECORTE:
+        nomes = list(MODELOS_RECORTE)
+        i = escolher("Qual modelo de recorte? (é baixado uma vez)", [MODELOS_RECORTE[n][0] for n in nomes], "1")
+        if i is None:
+            return None
+        c["recorte_modelo"] = nomes[i]
+        salvar_cfg()
+    descricao, arquivo, url = MODELOS_RECORTE[c["recorte_modelo"]]
+    destino = DATA_DIR / "modelos" / arquivo
+    if not destino.exists():
+        info(f"Baixando o modelo de recorte: {descricao}...")
+        baixar_arquivo(url, destino)
+    info("Carregando o modelo...")
+    return Recortador(c["recorte_modelo"])
+
+
+def escolher_fundo(video: bool):
+    """'transparente', 'verde', 'branco', 'preto', 'desfoque' ou o Path de uma imagem; None = cancelou."""
+    opcoes = [("transparente", "Transparente (" + ("vídeo WebM com transparência)" if video else "PNG)")),
+              ("verde", "Tela verde (chroma key, para editar)"), ("branco", "Branco"), ("preto", "Preto"),
+              ("desfoque", "Fundo desfocado (modo retrato)"), ("imagem", "Outra imagem do celular...")]
+    i = escolher("Que fundo colocar no lugar?", [rotulo for _, rotulo in opcoes], "2" if video else "1")
+    if i is None:
+        return None
+    return escolher_arquivo("Qual imagem de fundo?", EXT_IMAGEM) if opcoes[i][0] == "imagem" else opcoes[i][0]
+
+
+def compor_recorte(imagem, mascara, fundo):
+    """A pessoa sobre o fundo (Pillow RGB), ou com fundo transparente (RGBA) se `fundo` for 'transparente'."""
+    import numpy as np
+    from PIL import Image, ImageFilter, ImageOps
+    if fundo == "transparente":
+        return Image.fromarray(np.dstack([np.asarray(imagem), (mascara * 255).astype(np.uint8)]), "RGBA")
+    if isinstance(fundo, Path):
+        fundo = ImageOps.fit(Image.open(fundo).convert("RGB"), imagem.size)
+    elif fundo == "desfoque":
+        fundo = imagem.filter(ImageFilter.GaussianBlur(max(imagem.size) / 40))
+    elif isinstance(fundo, str):
+        fundo = Image.new("RGB", imagem.size, CORES_FUNDO[fundo])
+    a = mascara[..., None]
+    mistura = np.asarray(imagem, dtype=np.float32) * a + np.asarray(fundo, dtype=np.float32) * (1 - a)
+    return Image.fromarray(mistura.round().astype(np.uint8), "RGB")
+
+
+def _sobre_xadrez(imagem):
+    """Para a prévia: a imagem transparente sobre um xadrez cinza (como os editores mostram)."""
+    from PIL import Image
+    xadrez = Image.new("RGB", imagem.size, (200, 200, 200))
+    quadro = max(8, min(imagem.size) // 16)
+    for y in range(0, imagem.size[1], quadro):
+        for x in range((y // quadro) % 2 * quadro, imagem.size[0], 2 * quadro):
+            xadrez.paste((150, 150, 150), (x, y, x + quadro, y + quadro))
+    xadrez.paste(imagem, mask=imagem.getchannel("A"))
+    return xadrez
+
+
+def remover_fundo_foto() -> None:
+    arquivo = escolher_arquivo("Qual foto?", EXT_IMAGEM)
+    if not arquivo:
+        return
+    recortador = preparar_recorte()
+    fundo = escolher_fundo(video=False) if recortador else None
+    if fundo is None:
+        return
+    from PIL import Image, ImageOps
+    try:
+        imagem = ImageOps.exif_transpose(Image.open(arquivo)).convert("RGB")
+    except OSError as e:
+        raise ToonsError(f"Não consegui abrir a imagem: {e}") from None
+    info("Procurando a pessoa...")
+    mascara = recortador.mascara(imagem)
+    if mascara.mean() < 0.01:
+        aviso("Não achei ninguém na foto: o recorte saiu quase vazio.")
+    resultado = compor_recorte(imagem, mascara, fundo)
+    transparente = resultado.mode == "RGBA"
+    destino = pasta_saida("Sem fundo") / f"{arquivo.stem}_sem_fundo.{'png' if transparente else 'jpg'}"
+    resultado.save(destino, **({} if transparente else {"quality": 95}))
+    ok(f"Salvo: {destino}")
+    previa = DATA_DIR / "tmp" / "previa_recorte.png"
+    previa.parent.mkdir(parents=True, exist_ok=True)
+    (_sobre_xadrez(resultado) if transparente else resultado).save(previa)
+    print("\n".join(imagem_em_blocos(previa, max(16, min(largura_tela() - 2, 48)))))
+    if confirmar("Abrir a imagem?", True):
+        abrir_arquivo(destino)
+
+
+def _medidas_video(arquivo: Path) -> tuple:
+    """(largura, altura, quadros por segundo em texto, duração) já com o giro do celular aplicado."""
+    proc = rodar(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                  "stream=width,height,r_frame_rate:stream_side_data=rotation:format=duration", "-of", "json",
+                  str(arquivo)], capturar=True, timeout=60, mostrar=False)
+    try:
+        dados = json.loads(proc.stdout)
+        fluxo = dados["streams"][0]
+        largura, altura = int(fluxo["width"]), int(fluxo["height"])
+    except (ValueError, KeyError, IndexError):
+        raise ToonsError("Não achei a imagem desse vídeo.") from None
+    giro = next((abs(int(d.get("rotation", 0))) for d in fluxo.get("side_data_list") or [] if "rotation" in d), 0)
+    if giro in (90, 270):  # o ffmpeg desvira o vídeo gravado em pé ao decodificar
+        largura, altura = altura, largura
+    return largura, altura, fluxo.get("r_frame_rate") or "30", float(dados.get("format", {}).get("duration") or 0)
+
+
+def remover_fundo_video() -> None:
+    arquivo = escolher_arquivo("Qual vídeo?", tuple(EXTENSOES_VIDEO))
+    if not arquivo or not garantir_cmd("ffmpeg"):
+        return
+    recortador = preparar_recorte()
+    fundo = escolher_fundo(video=True) if recortador else None
+    if fundo is None:
+        return
+    from PIL import Image
+    largura, altura, fps, duracao = _medidas_video(arquivo)
+    escala = min(1.0, 1280 / max(largura, altura))  # até 1280 px: o recorte não melhora, só fica mais lento
+    largura, altura = max(2, round(largura * escala / 2) * 2), max(2, round(altura * escala / 2) * 2)
+    num, _, den = fps.partition("/")
+    total = max(1, round(duracao * float(num) / float(den or 1)))
+    transparente = fundo == "transparente"
+    destino = pasta_saida("Sem fundo") / f"{arquivo.stem}_sem_fundo.{'webm' if transparente else 'mp4'}"
+    parcial = destino.with_name(f".{destino.name}")
+    codificar = (["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-b:v", "3M", "-c:a", "libopus"] if transparente
+                 else ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", "-preset", "veryfast", "-c:a", "aac"])
+    leitor = subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(arquivo), "-vf",
+                               f"scale={largura}:{altura}", "-f", "rawvideo", "-pix_fmt", "rgb24", "-"],
+                              stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+    escritor = subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt",
+                                 "rgba" if transparente else "rgb24", "-s", f"{largura}x{altura}", "-r", fps, "-i", "-",
+                                 "-i", str(arquivo), "-map", "0:v", "-map", "1:a?", *codificar, "-shortest",
+                                 "-f", "webm" if transparente else "mp4", str(parcial)], stdin=subprocess.PIPE)
+    info(f"Recortando {total} quadros de {largura}×{altura} (Ctrl+C cancela)...")
+    feitos, anterior, inicio, terminou = 0, None, time.time(), False
+    try:
+        while True:
+            dados = leitor.stdout.read(largura * altura * 3)
+            if len(dados) < largura * altura * 3:
+                break
+            quadro = Image.frombytes("RGB", (largura, altura), dados)
+            mascara = recortador.mascara(quadro)
+            if anterior is not None:  # mistura um pouco do quadro anterior: o contorno pisca menos
+                mascara = 0.8 * mascara + 0.2 * anterior
+            anterior = mascara
+            escritor.stdin.write(compor_recorte(quadro, mascara, fundo).tobytes())
+            feitos += 1
+            resta = (time.time() - inicio) / feitos * max(0, total - feitos)
+            print(f"\r  {barra_horizontal(min(1.0, feitos / total), 20)} {feitos}/{total} quadros · "
+                  f"falta uns {fmt_relogio(resta)}\033[K", end="", flush=True)
+        terminou = True
+    finally:
+        print()
+        with contextlib.suppress(OSError):
+            escritor.stdin.close()
+        if not terminou:
+            for proc in (leitor, escritor):
+                proc.kill()
+        leitor.wait()
+        escritor.wait()
+        if not terminou or escritor.returncode != 0 or feitos == 0:
+            parcial.unlink(missing_ok=True)
+    if escritor.returncode != 0 or feitos == 0:
+        raise ToonsError("O ffmpeg não conseguiu montar o vídeo.")
+    parcial.replace(destino)
+    ok(f"Pronto em {fmt_relogio(time.time() - inicio)}: {destino}")
+    if transparente:
+        info("A galeria mostra o fundo transparente como preto; editores de vídeo mantêm a transparência.")
+    if confirmar("Abrir o vídeo?", True):
+        abrir_arquivo(destino)
+
+
+@submenu
+def menu_remover_fundo():
+    c = cfg()
+
+    def trocar_modelo():
+        c.pop("recorte_modelo", None)
+        if preparar_recorte():
+            ok(f"Modelo: {MODELOS_RECORTE[c['recorte_modelo']][0]}")
+
+    menu("✂️ Remover o fundo (deixar só a pessoa)", [
+        ("🖼️ Foto", remover_fundo_foto),
+        ("🎬 Vídeo", remover_fundo_video),
+        (lambda: f"Trocar o modelo ({MODELOS_RECORTE.get(c.get('recorte_modelo'), ('nenhum ainda',))[0]})",
+         trocar_modelo),
+    ], cabecalho=lambda: print(f"{DIM}Roda no próprio celular: a foto ou o vídeo não vão para a internet. "
+                               f"O resultado fica em Download/Termux-Toons/Sem fundo.{RST}"))
+
+
 @submenu
 def menu_ia():
     ia = ia_config()
@@ -17197,6 +17615,7 @@ def menu_ia():
         ("⚙️ Configurar (Claude, ChatGPT ou Gemini; chave e modelo)", configurar),
         ("🎙️ Voz para texto e texto para voz", menu_voz),
         ("🔍 Ler texto de imagens (OCR)", menu_ocr),
+        ("✂️ Remover o fundo de foto ou vídeo (deixar só a pessoa)", menu_remover_fundo),
         ("🧠 IA local, sem internet (llama.cpp)", menu_llm),
     ], cabecalho=lambda: print(f"{DIM}Na nuvem é preciso uma chave de API do provedor (paga por uso).{RST}"))
 
@@ -20286,6 +20705,10 @@ def _indice_busca() -> list:
         ("📻 Rádio online (mundo todo)", "radio fm estacao radios ao vivo mundo pais internacional idioma legenda",
          menu_radio),
         ("🎙️ Podcasts", "podcast podcasts episodio", menu_podcasts),
+        ("🔎 Descobrir a música pelo som", "descobrir reconhecer identificar qual musica nome da musica shazam som "
+                                            "audio arquivo mp3 mp4 video acoustid", descobrir_musica),
+        ("✂️ Remover o fundo (deixar só a pessoa)", "remover tirar fundo recortar recorte pessoa foto video "
+                                                      "transparente png tela verde chroma key retrato", menu_remover_fundo),
         ("🎚️ Equalizador", "equalizador eq graves agudos bass treble grave pre amplificador som hz db preset",
          tela_equalizador),
         ("🎵 Tocando agora (player)", "player tocando agora pausar pular proxima musica atual notificacao fila",
