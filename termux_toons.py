@@ -278,8 +278,11 @@ def ler_tecla() -> str:
                     break
             if seq.startswith(b"[<") and seq[-1:] in (b"M", b"m"):  # toque na tela (com o mouse ligado: \033[?1000h)
                 botao, x, y = (seq[2:-1].split(b";") + [b"", b"", b""])[:3]
-                return f"toque:{int(x)}:{int(y)}" if seq.endswith(b"M") and botao == b"0" and x.isdigit() and \
-                    y.isdigit() else ""
+                if not (seq.endswith(b"M") and x.isdigit() and y.isdigit()):
+                    return ""
+                if botao in (b"64", b"65"):  # rodinha; no Termux, arrastar o dedo (para cima = rodinha para baixo)
+                    return f"rolar:{'cima' if botao == b'64' else 'baixo'}:{int(x)}:{int(y)}"
+                return f"toque:{int(x)}:{int(y)}" if botao == b"0" else ""
             return _SEQUENCIAS.get(seq, "" if seq else "esc")
         if ch in (b"\r", b"\n"):
             return "enter"
@@ -5230,14 +5233,14 @@ FORMATOS_MUSICA = {
 
 
 # ── Equalizador ──────────────────────────────────────────────────────
-# 10 bandas como as do VLC (de -12 a +12 dB) e o pré-amplificador. Cada banda mexida vira um filtro
+# 10 bandas como as do VLC (de -20 a +20 dB) e o pré-amplificador. Cada banda mexida vira um filtro
 # 'equalizer' do ffmpeg (um pico de 1 oitava em volta da frequência). A mesma cadeia serve para tocar (o mpv
 # recebe --af=lavfi=[...] e muda na hora pelo socket) e para gravar no arquivo baixado: depois do yt-dlp, o
 # ffmpeg converte o arquivo final de novo com o filtro (o yt-dlp pula a conversão quando o áudio já vem no
 # formato pedido, e aí um filtro passado a ele não seria aplicado).
 
 FREQUENCIAS_EQ = [31, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
-LIMITE_EQ = 12
+LIMITE_EQ = 20
 PRESETS_EQ = {  # dB de 31 Hz a 16 kHz
     "Plano": [0] * 10,
     "Graves": [7, 6, 5, 3, 1, 0, 0, 0, 0, 0],
@@ -5260,8 +5263,9 @@ def equalizador() -> dict:
     eq.setdefault("ligado", False)
     eq.setdefault("pre", 0)
     eq.setdefault("preset", "Plano")
-    bandas = [int(g) for g in (eq.get("bandas") or [])][:10]
+    bandas = [max(-LIMITE_EQ, min(LIMITE_EQ, int(g))) for g in (eq.get("bandas") or [])][:10]
     eq["bandas"] = bandas + [0] * (10 - len(bandas))
+    eq["pre"] = max(-LIMITE_EQ, min(LIMITE_EQ, int(eq["pre"])))
     return eq
 
 
@@ -6047,6 +6051,7 @@ def tela_player() -> None:
                     recado = _favoritar_radio(f["pos"])
                 elif tecla == "e":
                     tela_equalizador()  # a música segue tocando; ele muda o som na hora
+                    _mouse(True)  # o equalizador desliga o toque ao sair
                     limpar()
                 elif tecla == "l" and radio:
                     if legenda:
@@ -6100,20 +6105,32 @@ def _barra_pre(pre: int, largura: int, ligado: bool) -> str:
     return f"{cheio}{'━' * pos}{NEG}●{RST}{trilho}{'─' * (largura - 1 - pos)}{RST}"
 
 
-def _desenhar_eq(eq: dict, sel: int, recado: str) -> None:
+def _desenhar_eq(eq: dict, sel: int, recado: str) -> dict:
+    """Desenha o equalizador e devolve onde cada parte ficou na tela, para os toques e o arrastar (linhas e
+    colunas contadas a partir de 1, como os toques chegam)."""
     colunas, linhas_tela = shutil.get_terminal_size((60, 24))
     largura_col = max(4, min(6, (colunas - 6) // 10))
-    recuo = " " * max(0, (colunas - 10 * largura_col) // 2)
+    recuo = max(0, (colunas - 10 * largura_col) // 2)
     ligado = eq["ligado"]
     linhas = [_no_centro(_faixa_titulo("🎚️ Equalizador", max(20, min(colunas, 70))), colunas), ""]
     estado = f"{VERD}● Ligado{RST}" if ligado else f"{DIM}○ Desligado{RST}"
-    linhas += [_no_centro(f"{estado}   Preset: {NEG}{nome_eq(eq)}{RST}", colunas), ""]
+    linhas.append(_no_centro(f"{estado}   Preset: {NEG}{nome_eq(eq)}{RST}", colunas))
+    reforco = max(0, *eq["bandas"]) + eq["pre"]
+    linhas.append(_no_centro(f"{AMAR}⚠ +{reforco} dB de reforço: se distorcer, baixe o pré{RST}", colunas)
+                  if ligado and reforco > 9 else "")
     rotulo_pre = f"{DESTAQUE} Pré-amplificador {RST}" if sel == 0 else " Pré-amplificador "
     largura_pre = max(8, min(30, colunas - 32))
-    linhas += [_no_centro(f"{rotulo_pre} {_barra_pre(eq['pre'], largura_pre, ligado)} {eq['pre']:+d} dB", colunas), ""]
-    # controles em pé: trilho acima da bolinha, cheio (laranja) abaixo, como no VLC
-    altura = max(5, min(13, linhas_tela - 20))
-    linhas.append(recuo + "".join((f"{g:+d}" if g else "0").center(largura_col) for g in eq["bandas"]) + f"{DIM} dB{RST}")
+    texto_pre = f"{rotulo_pre} {_barra_pre(eq['pre'], largura_pre, ligado)} {eq['pre']:+d} dB"
+    margem_pre = max(0, (colunas - _largura(texto_pre)) // 2)
+    indice_pre = len(linhas)
+    linhas += [_no_centro(texto_pre, colunas), ""]
+    # controles em pé: trilho acima da bolinha, cheio (laranja) abaixo, como no VLC; altura ímpar (o 0 no meio)
+    altura = max(5, min(21, linhas_tela - 21))
+    altura -= 1 - altura % 2
+    indice_valores = len(linhas)
+    linhas.append(" " * recuo + "".join((f"{g:+d}" if g else "0").center(largura_col) for g in eq["bandas"])
+                  + f"{DIM} dB{RST}")
+    indice_trilho = len(linhas)
     for r in range(altura):
         linha = ""
         for b, g in enumerate(eq["bandas"]):
@@ -6127,15 +6144,17 @@ def _desenhar_eq(eq: dict, sel: int, recado: str) -> None:
             esquerda = (largura_col - 1) // 2
             linha += " " * esquerda + ch + " " * (largura_col - 1 - esquerda)
         escala = {0: f"+{LIMITE_EQ}", (altura - 1) // 2: "0", altura - 1: f"-{LIMITE_EQ}"}.get(r, "")
-        linhas.append(recuo + linha + f"{DIM} {escala}{RST}")
+        linhas.append(" " * recuo + linha + f"{DIM} {escala}{RST}")
     rotulos = ""
     for b, rotulo in enumerate(ROTULOS_EQ):
         texto = rotulo.center(largura_col)
         rotulos += f"{DESTAQUE}{texto}{RST}" if b + 1 == sel else texto
-    linhas += [recuo + rotulos + f"{DIM} Hz{RST}", ""]
+    indice_rotulos = len(linhas)
+    linhas += [" " * recuo + rotulos + f"{DIM} Hz{RST}", ""]
     linhas.append(_no_centro(f"{AMAR}{recado}{RST}" if recado else "", colunas))
-    teclas = ["←→ escolhe a banda", "↑↓ ajusta 1 dB", "p/P troca o preset", "Espaço liga e desliga",
-              "0 zera a banda", "z zera tudo", "Enter sai"]
+    teclas = ["arraste para cima ou para baixo numa banda", "toque para escolher", "←→ escolhe a banda",
+              "↑↓ ajusta 1 dB", "p/P troca o preset", "Espaço liga e desliga", "0 zera a banda", "z zera tudo",
+              "Enter sai"]
     dicas = [""]
     for tecla in teclas:
         junto = f"{dicas[-1]} · {tecla}" if dicas[-1] else tecla
@@ -6144,10 +6163,34 @@ def _desenhar_eq(eq: dict, sel: int, recado: str) -> None:
         else:
             dicas[-1] = junto
     linhas += [""] + [_no_centro(f"{DIM}{d}{RST}", colunas) for d in dicas]
-    linhas = [""] * max(0, (linhas_tela - len(linhas)) // 2) + linhas
+    acima = max(0, (linhas_tela - len(linhas)) // 2)
+    linhas = [""] * acima + linhas
     sys.stdout.write("\033[H" + "\n".join(_cortar(linha, colunas) + "\033[K" for linha in linhas[:linhas_tela])
                      + "\033[J")
     sys.stdout.flush()
+    return {"pre": (acima + indice_pre + 1, margem_pre + 1, margem_pre + 18, margem_pre + 20,
+                    margem_pre + 19 + largura_pre),
+            "bandas": [(recuo + b * largura_col + 1, recuo + (b + 1) * largura_col) for b in range(10)],
+            "faixa": (acima + indice_valores + 1, acima + indice_rotulos + 1),
+            "trilho": (acima + indice_trilho + 1, altura)}
+
+
+def _toque_eq(areas: dict, x: int, y: int) -> tuple:
+    """(o que foi tocado: 0 = pré-amplificador, 1 a 10 = banda, None = nada; o valor daquele ponto do controle,
+    ou None se o toque foi no nome ou no número)."""
+    linha_pre, rotulo0, rotulo1, barra0, barra1 = areas["pre"]
+    if y == linha_pre and rotulo0 <= x <= barra1:
+        if barra0 <= x <= barra1:
+            return 0, round(-LIMITE_EQ + (x - barra0) / max(1, barra1 - barra0) * 2 * LIMITE_EQ)
+        return 0, None
+    if areas["faixa"][0] <= y <= areas["faixa"][1]:
+        for b, (x0, x1) in enumerate(areas["bandas"]):
+            if x0 <= x <= x1:
+                topo, altura = areas["trilho"]
+                if topo <= y < topo + altura:
+                    return b + 1, round(LIMITE_EQ - (y - topo) * 2 * LIMITE_EQ / (altura - 1))
+                return b + 1, None
+    return None, None
 
 
 def _usar_preset(eq: dict, nome: str) -> None:
@@ -6181,24 +6224,50 @@ def tela_equalizador() -> None:
         _equalizador_numerico(eq)
         return
     sel, recado, nomes = 1, "", list(PRESETS_EQ)
+
+    def definir(alvo: int, valor: int) -> None:  # alvo: 0 = pré-amplificador, 1 a 10 = banda; mexer já liga
+        valor = max(-LIMITE_EQ, min(LIMITE_EQ, valor))
+        if alvo == 0:
+            eq["pre"] = valor
+        else:
+            eq["bandas"][alvo - 1] = valor
+        eq["ligado"] = True
+
+    def valor_de(alvo: int) -> int:
+        return eq["pre"] if alvo == 0 else eq["bandas"][alvo - 1]
+
     fd = sys.stdin.fileno()
     antigo = termios.tcgetattr(fd)
     limpar()
     _cursor(False)
+    _mouse(True)  # toques e o arrastar do dedo (que o Termux manda como a rodinha do mouse)
     try:
         tty.setcbreak(fd)
         while True:
-            _desenhar_eq(eq, sel, recado)
+            areas = _desenhar_eq(eq, sel, recado)
             tecla, recado, mudou = ler_tecla(), "", True
             if tecla in ("esq", "dir"):
                 sel, mudou = (sel + (1 if tecla == "dir" else -1)) % 11, False
             elif tecla in ("cima", "baixo", "+", "-"):
-                passo = 1 if tecla in ("cima", "+") else -1
-                if sel == 0:
-                    eq["pre"] = max(-LIMITE_EQ, min(LIMITE_EQ, eq["pre"] + passo))
+                definir(sel, valor_de(sel) + (1 if tecla in ("cima", "+") else -1))
+            elif tecla.startswith("rolar:"):  # arrastar: 1 dB por linha, na banda onde o dedo encostou
+                _, direcao, x, y = tecla.split(":")
+                alvo = _toque_eq(areas, int(x), int(y))[0]
+                sel = sel if alvo is None else alvo
+                # no Termux o dedo subindo chega como rodinha para baixo; num mouse de verdade, para cima sobe
+                subir = direcao == "baixo" if IS_TERMUX else direcao == "cima"
+                definir(sel, valor_de(sel) + (1 if subir else -1))
+            elif tecla.startswith("toque:"):  # tocar escolhe; tocar numa altura do controle já põe aquele valor
+                _, x, y = tecla.split(":")
+                alvo, valor = _toque_eq(areas, int(x), int(y))
+                if alvo is None:
+                    mudou = False
                 else:
-                    eq["bandas"][sel - 1] = max(-LIMITE_EQ, min(LIMITE_EQ, eq["bandas"][sel - 1] + passo))
-                eq["ligado"] = True  # mexer já liga
+                    sel = alvo
+                    if valor is None:
+                        mudou = False
+                    else:
+                        definir(alvo, valor)
             elif tecla in ("p", "P"):
                 atual = nomes.index(nome_eq(eq)) if nome_eq(eq) in nomes else 0
                 _usar_preset(eq, nomes[(atual + (1 if tecla == "p" else -1)) % len(nomes)])
@@ -6223,6 +6292,7 @@ def tela_equalizador() -> None:
                 if aplicar_eq_no_player(eq):
                     recado = "♪ Já está valendo na música que está tocando."
     finally:
+        _mouse(False)
         termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
         _cursor(True)
     limpar()
