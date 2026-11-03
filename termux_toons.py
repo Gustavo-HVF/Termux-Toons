@@ -319,6 +319,24 @@ def _mouse(ligado: bool) -> None:
 atexit.register(_mouse, False)  # se algo der errado no meio, o terminal não fica mandando cliques
 
 
+def _linha_do_cursor() -> int | None:
+    """Em que linha da tela o cursor está (o terminal responde a ESC[6n com ESC[linha;colunaR). Serve para saber
+    onde ficou uma lista desenhada no meio do texto e achar a opção tocada."""
+    fd = sys.stdin.fileno()
+    antigo = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        sys.stdout.write("\033[6n")
+        sys.stdout.flush()
+        resposta = b""
+        while not re.search(rb"\x1b\[\d+;\d+R", resposta) and select.select([fd], [], [], 0.5)[0]:
+            resposta += os.read(fd, 32)  # pode vir junto o "soltou o dedo" do toque: fica de fora
+        achado = re.search(rb"\x1b\[(\d+);\d+R", resposta)
+        return int(achado.group(1)) if achado else None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
+
+
 def _sem_ansi(texto: str) -> str:
     return _ANSI.sub("", texto)
 
@@ -389,11 +407,12 @@ def _janela(sel: int, topo: int, altura: int, total: int) -> int:
 
 def _lista_inline(msg: str, opcoes: list, sel: int = 0, multipla: bool = False):
     """Lista escolhida com as setas logo abaixo da pergunta (sem limpar a tela)."""
-    dica = "↑↓ · Espaço marca · a todas · Enter" if multipla else "↑↓ e Enter · Esc cancela"
+    dica = "↑↓ · Espaço ou toque marca · a todas · Enter" if multipla else "↑↓ e Enter, ou toque · Esc cancela"
     print(f"{AMAR}?{RST} {msg} {DIM}({dica}){RST}")
     marcadas, topo, desenhadas, resultado = set(), 0, 0, None
     maior = max(_largura(str(op)) for op in opcoes) + (4 if multipla else 0)
     _cursor(False)
+    _mouse(True)  # arrastar o dedo move, tocar escolhe (no Termux:Float não há setas)
     try:
         while True:
             colunas, linhas_tela = shutil.get_terminal_size((60, 24))
@@ -404,8 +423,11 @@ def _lista_inline(msg: str, opcoes: list, sel: int = 0, multipla: bool = False):
             for i in range(topo, topo + altura):
                 caixa = ("[x] " if i in marcadas else "[ ] ") if multipla else ""
                 linhas.append(_linha_opcao(caixa + str(opcoes[i]), i == sel, largura))
+            # rodapé que aceita toque: "✔ pronto" (colunas 4 a 13) e "✖ cancelar" (depois)
+            rodape = f"   {VERD}✔ pronto{RST}   {DIM}✖ cancelar{RST}" if multipla else f"   {DIM}✖ cancelar{RST}"
             if len(opcoes) > altura:
-                linhas.append(f"{DIM}   {sel + 1}/{len(opcoes)}{RST}")
+                rodape += f"{DIM}   {sel + 1}/{len(opcoes)}{RST}"
+            linhas.append(rodape)
             if desenhadas:
                 sys.stdout.write(f"\033[{desenhadas}A\r")
             sys.stdout.write("".join(linha + "\033[K\n" for linha in linhas) + "\033[J")
@@ -413,6 +435,27 @@ def _lista_inline(msg: str, opcoes: list, sel: int = 0, multipla: bool = False):
             desenhadas = len(linhas)
 
             tecla = ler_tecla()
+            if tecla.startswith("rolar:"):  # arrastar o dedo: uma opção por linha arrastada
+                sel = min(len(opcoes) - 1, sel + 1) if tecla.split(":")[1] == "baixo" else max(0, sel - 1)
+                continue
+            if tecla.startswith("toque:"):
+                x, y = map(int, tecla.split(":")[1:])
+                abaixo = _linha_do_cursor()  # o cursor fica logo abaixo do rodapé
+                if abaixo is None:
+                    continue
+                i = y - (abaixo - desenhadas)
+                if 0 <= i < altura:  # numa opção: escolhe (ou marca, se der para escolher várias)
+                    sel = topo + i
+                    if not multipla:
+                        resultado = sel
+                        break
+                    marcadas ^= {sel}
+                elif y == abaixo - 1 and multipla and x <= 13:
+                    resultado = sorted(marcadas) or [sel]
+                    break
+                elif y == abaixo - 1 and x >= (14 if multipla else 4):
+                    break
+                continue
             if tecla in ("enter", "dir"):
                 resultado = (sorted(marcadas) or [sel]) if multipla else sel
                 break
@@ -427,6 +470,7 @@ def _lista_inline(msg: str, opcoes: list, sel: int = 0, multipla: bool = False):
             else:
                 sel = _mover(tecla, sel, len(opcoes), altura)
     finally:
+        _mouse(False)
         if desenhadas:
             sys.stdout.write(f"\033[{desenhadas}A\r\033[J")  # some com a lista
         _cursor(True)
@@ -454,12 +498,18 @@ def confirmar(msg: str, padrao: bool = False) -> bool:
     sim = padrao
     print(f"{AMAR}?{RST} {msg}")
     _cursor(False)
+    _mouse(True)
     try:
         while True:
-            sys.stdout.write(f"\r   {_botoes_sim_nao(sim)}  {DIM}(←→ e Enter){RST}\033[K")
+            sys.stdout.write(f"\r   {_botoes_sim_nao(sim)}  {DIM}(←→ e Enter, ou toque){RST}\033[K")
             sys.stdout.flush()
             tecla = ler_tecla()
-            if tecla in ("esq", "dir", "cima", "baixo", "\t"):
+            if tecla.startswith("toque:"):
+                botao = _botao_sim_nao(tecla)
+                if botao is not None:
+                    sim = botao
+                    break
+            elif tecla in ("esq", "dir", "cima", "baixo", "\t"):
                 sim = not sim
             elif tecla.lower() in ("s", "y"):
                 sim = True
@@ -470,9 +520,18 @@ def confirmar(msg: str, padrao: bool = False) -> bool:
             elif tecla == "enter":
                 break
     finally:
+        _mouse(False)
         _cursor(True)
     sys.stdout.write(f"\r   {VERD}✔{RST} {'Sim' if sim else 'Não'}\033[K\n")
     return sim
+
+
+def _botao_sim_nao(toque: str) -> bool | None:
+    """Qual botão do Sim/Não foi tocado ("   [Sim]  [Não]": colunas 4 a 8 e 11 a 15, na linha do cursor)."""
+    x, y = map(int, toque.split(":")[1:])
+    if y != _linha_do_cursor():
+        return None
+    return True if 4 <= x <= 8 else False if 11 <= x <= 15 else None
 
 
 def confirmar_no_prazo(msg: str, prazo: float) -> bool:
@@ -489,6 +548,7 @@ def confirmar_no_prazo(msg: str, prazo: float) -> bool:
     antigo = termios.tcgetattr(fd)
     sim, esgotou = False, True
     _cursor(False)
+    _mouse(True)
     try:
         tty.setcbreak(fd)  # o tempo todo, para o select ver cada tecla sem esperar Enter
         while (resta := prazo - time.time()) > 0:
@@ -497,13 +557,19 @@ def confirmar_no_prazo(msg: str, prazo: float) -> bool:
             if not select.select([fd], [], [], min(1.0, resta))[0]:
                 continue
             tecla = ler_tecla()
-            if tecla in ("esq", "dir", "cima", "baixo", "\t"):
+            if tecla.startswith("toque:"):
+                botao = _botao_sim_nao(tecla)
+                if botao is not None:
+                    sim, esgotou = botao, False
+                    break
+            elif tecla in ("esq", "dir", "cima", "baixo", "\t"):
                 sim = not sim
             elif tecla.lower() in ("s", "y", "n") or tecla in ("esc", "enter"):
                 sim = tecla.lower() in ("s", "y") or (tecla == "enter" and sim)
                 esgotou = False
                 break
     finally:
+        _mouse(False)
         termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
         _cursor(True)
     fim = f"{DIM}tempo esgotado{RST}" if esgotou else f"{VERD}✔{RST} {'Sim' if sim else 'Não'}"
@@ -635,6 +701,7 @@ def _menu_setas(titulo_menu: str, itens: list, sair: str, cabecalho, sel: int, d
     topo, digitos, t_digito = 0, "", 0.0
     limpar()
     _cursor(False)
+    _mouse(True)  # arrastar o dedo move, tocar abre (no Termux:Float não há setas)
     try:
         while True:
             colunas, linhas_tela = shutil.get_terminal_size((60, 24))
@@ -660,6 +727,7 @@ def _menu_setas(titulo_menu: str, itens: list, sair: str, cabecalho, sel: int, d
             recuo = " " * max(0, (colunas - largura - 4) // 2)
             linhas = [_no_centro(linha, colunas) for linha in cab]
             linhas += [_no_centro(_faixa_titulo(titulo_menu, max(20, min(colunas, 70))), colunas), ""]
+            indice_itens = len(linhas)
             for i in range(topo, topo + altura):
                 rotulo = f"{DIM}{rotulos[i]}{RST}" if i == total - 1 and i != sel else rotulos[i]  # "Voltar" apagado
                 linhas.append(recuo + _linha_opcao(rotulo, i == sel, largura))
@@ -669,16 +737,26 @@ def _menu_setas(titulo_menu: str, itens: list, sair: str, cabecalho, sel: int, d
                     texto = texto[:reserva - 1] + [_cortar(texto[reserva - 1] + " …", largura_desc)]
                 recuo_desc = " " * max(0, (colunas - largura_desc) // 2)
                 linhas += [""] + [f"{recuo_desc}{CIANO}{t}{RST}" for t in texto] + [""] * (reserva - len(texto))
-            rodape = "↑↓ mover · Enter abre · Esc volta"
+            rodape = "arraste ou ↑↓ · toque ou Enter abre · Esc volta"
             if total > altura:
                 rodape += f" · {sel + 1}/{total}"
             linhas += ["", _no_centro(f"{DIM}{rodape}{RST}", colunas)]
-            linhas = [""] * max(0, (linhas_tela - len(linhas)) // 2) + linhas  # sobrando espaço, centraliza na altura
+            acima = max(0, (linhas_tela - len(linhas)) // 2)  # sobrando espaço, centraliza na altura
+            linhas = [""] * acima + linhas
             sys.stdout.write("\033[H" + "\n".join(_cortar(linha, colunas) + "\033[K" for linha in linhas)
                              + "\033[J")
             sys.stdout.flush()
 
             tecla = ler_tecla()
+            if tecla.startswith("rolar:"):  # arrastar o dedo: uma opção por linha arrastada
+                sel = min(total - 1, sel + 1) if tecla.split(":")[1] == "baixo" else max(0, sel - 1)
+                continue
+            if tecla.startswith("toque:"):  # tocar numa opção abre ela
+                linha = int(tecla.split(":")[2]) - (acima + indice_itens + 1)
+                if 0 <= linha < altura:
+                    sel = topo + linha
+                    return None if sel == total - 1 else sel
+                continue
             if tecla in ("enter", "dir", " "):
                 return None if sel == total - 1 else sel
             if tecla in ("esc", "esq", "q", "backspace"):
@@ -693,6 +771,7 @@ def _menu_setas(titulo_menu: str, itens: list, sair: str, cabecalho, sel: int, d
             else:
                 sel = _mover(tecla, sel, total, altura)
     finally:
+        _mouse(False)
         _cursor(True)
 
 
@@ -13927,6 +14006,7 @@ def menu_tradutor():
         ("Trocar o idioma de destino", trocar_idioma),
         ("Traduzir o que está copiado", traduzir_area),
         ("Dicionário (português ou inglês)", dicionario),
+        ("🌐 Traduzir a tela (print → texto → tradução)", menu_traduzir_tela),
         (lambda: f"Falar as traduções em voz alta: {'sim' if c.get('tradutor_falar') else 'não'}",
          lambda: (c.update(tradutor_falar=not c.get("tradutor_falar")), salvar_cfg())),
     ])
@@ -17368,7 +17448,184 @@ def menu_ocr():
         ("Tirar uma foto e ler o texto", lambda: ler_de("foto")),
         ("Ler de uma imagem do celular", lambda: ler_de("arquivo")),
         ("Ler do último print de tela", lambda: ler_de("print")),
+        ("🌐 Traduzir a tela (print → texto → tradução)", menu_traduzir_tela),
     ])
+
+
+# ── Traduzir a tela ──────────────────────────────────────────────────
+# Pega a tela, lê o texto com o OCR (tesseract) e traduz. Jeitos de pegar a tela: esperar a pessoa tirar um
+# print com os botões do celular (não precisa de nada especial; o Termux-Toons pode ficar em segundo plano ou
+# no Termux:Float), capturar direto pelo ADB ou root (screencap) depois de uns segundos para trocar de app, ou
+# usar o último print. A tradução aparece aqui e numa notificação, para ler sem sair do app que está na tela.
+
+IDIOMAS_TELA = {  # código do tesseract: nome (o idioma do texto que está na tela)
+    "eng": "Inglês", "spa": "Espanhol", "fra": "Francês", "deu": "Alemão", "ita": "Italiano", "jpn": "Japonês",
+    "kor": "Coreano", "chi_sim": "Chinês (simplificado)", "chi_tra": "Chinês (tradicional)", "rus": "Russo",
+    "ara": "Árabe", "hin": "Hindi", "tur": "Turco", "por": "Português",
+}
+DESTINOS_TELA = {"pt": "Português", "en": "Inglês", "es": "Espanhol", "fr": "Francês", "it": "Italiano"}
+NOTIFICACAO_TRADUCAO = "toons-traducao"
+
+
+def _pastas_de_print() -> list:
+    s = HOME / "storage" / "shared"
+    return [s / "Pictures" / "Screenshots", s / "DCIM" / "Screenshots", s / "Screenshots"]
+
+
+def esperar_print(desde: float) -> Path:
+    """Espera aparecer um print mais novo que `desde` (os botões do celular) e devolve o arquivo já completo.
+    Ctrl+C desiste."""
+    while True:
+        novos = []
+        for pasta in _pastas_de_print():
+            with contextlib.suppress(OSError):
+                novos += [(arq.stat().st_mtime, arq) for arq in pasta.iterdir()
+                          if arq.suffix.lower() in EXT_IMAGEM and not arq.name.startswith(".")
+                          and arq.stat().st_mtime > desde]
+        if novos:
+            arquivo = max(novos)[1]
+            tamanho = -1
+            while tamanho != arquivo.stat().st_size:  # o Android ainda pode estar gravando
+                tamanho = arquivo.stat().st_size
+                time.sleep(0.5)
+            return arquivo
+        time.sleep(1)
+
+
+def capturar_tela(modo: str, serial: str | None) -> Path:
+    """Tira um print pelo ADB ou root (screencap) para a pasta Download e devolve o arquivo."""
+    nome = ".toons-tela.png"  # com ponto: a galeria não mostra
+    codigo, texto = shell_android(f"screencap -p /sdcard/Download/{nome}", modo, serial)
+    arquivo = pasta_download() / nome
+    if codigo != 0 or not arquivo.exists():
+        raise ToonsError(f"Não consegui capturar a tela: {texto[-200:] or f'código {codigo}'}")
+    return arquivo
+
+
+def _preparar_print(imagem: Path) -> Path:
+    """Print em modo escuro (letra clara em fundo escuro) vira o contrário: o OCR lê bem melhor assim."""
+    with contextlib.suppress(Exception):
+        from PIL import Image, ImageOps
+        cinza = Image.open(imagem).convert("L")
+        if sum(cinza.resize((64, 64)).getdata()) / 4096 < 110:
+            destino = DATA_DIR / "tmp" / "print_ocr.png"
+            destino.parent.mkdir(parents=True, exist_ok=True)
+            ImageOps.invert(cinza).save(destino)
+            return destino
+    return imagem
+
+
+def traduzir_imagem(imagem: Path, notificar_tambem: bool = True) -> str | None:
+    """Lê o texto do print, traduz e mostra aqui (e numa notificação). Devolve a tradução, ou None se não
+    achar texto."""
+    c = cfg()
+    idioma, destino = c.get("tela_idioma", "eng"), c.get("tela_destino", "pt")
+    info(f"Lendo o texto de {imagem.name}...")
+    texto = ocr(_preparar_print(imagem), idioma)
+    if idioma in ("eng", "spa", "fra", "deu", "ita", "por", "tur"):  # o OCR confunde o "I" sozinho com "|"
+        texto = re.sub(r"(?<![\w|])\|(?=\s)", "I", texto)
+    if not texto:
+        aviso("Não achei texto nesse print.")
+        return None
+    try:
+        traducao, _ = traduzir(texto[:4500], destino)
+    except ToonsError as e:  # sem internet: mostra o que leu e segue (no modo contínuo, espera o próximo)
+        print(f"\n{texto}\n")
+        aviso(f"Li o texto, mas não consegui traduzir: {e}")
+        return None
+    print(f"\n{DIM}{texto}{RST}\n\n{NEG}{VERD}{traducao}{RST}\n")
+    if notificar_tambem:  # com quebra de linha o Android mostra o texto inteiro ao abrir a notificação
+        notificar_seguro("🌐 Tradução da tela", f"{traducao[:1500]}\n({IDIOMAS_TELA.get(idioma, idioma)} → "
+                                               f"{DESTINOS_TELA.get(destino, destino)})", nid=NOTIFICACAO_TRADUCAO)
+    return traducao
+
+
+def traduzir_tela(modo: str) -> None:
+    """modo: 'print' (espera um print), 'continuo' (traduz cada print novo), 'captura' (ADB/root) ou 'ultimo'."""
+    c = cfg()
+    idioma = c.get("tela_idioma", "eng")
+    if not garantir_tesseract((idioma,)) or not garantir_storage():
+        return
+    if modo == "ultimo":
+        arquivo = ultimo_print()
+        if not arquivo:
+            raise ToonsError("Não achei prints (pastas Screenshots).")
+    elif modo == "captura":
+        acesso = acesso_shell_android()
+        segundos = c.get("tela_espera", 5)
+        info(f"Troque para o app em {segundos} s: a tela vai ser capturada (o celular vibra).")
+        for resta in range(segundos, 0, -1):
+            print(f"\r  {resta}...\033[K", end="", flush=True)
+            time.sleep(1)
+        print()
+        arquivo = capturar_tela(*acesso)
+        with contextlib.suppress(ToonsError):
+            vibrar(80)
+        try:
+            traducao = traduzir_imagem(arquivo)
+        finally:
+            arquivo.unlink(missing_ok=True)  # o print capturado só serve para ler
+        _depois_da_traducao(traducao)
+        return
+    else:
+        info("Tire um print da tela que quer traduzir (ligar + volume para baixo). Pode sair do Termux: a "
+             "tradução chega numa notificação." + (" Ctrl+C para parar." if modo == "continuo" else ""))
+        desde = time.time()
+        try:
+            while True:
+                print(f"{DIM}Esperando um print novo...{RST}")
+                arquivo = esperar_print(desde)
+                desde = arquivo.stat().st_mtime
+                traducao = traduzir_imagem(arquivo)
+                if modo != "continuo":
+                    break
+        except KeyboardInterrupt:
+            print()
+            return
+        _depois_da_traducao(traducao)
+        return
+    _depois_da_traducao(traduzir_imagem(arquivo))
+
+
+def _depois_da_traducao(traducao: str | None) -> None:
+    if not traducao:
+        return
+    i = escolher("E agora?", ["Copiar a tradução", "Ouvir a tradução", "Pronto"])
+    if i == 0:
+        copiar_texto(traducao)
+    elif i == 1:
+        with contextlib.suppress(ToonsError):
+            falar_em(traducao[:3500], cfg().get("tela_destino", "pt"))
+
+
+@submenu
+def menu_traduzir_tela():
+    c = cfg()
+
+    def idioma_da_tela():
+        codigos = list(IDIOMAS_TELA)
+        i = escolher("Em que idioma está o texto da tela?", list(IDIOMAS_TELA.values()))
+        if i is not None:
+            c["tela_idioma"] = codigos[i]
+            salvar_cfg()
+            garantir_tesseract((codigos[i],))  # já baixa o idioma do OCR
+
+    def traduzir_para():
+        codigos = list(DESTINOS_TELA)
+        i = escolher("Traduzir para", list(DESTINOS_TELA.values()))
+        if i is not None:
+            c["tela_destino"] = codigos[i]
+            salvar_cfg()
+
+    menu("🌐 Traduzir a tela", [
+        ("📸 Esperar eu tirar um print (botões do celular)", lambda: traduzir_tela("print")),
+        ("🔁 Modo contínuo: traduzir cada print novo", lambda: traduzir_tela("continuo")),
+        ("📱 Capturar a tela direto (ADB ou root)", lambda: traduzir_tela("captura")),
+        ("🖼️ Traduzir o último print", lambda: traduzir_tela("ultimo")),
+        (lambda: f"Idioma do texto na tela: {IDIOMAS_TELA.get(c.get('tela_idioma', 'eng'))}", idioma_da_tela),
+        (lambda: f"Traduzir para: {DESTINOS_TELA.get(c.get('tela_destino', 'pt'))}", traduzir_para),
+    ], cabecalho=lambda: print(f"{DIM}Tire um print com os botões do celular e a tradução chega aqui e numa "
+                               f"notificação, sem precisar voltar ao Termux.{RST}"))
 
 
 # ── Remover o fundo (deixar só a pessoa) ─────────────────────────────
@@ -17687,6 +17944,7 @@ def menu_ia():
         ("⚙️ Configurar (Claude, ChatGPT ou Gemini; chave e modelo)", configurar),
         ("🎙️ Voz para texto e texto para voz", menu_voz),
         ("🔍 Ler texto de imagens (OCR)", menu_ocr),
+        ("🌐 Traduzir a tela (print → texto → tradução)", menu_traduzir_tela),
         ("✂️ Remover o fundo de foto ou vídeo (deixar só a pessoa)", menu_remover_fundo),
         ("🧠 IA local, sem internet (llama.cpp)", menu_llm),
     ], cabecalho=lambda: print(f"{DIM}Na nuvem é preciso uma chave de API do provedor (paga por uso).{RST}"))
@@ -21813,6 +22071,8 @@ def _indice_busca() -> list:
         ("💬 Assistente na nuvem (Claude, ChatGPT, Gemini)", "claude chatgpt gpt gemini assistente nuvem api conversar", menu_llm),
         ("🎤 Voz para texto e texto para voz", "voz texto whisper ditado transcrever audio fala tts falar", menu_voz),
         ("🔎 OCR: texto de foto ou print", "ocr texto foto imagem tesseract ler print extrair", menu_ocr),
+        ("🌐 Traduzir a tela", "traduzir tela print captura screenshot ocr texto jogo app idioma tradução",
+         menu_traduzir_tela),
         ("🎮 Diversão e aprendizado", "diversao jogos retro basic cursos livros aprender", menu_diversao),
         ("🎯 Jogos", "jogo jogos 2048 campo minado sudoku forca velha tetris snake adivinhe quiz recorde", menu_jogos),
         ("🎓 Aprender programação", "aprender python bash git basic curso licao exercicio programar programacao", menu_aprender),
