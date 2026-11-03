@@ -23,14 +23,16 @@ Reúne em um único menu:
       apps, resolução da tela (inteira ou por app), fotos, conversor de arquivos, automação por eventos,
       espelhamento e transmissão da tela por link
   13. Internet: e-mail, notícias, downloads (aria2), chat na rede local, Browsh/w3m e encurtador/pastebin
-  14. Inteligência artificial: Claude/ChatGPT/Gemini, LLMs locais (llama.cpp), voz (whisper.cpp) e OCR
-  15. Diversão e aprendizado: jogos (incluindo os retrô), cursos de Python/Bash/Git, BASIC, leitor de
+  14. Meus dados na internet: o que está público sobre você na Receita Federal, Portal da Transparência,
+      Tribunais de Justiça e TRFs, Google, LinkedIn/Instagram/Facebook, Diário Oficial e Lattes
+  15. Inteligência artificial: Claude/ChatGPT/Gemini, LLMs locais (llama.cpp), voz (whisper.cpp) e OCR
+  16. Diversão e aprendizado: jogos (incluindo os retrô), cursos de Python/Bash/Git, BASIC, leitor de
       livros e arte ASCII
-  16. Programação e servidores: ambiente de desenvolvimento, SQLite/MariaDB/PostgreSQL, GitHub, cron,
+  17. Programação e servidores: ambiente de desenvolvimento, SQLite/MariaDB/PostgreSQL, GitHub, cron,
       Minecraft, Jellyfin e Navidrome
-  17. Atualização do Termux e dos repositórios
-  18. Otimização e limpeza (caches, arquivos grandes/duplicados, processos)
-  19. Configurações e diagnóstico
+  18. Atualização do Termux e dos repositórios
+  19. Otimização e limpeza (caches, arquivos grandes/duplicados, processos)
+  20. Configurações e diagnóstico
 
 Uso:
     python termux_toons.py            # menu interativo
@@ -20614,6 +20616,981 @@ def menu_programacao():
 
 
 # ════════════════════════════════════════════════════════════════════
+#  26. Meus dados na internet: o que está público sobre você
+# ════════════════════════════════════════════════════════════════════
+# Junta num lugar só as buscas que mostram o que está público sobre a própria pessoa:
+# Receita Federal, Portal da Transparência, Tribunais de Justiça e TRFs, Google, LinkedIn,
+# Instagram, Facebook, Diário Oficial e Lattes. Quase tudo são links para os sites
+# oficiais e buscas prontas, que abrem no navegador (muitos têm captcha ou login gov.br,
+# e é assim que deve ser). As consultas automáticas usam só APIs públicas: Querido
+# Diário (nome), BrasilAPI (CNPJ), Portal da Transparência (CPF, com a chave da própria
+# pessoa) e Pwned Passwords (só o começo do hash da senha). Os dados digitados ficam na
+# memória e só vão para o celular (arquivo privado do Termux) se a pessoa pedir.
+
+MEUS_DADOS_FILE = DATA_DIR / "meus_dados.json"
+CAMPOS_MEUS_DADOS = [  # (chave, nome do campo, nome curto, exemplo)
+    ("nome", "Nome completo", "nome", "Maria da Silva Souza"),
+    ("cpf", "CPF", "CPF", "123.456.789-09"),
+    ("cidade", "Cidade onde mora (ou morou)", "cidade", "Campinas"),
+    ("uf", "Estado (sigla)", "estado", "SP"),
+    ("email", "E-mail", "e-mail", "maria.souza@gmail.com"),
+    ("telefone", "Celular com DDD", "celular", "(19) 98765-4321"),
+    ("usuario", "Nome de usuário nas redes (@)", "@ das redes", "maria.souza"),
+    ("cnpj", "CNPJ do seu MEI ou empresa (se tiver)", "CNPJ", "12.345.678/0001-95"),
+]
+UFS = {  # sigla: (estado, região do TRF que julga as causas federais dali)
+    "AC": ("Acre", 1), "AL": ("Alagoas", 5), "AP": ("Amapá", 1), "AM": ("Amazonas", 1), "BA": ("Bahia", 1),
+    "CE": ("Ceará", 5), "DF": ("Distrito Federal", 1), "ES": ("Espírito Santo", 2), "GO": ("Goiás", 1),
+    "MA": ("Maranhão", 1), "MT": ("Mato Grosso", 1), "MS": ("Mato Grosso do Sul", 3), "MG": ("Minas Gerais", 6),
+    "PA": ("Pará", 1), "PB": ("Paraíba", 5), "PR": ("Paraná", 4), "PE": ("Pernambuco", 5), "PI": ("Piauí", 1),
+    "RJ": ("Rio de Janeiro", 2), "RN": ("Rio Grande do Norte", 5), "RS": ("Rio Grande do Sul", 4),
+    "RO": ("Rondônia", 1), "RR": ("Roraima", 1), "SC": ("Santa Catarina", 4), "SP": ("São Paulo", 3),
+    "SE": ("Sergipe", 5), "TO": ("Tocantins", 1),
+}
+SITES_TRF = {1: "https://portal.trf1.jus.br/", 2: "https://www.trf2.jus.br/", 3: "https://www.trf3.jus.br/",
+             4: "https://www.trf4.jus.br/", 5: "https://www.trf5.jus.br/", 6: "https://portal.trf6.jus.br/"}
+# 9º dígito do CPF = região fiscal onde ele foi emitido (o 0 é a 10ª região)
+REGIAO_FISCAL_CPF = ["RS", "DF, GO, MS, MT e TO", "AC, AM, AP, PA, RO e RR", "CE, MA e PI", "AL, PB, PE e RN",
+                     "BA e SE", "MG", "ES e RJ", "SP", "PR e SC"]
+ROTULOS_TRANSPARENCIA = {  # campos sim/não da API do Portal da Transparência (o resto vira texto sozinho)
+    "servidor": "servidor público federal", "servidorInativo": "servidor federal aposentado",
+    "pensionistaOuRepresentanteLegal": "pensionista (ou representante legal)",
+    "beneficiarioDiarias": "recebeu diárias de viagem", "contratado": "contratado pelo governo federal",
+    "permissionario": "permissionário", "instituidorPensao": "instituidor de pensão",
+    "sancionadoCEIS": "sanção no CEIS (inidôneos e suspensos)", "sancionadoCNEP": "sanção no CNEP",
+    "sancionadoCEAF": "expulso da administração federal (CEAF)", "favorecidoBolsaFamilia": "Bolsa Família",
+    "favorecidoNovoBolsaFamilia": "Novo Bolsa Família", "favorecidoAuxilioBrasil": "Auxílio Brasil",
+    "favorecidoAuxilioEmergencial": "Auxílio Emergencial", "auxilioEmergencial": "Auxílio Emergencial",
+    "favorecidoBpc": "BPC (benefício de prestação continuada)", "favorecidoPeti": "PETI",
+    "favorecidoSafra": "Garantia-Safra", "favorecidoSeguroDefeso": "Seguro-Defeso",
+    "favorecidoCpgf": "cartão de pagamento do governo", "favorecidoTransferencias": "transferências de recursos",
+    "favorecidoRecursos": "recursos federais", "participanteLicitacao": "participou de licitação",
+    "emitiuNFe": "emitiu nota fiscal para o governo",
+}
+URL_RECEITA_CPF = "https://servicos.receita.fazenda.gov.br/servicos/cpf/consultasituacao/consultapublica.asp"
+URL_RECEITA_CNPJ = "https://solucoes.receita.fazenda.gov.br/Servicos/cnpjreva/Cnpjreva_Solicitacao.asp"
+URL_ECAC = "https://cav.receita.fazenda.gov.br/autenticacao/login"
+URL_REGISTRATO = "https://www.bcb.gov.br/cidadaniafinanceira/registrato"
+URL_TRANSPARENCIA_BUSCA = "https://portaldatransparencia.gov.br/pessoa-fisica/busca/lista"
+URL_TRANSPARENCIA_API = "https://api.portaldatransparencia.gov.br/api-de-dados/pessoa-fisica"
+URL_TRANSPARENCIA_CHAVE = "https://portaldatransparencia.gov.br/api-de-dados/cadastrar-email"
+URL_JUSBR = "https://www.jus.br/"
+URL_DOU_BUSCA = "https://www.in.gov.br/consulta/-/buscar/dou"
+URL_QUERIDO_DIARIO = "https://queridodiario.ok.org.br/"
+URL_QUERIDO_DIARIO_API = "https://queridodiario.ok.org.br/api/gazettes"
+URL_LATTES = "https://buscatextual.cnpq.br/buscatextual/busca.do?metodo=apresentar"
+URL_HIBP = "https://haveibeenpwned.com/"
+URL_GOOGLE_SOBRE_VOCE = "https://myactivity.google.com/results-about-you"
+
+_MEUS_DADOS: dict | None = None
+_MD_PERGUNTOU_GUARDAR = False
+
+
+def meus_dados() -> dict:
+    """O que a pessoa preencheu: fica na memória e, se ela pediu, em ~/.termux_toons/meus_dados.json."""
+    global _MEUS_DADOS
+    if _MEUS_DADOS is None:
+        lido = ler_json(MEUS_DADOS_FILE, {})
+        _MEUS_DADOS = lido if isinstance(lido, dict) else {}
+    return _MEUS_DADOS
+
+
+def _so_digitos(texto) -> str:
+    return re.sub(r"\D", "", str(texto or ""))
+
+
+def cpf_valido(cpf: str) -> bool:
+    d = [int(c) for c in _so_digitos(cpf)]
+    if len(d) != 11 or len(set(d)) == 1:
+        return False
+    # dígitos verificadores: pesos 10..2 (e 11..2), resto da divisão por 11
+    return all(sum(v * (n + 1 - i) for i, v in enumerate(d[:n])) * 10 % 11 % 10 == d[n] for n in (9, 10))
+
+
+def cpf_formatado(cpf: str) -> str:
+    d = _so_digitos(cpf)
+    return f"{d[:3]}.{d[3:6]}.{d[6:9]}-{d[9:]}" if len(d) == 11 else str(cpf)
+
+
+def cpf_mascarado(cpf: str) -> str:
+    """Como os diários oficiais publicam depois da LGPD: ***.456.789-**."""
+    d = _so_digitos(cpf)
+    return f"***.{d[3:6]}.{d[6:9]}-**" if len(d) == 11 else "***"
+
+
+def cnpj_limpo(cnpj: str) -> str:
+    return re.sub(r"[^0-9A-Za-z]", "", str(cnpj or "")).upper()
+
+
+def cnpj_valido(cnpj: str) -> bool:
+    """Aceita o CNPJ numérico e o alfanumérico (letras nas 12 primeiras posições, desde julho de 2026):
+    cada caractere vale o código ASCII menos 48, então os números continuam valendo o próprio dígito."""
+    c = cnpj_limpo(cnpj)
+    if not re.fullmatch(r"[0-9A-Z]{12}\d{2}", c) or len(set(c)) == 1:
+        return False
+    pesos = [6, 5, 4, 3, 2, 9, 8, 7, 6, 5, 4, 3, 2]
+    for n in (12, 13):
+        resto = sum((ord(ch) - 48) * p for ch, p in zip(c[:n], pesos[13 - n:])) % 11
+        if (0 if resto < 2 else 11 - resto) != int(c[n]):
+            return False
+    return True
+
+
+def cnpj_formatado(cnpj: str) -> str:
+    c = cnpj_limpo(cnpj)
+    return f"{c[:2]}.{c[2:5]}.{c[5:8]}/{c[8:12]}-{c[12:]}" if len(c) == 14 else str(cnpj)
+
+
+def _telefone_digitos(tel: str) -> str:
+    """Só o DDD e o número (sem o +55); '' se não parecer um telefone brasileiro."""
+    d = _so_digitos(tel)
+    if len(d) in (12, 13) and d.startswith("55"):
+        d = d[2:]
+    return d if len(d) in (10, 11) else ""
+
+
+def _telefone_variantes(tel: str) -> list:
+    """'(19) 98765-4321' → os jeitos que o número costuma aparecer escrito em páginas."""
+    d = _telefone_digitos(tel)
+    if not d:
+        return [tel] if tel else []
+    ddd, num = d[:2], d[2:]
+    meio = len(num) - 4
+    return [f"({ddd}) {num[:meio]}-{num[meio:]}", d, f"{num[:meio]}-{num[meio:]}"]
+
+
+def _data_br(texto) -> str:
+    try:
+        return datetime.strptime(str(texto)[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        return str(texto or "")
+
+
+def _aspas(texto: str) -> str:
+    return '"' + str(texto).replace('"', "").strip() + '"'
+
+
+def _google(consulta: str, aba: str = "") -> str:
+    return url_com("https://www.google.com/search", q=consulta, tbm=aba)
+
+
+def _sigla_tj(uf: str) -> str:
+    return "TJDFT" if uf == "DF" else f"TJ{uf}"
+
+
+def _site_tj(uf: str) -> str:
+    return f"https://www.{_sigla_tj(uf).lower()}.jus.br/"
+
+
+def _lista_com_e(itens: list) -> str:
+    """['a', 'b', 'c'] → 'a, b e c'."""
+    itens = [str(i) for i in itens]
+    return ", ".join(itens[:-1]) + " e " + itens[-1] if len(itens) > 1 else "".join(itens)
+
+
+def _estados_trf(regiao: int) -> str:
+    return _lista_com_e([s for s, (_, r) in UFS.items() if r == regiao])
+
+
+def _md_validar(chave: str, valor: str) -> str:
+    """Arruma o que foi digitado (formato, maiúsculas...); ToonsError com o motivo se não der."""
+    valor = " ".join(valor.split())
+    if chave == "nome":
+        if len(valor) < 3 or not re.search(r"[^\W\d_]", valor):
+            raise ToonsError("Digite o nome completo.")
+        if " " not in valor:
+            aviso("Com o nome completo (nome e sobrenomes) as buscas acham bem menos homônimos.")
+    elif chave == "cpf":
+        if not cpf_valido(valor):
+            raise ToonsError("CPF inválido: os dígitos verificadores não conferem. Confira os 11 números.")
+        return cpf_formatado(valor)
+    elif chave == "cnpj":
+        if not cnpj_valido(valor):
+            raise ToonsError("CNPJ inválido: os dígitos verificadores não conferem.")
+        return cnpj_formatado(valor)
+    elif chave == "uf":
+        sigla = valor.upper()
+        if sigla not in UFS:
+            sigla = next((s for s, (nome, _) in UFS.items() if sem_acento(nome).lower() == sem_acento(valor).lower()),
+                         "")
+        if not sigla:
+            raise ToonsError("Digite a sigla do estado (ex.: SP, RJ, MG).")
+        return sigla
+    elif chave == "email":
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", valor):
+            raise ToonsError("E-mail inválido (ex.: nome@gmail.com).")
+        return valor.lower()
+    elif chave == "telefone":
+        if not _telefone_digitos(valor):
+            raise ToonsError("Digite o celular com DDD (ex.: 19 98765-4321).")
+        return _telefone_variantes(valor)[0]
+    elif chave == "usuario":
+        valor = valor.split("?")[0].rstrip("/").rsplit("/", 1)[-1].lstrip("@")  # aceita o link do perfil
+        if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", valor):
+            raise ToonsError("Use só letras, números, ponto e _ (ex.: maria.souza).")
+    return valor
+
+
+def _md_perguntar(campo: tuple, atual: str | None) -> str:
+    """Pergunta um campo até vir um valor válido. Enter mantém o atual; '-' apaga ('' = vazio)."""
+    chave, nome, _, exemplo = campo
+    dica = f"ex.: {exemplo}; " + ("'-' apaga" if atual else "Enter pula")
+    while True:
+        resp = perguntar(f"{nome} ({dica})", atual or None)
+        if resp.strip() in ("", "-"):
+            return ""
+        try:
+            return _md_validar(chave, resp)
+        except ToonsError as e:
+            erro(str(e))
+
+
+def _md_guardar() -> None:
+    """Grava no celular se a pessoa já escolheu guardar; se não, pergunta (uma vez por vez que abre o programa)."""
+    global _MD_PERGUNTOU_GUARDAR
+    if MEUS_DADOS_FILE.exists():
+        gravar_json(MEUS_DADOS_FILE, meus_dados(), privado=True)
+        return
+    if _MD_PERGUNTOU_GUARDAR or not meus_dados():
+        return
+    _MD_PERGUNTOU_GUARDAR = True
+    if confirmar("Guardar estes dados neste celular para a próxima vez? (arquivo que só o Termux lê)", False):
+        gravar_json(MEUS_DADOS_FILE, meus_dados(), privado=True)
+        ok(f"Guardado em {MEUS_DADOS_FILE}. Para apagar: 🗑️ Apagar meus dados deste celular.")
+    else:
+        info("Os dados ficam só até você fechar o Termux-Toons.")
+
+
+def _md_exigir(*chaves: str) -> dict | None:
+    """Os dados, pedindo na hora os campos que a busca precisa e ainda estão vazios (None se a pessoa pular)."""
+    d = meus_dados()
+    faltam = [c for c in CAMPOS_MEUS_DADOS if c[0] in chaves and not d.get(c[0])]
+    if faltam:
+        info(f"Para esta busca preciso de: {', '.join(c[2] for c in faltam)}.")
+        for campo in faltam:
+            valor = _md_perguntar(campo, None)
+            if not valor:
+                info("Sem esse dado não dá para fazer esta busca.")
+                return None
+            d[campo[0]] = valor
+        _md_guardar()
+    return d
+
+
+def editar_meus_dados() -> None:
+    d = meus_dados()
+    info("Preencha só o que quiser: cada busca também pede o que faltar na hora.")
+    while True:
+        opcoes = ["✏️ Preencher tudo, um depois do outro"]
+        opcoes += [f"{nome}: {d[chave] if d.get(chave) else DIM + '(vazio)' + RST}"
+                   for chave, nome, _, _ in CAMPOS_MEUS_DADOS]
+        opcoes.append("✔ Pronto")
+        i = escolher("O que preencher ou mudar?", opcoes)
+        if i is None or i == len(opcoes) - 1:
+            return
+        antes = dict(d)
+        for campo in CAMPOS_MEUS_DADOS if i == 0 else [CAMPOS_MEUS_DADOS[i - 1]]:
+            valor = _md_perguntar(campo, d.get(campo[0]))
+            if valor:
+                d[campo[0]] = valor
+            else:
+                d.pop(campo[0], None)
+        if d != antes:
+            _md_guardar()
+
+
+def _md_pasta_relatorios() -> Path:
+    """Downloads/Termux-Toons/Meus dados (sem criar a pasta)."""
+    return (DOWNLOADS / "Termux-Toons" if DOWNLOADS.exists() else DATA_DIR / "saida") / "Meus dados"
+
+
+def apagar_meus_dados() -> None:
+    global _MEUS_DADOS
+    pasta = _md_pasta_relatorios()
+    relatorios = sorted(pasta.glob("meus-dados-*.html")) if pasta.exists() else []
+    if not meus_dados() and not MEUS_DADOS_FILE.exists() and not relatorios:
+        info("Não há dados guardados.")
+    elif confirmar("Apagar os dados preenchidos" + (f" e {len(relatorios)} relatório(s) salvo(s)" if relatorios else "")
+                   + "?", False):
+        MEUS_DADOS_FILE.unlink(missing_ok=True)
+        _MEUS_DADOS = {}
+        for arq in relatorios:
+            arq.unlink(missing_ok=True)
+        ok("Apagado deste celular.")
+    c = cfg()
+    if c.get("transparencia_chave") and confirmar("Apagar também a chave da API do Portal da Transparência?", False):
+        c.pop("transparencia_chave", None)
+        salvar_cfg()
+        ok("Chave apagada.")
+
+
+# ── Links: cada um sabe de quais dados precisa, monta a URL e diz o que copiar para colar no site ──
+
+def _lk(rotulo, desc: str, url, precisa: tuple = (), copiar=None) -> dict:
+    """rotulo/url/copiar podem ser funções que recebem os dados; copiar devolve (nome, valor)."""
+    return {"rotulo": rotulo, "desc": desc, "url": url, "precisa": precisa, "copiar": copiar}
+
+
+def _gl(consulta, aba: str = ""):
+    """Link de busca no Google montado com os dados da pessoa."""
+    return lambda d: _google(consulta(d), aba)
+
+
+def _md_copiar_documento(d: dict):
+    """Nos sites dos tribunais a busca pelo CPF evita os homônimos; sem CPF, vai o nome."""
+    if d.get("cpf"):
+        return "CPF", cpf_formatado(d["cpf"])
+    return ("nome", d["nome"]) if d.get("nome") else None
+
+
+def _md_resolver(lk: dict, d: dict) -> tuple:
+    """(rótulo, url, (nome, valor) a copiar ou None) com os dados de agora."""
+    def valor(campo):
+        return lk[campo](d) if callable(lk[campo]) else lk[campo]
+    return valor("rotulo"), valor("url"), valor("copiar")
+
+
+def _md_rotulo(lk: dict) -> str:
+    d = meus_dados()
+    faltam = [curto for chave, _, curto, _ in CAMPOS_MEUS_DADOS if chave in lk["precisa"] and not d.get(chave)]
+    rotulo = lk["rotulo"](d) if callable(lk["rotulo"]) and not faltam else lk["rotulo"]
+    if callable(rotulo):  # o rótulo depende de um dado que ainda falta: usa o genérico
+        rotulo = rotulo({})
+    return f"{rotulo} {DIM}(pede {', '.join(faltam)}){RST}" if faltam else rotulo
+
+
+def _md_abrir(lk: dict) -> None:
+    d = _md_exigir(*lk["precisa"])
+    if d is None:
+        return
+    _, url, copiar = _md_resolver(lk, d)
+    for linha in textwrap.wrap(lk["desc"], max(30, min(largura_tela(), 80) - 2)):
+        print(f"{DIM}{linha}{RST}")
+    print(f"\n{CIANO}{url}{RST}\n")
+    if copiar and copiar[1]:
+        nome, valor = copiar
+        nome = nome[:1].upper() + nome[1:]
+        if tem("termux-clipboard-set") and copiar_texto(valor, avisar=False):
+            ok(f"{nome} copiado ({valor}): é só colar no site.")
+        else:
+            info(f"{nome} para digitar no site: {valor}")
+    if tem("termux-open-url") or tem("xdg-open"):
+        info("Abrindo no navegador...")
+    abrir_link(url)
+
+
+def _rotulo_tj(d: dict) -> str:
+    return f"Tribunal de Justiça do seu estado ({_sigla_tj(d['uf'])})" if d.get("uf") else \
+        "Tribunal de Justiça do seu estado"
+
+
+def _rotulo_trf(d: dict) -> str:
+    return f"Justiça Federal da sua região (TRF{UFS[d['uf']][1]})" if d.get("uf") else \
+        "Justiça Federal da sua região"
+
+
+def _md_grupos() -> list:
+    """As fontes, na ordem do menu. 'extras' são consultas feitas aqui mesmo (aparecem no topo do grupo)
+    e 'rodape' são ajustes (aparecem no fim)."""
+    nome = lambda d: _aspas(d["nome"])  # noqa: E731 — o nome exato, entre aspas
+    return [
+        {"chave": "receita", "titulo": "🧾 Receita Federal e CPF",
+         "desc": "Situação do CPF, comprovante do CNPJ (MEI), o que a Receita tem no e-CAC e o Registrato do "
+                 "Banco Central: contas, empréstimos e chaves PIX no seu CPF.",
+         "extras": [("🔢 Conferir o CPF aqui (dígitos e região onde foi emitido)", conferir_cpf,
+                     "Confere os dígitos verificadores e mostra a região fiscal de emissão, sem internet."),
+                    ("🏢 Dados públicos do meu CNPJ (endereço, sócios, telefone)", consultar_meu_cnpj,
+                     "Mostra o que qualquer pessoa vê ao consultar o seu CNPJ: no MEI costuma ser o endereço de "
+                     "casa.")],
+         "links": [
+             _lk("Situação cadastral do CPF na Receita",
+                 "Site da Receita Federal: mostra se o CPF está regular, suspenso ou pendente, com o nome e a data "
+                 "de inscrição. Pede a data de nascimento e um captcha; o CPF vai copiado.",
+                 URL_RECEITA_CPF, ("cpf",), lambda d: ("CPF", cpf_formatado(d["cpf"]))),
+             _lk("Comprovante do CNPJ (cartão CNPJ)",
+                 "Cartão CNPJ oficial do seu MEI ou empresa: situação, atividade e o endereço que fica público. "
+                 "O CNPJ vai copiado.", URL_RECEITA_CNPJ, ("cnpj",), lambda d: ("CNPJ", d["cnpj"])),
+             _lk("e-CAC: tudo o que a Receita tem sobre você",
+                 "Com login gov.br: dados cadastrais, declarações, pendências, malha fina e restituição.", URL_ECAC),
+             _lk("Registrato (Banco Central): contas, empréstimos e PIX",
+                 "Com login gov.br e de graça: em quais bancos há conta no seu CPF, empréstimos e dívidas, e as "
+                 "chaves PIX cadastradas. Serve para descobrir conta ou empréstimo feito sem você saber.",
+                 URL_REGISTRATO),
+         ]},
+        {"chave": "transparencia", "titulo": "🏛️ Portal da Transparência",
+         "desc": "Se você aparece como servidor público federal, recebeu benefício (Bolsa Família, BPC, Auxílio "
+                 "Emergencial...), diárias de viagem, ou tem alguma sanção.",
+         "extras": [("⚡ Consulta automática pelo CPF", transparencia_meu_cpf,
+                     "Pergunta à API do Portal da Transparência em quais bases o seu CPF aparece (precisa da chave "
+                     "grátis da API: veja 🔑 no fim da lista).")],
+         "links": [
+             _lk("Buscar pelo seu nome",
+                 "Página de pessoa física do Portal: servidor, benefícios, diárias, sanções e cartão de pagamento.",
+                 lambda d: url_com(URL_TRANSPARENCIA_BUSCA, termo=d["nome"], pagina=1, tamanhoPagina=10), ("nome",)),
+             _lk("Buscar pelo seu CPF",
+                 "A mesma busca pelo CPF: evita confundir você com quem tem o mesmo nome.",
+                 lambda d: url_com(URL_TRANSPARENCIA_BUSCA, termo=cpf_formatado(d["cpf"]), pagina=1,
+                                   tamanhoPagina=10), ("cpf",)),
+         ],
+         "rodape": [(lambda: "🔑 Chave da API: " + ("configurada" if cfg().get("transparencia_chave")
+                                                    else "não configurada"), configurar_chave_transparencia,
+                     "A chave é grátis: cadastre o e-mail no Portal da Transparência e ela chega por e-mail.")]},
+        {"chave": "tribunais", "titulo": "⚖️ Tribunais de Justiça e TRFs",
+         "desc": "Processos com o seu nome ou CPF: Jus.br do CNJ (todos os tribunais, com gov.br), TJ do seu estado, "
+                 "TRF da sua região e os sites que copiam processos (Jusbrasil e Escavador).",
+         "extras": [("🗺️ Outro estado: escolher o TJ ou o TRF", outro_tribunal,
+                     "Para quem morou em outro estado ou tem processo em outro lugar: os 27 TJs e os 6 TRFs.")],
+         "links": [
+             _lk("Jus.br (CNJ): os seus processos em todo o Brasil",
+                 "Portal do Conselho Nacional de Justiça: entre com o gov.br para ver os processos com o seu CPF nos "
+                 "tribunais integrados, ou busque por nome ou número do processo.", URL_JUSBR),
+             _lk(_rotulo_tj,
+                 "Processos estaduais (cível, família, consumidor, criminal, juizados). Abre o site do TJ: entre em "
+                 "Consulta processual e busque pelo CPF ou nome da parte (vai copiado).",
+                 lambda d: _site_tj(d["uf"]), ("uf",), _md_copiar_documento),
+             _lk(_rotulo_trf,
+                 "Justiça Federal: causas contra o INSS, a Caixa e a União (aposentadoria, FGTS, auxílios). Abre o "
+                 "site do TRF: entre em Consulta processual e busque pelo CPF ou nome (vai copiado).",
+                 lambda d: SITES_TRF[UFS[d["uf"]][1]], ("uf",), _md_copiar_documento),
+             _lk("Seu nome nos sites dos tribunais (Google)",
+                 "Decisões, pautas e diários da Justiça com o seu nome em qualquer tribunal (sites .jus.br).",
+                 _gl(lambda d: f"{nome(d)} site:jus.br"), ("nome",)),
+             _lk("Jusbrasil", "Site que copia processos e diários da Justiça: é onde o nome mais costuma aparecer "
+                              "no Google.",
+                 lambda d: url_com("https://www.jusbrasil.com.br/busca", q=nome(d)), ("nome",)),
+             _lk("Escavador", "Junta processos, diários oficiais e currículos Lattes pelo nome.",
+                 lambda d: url_com("https://www.escavador.com/busca", q=d["nome"]), ("nome",)),
+         ]},
+        {"chave": "google", "titulo": "🔎 Google",
+         "desc": "Buscas prontas com o seu nome, CPF, e-mail, celular e @: mostram o que qualquer pessoa acha "
+                 "sobre você, inclusive em PDFs e planilhas esquecidos em sites.",
+         "links": [
+             _lk("Seu nome exato", "Tudo o que o Google achou com o seu nome entre aspas.",
+                 _gl(nome), ("nome",)),
+             _lk("Seu nome + a sua cidade", "Tira os homônimos: só páginas com o nome e a cidade.",
+                 _gl(lambda d: f"{nome(d)} {_aspas(d['cidade'])}"), ("nome", "cidade")),
+             _lk("Seu nome em PDFs e planilhas",
+                 "Listas de aprovados, concursos, atas, processos e cadastros, que costumam expor CPF, endereço e "
+                 "telefone.", _gl(lambda d: f"{nome(d)} (filetype:pdf OR filetype:xls OR filetype:xlsx OR "
+                                            f"filetype:csv OR filetype:doc OR filetype:docx)"), ("nome",)),
+             _lk("Seu CPF em páginas e documentos",
+                 "Se aparecer algum resultado, o seu CPF está exposto em algum site ou documento público.",
+                 _gl(lambda d: f"{_aspas(cpf_formatado(d['cpf']))} OR {_aspas(_so_digitos(d['cpf']))}"), ("cpf",)),
+             _lk("Seu e-mail", "Páginas, listas e cadastros públicos com o seu e-mail.",
+                 _gl(lambda d: _aspas(d["email"])), ("email",)),
+             _lk("Seu celular", "O número escrito dos jeitos mais comuns (com e sem DDD, com e sem traço).",
+                 _gl(lambda d: " OR ".join(map(_aspas, _telefone_variantes(d["telefone"])))), ("telefone",)),
+             _lk("Seu @ de usuário", "Perfis e menções com o mesmo nome de usuário em outros sites.",
+                 _gl(lambda d: _aspas(d["usuario"])), ("usuario",)),
+             _lk("Imagens com o seu nome", "Fotos que o Google liga ao seu nome.", _gl(nome, "isch"), ("nome",)),
+             _lk("Notícias com o seu nome", "Matérias de jornais e sites de notícias.", _gl(nome, "nws"), ("nome",)),
+             _lk("Resultados sobre você (pedir para o Google tirar)",
+                 "Ferramenta do Google, com a sua conta: avisa quando surgem páginas com o seu telefone, e-mail ou "
+                 "endereço e pede para tirá-las da busca.", URL_GOOGLE_SOBRE_VOCE),
+         ]},
+        {"chave": "redes", "titulo": "💼 LinkedIn, Instagram e Facebook",
+         "desc": "O que as redes profissionais e sociais mostram sobre você, inclusive para quem não está logado "
+                 "e para o Google.",
+         "links": [
+             _lk("LinkedIn: buscar pessoas pelo nome",
+                 "Busca de pessoas do LinkedIn (precisa estar logado): o seu perfil e perfis com o mesmo nome.",
+                 lambda d: url_com("https://www.linkedin.com/search/results/people/", keywords=d["nome"]),
+                 ("nome",)),
+             _lk("LinkedIn pelo Google (perfil público)",
+                 "O que qualquer um vê sem login: perfis públicos que o Google indexou.",
+                 _gl(lambda d: f"site:linkedin.com/in {nome(d)}"), ("nome",)),
+             _lk("Instagram: o seu perfil",
+                 "Abre o seu perfil; sem estar logado, mostra só o que é público para todo mundo.",
+                 lambda d: f"https://www.instagram.com/{urllib.parse.quote(d['usuario'])}/", ("usuario",)),
+             _lk("Instagram pelo Google", "Perfis, fotos e marcações com o seu nome que o Google indexou.",
+                 _gl(lambda d: f"site:instagram.com {nome(d)}"), ("nome",)),
+             _lk("Facebook: buscar pessoas pelo nome", "Busca de pessoas do Facebook (precisa estar logado).",
+                 lambda d: url_com("https://www.facebook.com/search/people/", q=d["nome"]), ("nome",)),
+             _lk("Facebook pelo Google", "Perfis, páginas e publicações públicas com o seu nome.",
+                 _gl(lambda d: f"site:facebook.com {nome(d)}"), ("nome",)),
+         ]},
+        {"chave": "diario", "titulo": "📰 Diário Oficial",
+         "desc": "Nomeações, concursos, portarias, editais, licitações e intimações publicados com o seu nome nos "
+                 "diários oficiais da União, dos estados e dos municípios.",
+         "extras": [("⚡ Procurar meu nome nos diários dos municípios", diarios_municipais,
+                     "Consulta a API aberta do Querido Diário e mostra a cidade, a data e o trecho com o seu nome.")],
+         "links": [
+             _lk("Diário Oficial da União (DOU)",
+                 "Busca oficial da Imprensa Nacional pelo nome exato, em todas as seções.",
+                 lambda d: url_com(URL_DOU_BUSCA, q=nome(d), s="todos", exactDate="all", sortType="0"), ("nome",)),
+             _lk("Querido Diário (diários das prefeituras)",
+                 "Diários oficiais de centenas de municípios num lugar só. O nome vai copiado.",
+                 URL_QUERIDO_DIARIO, ("nome",), lambda d: ("nome", d["nome"])),
+             _lk("Diários oficiais pelo Google",
+                 "Publicações com o seu nome nos diários estaduais e municipais que o Google indexou.",
+                 _gl(lambda d: f'{nome(d)} "diário oficial"'), ("nome",)),
+         ]},
+        {"chave": "lattes", "titulo": "🎓 Currículo Lattes",
+         "desc": "Currículo acadêmico na plataforma do CNPq: formação, trabalhos e publicações com o seu nome.",
+         "links": [
+             _lk("Busca do Currículo Lattes (CNPq)",
+                 "Busca oficial por nome; marque 'Demais pesquisadores' para incluir quem não é doutor. O nome vai "
+                 "copiado.", URL_LATTES, ("nome",), lambda d: ("nome", d["nome"])),
+             _lk("Lattes pelo Google",
+                 "Currículos com o seu nome indexados (cada um tem um endereço lattes.cnpq.br/número).",
+                 _gl(lambda d: f"site:lattes.cnpq.br {nome(d)}"), ("nome",)),
+         ]},
+        {"chave": "vazamentos", "titulo": "🔐 Vazamentos de dados",
+         "desc": "Se o seu e-mail ou alguma senha sua apareceu em vazamentos de sites.",
+         "extras": [("🔑 Minha senha já vazou? (a senha não sai do celular)", verificar_senha_vazada,
+                     "Confere na base do Have I Been Pwned mandando só os 5 primeiros caracteres do hash SHA-1 da "
+                     "senha (k-anonimato).")],
+         "links": [
+             _lk("Have I Been Pwned: seu e-mail em vazamentos",
+                 "Mostra em quais vazamentos o seu e-mail apareceu e o que vazou junto (senha, telefone...). O e-mail "
+                 "vai copiado.", URL_HIBP, ("email",), lambda d: ("e-mail", d["email"])),
+         ]},
+        {"chave": "proteger", "titulo": "🧽 Remover ou esconder seus dados",
+         "desc": "Onde pedir para tirar seus dados das buscas e ajustar o que as redes mostram.",
+         "dicas": [
+             "Peça direto ao site: pela LGPD (art. 18) você pode pedir para corrigir, anonimizar ou apagar dados "
+             "desnecessários. Jusbrasil e Escavador têm formulário para isso (procure 'Privacidade' ou 'Remover' no "
+             "rodapé).",
+             "Diário Oficial e processos são públicos por lei e não somem; mas processos em segredo de justiça "
+             "(família, por exemplo) não deveriam aparecer: se aparecerem, avise o tribunal e o site.",
+             "CPF exposto não se troca: confira o Registrato de tempos em tempos e ligue a verificação em duas "
+             "etapas nas suas contas.",
+         ],
+         "links": [
+             _lk("Google: resultados sobre você",
+                 "Pede para tirar da busca páginas com o seu telefone, e-mail ou endereço e avisa quando surgirem "
+                 "novas.", URL_GOOGLE_SOBRE_VOCE),
+             _lk("Google: verificação de privacidade",
+                 "O que a sua conta Google mostra para os outros (perfil, fotos, avaliações no Maps) e o que fica "
+                 "salvo.", "https://myaccount.google.com/privacycheckup"),
+             _lk("Facebook: verificação de privacidade",
+                 "Quem vê suas publicações e a lista de amigos, e quem acha você pelo e-mail ou telefone.",
+                 "https://www.facebook.com/privacy/checkup"),
+             _lk("Instagram: conta privada",
+                 "Em Privacidade da conta: com a conta privada, só seguidores aprovados veem fotos e stories.",
+                 "https://www.instagram.com/accounts/privacy_and_security/"),
+             _lk("LinkedIn: o que o perfil público mostra",
+                 "Escolha o que aparece para quem não está logado e para o Google (foto, cargo, formação).",
+                 "https://www.linkedin.com/public-profile/settings"),
+             _lk("ANPD: reclamar de quem não atende o seu pedido",
+                 "Autoridade Nacional de Proteção de Dados: se um site ou empresa não responder ao seu pedido pela "
+                 "LGPD em 15 dias, registre a reclamação.", "https://www.gov.br/anpd/pt-br"),
+         ]},
+    ]
+
+
+def _md_grupo(chave: str) -> dict:
+    return next(g for g in _md_grupos() if g["chave"] == chave)
+
+
+def _md_menu_grupo(g: dict) -> None:
+    itens = [(rotulo, func) for rotulo, func, _ in g.get("extras", [])]
+    descricoes = [desc for _, _, desc in g.get("extras", [])]
+    itens += [(lambda lk=lk: _md_rotulo(lk), lambda lk=lk: _md_abrir(lk)) for lk in g["links"]]
+    descricoes += [lk["desc"] for lk in g["links"]]
+    itens += [(rotulo, func) for rotulo, func, _ in g.get("rodape", [])]
+    descricoes += [desc for _, _, desc in g.get("rodape", [])]
+
+    def cabecalho_grupo():
+        print(f"{DIM}{g['desc']}{RST}")
+        for dica in g.get("dicas", []):
+            print(f"{CIANO}•{RST} {dica}")
+
+    menu(g["titulo"], itens, cabecalho=cabecalho_grupo, descricoes=descricoes)
+
+
+def _md_abrir_grupo(chave: str):
+    """Submenu de um grupo (para o menu e para a 🔍 Buscar)."""
+    return submenu(lambda: _md_menu_grupo(_md_grupo(chave)))
+
+
+# ── Consultas feitas aqui mesmo. Cada uma devolve um "resultado" que vale para a tela e para o relatório:
+#    {"titulo", "linhas": [(rótulo, valor)], "itens": [(texto, link)], "alerta"} ──
+
+def _md_mostrar(r: dict) -> None:
+    print(f"\n{NEG}{r['titulo']}{RST}")
+    for rotulo, valor in r.get("linhas", []):
+        if valor not in (None, ""):
+            print(f"  {CIANO}{rotulo}:{RST} {valor}")
+    for n, (texto, link) in enumerate(r.get("itens", []), 1):
+        print(f"  {CIANO}{n:>2}.{RST} {texto}")
+        if link:
+            print(f"      {DIM}{link}{RST}")
+    if r.get("alerta"):
+        aviso(r["alerta"])
+
+
+def resultado_cpf(cpf: str) -> dict:
+    d = _so_digitos(cpf)
+    linhas = [("CPF", cpf_mascarado(cpf))]
+    if not cpf_valido(cpf):
+        linhas.append(("Dígitos verificadores", "não conferem: confira se digitou certo"))
+    else:
+        regiao = int(d[8])
+        linhas += [("Dígitos verificadores", "conferem"),
+                   ("Emitido na", f"{regiao or 10}ª região fiscal ({REGIAO_FISCAL_CPF[regiao]})")]
+    return {"titulo": "🔢 CPF", "linhas": linhas,
+            "alerta": None if cpf_valido(cpf) else "Um CPF com dígitos errados não existe na Receita."}
+
+
+def conferir_cpf() -> None:
+    d = _md_exigir("cpf")
+    if d is None:
+        return
+    _md_mostrar(resultado_cpf(d["cpf"]))
+    info("Conferir os dígitos não diz se o CPF está regular: isso só a Receita mostra.")
+    if confirmar("Ver a situação cadastral no site da Receita agora?", False):
+        _md_abrir(_md_grupo("receita")["links"][0])
+
+
+def resultado_cnpj(cnpj: str) -> dict:
+    """Dados públicos do CNPJ pela BrasilAPI (que repassa os dados abertos da Receita)."""
+    try:
+        e = pedir_json(f"https://brasilapi.com.br/api/cnpj/v1/{cnpj_limpo(cnpj)}", timeout=30)
+    except ToonsError as erro_api:
+        if "HTTP 404" in str(erro_api):
+            raise ToonsError("CNPJ não encontrado nos dados abertos da Receita (se é novo, pode demorar a "
+                             "aparecer).") from None
+        raise
+    if not isinstance(e, dict):
+        raise ToonsError("Resposta inesperada da BrasilAPI.")
+    endereco = ", ".join(p for p in (f"{e.get('descricao_tipo_de_logradouro') or ''} {e.get('logradouro') or ''} "
+                                     f"{e.get('numero') or ''}".strip(), e.get("complemento"), e.get("bairro"),
+                                     "/".join(x for x in (e.get("municipio"), e.get("uf")) if x),
+                                     f"CEP {e['cep']}" if e.get("cep") else "") if p and str(p).strip())
+    socios = [s.get("nome_socio") for s in e.get("qsa") or [] if s.get("nome_socio")]
+    mei = e.get("opcao_pelo_mei")
+    linhas = [("CNPJ", cnpj_formatado(cnpj)), ("Razão social", e.get("razao_social")),
+              ("Nome fantasia", e.get("nome_fantasia")), ("Situação", e.get("descricao_situacao_cadastral")),
+              ("Aberto em", _data_br(e.get("data_inicio_atividade")) if e.get("data_inicio_atividade") else ""),
+              ("Atividade", e.get("cnae_fiscal_descricao")), ("Porte", e.get("porte")),
+              ("MEI", "" if mei is None else "sim" if mei else "não"), ("Endereço", endereco),
+              ("Telefone", e.get("ddd_telefone_1")), ("E-mail", (e.get("email") or "").lower()),
+              ("Sócios", ", ".join(socios))]
+    publico = [n for n, v in (("o endereço", endereco), ("o telefone", e.get("ddd_telefone_1")),
+                              ("o e-mail", e.get("email"))) if v]
+    alerta = (f"Qualquer pessoa vê {_lista_com_e(publico)} ao consultar o CNPJ, e muitos sites copiam esses dados. "
+              "No MEI costuma ser o endereço de casa: se mudou, atualize no Portal do Empreendedor (gov.br).") \
+        if publico else None
+    return {"titulo": "🏢 CNPJ (dados abertos da Receita)", "linhas": linhas, "alerta": alerta}
+
+
+def consultar_meu_cnpj() -> None:
+    d = _md_exigir("cnpj")
+    if d is None:
+        return
+    info("Consultando a BrasilAPI (vai só o CNPJ)...")
+    _md_mostrar(resultado_cnpj(d["cnpj"]))
+
+
+def _humanizar_campo(chave: str) -> str:
+    """'favorecidoBolsaFamilia' → 'favorecido bolsa familia' (para campos que a tabela não conhece)."""
+    palavras = re.findall(r"[A-Z]{2,}(?![a-z])|[A-Z]?[a-z]+|\d+", chave)
+    return " ".join(p if p.isupper() else p.lower() for p in palavras) or chave
+
+
+def resultado_transparencia(cpf: str, chave: str) -> dict:
+    try:
+        dados = pedir_json(url_com(URL_TRANSPARENCIA_API, cpf=_so_digitos(cpf)),
+                           cabecalhos={"chave-api-dados": chave}, timeout=40)
+    except ToonsError as e:
+        if re.search(r"HTTP 40[13]", str(e)):
+            raise ToonsError("O Portal recusou a chave da API: confira em 🏛️ → 🔑 Chave da API.") from None
+        raise
+    if isinstance(dados, list):
+        dados = dados[0] if dados else {}
+    if not isinstance(dados, dict) or not dados:
+        return {"titulo": "🏛️ Portal da Transparência", "linhas": [("Resultado", "o CPF não aparece no Portal")]}
+    sim = [ROTULOS_TRANSPARENCIA.get(k) or _humanizar_campo(k) for k, v in dados.items() if v is True]
+    nao = [ROTULOS_TRANSPARENCIA.get(k) or _humanizar_campo(k) for k, v in dados.items() if v is False]
+    linhas = [("Nome", dados.get("nome")), ("NIS", dados.get("nis")),
+              ("Aparece como", ", ".join(dict.fromkeys(sim)) or "nada: não está em nenhuma das bases"),
+              ("Não aparece como", ", ".join(dict.fromkeys(nao)))]
+    return {"titulo": "🏛️ Portal da Transparência", "linhas": linhas,
+            "alerta": "Confira os detalhes (valores, datas, órgão) pela busca do Portal." if sim else None}
+
+
+def transparencia_meu_cpf() -> None:
+    chave = cfg().get("transparencia_chave")
+    if not chave:
+        info("A consulta automática precisa da chave da API do Portal da Transparência (grátis).")
+        configurar_chave_transparencia()
+        chave = cfg().get("transparencia_chave")
+        if not chave:
+            return
+    d = _md_exigir("cpf")
+    if d is None:
+        return
+    info("Consultando o Portal da Transparência (vai só o CPF)...")
+    _md_mostrar(resultado_transparencia(d["cpf"], chave))
+
+
+def configurar_chave_transparencia() -> None:
+    c = cfg()
+    print(f"{DIM}A API do Portal da Transparência é grátis: cadastre o seu e-mail e a chave chega por e-mail. "
+          f"Ela fica só neste celular, na configuração do Termux-Toons.{RST}")
+    if c.get("transparencia_chave"):
+        info(f"Chave atual: {mascarar(c['transparencia_chave'])}")
+    opcoes = ["Colar ou digitar a chave", "Abrir a página de cadastro (grátis)"]
+    if c.get("transparencia_chave"):
+        opcoes.append("Apagar a chave")
+    i = escolher("O que fazer?", opcoes)
+    if i == 0:
+        chave = perguntar("Chave da API").strip()
+        if not re.fullmatch(r"[A-Za-z0-9-]{16,}", chave):
+            erro("Essa não parece uma chave da API (é uma sequência de letras e números, sem espaços).")
+            return
+        c["transparencia_chave"] = chave
+        salvar_cfg()
+        ok("Chave guardada.")
+    elif i == 1:
+        abrir_link(URL_TRANSPARENCIA_CHAVE)
+        info("Quando a chave chegar por e-mail, volte aqui e escolha 'Colar ou digitar a chave'.")
+    elif i == 2:
+        c.pop("transparencia_chave", None)
+        salvar_cfg()
+        ok("Chave apagada.")
+
+
+def resultado_diarios(nome: str, quantos: int = 10) -> dict:
+    """Menções ao nome exato nos diários oficiais municipais do Querido Diário (Open Knowledge Brasil)."""
+    dados = pedir_json(url_com(URL_QUERIDO_DIARIO_API, querystring=_aspas(nome), excerpt_size=250,
+                               number_of_excerpts=1, size=quantos), timeout=45)
+    if not isinstance(dados, dict):
+        raise ToonsError("Resposta inesperada do Querido Diário.")
+    total = dados.get("total_gazettes") or 0
+    itens = []
+    for g in dados.get("gazettes") or []:
+        trecho = " ".join(g.get("excerpts") or g.get("highlight_texts") or [])
+        trecho = " ".join(re.sub(r"<[^>]+>", "", trecho).split())
+        lugar = "/".join(x for x in (g.get("territory_name"), g.get("state_code")) if x) or "?"
+        texto = f"{_data_br(g.get('date'))} · {lugar}" + (f" — {trecho[:240]}{'…' if len(trecho) > 240 else ''}"
+                                                          if trecho else "")
+        itens.append((texto, g.get("url") or g.get("txt_url") or ""))
+    mostrando = f" (mostrando {len(itens)})" if total > len(itens) else ""
+    return {"titulo": "📰 Diários oficiais dos municípios (Querido Diário)",
+            "linhas": [("Diários com o seu nome", f"{total}{mostrando}")], "itens": itens,
+            "alerta": "Homônimos aparecem também: confira a cidade e o trecho." if total else None}
+
+
+def diarios_municipais() -> None:
+    d = _md_exigir("nome")
+    if d is None:
+        return
+    info("Consultando o Querido Diário (vai só o nome)...")
+    r = resultado_diarios(d["nome"])
+    _md_mostrar(r)
+    com_link = [(texto, link) for texto, link in r["itens"] if link]
+    while com_link:
+        i = escolher("Abrir qual diário?", [texto.split(" — ")[0] for texto, _ in com_link])
+        if i is None:
+            return
+        abrir_link(com_link[i][1])
+
+
+def senha_vazada(senha: str) -> int:
+    """Quantas vezes a senha aparece no Pwned Passwords. Só os 5 primeiros caracteres do SHA-1 saem do celular;
+    o Add-Padding faz a resposta ter sempre tamanho parecido (ninguém deduz nada pelo tamanho)."""
+    h = hashlib.sha1(senha.encode("utf-8")).hexdigest().upper()
+    corpo = pedir_bytes(f"https://api.pwnedpasswords.com/range/{h[:5]}", cabecalhos={"Add-Padding": "true"},
+                        timeout=20).decode("utf-8", errors="replace")
+    for linha in corpo.splitlines():
+        sufixo, _, vezes = linha.strip().partition(":")
+        if sufixo == h[5:] and vezes.isdigit():
+            return int(vezes)
+    return 0
+
+
+def verificar_senha_vazada() -> None:
+    info("A senha não sai do celular: vão só os 5 primeiros caracteres do hash dela (k-anonimato).")
+    while True:
+        try:
+            senha = getpass.getpass(f"{AMAR}?{RST} Senha para conferir (Enter vazio sai): ")
+        except EOFError:
+            return
+        if not senha:
+            return
+        vezes = senha_vazada(senha)
+        if vezes:
+            erro(f"Essa senha apareceu {vezes:,} vez(es) em vazamentos. Troque-a em todo lugar onde ela é usada."
+                 .replace(",", "."))
+        else:
+            ok("Não aparece em nenhum vazamento conhecido (o que não quer dizer que ela é forte).")
+
+
+def outro_tribunal() -> None:
+    siglas = list(UFS)
+    i = escolher("Qual estado?", [f"{s} — {UFS[s][0]}" for s in siglas])
+    if i is None:
+        return
+    uf = siglas[i]
+    regiao = UFS[uf][1]
+    tj = _sigla_tj(uf)
+    j = escolher("Qual tribunal?", [f"Tribunal de Justiça ({tj})",
+                                    f"Justiça Federal (TRF{regiao}: {_estados_trf(regiao)})",
+                                    f"Seu nome no site do {tj} (Google)"])
+    if j == 0:
+        _md_abrir(_lk(f"Tribunal de Justiça ({tj})", "Entre em Consulta processual e busque pelo CPF ou nome da parte "
+                      "(vai copiado).", _site_tj(uf), copiar=_md_copiar_documento))
+    elif j == 1:
+        _md_abrir(_lk(f"TRF{regiao}", "Entre em Consulta processual e busque pelo CPF ou nome (vai copiado).",
+                      SITES_TRF[regiao], copiar=_md_copiar_documento))
+    elif j == 2:
+        site = f"{tj.lower()}.jus.br"
+        _md_abrir(_lk(f"Google no {tj}", "Páginas do tribunal com o seu nome (decisões, pautas, diário da Justiça).",
+                      _gl(lambda d: f"{_aspas(d['nome'])} site:{site}"), ("nome",)))
+
+
+# ── Verificar tudo: faz as consultas automáticas e gera uma página com todos os links ──
+
+def _md_sem_copiado(desc: str) -> str:
+    """Tira o 'vai copiado' das descrições: no relatório é a pessoa que digita no site."""
+    return re.sub(r";\s*o [^.;]+ vai copiado|\s*O [^.;]+ vai copiado\.|\s*\(vai copiado\)", "", desc)
+
+
+def _md_relatorio(d: dict, resultados: list) -> tuple:
+    """Grava a página HTML do relatório e devolve (caminho, quantos links)."""
+    import html as html_mod
+    esc = html_mod.escape
+    blocos = []
+    for r in resultados:
+        linhas = "".join(f"<dt>{esc(str(rot))}</dt><dd>{esc(str(v))}</dd>"
+                         for rot, v in r.get("linhas", []) if v not in (None, ""))
+        itens = "".join(f'<li><a href="{esc(link)}" target="_blank" rel="noopener noreferrer">{esc(texto)}</a></li>'
+                        if link else f"<li>{esc(texto)}</li>" for texto, link in r.get("itens", []))
+        blocos.append(f'<section class="resultado"><h3>{esc(r["titulo"])}</h3><dl>{linhas}</dl>'
+                      + (f"<ol>{itens}</ol>" if itens else "")
+                      + (f'<p class="alerta">⚠ {esc(r["alerta"])}</p>' if r.get("alerta") else "") + "</section>")
+    total = 0
+    grupos = []
+    for g in _md_grupos():
+        lis = []
+        for lk in g["links"]:
+            if not all(d.get(c) for c in lk["precisa"]):
+                continue
+            rotulo, url, copiar = _md_resolver(lk, d)
+            dica = f" <em>(digite o seu {esc(copiar[0])} no site)</em>" if copiar and copiar[1] else ""
+            lis.append(f'<li><a href="{esc(url)}" target="_blank" rel="noopener noreferrer">{esc(rotulo)}</a>'
+                       f"<small>{esc(_md_sem_copiado(lk['desc']))}{dica}</small></li>")
+        total += len(lis)
+        dicas = "".join(f"<li>{esc(t)}</li>" for t in g.get("dicas", []))
+        if lis or dicas:
+            grupos.append(f"<section><h2>{esc(g['titulo'])}</h2><p class=\"desc\">{esc(g['desc'])}</p>"
+                          + (f'<ul class="dicas">{dicas}</ul>' if dicas else "") + f"<ul>{''.join(lis)}</ul></section>")
+    faltam = [curto for chave, _, curto, _ in CAMPOS_MEUS_DADOS if not d.get(chave)]
+    quem = " · ".join(esc(x) for x in (d.get("nome"), cpf_mascarado(d["cpf"]) if d.get("cpf") else "",
+                                        "/".join(y for y in (d.get("cidade"), d.get("uf")) if y)) if x)
+    pagina = f"""<!doctype html>
+<html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer"><meta name="robots" content="noindex">
+<title>Meus dados na internet</title>
+<style>
+:root {{ --fundo:#f6f7f9; --cartao:#fff; --texto:#1d2329; --suave:#5d6874; --link:#0b63c5; --borda:#dde2e7;
+        --alerta:#8a5a00; --alerta-fundo:#fff5dc; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --fundo:#121417; --cartao:#1c2026; --texto:#e7eaee; --suave:#9aa5b1;
+        --link:#7db7ff; --borda:#2d333b; --alerta:#ffcf70; --alerta-fundo:#3a2f12; }} }}
+* {{ box-sizing:border-box; }}
+body {{ margin:0; background:var(--fundo); color:var(--texto); font:16px/1.5 system-ui, sans-serif; }}
+main {{ max-width:760px; margin:0 auto; padding:16px; }}
+h1 {{ font-size:1.5rem; margin:.2rem 0; }} h2 {{ font-size:1.15rem; margin:0 0 .3rem; }}
+h3 {{ font-size:1rem; margin:0 0 .4rem; }}
+.quem, .desc, small, .rodape {{ color:var(--suave); }}
+section {{ background:var(--cartao); border:1px solid var(--borda); border-radius:12px; padding:14px 16px;
+          margin:12px 0; }}
+ul, ol {{ padding-left:1.2rem; margin:.4rem 0 0; }} li {{ margin:.55rem 0; overflow-wrap:anywhere; }}
+a {{ color:var(--link); font-weight:600; text-decoration:none; }} a:hover {{ text-decoration:underline; }}
+small {{ display:block; font-size:.88rem; }}
+dl {{ display:grid; grid-template-columns:max-content 1fr; gap:.2rem .8rem; margin:0; }}
+dt {{ color:var(--suave); }} dd {{ margin:0; overflow-wrap:anywhere; }}
+.alerta {{ background:var(--alerta-fundo); color:var(--alerta); border-radius:8px; padding:8px 10px;
+           margin:.6rem 0 0; }}
+.dicas li {{ font-size:.92rem; }}
+.rodape {{ font-size:.85rem; margin:20px 0; }}
+</style></head><body><main>
+<h1>👤 Meus dados na internet</h1>
+<p class="quem">{quem}<br>Gerado pelo Termux-Toons em {datetime.now():%d/%m/%Y às %H:%M}.
+Toque nos links: eles abrem os sites oficiais e as buscas prontas.</p>
+{"<h2>Consultas feitas agora</h2>" + "".join(blocos) if blocos else ""}
+{"".join(grupos)}
+<p class="rodape">{"Com " + esc(", ".join(faltam)) + " preenchidos o relatório traz mais buscas. " if faltam else ""}
+Este arquivo tem os seus dados: apague quando não precisar mais (Termux-Toons → 👤 Meus dados na internet →
+🗑️ Apagar).</p>
+</main></body></html>
+"""
+    pasta = _md_pasta_relatorios()
+    pasta.mkdir(parents=True, exist_ok=True)
+    caminho = pasta / f"meus-dados-{datetime.now():%Y-%m-%d-%H%M%S}.html"
+    caminho.write_text(pagina, "utf-8")
+    return caminho, total
+
+
+def verificar_meus_dados() -> None:
+    d = _md_exigir("nome")
+    if d is None:
+        return
+    resultados = []
+    if d.get("cpf"):
+        resultados.append(resultado_cpf(d["cpf"]))
+        _md_mostrar(resultados[-1])
+    chave_api = cfg().get("transparencia_chave")
+    etapas = []
+    if d.get("cnpj"):
+        etapas.append(("BrasilAPI (vai só o CNPJ)", lambda: resultado_cnpj(d["cnpj"])))
+    if d.get("cpf") and chave_api:
+        etapas.append(("Portal da Transparência (vai só o CPF)", lambda: resultado_transparencia(d["cpf"], chave_api)))
+    etapas.append(("Querido Diário (vai só o nome)", lambda: resultado_diarios(d["nome"])))
+    for nome, consulta in etapas:
+        print()
+        info(f"Consultando {nome}...")
+        try:
+            resultados.append(consulta())
+        except ToonsError as e:
+            aviso(str(e))
+            continue
+        _md_mostrar(resultados[-1])
+    print()
+    if d.get("cpf") and not chave_api:
+        info("Portal da Transparência: sem a chave da API ele fica como link no relatório (🏛️ → 🔑 para configurar).")
+    faltam = [curto for chave, _, curto, _ in CAMPOS_MEUS_DADOS if not d.get(chave)]
+    if faltam:
+        info(f"Com {', '.join(faltam)} preenchidos o relatório traz mais buscas (📝 Preencher meus dados).")
+    caminho, total = _md_relatorio(d, resultados)
+    ok(f"Relatório com {total} buscas prontas: {caminho}")
+    aviso("O arquivo tem os seus dados: apague quando não precisar mais (🗑️ Apagar meus dados deste celular).")
+    abrir_arquivo(caminho)
+
+
+def _md_cabecalho() -> None:
+    d = meus_dados()
+    print(f"{DIM}O que está público sobre você: órgãos oficiais, tribunais, Diário Oficial, Google e redes. "
+          f"Os links abrem no navegador e os seus dados ficam só no celular.{RST}")
+    if d.get("nome"):
+        partes = [d["nome"], cpf_mascarado(d["cpf"]) if d.get("cpf") else "",
+                  "/".join(x for x in (d.get("cidade"), d.get("uf")) if x)]
+        print(f"{CIANO}👤 {' · '.join(p for p in partes if p)}{RST}")
+    else:
+        print(f"{AMAR}Comece por 📝 Preencher meus dados (ou vá direto: cada busca pede o que faltar).{RST}")
+    print(f"{DIM}Feito para pesquisar você mesmo(a): buscar dados de outra pessoa sem motivo legítimo pode "
+          f"violar a LGPD.{RST}")
+
+
+@submenu
+def menu_meus_dados():
+    grupos = _md_grupos()
+    itens = [("📝 Preencher meus dados", editar_meus_dados),
+             ("🚀 Verificar tudo e gerar o relatório", verificar_meus_dados)]
+    descricoes = ["Nome, CPF, cidade, estado, e-mail, celular, @ e CNPJ. Preencha só o que quiser.",
+                  "Faz as consultas automáticas (CPF, CNPJ, Querido Diário e Portal da Transparência) e gera uma "
+                  "página com todas as buscas prontas para tocar."]
+    itens += [(g["titulo"], _md_abrir_grupo(g["chave"])) for g in grupos]
+    descricoes += [g["desc"] for g in grupos]
+    itens.append(("🗑️ Apagar meus dados deste celular", apagar_meus_dados))
+    descricoes.append("Apaga o que foi guardado, os relatórios salvos e, se quiser, a chave da API.")
+    menu("👤 Meus dados na internet", itens, cabecalho=_md_cabecalho, descricoes=descricoes)
+
+
+# ════════════════════════════════════════════════════════════════════
 #  Configurações e diagnóstico
 # ════════════════════════════════════════════════════════════════════
 
@@ -20819,6 +21796,19 @@ def _indice_busca() -> list:
         ("💬 Chat na rede local", "chat mensagem rede local lan conversar sem internet", menu_chat),
         ("🌐 Navegador no terminal", "navegador browser browsh w3m web site pesquisar", menu_navegador),
         ("🔗 Encurtador, pastebin e enviar arquivo", "encurtador link pastebin enviar arquivo url curto", menu_links),
+        ("👤 Meus dados na internet", "meus dados pessoais pegada digital privacidade lgpd sobre mim exposto cpf nome "
+                                      "google linkedin instagram facebook redes sociais", menu_meus_dados),
+        ("🧾 Situação do CPF e do CNPJ (Receita Federal)", "receita federal cpf cnpj mei situacao cadastral ecac "
+                                                          "registrato banco central", _md_abrir_grupo("receita")),
+        ("🏛️ Portal da Transparência (meu nome ou CPF)", "portal transparencia servidor beneficio bolsa familia bpc "
+                                                         "auxilio sancao", _md_abrir_grupo("transparencia")),
+        ("⚖️ Processos no meu nome (TJ, TRF, Jus.br)", "processo processos tribunal justica tj trf jusbrasil escavador "
+                                                       "jus cnj", _md_abrir_grupo("tribunais")),
+        ("📰 Meu nome no Diário Oficial", "diario oficial dou uniao querido diario municipio prefeitura publicacao",
+         _md_abrir_grupo("diario")),
+        ("🎓 Currículo Lattes", "lattes cnpq curriculo pesquisador academico", _md_abrir_grupo("lattes")),
+        ("🔐 Vazamentos de e-mail e senha", "vazamento vazou senha email pwned haveibeenpwned exposto",
+         _md_abrir_grupo("vazamentos")),
         ("✨ Inteligência artificial", "ia ai inteligencia artificial claude chatgpt gemini llama voz ocr", menu_ia),
         ("💬 Assistente na nuvem (Claude, ChatGPT, Gemini)", "claude chatgpt gpt gemini assistente nuvem api conversar", menu_llm),
         ("🎤 Voz para texto e texto para voz", "voz texto whisper ditado transcrever audio fala tts falar", menu_voz),
@@ -20913,6 +21903,7 @@ def menu_principal() -> None:
         ("🧰 Utilitários", menu_utilitarios),
         ("📲 Celular e sistema", menu_celular),
         ("🌐 Internet", menu_internet),
+        ("👤 Meus dados na internet", menu_meus_dados),
         ("✨ Inteligência artificial", menu_ia),
         ("🎮 Diversão e aprendizado", menu_diversao),
         ("🛠️ Programação e servidores", menu_programacao),
