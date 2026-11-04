@@ -4915,12 +4915,20 @@ def _caminho_termux() -> Path:
 
 MAX_SITES = 5  # quantos sites podem ficar no ar ao mesmo tempo
 SITES_DIR = DATA_DIR / "sites"  # cópia do arquivo quando você publica só uma página (uma pasta por site)
+VISITAS_DIR = DATA_DIR / "visitas"  # registro de quem acessou cada site (uma linha JSON por acesso)
+VISITAS_MAX = 2 * 1024 * 1024  # acima disso o registro é cortado para não crescer sem fim
+_lock_visitas = threading.Lock()  # o servidor é multithread; grava uma visita de cada vez
+
+
+def _arquivo_visitas(n: int) -> Path:
+    return VISITAS_DIR / f"{n}.jsonl"
 
 
 class _HandlerSite(SimpleHTTPRequestHandler):
     """Entrega os arquivos de uma pasta como site: abre o index.html, mas não lista pastas
-    nem mostra arquivos ocultos (.git, .env...)."""
+    nem mostra arquivos ocultos (.git, .env...). Também anota quem acessou (IP, país, aparelho)."""
     server_version = f"TermuxToons/{VERSION}"
+    arquivo_visitas: Path | None = None  # para onde anotar as visitas (um processo por site)
 
     def list_directory(self, path):
         self.send_error(404, "Página não encontrada")
@@ -4937,15 +4945,61 @@ class _HandlerSite(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-cache")  # quem abre o link vê sempre a versão mais nova
         super().end_headers()
 
+    def _ip_real(self) -> str:
+        """O IP de quem abriu o link. Pelo túnel da Cloudflare o endereço direto é 127.0.0.1;
+        o IP de verdade vem no cabeçalho CF-Connecting-IP (ou X-Forwarded-For)."""
+        cab = self.headers
+        cf = cab.get("CF-Connecting-IP")
+        if cf and cf.strip():
+            return cf.strip()
+        xff = cab.get("X-Forwarded-For")
+        if xff and xff.strip():
+            return xff.split(",")[0].strip()
+        return self.client_address[0]
+
+    def _pela_internet(self) -> bool:
+        """Veio pelo túnel da Cloudflare (internet) ou pela mesma rede Wi-Fi?"""
+        return bool(self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For"))
+
+    def log_request(self, code="-", size="-"):
+        super().log_request(code, size)  # mantém a linha no log do serviço (com o IP real)
+        with contextlib.suppress(Exception):
+            self._anotar_visita(code)
+
     def log_message(self, fmt, *args):
-        log(f"{self.client_address[0]} {fmt % args}")
+        log(f"{self._ip_real()} {fmt % args}")
+
+    def _anotar_visita(self, codigo) -> None:
+        arq = type(self).arquivo_visitas
+        if not arq:
+            return
+        reg = {
+            "t": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "ip": self._ip_real(),
+            "pais": (self.headers.get("CF-IPCountry") or "").strip().upper(),
+            "via": "internet" if self._pela_internet() else "wifi",
+            "metodo": getattr(self, "command", "") or "",
+            "caminho": urllib.parse.unquote(urllib.parse.urlsplit(self.path or "").path),
+            "codigo": int(codigo) if str(codigo).isdigit() else str(codigo),
+            "agente": (self.headers.get("User-Agent") or "").strip(),
+            "ref": (self.headers.get("Referer") or "").strip(),
+        }
+        linha = json.dumps(reg, ensure_ascii=False) + "\n"
+        with _lock_visitas:
+            arq.parent.mkdir(parents=True, exist_ok=True)
+            with open(arq, "a", encoding="utf-8") as f:
+                f.write(linha)
+            if arq.stat().st_size > VISITAS_MAX:  # corta pelas últimas ~4000 visitas
+                ultimas = arq.read_text("utf-8", errors="replace").splitlines()[-4000:]
+                arq.write_text("\n".join(ultimas) + "\n", encoding="utf-8")
 
 
-def servir_site(pasta: str, porta: int) -> None:
+def servir_site(pasta: str, porta: int, visitas: str | None = None) -> None:
     """Sobe o site em primeiro plano (é o que roda dentro do tmux)."""
     pasta = str(Path(os.path.expanduser(pasta)).resolve())
     if not Path(pasta).is_dir():
         raise ToonsError(f"Pasta não encontrada: {pasta}")
+    _HandlerSite.arquivo_visitas = Path(visitas) if visitas else None
     with ThreadingHTTPServer(("0.0.0.0", porta), lambda *a, **k: _HandlerSite(*a, directory=pasta, **k)) as servidor:
         log(f"Site de {pasta} em http://{ip_local()}:{porta}  (Ctrl+C para parar)")
         servidor.serve_forever()
@@ -5029,6 +5083,204 @@ def _escolher_site(msg: str) -> int | None:
         return no_ar[0]
     i = escolher(msg, [_rotulo_site(n) for n in no_ar])
     return None if i is None else no_ar[i]
+
+
+# ── Quem acessou o site (visitas, IP e aparelho) ─────────────────────
+
+_PAISES = {
+    "BR": "Brasil", "PT": "Portugal", "US": "Estados Unidos", "AR": "Argentina",
+    "ES": "Espanha", "FR": "França", "DE": "Alemanha", "GB": "Reino Unido",
+    "IT": "Itália", "JP": "Japão", "CN": "China", "IN": "Índia", "RU": "Rússia",
+    "CA": "Canadá", "MX": "México", "CL": "Chile", "CO": "Colômbia", "UY": "Uruguai",
+    "PY": "Paraguai", "AO": "Angola", "MZ": "Moçambique", "NL": "Holanda",
+    "AU": "Austrália", "ZA": "África do Sul", "IE": "Irlanda", "CH": "Suíça",
+}
+
+
+def _bandeira(cc: str) -> str:
+    """Emoji da bandeira a partir do código de 2 letras do país (BR -> 🇧🇷)."""
+    cc = (cc or "").upper()
+    if len(cc) == 2 and cc.isalpha():
+        return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in cc)
+    return "🏳️"
+
+
+def _pais_por_extenso(cc: str) -> str:
+    cc = (cc or "").upper()
+    if not cc:
+        return "país desconhecido"
+    nome = _PAISES.get(cc, cc)
+    return f"{_bandeira(cc)} {nome}"
+
+
+def _descrever_agente(ua: str) -> str:
+    """Transforma o 'User-Agent' num rótulo curto: aparelho e navegador de quem acessou."""
+    u = (ua or "")
+    ul = u.lower()
+    if "android" in ul:
+        so = "Android"
+    elif "iphone" in ul:
+        so = "iPhone"
+    elif "ipad" in ul:
+        so = "iPad"
+    elif "windows" in ul:
+        so = "Windows"
+    elif "mac os x" in ul or "macintosh" in ul:
+        so = "Mac"
+    elif "cros" in ul:
+        so = "ChromeOS"
+    elif "linux" in ul:
+        so = "Linux"
+    else:
+        so = ""
+    if "edg/" in ul or "edga/" in ul or "edgios/" in ul:
+        nav = "Edge"
+    elif "opr/" in ul or "opera" in ul:
+        nav = "Opera"
+    elif "samsungbrowser" in ul:
+        nav = "Samsung Internet"
+    elif "firefox" in ul or "fxios" in ul:
+        nav = "Firefox"
+    elif "chrome" in ul or "crios" in ul:
+        nav = "Chrome"
+    elif "safari" in ul:
+        nav = "Safari"
+    elif "curl" in ul:
+        nav = "curl"
+    elif "wget" in ul:
+        nav = "wget"
+    elif "python" in ul:
+        nav = "script Python"
+    elif any(p in ul for p in ("bot", "spider", "crawl")):
+        nav = "robô/rastreador"
+    else:
+        nav = ""
+    partes = [p for p in (so, nav) if p]
+    if partes:
+        return " · ".join(partes)
+    return (u[:45] + "…") if len(u) > 46 else (u or "desconhecido")
+
+
+def _ler_visitas(n: int) -> list:
+    """Lê o registro de visitas do site n (lista de dicionários, do mais antigo ao mais novo)."""
+    arq = _arquivo_visitas(n)
+    if not arq.exists():
+        return []
+    visitas = []
+    for linha in arq.read_text("utf-8", errors="replace").splitlines():
+        linha = linha.strip()
+        if not linha:
+            continue
+        with contextlib.suppress(Exception):
+            visitas.append(json.loads(linha))
+    return visitas
+
+
+def _sites_com_visitas() -> list:
+    if not VISITAS_DIR.is_dir():
+        return []
+    ns = {int(p.stem) for p in VISITAS_DIR.glob("*.jsonl") if p.stem.isdigit()}
+    return sorted(n for n in ns if _arquivo_visitas(n).stat().st_size > 0)
+
+
+def _escolher_site_para_visitas(msg: str) -> int | None:
+    """Site para ver/limpar visitas: os que estão no ar e os que já têm registro."""
+    candidatos = sorted(set(sites_no_ar()) | set(_sites_com_visitas()))
+    if not candidatos:
+        info("Nenhuma página publicada e nenhum registro de visitas ainda.")
+        return None
+    if len(candidatos) == 1:
+        return candidatos[0]
+    rotulos = []
+    for n in candidatos:
+        nome = _dados_site(n)["nome"]
+        qtd = len({v.get("ip") for v in _ler_visitas(n) if v.get("ip")})
+        extra = "no ar" if n in sites_no_ar() else "fora do ar"
+        rotulos.append(f"{n}. {nome}  {DIM}({qtd} visitante(s), {extra}){RST}")
+    i = escolher(msg, rotulos)
+    return None if i is None else candidatos[i]
+
+
+def _eh_pagina(caminho: str) -> bool:
+    c = (caminho or "").lower().split("?")[0]
+    return c.endswith("/") or c.endswith((".html", ".htm")) or "." not in c.rsplit("/", 1)[-1]
+
+
+def ver_visitas_do_site(n: int | None = None) -> None:
+    """Mostra quem acessou o site: IP, país, aparelho/navegador e páginas abertas, por visitante."""
+    n = n or _escolher_site_para_visitas("Ver quem acessou qual site?")
+    if n is None:
+        return
+    visitas = _ler_visitas(n)
+    nome = _dados_site(n)["nome"]
+    if not visitas:
+        info(f"Site '{nome}': ninguém acessou ainda (ou o registro foi limpo).")
+        if n not in sites_no_ar():
+            print(f"  {DIM}Este site está fora do ar. Publique de novo para voltar a registrar visitas.{RST}")
+        return
+    # Agrupa por IP (o visitante). Mantém a ordem do último acesso de cada um.
+    por_ip: dict = {}
+    for v in visitas:
+        ip = v.get("ip") or "?"
+        d = por_ip.setdefault(ip, {"acessos": 0, "paginas": [], "primeiro": v.get("t", ""),
+                                   "ultimo": v.get("t", ""), "pais": "", "via": "", "agente": ""})
+        d["acessos"] += 1
+        d["ultimo"] = v.get("t", d["ultimo"])
+        if v.get("pais"):
+            d["pais"] = v["pais"]
+        if v.get("via"):
+            d["via"] = v["via"]
+        if v.get("agente"):
+            d["agente"] = v["agente"]
+        cam = v.get("caminho") or "/"
+        if _eh_pagina(cam) and cam not in d["paginas"]:
+            d["paginas"].append(cam)
+    ordenados = sorted(por_ip.items(), key=lambda kv: kv[1]["ultimo"], reverse=True)
+    total_acessos = sum(d["acessos"] for _, d in ordenados)
+    desde = min((d["primeiro"] for _, d in ordenados if d["primeiro"]), default="")
+    print()
+    info(f"Site '{nome}': {len(ordenados)} visitante(s) e {total_acessos} acesso(s)"
+         + (f", desde {desde}." if desde else "."))
+    if not any(d["via"] == "internet" for _, d in ordenados):
+        print(f"  {DIM}Nenhum acesso pelo túnel da Cloudflare ainda — todos foram pela mesma rede Wi-Fi. "
+              f"O IP real de quem está na internet só aparece com o túnel ligado.{RST}")
+    for pos, (ip, d) in enumerate(ordenados, 1):
+        via = "Internet (túnel Cloudflare)" if d["via"] == "internet" else "Mesma rede Wi-Fi"
+        pais = _pais_por_extenso(d["pais"]) if d["via"] == "internet" else "rede local"
+        print()
+        print(f"  {NEG}{pos}. {ip}{RST}   {CIANO}{pais}{RST} · {via}")
+        print(f"     Aparelho: {NEG}{_descrever_agente(d['agente'])}{RST}")
+        quando = d["primeiro"][11:] if d["primeiro"] else "?"
+        ate = d["ultimo"][11:] if d["ultimo"] else "?"
+        dia = d["ultimo"][:10] if d["ultimo"] else ""
+        print(f"     Acessos: {NEG}{d['acessos']}{RST}   1º: {quando}   último: {ate}"
+              + (f"  ({dia})" if dia else ""))
+        if d["paginas"]:
+            print(f"     Páginas: {', '.join(d['paginas'][:8])}"
+                  + (f" (+{len(d['paginas']) - 8})" if len(d["paginas"]) > 8 else ""))
+    print()
+    info("O IP identifica a conexão de quem acessou (operadora/Wi-Fi), não a pessoa pelo nome. "
+         "Isto é o registro de acessos ao seu próprio site, como todo servidor web guarda.")
+
+
+def limpar_visitas_do_site() -> None:
+    """Apaga o registro de visitas de um site (ou de todos)."""
+    com = _sites_com_visitas()
+    if not com:
+        info("Não há registro de visitas para apagar.")
+        return
+    alvos = com
+    if len(com) > 1:
+        rotulos = [f"{n}. {_dados_site(n)['nome']}" for n in com] + [f"Todos ({len(com)})"]
+        i = escolher("Limpar o registro de qual site?", rotulos)
+        if i is None:
+            return
+        alvos = com if i == len(com) else [com[i]]
+    if not confirmar(f"Apagar o registro de visitas de {len(alvos)} site(s)?", False):
+        return
+    for n in alvos:
+        _arquivo_visitas(n).unlink(missing_ok=True)
+    ok("Registro de visitas apagado.")
 
 
 def liberar_site() -> None:
@@ -5132,7 +5384,8 @@ def publicar_site() -> None:
         parar_servico(tunel)  # apontava para a porta antiga
     cfg()["sites"][str(n)] = {"nome": alvo.name, "pagina": pagina, "porta": porta}
     salvar_cfg()
-    if not iniciar_servico(servico, cmd_self("site", str(pasta), "--porta", str(porta)), reiniciar=True):
+    if not iniciar_servico(servico, cmd_self("site", str(pasta), "--porta", str(porta),
+                                             "--visitas", str(_arquivo_visitas(n))), reiniciar=True):
         return
     if not servico_ativo(tunel) and confirmar("Liberar para a internet (pessoas fora do seu Wi-Fi)?", True):
         abrir_tunel(tunel, porta)
@@ -5292,6 +5545,8 @@ def menu_arquivos():
         ("Sites publicados: ver os links", mostrar_links_do_site),
         ("Site publicado: QR code do link (gerar e baixar)", qr_do_site),
         ("Site publicado: liberar para a internet (túnel)", liberar_site),
+        ("Site publicado: ver quem acessou (IP, país e aparelho)", ver_visitas_do_site),
+        ("Site publicado: limpar o registro de visitas", limpar_visitas_do_site),
         ("Site publicado: tirar do ar", parar_site),
         *itens_servico("http-arquivos", "Compartilhar pasta via HTTP", http_iniciar),
         ("rclone: instalar e configurar nuvem (Drive, Dropbox, OneDrive...)", rclone_config),
@@ -24015,6 +24270,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("site", help="publica uma pasta como site (página HTML) em primeiro plano")
     p.add_argument("pasta")
     p.add_argument("--porta", type=int)
+    p.add_argument("--visitas", help="arquivo onde anotar quem acessou (IP, país, aparelho)")
     p = sub.add_parser("trote", help="sobe a página do trote/screamer em primeiro plano")
     p.add_argument("--porta", type=int)
     p = sub.add_parser("tela", help="transmite a tela do celular para o navegador (link secreto)")
@@ -24097,7 +24353,7 @@ def main(argv=None) -> int:
         elif args.comando == "arquivos":
             gerenciador_arquivos(args.pasta)
         elif args.comando == "site":
-            servir_site(args.pasta, args.porta or cfg()["site_porta"])
+            servir_site(args.pasta, args.porta or cfg()["site_porta"], args.visitas)
         elif args.comando == "trote":
             servir_trote(args.porta or cfg()["trote_porta"])
         elif args.comando == "tela":
