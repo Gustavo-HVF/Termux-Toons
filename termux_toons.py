@@ -348,7 +348,16 @@ def _largura_char(ch: str) -> int:
 
 
 def _largura(texto: str) -> int:
-    return sum(_largura_char(c) for c in _sem_ansi(texto))
+    total, anterior = 0, 0
+    for c in _sem_ansi(texto):
+        if c == "️":  # seletor de emoji: faz o símbolo anterior virar emoji, que o terminal desenha com largura 2
+            if anterior == 1:
+                total += 1
+                anterior = 2
+            continue
+        anterior = _largura_char(c)
+        total += anterior
+    return total
 
 
 def _cortar(texto: str, largura: int) -> str:
@@ -15902,6 +15911,14 @@ def _padrao_ir(codigo: dict) -> tuple:
             a, c = a & 0xFF, c & 0xFF
             bits = _bits(a, 8) + _bits(a if p == "SAMSUNG32" else a ^ 0xFF, 8) + _bits(c, 8) + _bits(c ^ 0xFF, 8)
         return 38000, _por_distancia((4500, 4500) if p == "SAMSUNG32" else (9000, 4500), bits, 560, 560, 1690)
+    if p == "NEC42":  # NEC com endereço de 13 bits (Apple, alguns sons e TVs)
+        a, c = a & 0x1FFF, c & 0xFF
+        bits = _bits(a, 13) + _bits(a ^ 0x1FFF, 13) + _bits(c, 8) + _bits(c ^ 0xFF, 8)
+        return 38000, _por_distancia((9000, 4500), bits, 560, 560, 1690)
+    if p == "PIONEER":  # igual ao NEC, mas a 40 kHz (aparelhos Pioneer)
+        a, c = a & 0xFF, c & 0xFF
+        bits = _bits(a, 8) + _bits(a ^ 0xFF, 8) + _bits(c, 8) + _bits(c ^ 0xFF, 8)
+        return 40000, _por_distancia((9000, 4500), bits, 560, 560, 1690)
     if p in ("SIRC", "SIRC15", "SIRC20"):
         quadro = [2400, 600]
         for bit in _bits(c & 0x7F, 7) + _bits(a, {"SIRC": 5, "SIRC15": 8, "SIRC20": 13}[p]):
@@ -16013,8 +16030,17 @@ _APELIDOS_IR = {
     "Input": ("input", "source", "src", "tv_av", "tv/av", "tv/video", "entrada"),
     "Up": ("up", "arrow_up", "cursor_up"), "Down": ("down", "arrow_down", "cursor_down"),
     "Left": ("left", "arrow_left", "cursor_left"), "Right": ("right", "arrow_right", "cursor_right"),
-    "Ok": ("ok", "enter", "select", "center"), "Home": ("home", "smart_hub", "menu"),
+    "Ok": ("ok", "enter", "select", "center"), "Home": ("home", "smart_hub"),
     "Back": ("back", "return", "exit", "voltar"),
+    "Menu": ("menu", "settings", "setup"),
+    "Play": ("play",), "Pause": ("pause", "play_pause", "playpause"), "Stop": ("stop",),
+    "Next": ("next", "fast_forward", "ff", "skip_next", "forward"),
+    "Prev": ("prev", "previous", "rewind", "rew", "skip_prev"),
+    # ar-condicionado (os nomes do arquivo ac.ir do Flipper)
+    "Off": ("off", "power_off", "poweroff", "desligar"),
+    "Dh": ("dh", "dry", "dehumidify", "desumidificar"),
+    "Cool_lo": ("cool_lo", "cool_low"), "Cool_hi": ("cool_hi", "cool_high"),
+    "Heat_lo": ("heat_lo", "heat_low"), "Heat_hi": ("heat_hi", "heat_high"),
 }
 
 
@@ -16043,8 +16069,21 @@ def ir_disponivel() -> str:
             "Xiaomi, Redmi e POCO)")
 
 
+def _um_quadro(padrao: list) -> list:
+    """Corta uma captura que repete o sinal várias vezes: fica só o primeiro quadro (até o primeiro silêncio longo),
+    porque o Android manda no máximo 2 segundos de uma vez."""
+    total = 0
+    for i, dur in enumerate(padrao):
+        total += dur
+        if i % 2 == 1 and dur > 40000 and total - dur > 2000:  # silêncio > 40 ms depois de já ter um quadro
+            return padrao[:i]
+    return padrao
+
+
 def ir_transmitir(codigo: dict) -> None:
     freq, padrao = _padrao_ir(codigo)
+    if sum(padrao) > 1_950_000:
+        padrao = _um_quadro(padrao)
     if not padrao or sum(padrao) > 1_950_000:
         raise ToonsError("Código de infravermelho vazio ou longo demais (o Android manda no máximo 2 segundos).")
     resposta = _tapi(["termux-infrared-transmit", "-f", str(freq), ",".join(map(str, padrao))], 20,
@@ -16106,8 +16145,8 @@ def codigo_digitado(texto: str) -> dict:
     palavras = texto.replace(",", " ").split()
     if not palavras:
         raise ToonsError("Código vazio.")
-    protocolos = {"NEC", "NECEXT", "SAMSUNG32", "SIRC", "SIRC15", "SIRC20", "RC5", "RC5X", "RC6", "KASEIKYO", "RCA",
-                  "SHARP"}
+    protocolos = {"NEC", "NECEXT", "NEC42", "PIONEER", "SAMSUNG32", "SIRC", "SIRC15", "SIRC20", "RC5", "RC5X", "RC6",
+                  "KASEIKYO", "RCA", "SHARP"}
     try:
         if palavras[0] == "0000" and len(palavras) >= 6 and all(re.fullmatch(r"[0-9a-fA-F]{4}", p) for p in palavras):
             valores = [int(p, 16) for p in palavras]
@@ -16133,29 +16172,43 @@ def codigo_digitado(texto: str) -> dict:
     return codigo
 
 
-def _biblioteca_tv() -> str:
-    """O arquivo de códigos universais de TV, baixado uma vez (e de novo a cada 90 dias)."""
-    if TV_BIBLIOTECA.exists() and time.time() - TV_BIBLIOTECA.stat().st_mtime < 90 * 86400:
-        return TV_BIBLIOTECA.read_text("utf-8", errors="replace")
+IR_BIBLIOTECA_BASE = ("https://raw.githubusercontent.com/flipperdevices/flipperzero-firmware/dev/applications/main/"
+                      "infrared/resources/infrared/assets/")
+# categoria → arquivo universal do Flipper Zero e o botão que desliga o aparelho (para a busca automática)
+_CATEGORIAS_IR = {
+    "tv": {"arquivo": "tv.ir", "desligar": "Power"},
+    "som": {"arquivo": "audio.ir", "desligar": "Power"},
+    "projetor": {"arquivo": "projector.ir", "desligar": "Power"},
+    "ar": {"arquivo": "ac.ir", "desligar": "Off"},
+}
+
+
+def _biblioteca_ir(arquivo: str = "tv.ir") -> str:
+    """Um arquivo de códigos universais do Flipper Zero (tv/audio/projector/ac), baixado uma vez (e de novo a cada
+    90 dias)."""
+    destino = TV_BIBLIOTECA if arquivo == "tv.ir" else DATA_DIR / ("ir_" + arquivo)
+    if destino.exists() and time.time() - destino.stat().st_mtime < 90 * 86400:
+        return destino.read_text("utf-8", errors="replace")
     try:
-        req = urllib.request.Request(TV_BIBLIOTECA_URL, headers={"User-Agent": USER_AGENT})
+        req = urllib.request.Request(IR_BIBLIOTECA_BASE + arquivo, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=30) as r:
             texto = r.read().decode("utf-8", errors="replace")
         if "name:" not in texto:
             raise ValueError("arquivo inesperado")
-        TV_BIBLIOTECA.parent.mkdir(parents=True, exist_ok=True)
-        TV_BIBLIOTECA.write_text(texto, "utf-8")
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        destino.write_text(texto, "utf-8")
         return texto
     except (OSError, ValueError) as e:
-        if TV_BIBLIOTECA.exists():
-            return TV_BIBLIOTECA.read_text("utf-8", errors="replace")
+        if destino.exists():
+            return destino.read_text("utf-8", errors="replace")
         aviso(f"Não consegui baixar a biblioteca universal ({e}): vou testar só as marcas mais comuns.")
         return ""
 
 
-def codigos_para_busca() -> list:
-    """Os códigos de liga/desliga para a busca automática: [(de onde veio, código, outros botões do mesmo controle)].
-    Primeiro os das marcas embutidas, depois os da biblioteca universal, sem repetir."""
+def codigos_para_busca(categoria: str = "tv") -> list:
+    """Os códigos de desligar para a busca automática: [(de onde veio, código, outros botões do mesmo controle)].
+    Primeiro os das marcas embutidas (só a TV tem), depois os da biblioteca universal, sem repetir."""
+    cat = _CATEGORIAS_IR[categoria]
     lista, vistos = [], set()
 
     def juntar(origem: str, codigo: dict, botoes: dict) -> None:
@@ -16167,18 +16220,23 @@ def codigos_para_busca() -> list:
             vistos.add((freq, *padrao))
             lista.append((origem, codigo, botoes))
 
-    for marca, botoes in TV_MARCAS_IR.items():
-        juntar(marca, botoes["Power"], botoes)
-    for controle, codigos in ler_arquivo_ir(_biblioteca_tv()):
+    if categoria == "tv":
+        for marca, botoes in TV_MARCAS_IR.items():
+            juntar(marca, botoes["Power"], botoes)
+    for controle, codigos in ler_arquivo_ir(_biblioteca_ir(cat["arquivo"])):
         nomes = [nome for nome, _ in codigos]
         um_controle = controle is not None and len(nomes) == len(set(nomes))  # grupo com um controle só
         for nome, codigo in codigos:
-            if _nome_botao(nome) in _APELIDOS_IR["Power"]:
+            if _nome_botao(nome) in _APELIDOS_IR[cat["desligar"]]:
                 juntar(controle or "biblioteca universal", codigo, dict(codigos) if um_controle else {})
     return lista
 
 
-def _varrer_codigos(lista: list, inicio: int) -> int | None:
+def _biblioteca_tv() -> str:
+    return _biblioteca_ir("tv.ir")
+
+
+def _varrer_codigos(lista: list, inicio: int, alvo: str = "a TV") -> int | None:
     """Manda os códigos a partir de `inicio`, um por vez, e devolve o índice do último mandado quando a pessoa toca
     na tela ou aperta uma tecla (None se acabaram). Esc cancela."""
     interativo = setas_ativas()
@@ -16203,7 +16261,7 @@ def _varrer_codigos(lista: list, inicio: int) -> int | None:
                     raise
             if not interativo:
                 print()
-                if confirmar("A TV desligou?", False):
+                if confirmar(f"{alvo.capitalize()} desligou?", False):
                     return k
             elif select.select([fd], [], [], 0.9)[0]:
                 if ler_tecla() == "esc":
@@ -16220,36 +16278,73 @@ def _varrer_codigos(lista: list, inicio: int) -> int | None:
             termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
 
 
-def busca_automatica_ir() -> dict | None:
-    """Testa os códigos de desligar de centenas de TVs, um por um, até a pessoa avisar que a TV desligou; depois
+def busca_automatica_ir(categoria: str = "tv", alvo: str = "a TV") -> dict | None:
+    """Testa os códigos de desligar de centenas de aparelhos, um por um, até a pessoa avisar que desligou; depois
     confirma qual foi. Devolve {'origem': ..., 'botoes': {...}} ou None."""
-    info("Preparando a lista de códigos (na primeira vez baixa a biblioteca universal de TVs)...")
-    lista = codigos_para_busca()
+    info("Preparando a lista de códigos (na primeira vez baixa a biblioteca universal)...")
+    lista = codigos_para_busca(categoria)
+    desligar = _CATEGORIAS_IR[categoria]["desligar"]
     print(f"\n{NEG}Como funciona:{RST}\n"
-          f"  1. Deixe a TV {NEG}ligada{RST}.\n"
-          f"  2. Aponte o topo do celular para a TV, de perto (até uns 3 metros).\n"
+          f"  1. Deixe {alvo} {NEG}ligado(a){RST}.\n"
+          f"  2. Aponte o topo do celular para o aparelho, de perto (até uns 3 metros).\n"
           f"  3. Vou mandar o sinal de desligar de {len(lista)} controles, um por segundo.\n"
-          f"  4. Quando a TV desligar, {NEG}toque na tela ou aperte uma tecla{RST} (Esc cancela).\n")
+          f"  4. Quando desligar, {NEG}toque na tela ou aperte uma tecla{RST} (Esc cancela).\n")
     if not confirmar("Começar?", True):
         return None
     inicio = 0
     while True:
-        parou = _varrer_codigos(lista, inicio)
+        parou = _varrer_codigos(lista, inicio, alvo)
         if parou is None:
-            aviso("Testei todos e a TV não desligou. Confira se o celular tem infravermelho e se está apontado para a "
-                  "TV; se ela for Smart, use o Wi-Fi. Também dá para importar o controle dela (arquivo .ir).")
+            aviso(f"Testei todos e {alvo} não desligou. Confira se o celular tem infravermelho e se está apontado para "
+                  "o aparelho. Também dá para importar o controle dele (arquivo .ir).")
             return None
         ok("Parou! Agora vamos confirmar qual código foi (a reação demora um pouco, então testo os últimos).")
         for k in range(parou, max(-1, parou - 3), -1):
-            info("Ligue a TV de novo (no controle ou no botão dela).")
+            info(f"Ligue {alvo} de novo (no controle ou no botão).")
             pausar()
             ir_transmitir(lista[k][1])
-            if confirmar(f"A TV desligou agora? ({lista[k][0]})", True):
+            if confirmar(f"Desligou agora? ({lista[k][0]})", True):
                 origem, codigo, botoes = lista[k]
-                return {"origem": origem, "botoes": {**botoes, "Power": codigo}}
+                return {"origem": origem, "botoes": {**botoes, desligar: codigo}}
         if not confirmar("Não foi nenhum desses. Continuar a busca de onde parou?", True):
             return None
         inicio = parou + 1
+
+
+def desligar_tvs_por_perto() -> None:
+    """Dispara, em sequência, o 'desligar' de centenas de TVs (estilo TV-B-Gone). Esc cancela."""
+    problema = ir_disponivel()
+    if problema:
+        raise ToonsError(f"Sem infravermelho: {problema}.")
+    lista = codigos_para_busca("tv")
+    print(f"{NEG}Vou mandar o sinal de desligar de {len(lista)} modelos de TV, um atrás do outro.{RST}\n"
+          "Aponte o topo do celular para a(s) TV(s). Serve para desligar a TV de uma loja, academia ou sala de espera.")
+    if not confirmar("Começar?", True):
+        return
+    interativo = setas_ativas()
+    fd = sys.stdin.fileno()
+    antigo = termios.tcgetattr(fd) if interativo else None
+    enviados = 0
+    try:
+        if interativo:
+            tty.setcbreak(fd)
+            _mouse(True)
+        for k, (origem, codigo, _) in enumerate(lista):
+            print(f"\r\033[K  📴 {k + 1}/{len(lista)}  {DIM}{_cortar(origem, max(10, largura_tela() - 20))}{RST}",
+                  end="", flush=True)
+            with contextlib.suppress(ToonsError):
+                ir_transmitir(codigo)
+                enviados += 1
+            if interativo and select.select([fd], [], [], 0.12)[0] and ler_tecla() == "esc":
+                print()
+                aviso("Cancelado.")
+                return
+        print()
+    finally:
+        if interativo:
+            _mouse(False)
+            termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
+    ok(f"Mandei {enviados} códigos de desligar. Se alguma TV não desligou, pode ser que ela não estivesse no alcance.")
 
 
 # ── Wi-Fi: WebSocket (Samsung e LG), ADB (Android TV), HTTP (Roku) e Wake-on-LAN ──
@@ -16861,26 +16956,29 @@ _ATALHOS_CONTROLE = {
     "b": "voltar", "i": "entrada", "e": "entrada",
 }
 _COR_BOTAO, _COR_BOTAO_OFF, _COR_ENERGIA = _c("1;97;48;5;238"), _c("2;37;48;5;236"), _c("1;97;41")
+TV_DICAS = ["toque nos botões", "arraste para cima ou para baixo: volume", "p liga/desliga", "setas e Enter navegam",
+            "+/- volume", "m mudo", "PgUp/PgDn canal", "Esc sai"]
 
 
-def _desenhar_controle(controle: ControleTV, recado: str, apertado: str | None) -> list:
-    """Desenha o controle remoto e devolve onde ficou cada botão: [(linha, altura, coluna 1, coluna 2, ação)], com
-    linhas e colunas contadas a partir de 1, como os toques chegam."""
+def _desenhar_painel(titulo: str, subtitulo: str, layout: list, ativo, energia: set, dicas: list,
+                     recado: str, apertado: str | None) -> list:
+    """Desenha um controle remoto (TV ou outro aparelho) e devolve onde ficou cada botão:
+    [(linha, altura, coluna 1, coluna 2, ação)], com linhas e colunas a partir de 1, como os toques chegam."""
     colunas, linhas_tela = shutil.get_terminal_size((60, 24))
-    fileiras = len(_BOTOES_CONTROLE)
+    fileiras = len(layout)
     altura, espaco = ((3, 1) if linhas_tela >= fileiras * 4 + 7 else (3, 0) if linhas_tela >= fileiras * 3 + 7
                       else (1, 1) if linhas_tela >= fileiras * 2 + 7 else (1, 0))
-    linhas = [_no_centro(_faixa_titulo(f"📺 {controle.tv['nome']}", max(20, min(colunas, 50))), colunas),
-              _no_centro(f"{DIM}{TIPOS_TV.get(controle.tv['tipo'], '')}{RST}", colunas), ""]
+    linhas = [_no_centro(_faixa_titulo(titulo, max(20, min(colunas, 50))), colunas)]
+    linhas += ([_no_centro(f"{DIM}{subtitulo}{RST}", colunas)] if subtitulo else []) + [""]
     alvos = []
-    for fileira in _BOTOES_CONTROLE:
+    for fileira in layout:
         larguras = [_largura(rotulo) + 4 for _, rotulo in fileira]
         x = max(0, (colunas - sum(larguras) - 2 * (len(fileira) - 1)) // 2)
         partes = [" " * x for _ in range(altura)]
         for (acao, rotulo), largura in zip(fileira, larguras):
-            ativo = acao == "sair" or controle.tem(acao)
-            cor = (DESTAQUE if acao == apertado else _COR_ENERGIA if acao == "alternar" and ativo
-                   else _COR_BOTAO if ativo else _COR_BOTAO_OFF)
+            lig = acao == "sair" or ativo(acao)
+            cor = (DESTAQUE if acao == apertado else _COR_ENERGIA if acao in energia and lig
+                   else _COR_BOTAO if lig else _COR_BOTAO_OFF)
             for r in range(altura):
                 miolo = _centralizar(rotulo, largura) if r == altura // 2 else " " * largura
                 partes[r] += f"{cor}{miolo}{RST}  "
@@ -16888,15 +16986,14 @@ def _desenhar_controle(controle: ControleTV, recado: str, apertado: str | None) 
             x += largura + 2
         linhas += partes + [""] * espaco
     linhas.append(_no_centro(recado, colunas) if recado else "")
-    dicas, teclas = [""], ["toque nos botões", "arraste para cima ou para baixo: volume", "p liga/desliga",
-                           "setas e Enter navegam", "+/- volume", "m mudo", "PgUp/PgDn canal", "Esc sai"]
-    for tecla in teclas:
-        junto = f"{dicas[-1]} · {tecla}" if dicas[-1] else tecla
-        if _largura(junto) > colunas - 2 and dicas[-1]:
-            dicas.append(tecla)
+    agrupadas = [""]
+    for tecla in dicas:
+        junto = f"{agrupadas[-1]} · {tecla}" if agrupadas[-1] else tecla
+        if _largura(junto) > colunas - 2 and agrupadas[-1]:
+            agrupadas.append(tecla)
         else:
-            dicas[-1] = junto
-    linhas += [_no_centro(f"{DIM}{d}{RST}", colunas) for d in dicas]
+            agrupadas[-1] = junto
+    linhas += [_no_centro(f"{DIM}{d}{RST}", colunas) for d in agrupadas]
     acima = max(0, (linhas_tela - len(linhas)) // 2)
     linhas = [""] * acima + linhas
     sys.stdout.write("\033[H" + "\n".join(_cortar(linha, colunas) + "\033[K" for linha in linhas[:linhas_tela])
@@ -16909,69 +17006,78 @@ def _botao_tocado(alvos: list, x: int, y: int) -> str | None:
     return next((acao for linha, alt, x0, x1, acao in alvos if linha <= y < linha + alt and x0 <= x <= x1), None)
 
 
+def _painel_controle(titulo: str, subtitulo: str, layout: list, ativo, energia: set, dicas: list,
+                     acionar, rotulo, atalhos: dict, volume: tuple | None) -> None:
+    """Laço de um controle remoto na tela: toque nos botões, arraste (volume) ou use o teclado. `acionar(acao)` faz o
+    comando e devolve a mensagem (ou levanta ToonsError); `rotulo(acao)` dá o nome do botão."""
+    if not setas_ativas():
+        acoes = [a for fileira in layout for a, _ in fileira if a != "sair" and ativo(a)]
+        while True:
+            i = escolher(f"{titulo}: qual botão?", [rotulo(a) for a in acoes])
+            if i is None:
+                return
+            try:
+                ok(acionar(acoes[i]))
+            except ToonsError as e:
+                erro(str(e))
+    fd = sys.stdin.fileno()
+    antigo = termios.tcgetattr(fd)
+    limpar()
+    _cursor(False)
+    _mouse(True)
+    recado, pendente = "", None
+    try:
+        tty.setcbreak(fd)
+        while True:
+            alvos = _desenhar_painel(titulo, subtitulo, layout, ativo, energia, dicas, recado, None)
+            tecla, pendente = pendente or ler_tecla(), None
+            acao, vezes = None, 1
+            if tecla in ("esc", "q", "Q"):
+                break
+            if tecla.startswith("toque:"):
+                _, x, y = tecla.split(":")
+                acao = _botao_tocado(alvos, int(x), int(y))
+                if acao == "sair":
+                    break
+            elif tecla.startswith("rolar:") and volume:  # arrastar: volume (no Termux, dedo subindo = rodinha p/ baixo)
+                direcao = tecla.split(":")[1]
+                acao = volume[0] if (direcao == "baixo") == IS_TERMUX else volume[1]
+                while vezes < 5 and select.select([fd], [], [], 0.08)[0]:  # junta o arrastar num só envio
+                    proxima = ler_tecla()
+                    if proxima.startswith(f"rolar:{direcao}:"):
+                        vezes += 1
+                    else:
+                        pendente = proxima
+                        break
+            else:
+                acao = atalhos.get(tecla)
+            if not acao:
+                continue
+            if not ativo(acao):
+                recado = f"{AMAR}Esse aparelho não tem o botão '{rotulo(acao)}'.{RST}"
+                continue
+            _desenhar_painel(titulo, subtitulo, layout, ativo, energia, dicas, f"{DIM}… {rotulo(acao)}{RST}", acao)
+            try:
+                for _ in range(vezes):
+                    resultado = acionar(acao)
+                recado = f"{VERD}{resultado}{' ×' + str(vezes) if vezes > 1 else ''}{RST}"
+            except ToonsError as e:
+                recado = f"{VERM}✖ {e}{RST}"
+    finally:
+        _mouse(False)
+        termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
+        _cursor(True)
+    limpar()
+
+
 @submenu
 def tela_controle_tv(tv: dict | None = None) -> None:
-    """Controle remoto na tela: toque nos botões, arraste para mudar o volume ou use o teclado."""
+    """Controle remoto da TV na tela: toque nos botões, arraste para mudar o volume ou use o teclado."""
     controle = ControleTV(tv or tv_escolhida())
     try:
-        if not setas_ativas():
-            acoes = [a for a in TV_TECLAS if a not in ("ligar", "desligar") and controle.tem(a)]
-            while True:
-                i = escolher(f"📺 {controle.tv['nome']}: qual botão?", [TV_TECLAS[a][0] for a in acoes])
-                if i is None:
-                    return
-                try:
-                    ok(controle.tecla(acoes[i]))
-                except ToonsError as e:
-                    erro(str(e))
-        fd = sys.stdin.fileno()
-        antigo = termios.tcgetattr(fd)
-        limpar()
-        _cursor(False)
-        _mouse(True)
-        recado, pendente = "", None
-        try:
-            tty.setcbreak(fd)
-            while True:
-                alvos = _desenhar_controle(controle, recado, None)
-                tecla, pendente = pendente or ler_tecla(), None
-                acao, vezes = None, 1
-                if tecla in ("esc", "q", "Q"):
-                    break
-                if tecla.startswith("toque:"):
-                    _, x, y = tecla.split(":")
-                    acao = _botao_tocado(alvos, int(x), int(y))
-                    if acao == "sair":
-                        break
-                elif tecla.startswith("rolar:"):  # arrastar: volume (no Termux, dedo subindo = rodinha para baixo)
-                    direcao = tecla.split(":")[1]
-                    acao = "vol+" if (direcao == "baixo") == IS_TERMUX else "vol-"
-                    while vezes < 5 and select.select([fd], [], [], 0.08)[0]:  # junta o arrastar num só envio
-                        proxima = ler_tecla()
-                        if proxima.startswith(f"rolar:{direcao}:"):
-                            vezes += 1
-                        else:
-                            pendente = proxima
-                            break
-                else:
-                    acao = _ATALHOS_CONTROLE.get(tecla)
-                if not acao:
-                    continue
-                if not controle.tem(acao):
-                    recado = f"{AMAR}Essa TV não tem o botão '{TV_TECLAS[acao][0]}'.{RST}"
-                    continue
-                _desenhar_controle(controle, f"{DIM}… {TV_TECLAS[acao][0]}{RST}", acao)
-                try:
-                    for _ in range(vezes):
-                        resultado = controle.tecla(acao)
-                    recado = f"{VERD}{resultado}{' ×' + str(vezes) if vezes > 1 else ''}{RST}"
-                except ToonsError as e:
-                    recado = f"{VERM}✖ {e}{RST}"
-        finally:
-            _mouse(False)
-            termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
-            _cursor(True)
-        limpar()
+        _painel_controle(f"📺 {controle.tv['nome']}", TIPOS_TV.get(controle.tv["tipo"], ""), _BOTOES_CONTROLE,
+                         lambda a: a == "sair" or controle.tem(a), {"alternar"}, TV_DICAS,
+                         controle.tecla, lambda a: TV_TECLAS[a][0], _ATALHOS_CONTROLE, ("vol+", "vol-"))
     finally:
         controle.fechar()
 
@@ -16988,7 +17094,8 @@ def _nova_tv_ir() -> dict | None:
     if i is None:
         return None
     if i == len(marcas) + 1:
-        return _importar_codigos_ir()
+        imp = _importar_codigos_ir("a TV")
+        return {"tipo": "ir", **imp} if imp else None
     if i < len(marcas):
         marca = marcas[i]
         while True:
@@ -17011,7 +17118,8 @@ def _nova_tv_ir() -> dict | None:
     return {"tipo": "ir", "codigos": achado["botoes"], "modelo": achado["origem"]}
 
 
-def _importar_codigos_ir() -> dict | None:
+def _importar_codigos_ir(alvo: str = "a TV", desligar: str = "Power") -> dict | None:
+    """Importa o controle de um arquivo .ir ou de um código colado. Devolve {'codigos': {...}, 'modelo': ...}."""
     j = escolher("De onde vem o código?", ["Arquivo .ir (Flipper Zero / Flipper-IRDB, baixado no celular)",
                                            "Colar um código (Pronto, tempos em µs ou protocolo)"])
     if j == 0:
@@ -17024,19 +17132,19 @@ def _importar_codigos_ir() -> dict | None:
                 botoes.setdefault(nome, codigo)
         if not botoes:
             raise ToonsError("Não achei códigos nesse arquivo.")
-        if _codigo_ir(botoes, "Power") is None:
-            aviso("Esse arquivo não tem o botão de liga/desliga ('Power'); os outros botões funcionam.")
+        if _codigo_ir(botoes, desligar) is None:
+            aviso(f"Esse arquivo não tem o botão de desligar ('{desligar}'); os outros botões funcionam.")
         ok(f"{len(botoes)} botões: {', '.join(list(botoes)[:15])}{'...' if len(botoes) > 15 else ''}")
-        return {"tipo": "ir", "codigos": botoes, "modelo": arquivo.stem}
+        return {"codigos": botoes, "modelo": arquivo.stem}
     if j == 1:
         info("Exemplos: 0000 006D 0022 0002 0157 00AC ... (Pronto) · 38000 9000,4500,560,560,... (tempos em µs) · "
              "NEC 04 08 (protocolo, endereço e comando em hexadecimal)")
-        codigo = codigo_digitado(perguntar("Código do liga/desliga"))
-        info("Aponte o celular para a TV para testar.")
+        codigo = codigo_digitado(perguntar("Código do desligar"))
+        info(f"Aponte o celular para {alvo} para testar.")
         pausar()
         ir_transmitir(codigo)
-        if confirmar("A TV desligou (ou ligou)?", True) or confirmar("Salvar mesmo assim?", False):
-            return {"tipo": "ir", "codigos": {"Power": codigo}, "modelo": "código colado"}
+        if confirmar("Funcionou (desligou ou ligou)?", True) or confirmar("Salvar mesmo assim?", False):
+            return {"codigos": {desligar: codigo}, "modelo": "código colado"}
     return None
 
 
@@ -17193,7 +17301,287 @@ def menu_tv():
         (lambda: f"🔀 Trocar de TV ({len(tvs)})", trocar),
         ("📝 Renomear ou apagar uma TV", editar),
         ("📲 Atalho na tela inicial (Termux:Widget)", atalho_tv),
+        ("📴 Desligar TVs por perto (TV-B-Gone)", desligar_tvs_por_perto),
         ("❓ Meu celular tem infravermelho?", checar_ir),
+    ], cabecalho=cabecalho)
+
+
+# ── Controle de outros aparelhos por infravermelho (som, projetor, ar-condicionado) ──
+
+APARELHOS = {
+    "som": {
+        "icone": "🔊", "nome": "🔊 Soundbar / aparelho de som", "nome_curto": "Som", "alvo": "o som",
+        "padrao_nome": "Som da sala", "energia": {"Power"},
+        "botoes": [
+            [("Power", "⏻ Liga/desliga"), ("Mute", "🔇 Mudo")],
+            [("Vol_dn", "🔉 Vol −"), ("Vol_up", "🔊 Vol +")],
+            [("Prev", "⏮ Ant"), ("Play", "▶ Play"), ("Next", "⏭ Próx")],
+            [("Pause", "⏸ Pausa")],
+            [("sair", "✖ Sair")],
+        ],
+        "dicas": ["toque nos botões", "arraste para cima ou para baixo: volume", "p liga/desliga", "setas",
+                  "+/- volume", "m mudo", "Esc sai"],
+    },
+    "projetor": {
+        "icone": "🎬", "nome": "🎬 Projetor / TV box / conversor", "nome_curto": "Projetor/TV box",
+        "alvo": "o aparelho", "padrao_nome": "Projetor", "energia": {"Power"},
+        "botoes": [
+            [("Power", "⏻ Liga/desliga"), ("Mute", "🔇 Mudo")],
+            [("Up", " ▲ ")],
+            [("Left", " ◀ "), ("Ok", " OK "), ("Right", " ▶ ")],
+            [("Down", " ▼ ")],
+            [("Menu", "☰ Menu"), ("Back", "↩ Voltar"), ("Input", "⇄ Fonte")],
+            [("Vol_dn", "🔉 Vol −"), ("Vol_up", "🔊 Vol +")],
+            [("sair", "✖ Sair")],
+        ],
+        "dicas": ["toque nos botões", "arraste: volume", "p liga/desliga", "setas e Enter navegam", "+/- volume",
+                  "m mudo", "Esc sai"],
+    },
+    "ar": {
+        "icone": "🧊", "nome": "🧊 Ar-condicionado", "nome_curto": "Ar-condicionado", "alvo": "o ar-condicionado",
+        "padrao_nome": "Ar da sala", "energia": {"Off"},
+        "botoes": [
+            [("Off", "⏻ Desligar")],
+            [("Cool_lo", "🧊 Mais frio"), ("Cool_hi", "🧊 Menos frio")],
+            [("Heat_hi", "🔥 Mais quente"), ("Heat_lo", "🔥 Menos quente")],
+            [("Dh", "💧 Desumidificar")],
+            [("sair", "✖ Sair")],
+        ],
+        "dicas": ["toque nos botões", "p desliga", "Esc sai"],
+    },
+}
+
+
+def _aparelhos() -> list:
+    return cfg().setdefault("aparelhos", [])
+
+
+def aparelho_escolhido(nome: str | None = None) -> dict:
+    aps = _aparelhos()
+    if not aps:
+        raise ToonsError("Nenhum aparelho configurado. Adicione em 📲 Celular e sistema → 🎛️ Controle de outros "
+                         "aparelhos.")
+    if nome:
+        achado = next((a for a in aps if a["nome"].casefold() == nome.casefold()), None)
+        if achado is None:
+            raise ToonsError(f"Não achei '{nome}'. Aparelhos: {', '.join(a['nome'] for a in aps)}")
+        return achado
+    i = cfg().get("aparelho_atual", 0)
+    return aps[i] if isinstance(i, int) and 0 <= i < len(aps) else aps[0]
+
+
+def descrever_aparelho(ap: dict) -> str:
+    conf = APARELHOS.get(ap["categoria"], {})
+    extra = ap.get("modelo") or ""
+    return f"{ap['nome']} · {conf.get('nome_curto', ap['categoria'])}" + (f" ({extra})" if extra else "")
+
+
+def _rotulos(layout: list) -> dict:
+    return {acao: rotulo for fileira in layout for acao, rotulo in fileira}
+
+
+def _atalhos_aparelho(ativo) -> dict:
+    """Teclas de atalho do controle, só para os botões que o aparelho tem."""
+    candidatos = {
+        "p": ("Power", "Off"), "P": ("Power", "Off"), "+": ("Vol_up",), "=": ("Vol_up",), "-": ("Vol_dn",),
+        "m": ("Mute",), "M": ("Mute",), "cima": ("Up",), "baixo": ("Down",), "esq": ("Left",), "dir": ("Right",),
+        "enter": ("Ok", "Play"), " ": ("Ok", "Play"), "backspace": ("Back",), "b": ("Back",), "i": ("Input",),
+        "e": ("Input",),
+    }
+    atalhos = {}
+    for tecla, nomes in candidatos.items():
+        achado = next((n for n in nomes if ativo(n)), None)
+        if achado:
+            atalhos[tecla] = achado
+    return atalhos
+
+
+def aparelho_comando(acao: str, nome: str | None = None) -> str:
+    """Um botão só, de qualquer lugar (atalho da tela inicial, linha de comando)."""
+    ap = aparelho_escolhido(nome)
+    codigo = _codigo_ir(ap.get("codigos", {}), acao)
+    if codigo is None:
+        raise ToonsError(f"O aparelho '{ap['nome']}' não tem o botão '{acao}'.")
+    ir_transmitir(codigo)
+    return f"✔ {acao} ({ap['nome']})"
+
+
+@submenu
+def tela_controle_aparelho(ap: dict | None = None) -> None:
+    """Controle remoto na tela de um aparelho por infravermelho (só os botões que ele tem ficam acesos)."""
+    ap = ap or aparelho_escolhido()
+    conf = APARELHOS[ap["categoria"]]
+    botoes = ap.get("codigos", {})
+    rotulos = _rotulos(conf["botoes"])
+
+    def ativo(acao: str) -> bool:
+        return acao == "sair" or _codigo_ir(botoes, acao) is not None
+
+    def rotular(acao: str) -> str:
+        return rotulos.get(acao, acao).strip()
+
+    def acionar(acao: str) -> str:
+        codigo = _codigo_ir(botoes, acao)
+        if codigo is None:
+            raise ToonsError(f"Esse aparelho não tem o botão '{rotular(acao)}'.")
+        ir_transmitir(codigo)
+        return f"✔ {rotular(acao)}"
+
+    volume = ("Vol_up", "Vol_dn") if ativo("Vol_up") and ativo("Vol_dn") else None
+    subtitulo = conf["nome_curto"] + (f" · {ap['modelo']}" if ap.get("modelo") else "")
+    _painel_controle(f"{conf['icone']} {ap['nome']}", subtitulo, conf["botoes"], ativo, conf["energia"],
+                     conf["dicas"], acionar, rotular, _atalhos_aparelho(ativo), volume)
+
+
+# ── Adicionar e configurar os aparelhos ──
+
+def _modelos_do_arquivo(arquivo: str) -> list:
+    """[(nome do controle, {botão: código})] da biblioteca universal, um por modelo."""
+    modelos = []
+    for controle, codigos in ler_arquivo_ir(_biblioteca_ir(arquivo)):
+        if not controle:
+            continue
+        botoes = {}
+        for nome, codigo in codigos:
+            botoes.setdefault(nome, codigo)
+        modelos.append((controle, botoes))
+    return modelos
+
+
+def _novo_aparelho_ir(categoria: str) -> dict | None:
+    problema = ir_disponivel()
+    if problema:
+        raise ToonsError(f"Sem infravermelho: {problema}.")
+    cat, conf = _CATEGORIAS_IR[categoria], APARELHOS[categoria]
+    desligar, alvo = cat["desligar"], conf["alvo"]
+    info("Preparando a lista de modelos (na primeira vez baixa a biblioteca universal)...")
+    modelos = _modelos_do_arquivo(cat["arquivo"])
+    marcas = sorted({m.split()[0] for m, _ in modelos}, key=str.casefold)
+    i = escolher("Qual a marca?", marcas + ["🔎 Não sei / outra marca: busca automática (testa centenas)",
+                                            "📄 Importar um arquivo .ir ou colar um código"])
+    if i is None:
+        return None
+    if i == len(marcas) + 1:
+        imp = _importar_codigos_ir(alvo, desligar)
+        return {"categoria": categoria, **imp} if imp else None
+    if i < len(marcas):
+        desses = [(m, c) for m, c in modelos if m.split()[0] == marcas[i]]
+        if len(desses) > 1:
+            j = escolher(f"Qual modelo {marcas[i]}?", [m for m, _ in desses])
+            if j is None:
+                return None
+            modelo, codigos = desses[j]
+        else:
+            modelo, codigos = desses[0]
+        codigo = _codigo_ir(codigos, desligar)
+        while True:
+            if codigo is not None:
+                info(f"Aponte o topo do celular para {alvo} (de perto). Vou mandar o desligar.")
+                pausar()
+                ir_transmitir(codigo)
+                if confirmar("Funcionou (desligou ou ligou)?", True):
+                    return {"categoria": categoria, "codigos": codigos, "modelo": modelo}
+            elif confirmar("Esse modelo não tem botão de desligar para testar. Usar assim mesmo?", True):
+                return {"categoria": categoria, "codigos": codigos, "modelo": modelo}
+            j = escolher("E agora?", ["Tentar de novo", "Busca automática (testa centenas)", "Cancelar"])
+            if j == 1:
+                break
+            if j != 0:
+                return None
+    achado = busca_automatica_ir(categoria, alvo)
+    if not achado:
+        return None
+    return {"categoria": categoria, "codigos": achado["botoes"], "modelo": achado["origem"]}
+
+
+def adicionar_aparelho() -> None:
+    cats = list(APARELHOS)
+    i = escolher("Que aparelho você quer controlar?", [APARELHOS[c]["nome"] for c in cats])
+    if i is None:
+        return
+    cat = cats[i]
+    if cat == "ar":
+        info("No ar-condicionado, o controle universal tem presets: desligar, mais/menos frio, mais/menos quente e "
+             "desumidificar (não é grau a grau).")
+    novo = _novo_aparelho_ir(cat)
+    if not novo:
+        return
+    aps = _aparelhos()
+    nome = perguntar("Nome desse aparelho", APARELHOS[cat]["padrao_nome"]).strip() or APARELHOS[cat]["nome_curto"]
+    while any(a["nome"].casefold() == nome.casefold() for a in aps):
+        nome += " 2"
+    aps.append({"nome": nome, **novo})
+    cfg()["aparelho_atual"] = len(aps) - 1
+    salvar_cfg()
+    ok(f"Pronto! {descrever_aparelho(aps[-1])}")
+    info("Use '🎮 Controle remoto'. Dá para pôr um atalho na tela inicial (Termux:Widget) e usar no terminal "
+         "(toons aparelho ...).")
+
+
+def atalho_aparelho(ap: dict) -> None:
+    pasta = HOME / ".shortcuts"
+    (pasta / "tasks").mkdir(parents=True, exist_ok=True)
+    inicio = f"#!{PREFIX or '/data/data/com.termux/files/usr'}/bin/bash\n"
+    desligar = _CATEGORIAS_IR[ap["categoria"]]["desligar"]
+    atalhos = {pasta / "tasks" / f"{ap['nome']} desligar.sh": desligar,
+               pasta / f"{ap['nome']} controle.sh": "controle"}
+    for arquivo, acao in atalhos.items():
+        arquivo.write_text(inicio + shlex.join([sys.executable, str(SCRIPT), "aparelho", ap["nome"], acao]) + "\n",
+                           "utf-8")
+        os.chmod(arquivo, 0o700)
+    ok(f"Atalhos criados: '{ap['nome']} desligar' e '{ap['nome']} controle'.")
+    info("Instale o app Termux:Widget (mesma loja do Termux) e ponha o widget dele na tela inicial.")
+
+
+@submenu
+def menu_aparelhos():
+    c = cfg()
+    aps = _aparelhos()
+
+    def cabecalho():
+        if aps:
+            print(f"Aparelho: {NEG}{descrever_aparelho(aparelho_escolhido())}{RST}")
+        else:
+            print(f"{DIM}Nenhum aparelho ainda: comece em ➕ Adicionar{RST}")
+
+    def trocar():
+        if not aps:
+            raise ToonsError("Nenhum aparelho configurado ainda.")
+        i = escolher("Qual aparelho controlar?", [descrever_aparelho(a) for a in aps],
+                     aps.index(aparelho_escolhido()) + 1)
+        if i is not None:
+            c["aparelho_atual"] = i
+            salvar_cfg()
+            ok(f"Controlando: {aps[i]['nome']}")
+
+    def editar():
+        if not aps:
+            raise ToonsError("Nenhum aparelho configurado ainda.")
+        i = escolher("Qual aparelho?", [descrever_aparelho(a) for a in aps])
+        if i is None:
+            return
+        j = escolher(aps[i]["nome"], ["Renomear", "Apagar"])
+        if j == 0:
+            aps[i]["nome"] = perguntar("Novo nome", aps[i]["nome"]).strip() or aps[i]["nome"]
+        elif j == 1 and confirmar(f"Apagar '{aps[i]['nome']}'?", False):
+            del aps[i]
+            c["aparelho_atual"] = 0
+        else:
+            return
+        salvar_cfg()
+        ok("Feito.")
+
+    def atalho():
+        if not aps:
+            raise ToonsError("Nenhum aparelho configurado ainda.")
+        atalho_aparelho(aparelho_escolhido())
+
+    menu("📡 Controle de outros aparelhos (som, projetor, ar)", [
+        ("🎮 Controle remoto", tela_controle_aparelho),
+        ("➕ Adicionar aparelho (som, projetor, ar-condicionado)", adicionar_aparelho),
+        (lambda: f"🔀 Trocar de aparelho ({len(aps)})", trocar),
+        ("📝 Renomear ou apagar", editar),
+        ("📲 Atalho na tela inicial (Termux:Widget)", atalho),
     ], cabecalho=cabecalho)
 
 
@@ -17212,6 +17600,7 @@ def menu_celular():
         ("🤖 Automação por eventos (Wi-Fi, carregador, horário)", menu_automacao),
         ("📲 Espelhar e transmitir a tela (scrcpy ou link pela internet)", menu_espelhar),
         ("📺 Controle da TV (infravermelho do celular ou Wi-Fi)", menu_tv),
+        ("📡 Controle de outros aparelhos (som, projetor, ar)", menu_aparelhos),
     ])
 
 
@@ -23455,6 +23844,8 @@ def _indice_busca() -> list:
         ("📱 Espelhar a tela (scrcpy)", "espelhar scrcpy tela espelhamento mostrar", menu_espelhar),
         ("📺 Controle da TV", "tv televisao controle remoto infravermelho ir sensor ligar desligar smart samsung lg "
          "roku android google tcl philips sony volume canal", menu_tv),
+        ("📡 Controle de outros aparelhos (som, projetor, ar)", "som soundbar projetor ar condicionado "
+         "ar-condicionado tv box conversor infravermelho ir controle remoto universal flipper", menu_aparelhos),
         ("🖥️ Resolução da tela", "resolucao tela dpi densidade pixel diminuir baixar jogo app leve desempenho fps "
                                  "lag travando wm size", menu_resolucao),
         ("📡 Modem (AT / 3GPP)", "modem at comando 3gpp sinal operadora", menu_modem),
@@ -23644,6 +24035,10 @@ def main(argv=None) -> int:
     p = sub.add_parser("tv", help="controla a TV (infravermelho ou Wi-Fi): alternar, ligar, desligar, vol+, mudo...")
     p.add_argument("acao", nargs="?", default="alternar", choices=[*TV_TECLAS, "controle"])
     p.add_argument("--tv", metavar="NOME", help="qual TV (padrão: a escolhida no menu)")
+    p = sub.add_parser("aparelho", help="controla som/projetor/ar por infravermelho (botão ou 'controle')")
+    p.add_argument("nome", help="nome do aparelho configurado no menu")
+    p.add_argument("acao", nargs="?", default="controle", help="botão (Power, Off, Vol_up...) ou 'controle'")
+    sub.add_parser("tvbgone", help="desliga as TVs por perto (estilo TV-B-Gone)")
     sub.add_parser("atualizar", help="atualiza Termux, pacotes Python, distros e o Termux-Toons")
     sub.add_parser("limpar", help="otimização rápida: limpa caches e temporários com segurança")
     sub.add_parser("doctor", help="diagnóstico do ambiente")
@@ -23745,6 +24140,18 @@ def main(argv=None) -> int:
                     if not sys.stdout.isatty():  # atalho da tela inicial (sem terminal): avisa numa notificação
                         notificar_seguro("📺 TV", f"✖ {e}")
                     raise
+        elif args.comando == "aparelho":
+            if args.acao == "controle":
+                tela_controle_aparelho(aparelho_escolhido(args.nome))
+            else:
+                try:
+                    print(aparelho_comando(args.acao, args.nome))
+                except ToonsError as e:
+                    if not sys.stdout.isatty():
+                        notificar_seguro("🎛️ Aparelho", f"✖ {e}")
+                    raise
+        elif args.comando == "tvbgone":
+            desligar_tvs_por_perto()
         elif args.comando == "limpar":
             otimizacao_rapida(interativo=False)
         elif args.comando == "atualizar":
