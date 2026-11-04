@@ -4917,6 +4917,7 @@ MAX_SITES = 5  # quantos sites podem ficar no ar ao mesmo tempo
 SITES_DIR = DATA_DIR / "sites"  # cópia do arquivo quando você publica só uma página (uma pasta por site)
 VISITAS_DIR = DATA_DIR / "visitas"  # registro de quem acessou cada site (uma linha JSON por acesso)
 VISITAS_MAX = 2 * 1024 * 1024  # acima disso o registro é cortado para não crescer sem fim
+GEO_CACHE_FILE = VISITAS_DIR / "geo.json"  # IP -> cidade/operadora já consultados (evita repetir a busca)
 _lock_visitas = threading.Lock()  # o servidor é multithread; grava uma visita de cada vez
 
 
@@ -5206,6 +5207,67 @@ def _eh_pagina(caminho: str) -> bool:
     return c.endswith("/") or c.endswith((".html", ".htm")) or "." not in c.rsplit("/", 1)[-1]
 
 
+def _ip_publico(ip: str) -> bool:
+    """IP da internet (dá para geolocalizar) e não um endereço da rede local/127.0.0.1."""
+    try:
+        import ipaddress
+        return ipaddress.ip_address(ip).is_global
+    except Exception:
+        return False
+
+
+def _geo_ip(ip: str) -> dict:
+    """Consulta online a localização aproximada de um IP: cidade, região, país e operadora.
+    Retorna {} se não der (sem internet, IP local, serviço fora do ar)."""
+    if not _ip_publico(ip):
+        return {}
+    url = f"https://ipwho.is/{urllib.parse.quote(ip)}?lang=pt&fields=success,city,region,country,connection"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            dados = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return {}
+    if not isinstance(dados, dict) or not dados.get("success"):
+        return {}
+    con = dados.get("connection") or {}
+    return {
+        "cidade": (dados.get("city") or "").strip(),
+        "regiao": (dados.get("region") or "").strip(),
+        "pais": (dados.get("country") or "").strip(),
+        "operadora": (con.get("isp") or con.get("org") or "").strip(),
+    }
+
+
+def _carregar_geo_cache() -> dict:
+    with contextlib.suppress(Exception):
+        return json.loads(GEO_CACHE_FILE.read_text("utf-8"))
+    return {}
+
+
+def _geolocalizar(ips: list) -> dict:
+    """Localização aproximada de cada IP público, reaproveitando o cache em disco."""
+    cache = _carregar_geo_cache()
+    novos = False
+    for i, ip in enumerate([p for p in ips if _ip_publico(p) and p not in cache]):
+        if i:
+            time.sleep(0.3)  # respeita o limite do serviço gratuito
+        cache[ip] = _geo_ip(ip)
+        novos = True
+    if novos:
+        with contextlib.suppress(Exception):
+            GEO_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            GEO_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False), "utf-8")
+    return {ip: cache.get(ip) or {} for ip in ips}
+
+
+def _linha_local(g: dict) -> str:
+    """Monta 'Cidade, Região · Operadora' a partir do resultado da geolocalização."""
+    lugar = ", ".join(p for p in (g.get("cidade"), g.get("regiao")) if p)
+    partes = [p for p in (lugar, g.get("operadora")) if p]
+    return " · ".join(partes)
+
+
 def ver_visitas_do_site(n: int | None = None) -> None:
     """Mostra quem acessou o site: IP, país, aparelho/navegador e páginas abertas, por visitante."""
     n = n or _escolher_site_para_visitas("Ver quem acessou qual site?")
@@ -5244,11 +5306,20 @@ def ver_visitas_do_site(n: int | None = None) -> None:
     if not any(d["via"] == "internet" for _, d in ordenados):
         print(f"  {DIM}Nenhum acesso pelo túnel da Cloudflare ainda — todos foram pela mesma rede Wi-Fi. "
               f"O IP real de quem está na internet só aparece com o túnel ligado.{RST}")
+    # Localização aproximada (cidade/operadora) a partir do IP: consulta online, opcional.
+    geo: dict = {}
+    publicos = [ip for ip, d in ordenados if d["via"] == "internet" and _ip_publico(ip)]
+    if publicos and confirmar(f"Buscar a cidade e a operadora de {len(publicos)} IP(s) na internet "
+                              "(faz uma consulta online)?", True):
+        geo = _geolocalizar(publicos)
     for pos, (ip, d) in enumerate(ordenados, 1):
         via = "Internet (túnel Cloudflare)" if d["via"] == "internet" else "Mesma rede Wi-Fi"
         pais = _pais_por_extenso(d["pais"]) if d["via"] == "internet" else "rede local"
         print()
         print(f"  {NEG}{pos}. {ip}{RST}   {CIANO}{pais}{RST} · {via}")
+        local = _linha_local(geo.get(ip, {}))
+        if local:
+            print(f"     Local (aprox.): {NEG}{local}{RST}")
         print(f"     Aparelho: {NEG}{_descrever_agente(d['agente'])}{RST}")
         quando = d["primeiro"][11:] if d["primeiro"] else "?"
         ate = d["ultimo"][11:] if d["ultimo"] else "?"
@@ -5259,7 +5330,8 @@ def ver_visitas_do_site(n: int | None = None) -> None:
             print(f"     Páginas: {', '.join(d['paginas'][:8])}"
                   + (f" (+{len(d['paginas']) - 8})" if len(d["paginas"]) > 8 else ""))
     print()
-    info("O IP identifica a conexão de quem acessou (operadora/Wi-Fi), não a pessoa pelo nome. "
+    info("O IP identifica a conexão de quem acessou (operadora/Wi-Fi), não a pessoa pelo nome; "
+         "a localização é aproximada (cidade/região da operadora), não o endereço exato. "
          "Isto é o registro de acessos ao seu próprio site, como todo servidor web guarda.")
 
 
