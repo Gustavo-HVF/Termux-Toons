@@ -348,7 +348,16 @@ def _largura_char(ch: str) -> int:
 
 
 def _largura(texto: str) -> int:
-    return sum(_largura_char(c) for c in _sem_ansi(texto))
+    total, anterior = 0, 0
+    for c in _sem_ansi(texto):
+        if c == "️":  # seletor de emoji: faz o símbolo anterior virar emoji, que o terminal desenha com largura 2
+            if anterior == 1:
+                total += 1
+                anterior = 2
+            continue
+        anterior = _largura_char(c)
+        total += anterior
+    return total
 
 
 def _cortar(texto: str, largura: int) -> str:
@@ -1718,6 +1727,7 @@ AJUDA_BOT = """🤖 Termux-Toons — comandos
 {p}notificar <texto> – mostra notificação
 {p}vibrar [ms] – vibra o celular
 {p}lanterna on|off – liga/desliga a lanterna
+{p}tv [ligar|desligar|mudo|vol+|vol-] – controla a TV
 {p}sms <número> <texto> – envia SMS
 {p}ia <pergunta> – pergunta ao LLM local
 {p}servicos – serviços ativos
@@ -1792,6 +1802,15 @@ class BotCore:
         ligar = arg.lower() not in ("off", "desligar", "0", "nao", "não")
         lanterna(ligar)
         return {"texto": "🔦 Lanterna " + ("ligada" if ligar else "desligada")}
+
+    def c_tv(self, arg):
+        palavras = {"": "alternar", "on": "ligar", "off": "desligar", "mute": "mudo", "+": "vol+", "volume+": "vol+",
+                    "-": "vol-", "volume-": "vol-", "liga": "ligar", "desliga": "desligar"}
+        chave = arg.lower().replace(" ", "")
+        acao = palavras.get(chave, chave)
+        if acao not in TV_TECLAS:
+            return {"texto": f"Uso: {self.p}tv [ligar|desligar|mudo|vol+|vol-|canal+|canal-]"}
+        return {"texto": "📺 " + tv_comando(acao)}
 
     def c_sms(self, arg):
         numero, _, msg = arg.partition(" ")
@@ -2149,6 +2168,7 @@ def menu_termux_api():
         ("Vibrar", lambda: vibrar(perguntar_int("Duração (ms)", 500, 50, 5000))),
         ("Lanterna liga/desliga", lambda: lanterna(confirmar("Ligar a lanterna?", True))),
         ("Área de transferência", clipboard),
+        ("Infravermelho: controle da TV", menu_tv),
         ("Volume do sistema", lambda: mostrar_dados(_tapi(["termux-volume"], 15))),
         ("Instalar o pacote termux-api", lambda: instalar_pkg("termux-api")),
     ])
@@ -15104,6 +15124,7 @@ ACOES = {
     "lanterna": "Ligar/desligar a lanterna",
     "abrir_link": "Abrir um link",
     "telegram": "Mandar mensagem no Telegram (bot configurado)",
+    "tv": "Controlar a TV (desligar, ligar, mudo, volume)",
     "comando": "Rodar um comando do Termux",
 }
 
@@ -15119,6 +15140,9 @@ def descrever_automacao(a: dict) -> str:
         "carregando": lambda: "ao começar a carregar", "descarregando": lambda: "ao tirar do carregador",
         "bateria_abaixo": lambda: f"bateria < {g['limite']}%", "bateria_acima": lambda: f"bateria > {g['limite']}%",
     }[g["tipo"]]()
+    if ac["tipo"] == "tv":
+        return f"{quando} → TV: {TV_TECLAS.get(ac['valor'], (ac['valor'],))[0].lower()}" + (
+            f" ({ac['tv']})" if ac.get("tv") else "")
     return f"{quando} → {ACOES[ac['tipo']].lower()}" + (f": {ac.get('texto') or ac.get('valor') or ''}"[:60]
                                                          if ac.get("texto") or ac.get("valor") else "")
 
@@ -15143,6 +15167,8 @@ def executar_acao(acao: dict) -> None:
             raise ToonsError("Configure o bot do Telegram primeiro (menu Bots).")
         for chat in c["telegram_ids_permitidos"]:
             tg_enviar_texto(c["telegram_token"], chat, acao["texto"])
+    elif tipo == "tv":
+        log(tv_comando(acao["valor"], acao.get("tv")))
     elif tipo == "comando":
         proc = rodar(acao["valor"], capturar=True, timeout=600, mostrar=False)
         log(f"comando terminou com código {proc.returncode}: {(proc.stdout or '')[-300:]}")
@@ -15283,6 +15309,23 @@ def menu_automacao():
             a["valor"] = "on" if confirmar("Ligar? (Não = desligar)", True) else "off"
         elif tipo == "abrir_link":
             a["valor"] = perguntar("Link")
+        elif tipo == "tv":
+            tvs = _tvs()
+            if not tvs:
+                raise ToonsError("Adicione a TV primeiro (📲 Celular e sistema → 📺 Controle da TV).")
+            acoes = ["desligar", "ligar", "alternar", "mudo", "vol+", "vol-"]
+            k = escolher("Fazer o quê com a TV?", [TV_TECLAS[t][0] for t in acoes])
+            if k is None:
+                return None
+            a["valor"] = acoes[k]
+            n = escolher("Qual TV?", [tv["nome"] for tv in tvs]) if len(tvs) > 1 else 0
+            if n is None:
+                return None
+            a["tv"] = tvs[n]["nome"]
+            if a["valor"] in ("ligar", "desligar") and tvs[n]["tipo"] == "ir" \
+                    and _codigo_ir(ControleTV(tvs[n])._botoes(), TV_TECLAS[a["valor"]][1]) is None:
+                aviso("Pelo infravermelho essa TV só tem o botão liga/desliga (ele não sabe se ela está ligada): se na "
+                      f"hora ela já estiver {'desligada, vai ligar' if a['valor'] == 'desligar' else 'ligada, vai desligar'}.")
         elif tipo == "comando":
             a["valor"] = perguntar("Comando (ex.: termux-wifi-enable false)")
         return a
@@ -15789,6 +15832,1759 @@ def menu_espelhar():
     ])
 
 
+# ── Controle da TV (infravermelho do celular ou Wi-Fi) ───────────────
+
+TIPOS_TV = {
+    "ir": "infravermelho do celular",
+    "samsung": "Samsung pelo Wi-Fi",
+    "lg": "LG (webOS) pelo Wi-Fi",
+    "androidtv": "Android TV / Google TV pelo Wi-Fi (ADB)",
+    "roku": "Roku TV pelo Wi-Fi",
+}
+# a biblioteca universal de TVs do Flipper Zero (centenas de controles), usada pela busca automática
+TV_BIBLIOTECA_URL = ("https://raw.githubusercontent.com/flipperdevices/flipperzero-firmware/dev/applications/main/"
+                     "infrared/resources/infrared/assets/tv.ir")
+TV_BIBLIOTECA = DATA_DIR / "tv_codigos.ir"
+
+# ação → (rótulo, botão no infravermelho, Samsung, LG, Android TV, Roku); None = não tem por esse caminho
+TV_TECLAS = {
+    "alternar": ("Liga/desliga", "Power", "KEY_POWER", "POWER", "KEYCODE_POWER", "Power"),
+    "ligar": ("Ligar", "Ligar", "KEY_POWER", "POWER", "KEYCODE_WAKEUP", "PowerOn"),
+    "desligar": ("Desligar", "Desligar", "KEY_POWER", "POWER", "KEYCODE_SLEEP", "PowerOff"),
+    "vol+": ("Volume +", "Vol_up", "KEY_VOLUP", "VOLUMEUP", "KEYCODE_VOLUME_UP", "VolumeUp"),
+    "vol-": ("Volume −", "Vol_dn", "KEY_VOLDOWN", "VOLUMEDOWN", "KEYCODE_VOLUME_DOWN", "VolumeDown"),
+    "mudo": ("Mudo", "Mute", "KEY_MUTE", "MUTE", "KEYCODE_VOLUME_MUTE", "VolumeMute"),
+    "canal+": ("Canal +", "Ch_next", "KEY_CHUP", "CHANNELUP", "KEYCODE_CHANNEL_UP", "ChannelUp"),
+    "canal-": ("Canal −", "Ch_prev", "KEY_CHDOWN", "CHANNELDOWN", "KEYCODE_CHANNEL_DOWN", "ChannelDown"),
+    "entrada": ("Entrada", "Input", "KEY_SOURCE", "INPUT_HUB", "KEYCODE_TV_INPUT", None),
+    "cima": ("▲", "Up", "KEY_UP", "UP", "KEYCODE_DPAD_UP", "Up"),
+    "baixo": ("▼", "Down", "KEY_DOWN", "DOWN", "KEYCODE_DPAD_DOWN", "Down"),
+    "esquerda": ("◀", "Left", "KEY_LEFT", "LEFT", "KEYCODE_DPAD_LEFT", "Left"),
+    "direita": ("▶", "Right", "KEY_RIGHT", "RIGHT", "KEYCODE_DPAD_RIGHT", "Right"),
+    "ok": ("OK", "Ok", "KEY_ENTER", "ENTER", "KEYCODE_DPAD_CENTER", "Select"),
+    "inicio": ("Início", "Home", "KEY_HOME", "HOME", "KEYCODE_HOME", "Home"),
+    "voltar": ("Voltar", "Back", "KEY_RETURN", "BACK", "KEYCODE_BACK", "Back"),
+}
+_COLUNA_TV = {"samsung": 2, "lg": 3, "androidtv": 4, "roku": 5}
+ENERGIA_TV = ("alternar", "ligar", "desligar")
+
+
+# ── Infravermelho: montar o sinal de cada protocolo ──
+
+def _bits(valor: int, n: int) -> list:
+    """Os n bits de `valor`, do menos para o mais significativo (a ordem em que o controle manda)."""
+    return [(valor >> i) & 1 for i in range(n)]
+
+
+def _por_distancia(cabecalho: tuple, bits: list, marca: int, zero: int, um: int) -> list:
+    """Pulso de luz fixo e o apagado depois dele diz se o bit é 0 ou 1 (NEC, Samsung, RCA, Panasonic, Sharp)."""
+    padrao = list(cabecalho)
+    for bit in bits:
+        padrao += [marca, um if bit else zero]
+    return padrao + [marca]
+
+
+def _manchester(meios: list) -> list:
+    """[(aceso, µs)] → padrão aceso/apagado começando aceso, juntando os pedaços iguais seguidos (RC5, RC6)."""
+    padrao, nivel = [], None
+    for aceso, us in meios:
+        if aceso == nivel:
+            padrao[-1] += us
+        elif padrao or aceso:
+            padrao.append(us)
+            nivel = aceso
+    if nivel is False:
+        padrao.pop()
+    return padrao
+
+
+def _padrao_ir(codigo: dict) -> tuple:
+    """(frequência em Hz, padrão aceso/apagado em µs) de um código: bruto ('freq' e 'padrao') ou de protocolo, como
+    nos arquivos .ir do Flipper Zero ('protocolo', 'endereco', 'comando')."""
+    if "padrao" in codigo:
+        return int(codigo.get("freq") or 38000), [max(1, int(x)) for x in codigo["padrao"]]
+    p, a, c = str(codigo["protocolo"]).upper(), int(codigo["endereco"]), int(codigo["comando"])
+    if p in ("NEC", "NECEXT", "SAMSUNG32"):
+        if p == "NECEXT":
+            bits = _bits(a & 0xFFFF, 16) + _bits(c & 0xFFFF, 16)
+        else:
+            a, c = a & 0xFF, c & 0xFF
+            bits = _bits(a, 8) + _bits(a if p == "SAMSUNG32" else a ^ 0xFF, 8) + _bits(c, 8) + _bits(c ^ 0xFF, 8)
+        return 38000, _por_distancia((4500, 4500) if p == "SAMSUNG32" else (9000, 4500), bits, 560, 560, 1690)
+    if p == "NEC42":  # NEC com endereço de 13 bits (Apple, alguns sons e TVs)
+        a, c = a & 0x1FFF, c & 0xFF
+        bits = _bits(a, 13) + _bits(a ^ 0x1FFF, 13) + _bits(c, 8) + _bits(c ^ 0xFF, 8)
+        return 38000, _por_distancia((9000, 4500), bits, 560, 560, 1690)
+    if p == "PIONEER":  # igual ao NEC, mas a 40 kHz (aparelhos Pioneer)
+        a, c = a & 0xFF, c & 0xFF
+        bits = _bits(a, 8) + _bits(a ^ 0xFF, 8) + _bits(c, 8) + _bits(c ^ 0xFF, 8)
+        return 40000, _por_distancia((9000, 4500), bits, 560, 560, 1690)
+    if p in ("SIRC", "SIRC15", "SIRC20"):
+        quadro = [2400, 600]
+        for bit in _bits(c & 0x7F, 7) + _bits(a, {"SIRC": 5, "SIRC15": 8, "SIRC20": 13}[p]):
+            quadro += [1200 if bit else 600, 600]
+        quadro[-1] += 45000 - sum(quadro)  # a Sony só obedece com o quadro repetido, um a cada 45 ms
+        return 40000, (quadro * 3)[:-1]
+    if p in ("RC5", "RC5X"):
+        bits = [1, 0 if c & 0x40 else 1, 0] + _bits(a & 0x1F, 5)[::-1] + _bits(c & 0x3F, 6)[::-1]
+        return 36000, _manchester([meio for bit in bits for meio in ((not bit, 889), (bool(bit), 889))])
+    if p == "RC6":
+        meios = [(True, 2666), (False, 889)]
+        sequencia = [(1, 444), (0, 444), (0, 444), (0, 444), (0, 889)]  # início, modo 0 e o bit de repetição (duplo)
+        sequencia += [(bit, 444) for bit in _bits(a & 0xFF, 8)[::-1] + _bits(c & 0xFF, 8)[::-1]]
+        for bit, us in sequencia:
+            meios += [(bool(bit), us), (not bit, us)]
+        return 36000, _manchester(meios)
+    if p == "KASEIKYO":  # Panasonic e outras japonesas
+        fabricante, genero, ident = (a >> 8) & 0xFFFF, a & 0xFF, (a >> 24) & 3
+        x = (fabricante ^ (fabricante >> 8)) & 0xFF
+        b2 = (x ^ (x >> 4)) & 0x0F | genero & 0xF0
+        b3 = genero & 0x0F | (c & 0x0F) << 4
+        b4 = (c >> 4) & 0x3F | ident << 6
+        dados = [fabricante & 0xFF, fabricante >> 8, b2, b3, b4, b2 ^ b3 ^ b4]
+        return 37000, _por_distancia((3456, 1728), [bit for byte in dados for bit in _bits(byte, 8)], 432, 432, 1296)
+    if p == "RCA":  # TCL
+        a, c = a & 0x0F, c & 0xFF
+        bits = _bits(a, 4) + _bits(c, 8) + _bits(a ^ 0x0F, 4) + _bits(c ^ 0xFF, 8)
+        return 38000, _por_distancia((3680, 3680), bits, 460, 920, 1840)
+    if p == "SHARP":  # manda o comando e depois o inverso dele
+        padrao = []
+        for comando, fim in ((c & 0xFF, [1, 0]), (c & 0xFF ^ 0xFF, [0, 1])):
+            padrao += _por_distancia((), _bits(a & 0x1F, 5) + _bits(comando, 8) + fim, 264, 792, 1848) + [43560]
+        return 38000, padrao[:-1]
+    raise ToonsError(f"Protocolo de infravermelho não suportado: {codigo['protocolo']}")
+
+
+def _rev8(valor: int) -> int:
+    return int(f"{valor & 0xFF:08b}"[::-1], 2)
+
+
+def _botoes_ir(protocolo: str, endereco: int, comandos: dict) -> dict:
+    return {nome: {"protocolo": protocolo, "endereco": endereco, "comando": c} for nome, c in comandos.items()}
+
+
+def _nec_ext(endereco: int, comandos: dict) -> dict:
+    """NEC com endereço de 16 bits: o comando vai junto com o inverso dele."""
+    return _botoes_ir("NECext", endereco, {nome: c | (c ^ 0xFF) << 8 for nome, c in comandos.items()})
+
+
+def _panasonic(comandos: dict) -> dict:
+    """Panasonic (Kaseikyo) a partir dos números das tabelas do IRDB (aparelho 128, subaparelho 0)."""
+    return {nome: {"protocolo": "Kaseikyo", "endereco": 0x00200280 | (f >> 6) << 24, "comando": (f & 0x3F) << 4}
+            for nome, f in comandos.items()}
+
+
+# Códigos das marcas mais comuns, conferidos no IRDB e na biblioteca do Flipper Zero. "Ligar" e "Desligar"
+# separados (códigos discretos) só onde a marca tem: com eles uma automação não liga a TV sem querer.
+TV_MARCAS_IR = {
+    "Samsung": _botoes_ir("Samsung32", 0x07, {
+        "Power": 0x02, "Ligar": 0x99, "Desligar": 0x98, "Vol_up": 0x07, "Vol_dn": 0x0B, "Mute": 0x0F,
+        "Ch_next": 0x12, "Ch_prev": 0x10, "Input": 0x01, "Up": 0x60, "Down": 0x61, "Left": 0x65, "Right": 0x62,
+        "Ok": 0x68, "Back": 0x58, "Home": 0x79}),
+    "LG (e CCE antiga)": _botoes_ir("NEC", 0x04, {
+        "Power": 0x08, "Ligar": 0xC4, "Desligar": 0xC5, "Vol_up": 0x02, "Vol_dn": 0x03, "Mute": 0x09,
+        "Ch_next": 0x00, "Ch_prev": 0x01, "Input": 0x0B, "Up": 0x40, "Down": 0x41, "Left": 0x07, "Right": 0x06,
+        "Ok": 0x44, "Back": 0x28, "Home": 0x43}),
+    "TCL / Semp TCL": _botoes_ir("RCA", 0x0F, {nome: _rev8(f) for nome, f in {
+        "Power": 42, "Vol_up": 47, "Vol_dn": 46, "Mute": 63, "Ch_next": 45, "Ch_prev": 44, "Input": 163, "Up": 89,
+        "Down": 88, "Left": 86, "Right": 87, "Ok": 244, "Back": 39, "Home": 8}.items()}),
+    "TCL Roku TV": _nec_ext(0xC7EA, {
+        "Power": 0x17, "Vol_up": 0x0F, "Vol_dn": 0x10, "Mute": 0x20, "Ch_next": 0x19, "Ch_prev": 0x33}),
+    "Philips": _botoes_ir("RC6", 0x00, {
+        "Power": 0x0C, "Vol_up": 0x10, "Vol_dn": 0x11, "Mute": 0x0D, "Ch_next": 0x4C, "Ch_prev": 0x4D,
+        "Input": 0x38, "Up": 0x58, "Down": 0x59, "Left": 0x5A, "Right": 0x5B, "Ok": 0x5C, "Back": 0x0A,
+        "Home": 0x54}),
+    "Philips antiga (RC5)": _botoes_ir("RC5", 0x00, {
+        "Power": 12, "Vol_up": 16, "Vol_dn": 17, "Mute": 13, "Ch_next": 32, "Ch_prev": 33, "Up": 28, "Down": 29,
+        "Left": 44, "Right": 43, "Home": 46, "Back": 15}),
+    "AOC": _nec_ext(0xBD00, {
+        "Power": 1, "Mute": 4, "Input": 5, "Vol_up": 12, "Vol_dn": 16, "Ch_next": 24, "Ch_prev": 28, "Home": 10}),
+    "Sony": _botoes_ir("SIRC", 0x01, {
+        "Power": 21, "Ligar": 46, "Desligar": 47, "Vol_up": 18, "Vol_dn": 19, "Mute": 20, "Ch_next": 16,
+        "Ch_prev": 17, "Input": 37, "Up": 116, "Down": 117, "Left": 52, "Right": 51, "Ok": 101, "Back": 99,
+        "Home": 96}),
+    "Panasonic": _panasonic({
+        "Power": 61, "Ligar": 62, "Desligar": 63, "Vol_up": 32, "Vol_dn": 33, "Mute": 50, "Ch_next": 52,
+        "Ch_prev": 53, "Input": 5, "Up": 74, "Down": 75, "Left": 78, "Right": 79, "Ok": 73, "Back": 212,
+        "Home": 82}),
+    "Toshiba / Semp Toshiba": _botoes_ir("NEC", 0x40, {
+        "Power": 18, "Ligar": 126, "Desligar": 127, "Vol_up": 26, "Vol_dn": 30, "Mute": 16, "Ch_next": 27,
+        "Ch_prev": 31, "Input": 15, "Ok": 23, "Home": 128, "Back": 88}),
+    "Hisense": _nec_ext(0xBF00, {
+        "Power": 0x0D, "Mute": 0x0E, "Vol_up": 0x44, "Vol_dn": 0x43, "Ch_next": 0x4A, "Ch_prev": 0x4B}),
+    "Sharp": _botoes_ir("Sharp", 0x01, {
+        "Power": 22, "Vol_up": 20, "Vol_dn": 21, "Mute": 23, "Ch_next": 17, "Ch_prev": 18, "Input": 19,
+        "Home": 32}),
+}
+
+# outros nomes que os arquivos .ir costumam dar aos mesmos botões
+_APELIDOS_IR = {
+    "Power": ("power", "pwr", "power_toggle", "on_off", "onoff", "standby", "power_on_off"),
+    "Ligar": ("ligar", "power_on", "poweron", "pwr_on", "on"),
+    "Desligar": ("desligar", "power_off", "poweroff", "pwr_off", "off"),
+    "Vol_up": ("vol_up", "volup", "volume_up", "vol+", "volume+", "vol_plus"),
+    "Vol_dn": ("vol_dn", "vol_down", "voldown", "volume_down", "vol-", "volume-", "vol_minus"),
+    "Mute": ("mute", "mudo"),
+    "Ch_next": ("ch_next", "ch_up", "chup", "channel_up", "ch+", "channel+", "p+"),
+    "Ch_prev": ("ch_prev", "ch_dn", "ch_down", "chdown", "channel_down", "ch-", "channel-", "p-"),
+    "Input": ("input", "source", "src", "tv_av", "tv/av", "tv/video", "entrada"),
+    "Up": ("up", "arrow_up", "cursor_up"), "Down": ("down", "arrow_down", "cursor_down"),
+    "Left": ("left", "arrow_left", "cursor_left"), "Right": ("right", "arrow_right", "cursor_right"),
+    "Ok": ("ok", "enter", "select", "center"), "Home": ("home", "smart_hub"),
+    "Back": ("back", "return", "exit", "voltar"),
+    "Menu": ("menu", "settings", "setup"),
+    "Play": ("play",), "Pause": ("pause", "play_pause", "playpause"), "Stop": ("stop",),
+    "Next": ("next", "fast_forward", "ff", "skip_next", "forward"),
+    "Prev": ("prev", "previous", "rewind", "rew", "skip_prev"),
+    # ar-condicionado (os nomes do arquivo ac.ir do Flipper)
+    "Off": ("off", "power_off", "poweroff", "desligar"),
+    "Dh": ("dh", "dry", "dehumidify", "desumidificar"),
+    "Cool_lo": ("cool_lo", "cool_low"), "Cool_hi": ("cool_hi", "cool_high"),
+    "Heat_lo": ("heat_lo", "heat_low"), "Heat_hi": ("heat_hi", "heat_high"),
+}
+
+
+def _nome_botao(nome: str) -> str:
+    return re.sub(r"[\s\-]+", "_", nome.strip().lower())
+
+
+def _codigo_ir(botoes: dict, botao: str) -> dict | None:
+    if botao in botoes:
+        return botoes[botao]
+    normais = {_nome_botao(nome): codigo for nome, codigo in botoes.items()}
+    return next((normais[a] for a in _APELIDOS_IR.get(botao, ()) if a in normais), None)
+
+
+def ir_disponivel() -> str:
+    """'' se dá para usar o infravermelho do celular; senão, o motivo."""
+    if not tem("termux-infrared-frequencies"):
+        return "falta o pacote termux-api (pkg install termux-api) e o app Termux:API"
+    try:
+        faixas = _tapi(["termux-infrared-frequencies"], 20)
+    except ToonsError as e:
+        return str(e)
+    if isinstance(faixas, list) and faixas:
+        return ""
+    return ("este celular não tem emissor infravermelho (o 'sensor' de controle remoto que fica no topo de muitos "
+            "Xiaomi, Redmi e POCO)")
+
+
+def _um_quadro(padrao: list) -> list:
+    """Corta uma captura que repete o sinal várias vezes: fica só o primeiro quadro (até o primeiro silêncio longo),
+    porque o Android manda no máximo 2 segundos de uma vez."""
+    total = 0
+    for i, dur in enumerate(padrao):
+        total += dur
+        if i % 2 == 1 and dur > 40000 and total - dur > 2000:  # silêncio > 40 ms depois de já ter um quadro
+            return padrao[:i]
+    return padrao
+
+
+def ir_transmitir(codigo: dict) -> None:
+    freq, padrao = _padrao_ir(codigo)
+    if sum(padrao) > 1_950_000:
+        padrao = _um_quadro(padrao)
+    if not padrao or sum(padrao) > 1_950_000:
+        raise ToonsError("Código de infravermelho vazio ou longo demais (o Android manda no máximo 2 segundos).")
+    resposta = _tapi(["termux-infrared-transmit", "-f", str(freq), ",".join(map(str, padrao))], 20,
+                     json_saida=False)
+    if resposta.strip():  # quando dá certo não aparece nada
+        raise ToonsError(f"O infravermelho não mandou o sinal: {resposta.strip()[:200]}")
+
+
+def _hex_le(texto: str) -> int:
+    """'04 00 00 00' (bytes em hexadecimal, o primeiro é o menos significativo) → 4."""
+    return int.from_bytes(bytes.fromhex(texto.replace(" ", "")) or b"\0", "little")
+
+
+def _codigo_do_bloco(bloco: dict) -> dict | None:
+    try:
+        if bloco.get("type") == "raw" and bloco.get("data"):
+            return {"freq": int(float(bloco.get("frequency") or 38000)),
+                    "padrao": [int(x) for x in bloco["data"].split()]}
+        if bloco.get("type") == "parsed" and bloco.get("protocol"):
+            return {"protocolo": bloco["protocol"], "endereco": _hex_le(bloco.get("address", "")),
+                    "comando": _hex_le(bloco.get("command", ""))}
+    except ValueError:
+        pass
+    return None
+
+
+def ler_arquivo_ir(texto: str) -> list:
+    """Grupos [(controle ou None, [(botão, código)])] de um arquivo .ir (o formato do Flipper Zero, usado nas bases de
+    controles remotos da internet). Um comentário com o nome do controle ('# Model: ...') começa um grupo."""
+    grupos, bloco = [(None, [])], {}
+
+    def fechar():
+        codigo = _codigo_do_bloco(bloco) if "name" in bloco else None
+        if codigo:
+            grupos[-1][1].append((bloco["name"], codigo))
+        bloco.clear()
+
+    for linha in texto.splitlines():
+        linha = linha.strip()
+        if linha.startswith("#"):
+            fechar()
+            comentario = re.sub(r"^(?:#\s*)+(?:Model:\s*)?", "", linha).strip()
+            if comentario:
+                grupos.append((comentario, []))
+            continue
+        chave, separador, valor = linha.partition(":")
+        if separador:
+            chave = chave.strip().lower()
+            if chave == "name" and "name" in bloco:
+                fechar()
+            bloco[chave] = valor.strip()
+    fechar()
+    return [g for g in grupos if g[1]]
+
+
+def codigo_digitado(texto: str) -> dict:
+    """Código colado pela pessoa: Pronto ('0000 006D 0022 ...'), bruto ('38000 9000,4500,560,...' ou só os tempos em
+    µs) ou de protocolo, com endereço e comando em hexadecimal ('NEC 04 08', 'Samsung32 07 02')."""
+    palavras = texto.replace(",", " ").split()
+    if not palavras:
+        raise ToonsError("Código vazio.")
+    protocolos = {"NEC", "NECEXT", "NEC42", "PIONEER", "SAMSUNG32", "SIRC", "SIRC15", "SIRC20", "RC5", "RC5X", "RC6",
+                  "KASEIKYO", "RCA", "SHARP"}
+    try:
+        if palavras[0] == "0000" and len(palavras) >= 6 and all(re.fullmatch(r"[0-9a-fA-F]{4}", p) for p in palavras):
+            valores = [int(p, 16) for p in palavras]
+            periodo = valores[1] * 0.241246  # µs por ciclo da portadora
+            unico, repete = valores[2], valores[3]
+            pares = valores[4:]
+            sequencia = pares[:2 * unico] if unico else pares[:2 * repete]
+            if not periodo or not sequencia:
+                raise ValueError
+            codigo = {"freq": round(1_000_000 / periodo), "padrao": [max(1, round(v * periodo)) for v in sequencia]}
+        elif palavras[0].upper() in protocolos and len(palavras) >= 3:
+            codigo = {"protocolo": palavras[0], "endereco": int(palavras[1], 16), "comando": int(palavras[2], 16)}
+        elif all(p.isdigit() for p in palavras) and len(palavras) >= 3:
+            numeros = [int(p) for p in palavras]
+            freq = numeros.pop(0) if numeros[0] >= 20000 else 38000
+            codigo = {"freq": freq, "padrao": numeros}
+        else:
+            raise ValueError
+        _padrao_ir(codigo)
+    except (ValueError, IndexError):
+        raise ToonsError("Não reconheci o código. Use Pronto (0000 006D ...), os tempos em µs (38000 9000,4500,...) "
+                         "ou protocolo, endereço e comando (NEC 04 08).") from None
+    return codigo
+
+
+IR_BIBLIOTECA_BASE = ("https://raw.githubusercontent.com/flipperdevices/flipperzero-firmware/dev/applications/main/"
+                      "infrared/resources/infrared/assets/")
+# categoria → arquivo universal do Flipper Zero e o botão que desliga o aparelho (para a busca automática)
+_CATEGORIAS_IR = {
+    "tv": {"arquivo": "tv.ir", "desligar": "Power"},
+    "som": {"arquivo": "audio.ir", "desligar": "Power"},
+    "projetor": {"arquivo": "projector.ir", "desligar": "Power"},
+    "ar": {"arquivo": "ac.ir", "desligar": "Off"},
+}
+
+
+def _biblioteca_ir(arquivo: str = "tv.ir") -> str:
+    """Um arquivo de códigos universais do Flipper Zero (tv/audio/projector/ac), baixado uma vez (e de novo a cada
+    90 dias)."""
+    destino = TV_BIBLIOTECA if arquivo == "tv.ir" else DATA_DIR / ("ir_" + arquivo)
+    if destino.exists() and time.time() - destino.stat().st_mtime < 90 * 86400:
+        return destino.read_text("utf-8", errors="replace")
+    try:
+        req = urllib.request.Request(IR_BIBLIOTECA_BASE + arquivo, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            texto = r.read().decode("utf-8", errors="replace")
+        if "name:" not in texto:
+            raise ValueError("arquivo inesperado")
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        destino.write_text(texto, "utf-8")
+        return texto
+    except (OSError, ValueError) as e:
+        if destino.exists():
+            return destino.read_text("utf-8", errors="replace")
+        aviso(f"Não consegui baixar a biblioteca universal ({e}): vou testar só as marcas mais comuns.")
+        return ""
+
+
+def codigos_para_busca(categoria: str = "tv") -> list:
+    """Os códigos de desligar para a busca automática: [(de onde veio, código, outros botões do mesmo controle)].
+    Primeiro os das marcas embutidas (só a TV tem), depois os da biblioteca universal, sem repetir."""
+    cat = _CATEGORIAS_IR[categoria]
+    lista, vistos = [], set()
+
+    def juntar(origem: str, codigo: dict, botoes: dict) -> None:
+        try:
+            freq, padrao = _padrao_ir(codigo)
+        except (ToonsError, ValueError, KeyError):
+            return  # protocolo que não sabemos montar
+        if (freq, *padrao) not in vistos and sum(padrao) <= 1_950_000:
+            vistos.add((freq, *padrao))
+            lista.append((origem, codigo, botoes))
+
+    if categoria == "tv":
+        for marca, botoes in TV_MARCAS_IR.items():
+            juntar(marca, botoes["Power"], botoes)
+    for controle, codigos in ler_arquivo_ir(_biblioteca_ir(cat["arquivo"])):
+        nomes = [nome for nome, _ in codigos]
+        um_controle = controle is not None and len(nomes) == len(set(nomes))  # grupo com um controle só
+        for nome, codigo in codigos:
+            if _nome_botao(nome) in _APELIDOS_IR[cat["desligar"]]:
+                juntar(controle or "biblioteca universal", codigo, dict(codigos) if um_controle else {})
+    return lista
+
+
+def _biblioteca_tv() -> str:
+    return _biblioteca_ir("tv.ir")
+
+
+def _varrer_codigos(lista: list, inicio: int, alvo: str = "a TV") -> int | None:
+    """Manda os códigos a partir de `inicio`, um por vez, e devolve o índice do último mandado quando a pessoa toca
+    na tela ou aperta uma tecla (None se acabaram). Esc cancela."""
+    interativo = setas_ativas()
+    fd = sys.stdin.fileno()
+    antigo = termios.tcgetattr(fd) if interativo else None
+    try:
+        if interativo:
+            tty.setcbreak(fd)
+            _mouse(True)
+        falhas = 0
+        for k in range(inicio, len(lista)):
+            origem = lista[k][0]
+            print(f"\r\033[K  📡 {k + 1}/{len(lista)}  {DIM}{_cortar(origem, max(10, largura_tela() - 20))}{RST}",
+                  end="", flush=True)
+            try:
+                ir_transmitir(lista[k][1])
+                falhas = 0
+            except ToonsError:
+                falhas += 1
+                if k == inicio or falhas >= 3:
+                    print()
+                    raise
+            if not interativo:
+                print()
+                if confirmar(f"{alvo.capitalize()} desligou?", False):
+                    return k
+            elif select.select([fd], [], [], 0.9)[0]:
+                if ler_tecla() == "esc":
+                    raise KeyboardInterrupt
+                time.sleep(0.15)
+                termios.tcflush(fd, termios.TCIFLUSH)  # o "soltou o dedo" não vira resposta da próxima pergunta
+                print()
+                return k
+        print()
+        return None
+    finally:
+        if interativo:
+            _mouse(False)
+            termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
+
+
+def busca_automatica_ir(categoria: str = "tv", alvo: str = "a TV") -> dict | None:
+    """Testa os códigos de desligar de centenas de aparelhos, um por um, até a pessoa avisar que desligou; depois
+    confirma qual foi. Devolve {'origem': ..., 'botoes': {...}} ou None."""
+    info("Preparando a lista de códigos (na primeira vez baixa a biblioteca universal)...")
+    lista = codigos_para_busca(categoria)
+    desligar = _CATEGORIAS_IR[categoria]["desligar"]
+    print(f"\n{NEG}Como funciona:{RST}\n"
+          f"  1. Deixe {alvo} {NEG}ligado(a){RST}.\n"
+          f"  2. Aponte o topo do celular para o aparelho, de perto (até uns 3 metros).\n"
+          f"  3. Vou mandar o sinal de desligar de {len(lista)} controles, um por segundo.\n"
+          f"  4. Quando desligar, {NEG}toque na tela ou aperte uma tecla{RST} (Esc cancela).\n")
+    if not confirmar("Começar?", True):
+        return None
+    inicio = 0
+    while True:
+        parou = _varrer_codigos(lista, inicio, alvo)
+        if parou is None:
+            aviso(f"Testei todos e {alvo} não desligou. Confira se o celular tem infravermelho e se está apontado para "
+                  "o aparelho. Também dá para importar o controle dele (arquivo .ir).")
+            return None
+        ok("Parou! Agora vamos confirmar qual código foi (a reação demora um pouco, então testo os últimos).")
+        for k in range(parou, max(-1, parou - 3), -1):
+            info(f"Ligue {alvo} de novo (no controle ou no botão).")
+            pausar()
+            ir_transmitir(lista[k][1])
+            if confirmar(f"Desligou agora? ({lista[k][0]})", True):
+                origem, codigo, botoes = lista[k]
+                return {"origem": origem, "botoes": {**botoes, desligar: codigo}}
+        if not confirmar("Não foi nenhum desses. Continuar a busca de onde parou?", True):
+            return None
+        inicio = parou + 1
+
+
+def desligar_tvs_por_perto() -> None:
+    """Dispara, em sequência, o 'desligar' de centenas de TVs (estilo TV-B-Gone). Esc cancela."""
+    problema = ir_disponivel()
+    if problema:
+        raise ToonsError(f"Sem infravermelho: {problema}.")
+    lista = codigos_para_busca("tv")
+    print(f"{NEG}Vou mandar o sinal de desligar de {len(lista)} modelos de TV, um atrás do outro.{RST}\n"
+          "Aponte o topo do celular para a(s) TV(s). Serve para desligar a TV de uma loja, academia ou sala de espera.")
+    if not confirmar("Começar?", True):
+        return
+    interativo = setas_ativas()
+    fd = sys.stdin.fileno()
+    antigo = termios.tcgetattr(fd) if interativo else None
+    enviados = 0
+    try:
+        if interativo:
+            tty.setcbreak(fd)
+            _mouse(True)
+        for k, (origem, codigo, _) in enumerate(lista):
+            print(f"\r\033[K  📴 {k + 1}/{len(lista)}  {DIM}{_cortar(origem, max(10, largura_tela() - 20))}{RST}",
+                  end="", flush=True)
+            with contextlib.suppress(ToonsError):
+                ir_transmitir(codigo)
+                enviados += 1
+            if interativo and select.select([fd], [], [], 0.12)[0] and ler_tecla() == "esc":
+                print()
+                aviso("Cancelado.")
+                return
+        print()
+    finally:
+        if interativo:
+            _mouse(False)
+            termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
+    ok(f"Mandei {enviados} códigos de desligar. Se alguma TV não desligou, pode ser que ela não estivesse no alcance.")
+
+
+# ── Wi-Fi: WebSocket (Samsung e LG), ADB (Android TV), HTTP (Roku) e Wake-on-LAN ──
+
+class _WebSocket:
+    """Cliente WebSocket mínimo, só com a biblioteca padrão (é por onde as TVs Samsung e LG recebem comandos)."""
+
+    def __init__(self, url: str, timeout: float = 8):
+        import ssl
+        partes = urllib.parse.urlsplit(url)
+        seguro = partes.scheme == "wss"
+        porta = partes.port or (443 if seguro else 80)
+        conexao = socket.create_connection((partes.hostname, porta), timeout=timeout)
+        try:
+            if seguro:  # a TV usa um certificado feito por ela mesma: não há o que validar
+                contexto = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+                contexto.check_hostname = False
+                contexto.verify_mode = ssl.CERT_NONE
+                conexao = contexto.wrap_socket(conexao, server_hostname=partes.hostname)
+            chave = base64.b64encode(os.urandom(16)).decode()
+            caminho = (partes.path or "/") + (f"?{partes.query}" if partes.query else "")
+            conexao.sendall(f"GET {caminho} HTTP/1.1\r\nHost: {partes.hostname}:{porta}\r\nUpgrade: websocket\r\n"
+                            f"Connection: Upgrade\r\nSec-WebSocket-Key: {chave}\r\n"
+                            "Sec-WebSocket-Version: 13\r\n\r\n".encode())
+            resposta = b""
+            while b"\r\n\r\n" not in resposta:
+                bloco = conexao.recv(4096)
+                if not bloco:
+                    raise OSError("a TV fechou a conexão")
+                resposta += bloco
+            cabecalho, _, self._sobra = resposta.partition(b"\r\n\r\n")
+            status = cabecalho.split(b"\r\n")[0].decode(errors="replace")
+            if " 101" not in status:
+                raise OSError(f"a TV respondeu '{status}'")
+        except BaseException:
+            conexao.close()
+            raise
+        self.conexao = conexao
+
+    def _quadro(self, opcode: int, dados: bytes) -> None:
+        mascara, n = os.urandom(4), len(dados)
+        tamanho = (bytes([0x80 | n]) if n < 126 else bytes([0x80 | 126]) + n.to_bytes(2, "big") if n < 65536
+                   else bytes([0x80 | 127]) + n.to_bytes(8, "big"))
+        self.conexao.sendall(bytes([0x80 | opcode]) + tamanho + mascara
+                             + bytes(b ^ mascara[i % 4] for i, b in enumerate(dados)))
+
+    def enviar(self, texto: str) -> None:
+        self._quadro(0x1, texto.encode())
+
+    def _ler(self, n: int) -> bytes:
+        while len(self._sobra) < n:
+            bloco = self.conexao.recv(65536)
+            if not bloco:
+                raise OSError("a TV fechou a conexão")
+            self._sobra += bloco
+        dados, self._sobra = self._sobra[:n], self._sobra[n:]
+        return dados
+
+    def receber(self, timeout: float | None = None) -> str:
+        if timeout is not None:
+            self.conexao.settimeout(max(0.1, timeout))
+        mensagem = b""
+        while True:
+            cabecalho = self._ler(2)
+            n = cabecalho[1] & 0x7F
+            if n >= 126:
+                n = int.from_bytes(self._ler(2 if n == 126 else 8), "big")
+            mascara = self._ler(4) if cabecalho[1] & 0x80 else b""
+            dados = self._ler(n)
+            if mascara:
+                dados = bytes(b ^ mascara[i % 4] for i, b in enumerate(dados))
+            opcode = cabecalho[0] & 0x0F
+            if opcode == 0x8:
+                raise OSError("a TV fechou a conexão")
+            if opcode == 0x9:
+                self._quadro(0xA, dados)  # ping → pong
+            elif opcode in (0x0, 0x1, 0x2):
+                mensagem += dados
+                if cabecalho[0] & 0x80:
+                    return mensagem.decode("utf-8", errors="replace")
+
+    def receber_json(self, timeout: float | None = None) -> dict:
+        while True:
+            try:
+                dados = json.loads(self.receber(timeout))
+            except ValueError:
+                continue
+            if isinstance(dados, dict):
+                return dados
+
+    def fechar(self) -> None:
+        with contextlib.suppress(OSError):
+            self._quadro(0x8, b"\x03\xe8")
+        with contextlib.suppress(OSError):
+            self.conexao.close()
+
+
+def wake_on_lan(macs: list, ip: str | None = None) -> None:
+    """Manda o 'pacote mágico' que liga a TV pela rede (ela precisa estar com 'Ligar pela rede/pelo celular' ativo)."""
+    pacotes = []
+    for mac in macs:
+        limpo = re.sub(r"[^0-9a-fA-F]", "", mac)
+        if len(limpo) == 12:
+            pacotes.append(b"\xff" * 6 + bytes.fromhex(limpo) * 16)
+    if not pacotes:
+        raise ToonsError("Não sei o endereço MAC da TV para ligá-la pela rede.")
+    destinos = {"255.255.255.255"}
+    if ip and re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ip):
+        destinos |= {ip.rsplit(".", 1)[0] + ".255", ip}  # o broadcast da rede de casa (/24) e a própria TV
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        for _ in range(3):
+            for pacote in pacotes:
+                for destino in destinos:
+                    for porta in (9, 7):
+                        with contextlib.suppress(OSError):
+                            s.sendto(pacote, (destino, porta))
+            time.sleep(0.1)
+
+
+_MAC = re.compile(r"(?:[0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}")
+
+
+def _macs_em(dados) -> list:
+    """Todos os endereços MAC de uma resposta JSON da TV."""
+    achados = []
+    if isinstance(dados, dict):
+        for chave, valor in dados.items():
+            if isinstance(valor, str) and "mac" in chave.lower() and _MAC.fullmatch(valor):
+                achados.append(valor)
+            else:
+                achados += _macs_em(valor)
+    elif isinstance(dados, list):
+        for valor in dados:
+            achados += _macs_em(valor)
+    return list(dict.fromkeys(achados))
+
+
+_NOME_NO_CONTROLE = base64.b64encode(b"Termux-Toons").decode()
+
+
+def _samsung_info(ip: str) -> dict | None:
+    """O que a TV Samsung conta de si (nome, modelo, MAC, se está ligada); None se não respondeu."""
+    try:
+        with _SEM_PROXY.open(f"http://{ip}:8001/api/v2/", timeout=4) as r:
+            dados = json.loads(r.read().decode("utf-8", errors="replace"))
+        return dados if isinstance(dados, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _samsung_conectar(tv: dict, espera: float = 8) -> _WebSocket:
+    """Abre o canal do controle remoto. Na primeira vez a TV pergunta se permite e manda um token, que fica salvo."""
+    ip, erros = tv["ip"], []
+    for url in (f"wss://{ip}:8002/api/v2/channels/samsung.remote.control?name={_NOME_NO_CONTROLE}"
+                + (f"&token={tv['token']}" if tv.get("token") else ""),
+                f"ws://{ip}:8001/api/v2/channels/samsung.remote.control?name={_NOME_NO_CONTROLE}"):
+        try:
+            ws = _WebSocket(url, timeout=espera)
+        except OSError as e:
+            erros.append(str(e) or type(e).__name__)
+            continue
+        try:
+            while True:
+                evento = ws.receber_json(espera)
+                if evento.get("event") == "ms.channel.connect":
+                    break
+                if evento.get("event") == "ms.channel.unauthorized":
+                    raise ToonsError("A TV não permitiu. Aceite o pedido do Termux-Toons na tela da TV (ou libere em "
+                                     "Configurações → Geral → Gerenciador de dispositivos externos).")
+        except OSError as e:
+            ws.fechar()
+            erros.append(str(e) or type(e).__name__)
+            continue
+        except BaseException:
+            ws.fechar()
+            raise
+        token = (evento.get("data") or {}).get("token")
+        if token and token != tv.get("token"):
+            tv["token"] = token
+            salvar_cfg()
+        return ws
+    raise ToonsError(f"A TV Samsung não respondeu em {ip} ({'; '.join(erros)}). Ela está ligada e no mesmo Wi-Fi?")
+
+
+_LG_PERMISSOES = [
+    "APP_TO_APP", "CLOSE", "CONTROL_AUDIO", "CONTROL_DISPLAY", "CONTROL_INPUT_JOYSTICK", "CONTROL_INPUT_MEDIA_PLAYBACK",
+    "CONTROL_INPUT_MEDIA_RECORDING", "CONTROL_INPUT_TEXT", "CONTROL_INPUT_TV", "CONTROL_MOUSE_AND_KEYBOARD",
+    "CONTROL_POWER", "CONTROL_TV_SCREEN", "LAUNCH", "LAUNCH_WEBAPP", "READ_APP_STATUS", "READ_COUNTRY_INFO",
+    "READ_CURRENT_CHANNEL", "READ_INPUT_DEVICE_LIST", "READ_INSTALLED_APPS", "READ_LGE_SDX", "READ_LGE_TV_INPUT_EVENTS",
+    "READ_NETWORK_STATE", "READ_NOTIFICATIONS", "READ_POWER_STATE", "READ_RUNNING_APPS", "READ_SETTINGS",
+    "READ_TV_CHANNEL_LIST", "READ_TV_CURRENT_TIME", "READ_UPDATE_INFO", "SEARCH", "TEST_OPEN", "TEST_PROTECTED",
+    "TEST_SECURE", "UPDATE_FROM_REMOTE_APP", "WRITE_NOTIFICATION_ALERT", "WRITE_NOTIFICATION_TOAST", "WRITE_SETTINGS",
+]
+
+
+class _TvLG:
+    """Conexão com uma TV LG (webOS). Na primeira vez a TV pergunta se permite e manda uma chave, que fica salva."""
+
+    def __init__(self, tv: dict, espera: float = 10):
+        self.tv, self.n, self.entrada, self.ws = tv, 0, None, None
+        erros = []
+        for url in (f"ws://{tv['ip']}:3000", f"wss://{tv['ip']}:3001"):  # as mais novas só aceitam a segura
+            try:
+                self.ws = _WebSocket(url, timeout=6)
+                break
+            except OSError as e:
+                erros.append(str(e) or type(e).__name__)
+        if self.ws is None:
+            raise ToonsError(f"A TV LG não respondeu em {tv['ip']} ({'; '.join(erros)}). Ela está ligada e no mesmo "
+                             "Wi-Fi?")
+        try:
+            self._registrar(espera)
+        except OSError as e:
+            self.fechar()
+            raise ToonsError(f"A TV LG fechou a conexão ({e or type(e).__name__}).") from None
+        except BaseException:
+            self.fechar()
+            raise
+
+    def _resposta(self, ident: str, timeout: float) -> dict:
+        prazo = time.time() + timeout
+        while True:
+            resto = prazo - time.time()
+            if resto <= 0:
+                raise TimeoutError
+            r = self.ws.receber_json(resto)
+            if r.get("id") == ident:
+                return r
+
+    def _registrar(self, espera: float) -> None:
+        # as versões novas do webOS querem o "hello" e as informações do sistema antes do registro
+        self.ws.enviar(json.dumps({"id": "hello", "type": "hello", "payload": {}}))
+        self.ws.enviar(json.dumps({"id": "info", "type": "request", "uri": "ssap://system/getSystemInfo",
+                                   "payload": {}}))
+        with contextlib.suppress(OSError):
+            self._resposta("info", 4)
+        carga = {"forcePairing": False, "pairingType": "PROMPT",
+                 "manifest": {"manifestVersion": 1, "appVersion": "1.1", "permissions": _LG_PERMISSOES}}
+        if self.tv.get("chave"):
+            carga["client-key"] = self.tv["chave"]
+        self.ws.enviar(json.dumps({"type": "register", "id": "register_0", "payload": carga}))
+        prazo = time.time() + espera
+        while True:
+            try:
+                r = self._resposta("register_0", prazo - time.time())
+            except TimeoutError:
+                raise ToonsError("A TV não confirmou. Aceite o pedido do Termux-Toons na tela da TV e tente de "
+                                 "novo.") from None
+            if r.get("type") == "registered":
+                chave = (r.get("payload") or {}).get("client-key")
+                if chave and chave != self.tv.get("chave"):
+                    self.tv["chave"] = chave
+                    salvar_cfg()
+                return
+            if r.get("type") == "error":
+                raise ToonsError(f"A TV LG recusou: {r.get('error')}")
+            # 'response' com pairingType PROMPT: a TV está mostrando o pedido; continua esperando
+
+    def pedir(self, uri: str, carga: dict | None = None) -> dict:
+        self.n += 1
+        ident = f"toons_{self.n}"
+        try:
+            self.ws.enviar(json.dumps({"id": ident, "type": "request", "uri": f"ssap://{uri}", "payload": carga or {}}))
+            r = self._resposta(ident, 8)
+        except TimeoutError:
+            raise ToonsError("A TV LG não respondeu.") from None
+        except OSError as e:
+            raise ToonsError(f"A conexão com a TV LG caiu ({e or type(e).__name__}).") from None
+        if r.get("type") == "error":
+            raise ToonsError(f"A TV LG respondeu: {r.get('error')}")
+        return r.get("payload") or {}
+
+    def botao(self, nome: str) -> None:
+        """Aperta um botão do controle (pelo canal de botões, que a TV abre num endereço próprio)."""
+        if self.entrada is None:
+            caminho = self.pedir("com.webos.service.networkinput/getPointerInputSocket").get("socketPath")
+            if not caminho:
+                raise ToonsError("A TV LG não abriu o canal dos botões.")
+            self.entrada = _WebSocket(caminho, timeout=6)
+        self.entrada.enviar(f"type:button\nname:{nome}\n\n")
+
+    def fechar(self) -> None:
+        for ws in (self.entrada, self.ws):
+            if ws is not None:
+                ws.fechar()
+
+
+def _adb_tv(tv: dict, esperar_permissao: float = 0) -> str:
+    """Conecta o adb à TV (Depuração por rede) e devolve o serial; na primeira vez a TV pergunta se permite."""
+    if not garantir_adb():
+        raise ToonsError("Sem o adb (pacote android-tools).")
+    serial = tv["ip"] if ":" in tv["ip"] else f"{tv['ip']}:5555"
+    prazo = time.time() + esperar_permissao
+    while True:
+        conectar = adb("connect", serial, timeout=15)
+        estado = adb("get-state", serial=serial, timeout=10)
+        if (estado.stdout or "").strip() == "device":
+            return serial
+        texto = " ".join(f"{p.stdout or ''} {p.stderr or ''}" for p in (conectar, estado)).strip()
+        if time.time() >= prazo:
+            if "unauthorized" in texto or "authenticate" in texto:
+                raise ToonsError("A TV ainda não permitiu: aceite 'Permitir depuração' na tela da TV (marque 'Sempre "
+                                 "permitir deste computador').")
+            raise ToonsError(f"A TV não respondeu em {serial} ({texto[:160] or 'sem resposta'}). Ligue a 'Depuração "
+                             "USB' e a 'Depuração por rede (ADB)' nas Opções do desenvolvedor da TV.")
+        time.sleep(2)
+
+
+def _macs_android(serial: str, ip: str) -> list:
+    """MAC da placa de rede que tem o IP da TV (pelo adb)."""
+    texto = adb_shell("ip -o -4 addr show; ip -o link show", serial=serial, timeout=20)
+    placa = next((m.group(1) for m in re.finditer(r"^\d+:\s+(\S+)\s+inet\s+([\d.]+)", texto, re.M)
+                  if m.group(2) == ip.split(":")[0]), None)
+    macs = [m.group(2) for m in re.finditer(r"^\d+:\s+([^:@\s]+)\S*:.*?link/ether\s+([0-9a-fA-F:]{17})", texto, re.M)
+            if placa is None or m.group(1) == placa]
+    return macs[:3]
+
+
+def _roku(ip: str, caminho: str, apertar: bool = False) -> str | None:
+    """Fala com a Roku TV (porta 8060); None se ela não respondeu."""
+    req = urllib.request.Request(f"http://{ip}:8060/{caminho}", data=b"" if apertar else None,
+                                 method="POST" if apertar else "GET")
+    try:
+        with _SEM_PROXY.open(req, timeout=4) as r:
+            return r.read().decode("utf-8", errors="replace")
+    except (OSError, ValueError):
+        return None
+
+
+def _roku_info(ip: str) -> dict | None:
+    xml = _roku(ip, "query/device-info")
+    if xml is None:
+        return None
+    try:
+        return {el.tag: (el.text or "").strip() for el in ET.fromstring(xml)}
+    except ET.ParseError:
+        return None
+
+
+def _descricao_upnp(url: str) -> tuple:
+    """(nome, fabricante e modelo) que o aparelho publica na rede."""
+    if not url.startswith("http"):
+        return "", ""
+    try:
+        with _SEM_PROXY.open(url, timeout=3) as r:
+            raiz = ET.fromstring(r.read())
+    except (OSError, ValueError, ET.ParseError):
+        return "", ""
+
+    def achar(nome: str) -> str:
+        return next((el.text.strip() for el in raiz.iter() if el.tag.rsplit("}", 1)[-1] == nome and el.text), "")
+
+    return achar("friendlyName"), " ".join(filter(None, (achar("manufacturer"), achar("modelName"))))
+
+
+def _tipo_tv_ssdp(respostas: list) -> str | None:
+    """Que TV é, pelas respostas SSDP de um aparelho (None se não parece TV: roteador, impressora...)."""
+    texto = " ".join(f"{c.get('st', '')} {c.get('usn', '')} {c.get('server', '')}" for c in respostas).lower()
+    if "roku" in texto:
+        return "roku"
+    if "samsung" in texto:
+        return "samsung"
+    if "webos" in texto or "lge-com" in texto:
+        return "lg"
+    return "androidtv" if "dial-multiscreen" in texto else None  # Android TV, Google TV, Fire TV (e Chromecast)
+
+
+def procurar_tvs(espera: float = 3.0) -> list:
+    """TVs que respondem no Wi-Fi (SSDP, o mesmo 'procurar aparelhos' dos apps de controle remoto)."""
+    buscas = ["ssdp:all", "roku:ecp", "urn:samsung.com:device:RemoteControlReceiver:1",
+              "urn:lge-com:service:webos-second-screen:1", "urn:dial-multiscreen-org:service:dial:1"]
+    respostas: dict = {}
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP) as s:
+        s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+        s.settimeout(0.3)
+        for _ in range(2):
+            for busca in buscas:
+                with contextlib.suppress(OSError):
+                    s.sendto(("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\n"
+                              f"MX: 2\r\nST: {busca}\r\n\r\n").encode(), ("239.255.255.250", 1900))
+        fim = time.time() + espera
+        while time.time() < fim:
+            try:
+                dados, (ip, _) = s.recvfrom(65507)
+            except TimeoutError:
+                continue
+            except OSError:
+                break
+            cabecalho = {}
+            for linha in dados.decode("utf-8", errors="replace").split("\r\n")[1:]:
+                chave, separador, valor = linha.partition(":")
+                if separador:
+                    cabecalho[chave.strip().lower()] = valor.strip()
+            respostas.setdefault(ip, []).append(cabecalho)
+    tvs = []
+    for ip, lista in respostas.items():
+        tipo = _tipo_tv_ssdp(lista)
+        if tipo is None:
+            continue
+        nome, modelo = _descricao_upnp(next((c["location"] for c in lista if c.get("location")), ""))
+        if tipo == "samsung":
+            dados = _samsung_info(ip)
+            if dados is None:
+                continue  # outro aparelho Samsung (celular, impressora, soundbar)
+            aparelho = dados.get("device") or {}
+            nome, modelo = aparelho.get("name") or dados.get("name") or nome, aparelho.get("modelName") or modelo
+        tvs.append({"ip": ip, "tipo": tipo, "nome": nome or TIPOS_TV[tipo], "modelo": modelo})
+    return sorted(tvs, key=lambda t: list(TIPOS_TV).index(t["tipo"]))
+
+
+# ── Controle de uma TV (qualquer caminho) ──
+
+class ControleTV:
+    """Manda as teclas para uma TV; guarda a conexão aberta enquanto o controle remoto está na tela."""
+
+    def __init__(self, tv: dict):
+        self.tv, self._ws, self._lg, self._serial = tv, None, None, None
+
+    def fechar(self) -> None:
+        if self._ws is not None:
+            time.sleep(0.3)  # fechar logo depois da tecla pode fazer a Samsung ignorá-la
+            self._ws.fechar()
+        if self._lg is not None:
+            time.sleep(0.2)
+            self._lg.fechar()
+        self._ws = self._lg = None
+
+    def _botoes(self) -> dict:
+        return {**TV_MARCAS_IR.get(self.tv.get("marca"), {}), **(self.tv.get("codigos") or {})}
+
+    def tem(self, acao: str) -> bool:
+        """Se essa TV tem o botão (pelo caminho dela)."""
+        if self.tv["tipo"] == "ir":
+            botoes = self._botoes()
+            return _codigo_ir(botoes, TV_TECLAS[acao][1]) is not None or (
+                acao in ENERGIA_TV and _codigo_ir(botoes, "Power") is not None)
+        return acao in ENERGIA_TV or TV_TECLAS[acao][_COLUNA_TV[self.tv["tipo"]]] is not None
+
+    def tecla(self, acao: str) -> str:
+        """Manda a tecla e devolve o que foi feito, para mostrar."""
+        rotulo = TV_TECLAS[acao][0]
+        if self.tv["tipo"] == "ir":
+            botoes = self._botoes()
+            codigo, extra = _codigo_ir(botoes, TV_TECLAS[acao][1]), ""
+            if codigo is None and acao in ENERGIA_TV:
+                codigo = _codigo_ir(botoes, "Power")
+                if acao != "alternar":
+                    extra = " (pelo liga/desliga: o infravermelho não sabe se a TV estava ligada)"
+            if codigo is None:
+                raise ToonsError(f"Não tenho o código do botão '{rotulo}' dessa TV.")
+            ir_transmitir(codigo)
+            return f"✔ {rotulo}{extra}"
+        if acao in ENERGIA_TV:
+            return self._energia(acao)
+        nome = TV_TECLAS[acao][_COLUNA_TV[self.tv["tipo"]]]
+        if nome is None:
+            raise ToonsError(f"Essa TV não tem o botão '{rotulo}' pelo Wi-Fi.")
+        self._mandar(nome)
+        return f"✔ {rotulo}"
+
+    def _mandar(self, nome: str) -> None:
+        tipo, ip = self.tv["tipo"], self.tv["ip"]
+        if tipo == "samsung":
+            for tentativa in range(2):  # se a conexão guardada caiu, abre outra
+                if self._ws is None:
+                    self._ws = _samsung_conectar(self.tv)
+                try:
+                    self._ws.enviar(json.dumps({"method": "ms.remote.control", "params": {
+                        "Cmd": "Click", "DataOfCmd": nome, "Option": "false", "TypeOfRemote": "SendRemoteKey"}}))
+                    return
+                except OSError:
+                    self._ws.fechar()
+                    self._ws = None
+                    if tentativa:
+                        raise ToonsError("A conexão com a TV caiu.") from None
+        elif tipo == "lg":
+            for tentativa in range(2):
+                if self._lg is None:
+                    self._lg = _TvLG(self.tv)
+                try:
+                    self._lg.botao(nome)
+                    return
+                except OSError:
+                    self._lg.fechar()
+                    self._lg = None
+                    if tentativa:
+                        raise ToonsError("A conexão com a TV caiu.") from None
+        elif tipo == "androidtv":
+            self._serial = self._serial or _adb_tv(self.tv)
+            proc = adb("shell", "input", "keyevent", nome, serial=self._serial, timeout=20)
+            if proc.returncode != 0:
+                self._serial = None
+                raise ToonsError(f"A TV não recebeu a tecla: {(proc.stderr or proc.stdout or '').strip()[:160]}")
+        elif tipo == "roku":
+            if _roku(ip, f"keypress/{nome}", apertar=True) is None:
+                raise ToonsError(f"A Roku TV não respondeu em {ip}. Ela está ligada e no mesmo Wi-Fi?")
+
+    def _ligada(self) -> tuple:
+        """(ligada: True/False/None se não dá para saber, responde pela rede: bool)."""
+        tipo, ip = self.tv["tipo"], self.tv["ip"]
+        if tipo == "samsung":
+            dados = _samsung_info(ip)
+            if dados is None:
+                return False, False
+            estado = (dados.get("device") or {}).get("PowerState")
+            return (estado == "on" if estado else True), True  # as antigas só respondem ligadas
+        if tipo == "roku":
+            dados = _roku_info(ip)
+            return (False, False) if dados is None else (dados.get("power-mode") == "PowerOn", True)
+        if tipo == "lg":
+            try:
+                self._lg = self._lg or _TvLG(self.tv, espera=6)
+            except ToonsError:
+                return False, False
+            try:
+                estado = self._lg.pedir("com.webos.service.tvpower/power/getPowerState").get("state", "")
+            except (ToonsError, OSError):
+                return True, True
+            return estado not in ("Active Standby", "Suspend", "Power Off"), True
+        if tipo == "androidtv":
+            try:
+                self._serial = self._serial or _adb_tv(self.tv)
+            except ToonsError:
+                return False, False
+            estado = re.search(r"mWakefulness=(\w+)", adb_shell("dumpsys power", serial=self._serial, timeout=20))
+            return (estado.group(1) == "Awake" if estado else None), True
+        return None, False
+
+    def _energia(self, acao: str) -> str:
+        tipo, coluna = self.tv["tipo"], _COLUNA_TV[self.tv["tipo"]]
+        ligada, responde = self._ligada()
+        if acao == "alternar":
+            if ligada is None:
+                self._mandar(TV_TECLAS["alternar"][coluna])
+                return "✔ Liga/desliga"
+            acao = "desligar" if ligada else "ligar"
+        if acao == "desligar":
+            if ligada is False:
+                return "A TV já está desligada."
+            if tipo == "lg":
+                self._lg.pedir("system/turnOff")
+            else:
+                self._mandar(TV_TECLAS["desligar"][coluna])
+            return "✔ TV desligada"
+        if ligada:
+            return "A TV já está ligada."
+        if responde and tipo in ("samsung", "roku", "androidtv"):  # em espera, mas ainda na rede
+            with contextlib.suppress(ToonsError):
+                self._mandar(TV_TECLAS["ligar"][coluna])
+                if tipo != "samsung":
+                    return "✔ TV ligada"
+        if self.tv.get("macs"):
+            wake_on_lan(self.tv["macs"], self.tv.get("ip"))
+            return "✔ Mandei o sinal para ligar pela rede (Wake-on-LAN)"
+        if responde:
+            return "✔ Mandei o sinal para ligar"
+        raise ToonsError("A TV não responde na rede e não sei o MAC dela para ligá-la pela rede. Ligue a opção "
+                         "'Ligar pela rede/pelo celular' na TV e adicione-a de novo.")
+
+
+def _tvs() -> list:
+    return cfg().setdefault("tvs", [])
+
+
+def tv_escolhida(nome: str | None = None) -> dict:
+    tvs = _tvs()
+    if not tvs:
+        raise ToonsError("Nenhuma TV configurada. Adicione em 📲 Celular e sistema → 📺 Controle da TV.")
+    if nome:
+        achada = next((tv for tv in tvs if tv["nome"].casefold() == nome.casefold()), None)
+        if achada is None:
+            raise ToonsError(f"Não achei a TV '{nome}'. TVs: {', '.join(tv['nome'] for tv in tvs)}")
+        return achada
+    i = cfg().get("tv_atual", 0)
+    return tvs[i] if isinstance(i, int) and 0 <= i < len(tvs) else tvs[0]
+
+
+def descrever_tv(tv: dict) -> str:
+    extra = tv.get("marca") or tv.get("modelo") or ""
+    return f"{tv['nome']} · {TIPOS_TV.get(tv['tipo'], tv['tipo'])}" + (f" ({extra})" if extra else "")
+
+
+def tv_comando(acao: str, nome: str | None = None) -> str:
+    """Uma tecla só, de qualquer lugar (menu, atalho, automação, bot)."""
+    controle = ControleTV(tv_escolhida(nome))
+    try:
+        return controle.tecla(acao)
+    finally:
+        controle.fechar()
+
+
+# ── Tela do controle remoto ──
+
+_BOTOES_CONTROLE = [
+    [("alternar", "⏻ Liga/desliga"), ("mudo", "🔇 Mudo")],
+    [("cima", " ▲ ")],
+    [("esquerda", " ◀ "), ("ok", " OK "), ("direita", " ▶ ")],
+    [("baixo", " ▼ ")],
+    [("voltar", "↩ Voltar"), ("inicio", "⌂ Início"), ("entrada", "⇄ Entrada")],
+    [("vol-", "🔉 Vol −"), ("vol+", "🔊 Vol +")],
+    [("canal-", "Canal −"), ("canal+", "Canal +")],
+    [("sair", "✖ Sair")],
+]
+_ATALHOS_CONTROLE = {
+    "p": "alternar", "P": "alternar", "cima": "cima", "baixo": "baixo", "esq": "esquerda", "dir": "direita",
+    "enter": "ok", " ": "ok", "+": "vol+", "=": "vol+", "-": "vol-", "m": "mudo", "M": "mudo", "pgup": "canal+",
+    "]": "canal+", "pgdn": "canal-", "[": "canal-", "h": "inicio", "home": "inicio", "backspace": "voltar",
+    "b": "voltar", "i": "entrada", "e": "entrada",
+}
+_COR_BOTAO, _COR_BOTAO_OFF, _COR_ENERGIA = _c("1;97;48;5;238"), _c("2;37;48;5;236"), _c("1;97;41")
+TV_DICAS = ["toque nos botões", "arraste para cima ou para baixo: volume", "p liga/desliga", "setas e Enter navegam",
+            "+/- volume", "m mudo", "PgUp/PgDn canal", "Esc sai"]
+
+
+def _desenhar_painel(titulo: str, subtitulo: str, layout: list, ativo, energia: set, dicas: list,
+                     recado: str, apertado: str | None) -> list:
+    """Desenha um controle remoto (TV ou outro aparelho) e devolve onde ficou cada botão:
+    [(linha, altura, coluna 1, coluna 2, ação)], com linhas e colunas a partir de 1, como os toques chegam."""
+    colunas, linhas_tela = shutil.get_terminal_size((60, 24))
+    fileiras = len(layout)
+    altura, espaco = ((3, 1) if linhas_tela >= fileiras * 4 + 7 else (3, 0) if linhas_tela >= fileiras * 3 + 7
+                      else (1, 1) if linhas_tela >= fileiras * 2 + 7 else (1, 0))
+    linhas = [_no_centro(_faixa_titulo(titulo, max(20, min(colunas, 50))), colunas)]
+    linhas += ([_no_centro(f"{DIM}{subtitulo}{RST}", colunas)] if subtitulo else []) + [""]
+    alvos = []
+    for fileira in layout:
+        larguras = [_largura(rotulo) + 4 for _, rotulo in fileira]
+        x = max(0, (colunas - sum(larguras) - 2 * (len(fileira) - 1)) // 2)
+        partes = [" " * x for _ in range(altura)]
+        for (acao, rotulo), largura in zip(fileira, larguras):
+            lig = acao == "sair" or ativo(acao)
+            cor = (DESTAQUE if acao == apertado else _COR_ENERGIA if acao in energia and lig
+                   else _COR_BOTAO if lig else _COR_BOTAO_OFF)
+            for r in range(altura):
+                miolo = _centralizar(rotulo, largura) if r == altura // 2 else " " * largura
+                partes[r] += f"{cor}{miolo}{RST}  "
+            alvos.append((len(linhas), altura, x + 1, x + largura, acao))
+            x += largura + 2
+        linhas += partes + [""] * espaco
+    linhas.append(_no_centro(recado, colunas) if recado else "")
+    agrupadas = [""]
+    for tecla in dicas:
+        junto = f"{agrupadas[-1]} · {tecla}" if agrupadas[-1] else tecla
+        if _largura(junto) > colunas - 2 and agrupadas[-1]:
+            agrupadas.append(tecla)
+        else:
+            agrupadas[-1] = junto
+    linhas += [_no_centro(f"{DIM}{d}{RST}", colunas) for d in agrupadas]
+    acima = max(0, (linhas_tela - len(linhas)) // 2)
+    linhas = [""] * acima + linhas
+    sys.stdout.write("\033[H" + "\n".join(_cortar(linha, colunas) + "\033[K" for linha in linhas[:linhas_tela])
+                     + "\033[J")
+    sys.stdout.flush()
+    return [(acima + linha + 1, alt, x0, x1, acao) for linha, alt, x0, x1, acao in alvos]
+
+
+def _botao_tocado(alvos: list, x: int, y: int) -> str | None:
+    return next((acao for linha, alt, x0, x1, acao in alvos if linha <= y < linha + alt and x0 <= x <= x1), None)
+
+
+def _painel_controle(titulo: str, subtitulo: str, layout: list, ativo, energia: set, dicas: list,
+                     acionar, rotulo, atalhos: dict, volume: tuple | None) -> None:
+    """Laço de um controle remoto na tela: toque nos botões, arraste (volume) ou use o teclado. `acionar(acao)` faz o
+    comando e devolve a mensagem (ou levanta ToonsError); `rotulo(acao)` dá o nome do botão."""
+    if not setas_ativas():
+        acoes = [a for fileira in layout for a, _ in fileira if a != "sair" and ativo(a)]
+        while True:
+            i = escolher(f"{titulo}: qual botão?", [rotulo(a) for a in acoes])
+            if i is None:
+                return
+            try:
+                ok(acionar(acoes[i]))
+            except ToonsError as e:
+                erro(str(e))
+    fd = sys.stdin.fileno()
+    antigo = termios.tcgetattr(fd)
+    limpar()
+    _cursor(False)
+    _mouse(True)
+    recado, pendente = "", None
+    try:
+        tty.setcbreak(fd)
+        while True:
+            alvos = _desenhar_painel(titulo, subtitulo, layout, ativo, energia, dicas, recado, None)
+            tecla, pendente = pendente or ler_tecla(), None
+            acao, vezes = None, 1
+            if tecla in ("esc", "q", "Q"):
+                break
+            if tecla.startswith("toque:"):
+                _, x, y = tecla.split(":")
+                acao = _botao_tocado(alvos, int(x), int(y))
+                if acao == "sair":
+                    break
+            elif tecla.startswith("rolar:") and volume:  # arrastar: volume (no Termux, dedo subindo = rodinha p/ baixo)
+                direcao = tecla.split(":")[1]
+                acao = volume[0] if (direcao == "baixo") == IS_TERMUX else volume[1]
+                while vezes < 5 and select.select([fd], [], [], 0.08)[0]:  # junta o arrastar num só envio
+                    proxima = ler_tecla()
+                    if proxima.startswith(f"rolar:{direcao}:"):
+                        vezes += 1
+                    else:
+                        pendente = proxima
+                        break
+            else:
+                acao = atalhos.get(tecla)
+            if not acao:
+                continue
+            if not ativo(acao):
+                recado = f"{AMAR}Esse aparelho não tem o botão '{rotulo(acao)}'.{RST}"
+                continue
+            _desenhar_painel(titulo, subtitulo, layout, ativo, energia, dicas, f"{DIM}… {rotulo(acao)}{RST}", acao)
+            try:
+                for _ in range(vezes):
+                    resultado = acionar(acao)
+                recado = f"{VERD}{resultado}{' ×' + str(vezes) if vezes > 1 else ''}{RST}"
+            except ToonsError as e:
+                recado = f"{VERM}✖ {e}{RST}"
+    finally:
+        _mouse(False)
+        termios.tcsetattr(fd, termios.TCSADRAIN, antigo)
+        _cursor(True)
+    limpar()
+
+
+@submenu
+def tela_controle_tv(tv: dict | None = None) -> None:
+    """Controle remoto da TV na tela: toque nos botões, arraste para mudar o volume ou use o teclado."""
+    controle = ControleTV(tv or tv_escolhida())
+    try:
+        _painel_controle(f"📺 {controle.tv['nome']}", TIPOS_TV.get(controle.tv["tipo"], ""), _BOTOES_CONTROLE,
+                         lambda a: a == "sair" or controle.tem(a), {"alternar"}, TV_DICAS,
+                         controle.tecla, lambda a: TV_TECLAS[a][0], _ATALHOS_CONTROLE, ("vol+", "vol-"))
+    finally:
+        controle.fechar()
+
+
+# ── Adicionar, escolher e configurar as TVs ──
+
+def _nova_tv_ir() -> dict | None:
+    problema = ir_disponivel()
+    if problema:
+        raise ToonsError(f"Sem infravermelho: {problema}. Se a TV for Smart, adicione pelo Wi-Fi.")
+    marcas = list(TV_MARCAS_IR)
+    i = escolher("Qual a marca da TV?", marcas + ["🔎 Outra marca / não sei: busca automática (testa centenas)",
+                                                  "📄 Importar um arquivo .ir ou colar um código"])
+    if i is None:
+        return None
+    if i == len(marcas) + 1:
+        imp = _importar_codigos_ir("a TV")
+        return {"tipo": "ir", **imp} if imp else None
+    if i < len(marcas):
+        marca = marcas[i]
+        while True:
+            info("Aponte o topo do celular para a TV (de perto). Vou mandar o liga/desliga.")
+            pausar()
+            ir_transmitir(TV_MARCAS_IR[marca]["Power"])
+            if confirmar("A TV desligou (ou ligou)?", True):
+                return {"tipo": "ir", "marca": marca}
+            j = escolher("Não funcionou. E agora?", ["Tentar de novo", "Busca automática (testa centenas de códigos)",
+                                                     "Cancelar"])
+            if j == 1:
+                break
+            if j != 0:
+                return None
+    achado = busca_automatica_ir()
+    if not achado:
+        return None
+    if achado["origem"] in TV_MARCAS_IR:
+        return {"tipo": "ir", "marca": achado["origem"]}
+    return {"tipo": "ir", "codigos": achado["botoes"], "modelo": achado["origem"]}
+
+
+def _importar_codigos_ir(alvo: str = "a TV", desligar: str = "Power") -> dict | None:
+    """Importa o controle de um arquivo .ir ou de um código colado. Devolve {'codigos': {...}, 'modelo': ...}."""
+    j = escolher("De onde vem o código?", ["Arquivo .ir (Flipper Zero / Flipper-IRDB, baixado no celular)",
+                                           "Colar um código (Pronto, tempos em µs ou protocolo)"])
+    if j == 0:
+        arquivo = escolher_arquivo("Qual arquivo .ir?", (".ir",))
+        if not arquivo:
+            return None
+        botoes = {}
+        for _, codigos in ler_arquivo_ir(arquivo.read_text("utf-8", errors="replace")):
+            for nome, codigo in codigos:
+                botoes.setdefault(nome, codigo)
+        if not botoes:
+            raise ToonsError("Não achei códigos nesse arquivo.")
+        if _codigo_ir(botoes, desligar) is None:
+            aviso(f"Esse arquivo não tem o botão de desligar ('{desligar}'); os outros botões funcionam.")
+        ok(f"{len(botoes)} botões: {', '.join(list(botoes)[:15])}{'...' if len(botoes) > 15 else ''}")
+        return {"codigos": botoes, "modelo": arquivo.stem}
+    if j == 1:
+        info("Exemplos: 0000 006D 0022 0002 0157 00AC ... (Pronto) · 38000 9000,4500,560,560,... (tempos em µs) · "
+             "NEC 04 08 (protocolo, endereço e comando em hexadecimal)")
+        codigo = codigo_digitado(perguntar("Código do desligar"))
+        info(f"Aponte o celular para {alvo} para testar.")
+        pausar()
+        ir_transmitir(codigo)
+        if confirmar("Funcionou (desligou ou ligou)?", True) or confirmar("Salvar mesmo assim?", False):
+            return {"codigos": {desligar: codigo}, "modelo": "código colado"}
+    return None
+
+
+def _parear_tv_wifi(tv: dict) -> None:
+    """Primeira conexão: a TV pede permissão; aproveita para guardar o MAC (para ligar pela rede)."""
+    tipo, ip = tv["tipo"], tv["ip"]
+    if tipo == "samsung":
+        info("Na TV vai aparecer um pedido de permissão: escolha 'Permitir'.")
+        _samsung_conectar(tv, espera=40).fechar()
+        mac = ((_samsung_info(ip) or {}).get("device") or {}).get("wifiMac")
+        tv["macs"] = [mac] if mac else []
+    elif tipo == "lg":
+        info("Na TV vai aparecer um pedido de permissão: escolha 'Sim' / 'Aceitar'.")
+        lg = _TvLG(tv, espera=60)
+        try:
+            with contextlib.suppress(ToonsError, OSError):
+                tv["macs"] = _macs_em(lg.pedir("com.webos.service.connectionmanager/getinfo"))
+            with contextlib.suppress(ToonsError, OSError):
+                lg.pedir("system.notifications/createToast", {"message": "Termux-Toons conectado ✓"})
+        finally:
+            lg.fechar()
+    elif tipo == "androidtv":
+        print(f"\n{NEG}Na TV, uma vez só:{RST}\n"
+              "  1. Configurações → Preferências do dispositivo (ou Sistema) → Sobre → toque 7 vezes em 'Build'.\n"
+              "  2. Em Opções do desenvolvedor, ligue 'Depuração USB' e 'Depuração por rede' (ou 'ADB pela rede').\n"
+              "  3. Quando aparecer 'Permitir depuração?', marque 'Sempre permitir' e confirme.\n")
+        pausar()
+        info("Esperando a TV permitir (até 1 minuto)...")
+        serial = _adb_tv(tv, esperar_permissao=60)
+        with contextlib.suppress(ToonsError):
+            tv["macs"] = _macs_android(serial, ip)
+    elif tipo == "roku":
+        dados = _roku_info(ip)
+        if dados is None:
+            raise ToonsError(f"A Roku TV não respondeu em {ip}. Ela está ligada e no mesmo Wi-Fi?")
+        tv["macs"] = [m for m in (dados.get("wifi-mac"), dados.get("ethernet-mac")) if m]
+        tv.setdefault("modelo", dados.get("model-name", ""))
+    if tv.get("macs"):
+        info("Para ligar a TV pelo celular, deixe ativa na TV a opção 'Ligar pela rede' / 'Ligar com o celular' "
+             "(Wake-on-LAN ou 'Mobile TV On').")
+
+
+def _nova_tv_wifi() -> dict | None:
+    while True:
+        info("Procurando TVs no Wi-Fi (a TV precisa estar ligada e na mesma rede)...")
+        achadas = procurar_tvs()
+        opcoes = [f"{t['nome']}  {DIM}{TIPOS_TV[t['tipo']]} · {t['ip']}{RST}" for t in achadas]
+        i = escolher("Qual é a sua TV?" if achadas else "Não achei nenhuma TV. E agora?",
+                     opcoes + ["Digitar o IP da TV", "Procurar de novo"])
+        if i is None:
+            return None
+        if i < len(achadas):
+            tv = {k: v for k, v in achadas[i].items() if k != "nome"}
+            break
+        if i == len(achadas):
+            ip = perguntar("IP da TV (fica em Configurações → Rede → Status ou Informações da rede)").strip()
+            if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", ip):
+                raise ToonsError("IP inválido (ex.: 192.168.0.20).")
+            tipos = list(TIPOS_TV)[1:]
+            j = escolher("Que TV é essa?", [TIPOS_TV[t] for t in tipos])
+            if j is None:
+                return None
+            tv = {"ip": ip, "tipo": tipos[j]}
+            break
+    _parear_tv_wifi(tv)
+    return tv
+
+
+def adicionar_tv() -> None:
+    i = escolher("Como o celular vai falar com a TV?", [
+        "📡 Infravermelho do celular (qualquer TV, até as antigas; o celular precisa ter o emissor IR)",
+        "📶 Wi-Fi (Smart TV: Samsung, LG, Android TV / Google TV, Roku)"])
+    if i is None:
+        return
+    tv = _nova_tv_ir() if i == 0 else _nova_tv_wifi()
+    if not tv:
+        return
+    tvs = _tvs()
+    nome = perguntar("Nome dessa TV", "TV da sala" if not tvs else f"TV {len(tvs) + 1}").strip() or "TV"
+    while any(t["nome"].casefold() == nome.casefold() for t in tvs):
+        nome += " 2"
+    tvs.append({"nome": nome, **tv})
+    cfg()["tv_atual"] = len(tvs) - 1
+    salvar_cfg()
+    ok(f"Pronto! {descrever_tv(tvs[-1])}")
+    info("Use '⏻ Ligar / desligar' ou '🎮 Controle remoto'. Também dá para pôr na tela inicial (Termux:Widget), "
+         "numa automação (ex.: desligar às 23h) e no bot (/tv).")
+
+
+def atalho_tv() -> None:
+    pasta = HOME / ".shortcuts"
+    (pasta / "tasks").mkdir(parents=True, exist_ok=True)
+    inicio = f"#!{PREFIX or '/data/data/com.termux/files/usr'}/bin/bash\n"
+    atalhos = {pasta / "tasks" / "TV liga-desliga.sh": "alternar", pasta / "TV controle remoto.sh": "controle"}
+    for arquivo, acao in atalhos.items():
+        arquivo.write_text(inicio + shlex.join([sys.executable, str(SCRIPT), "tv", acao]) + "\n", "utf-8")
+        os.chmod(arquivo, 0o700)
+    ok("Atalhos criados: 'TV liga-desliga' (funciona sem abrir o Termux) e 'TV controle remoto'.")
+    info("Instale o app Termux:Widget (mesma loja do Termux) e ponha o widget dele na tela inicial.")
+
+
+@submenu
+def menu_tv():
+    c = cfg()
+    tvs = _tvs()
+
+    def cabecalho():
+        if tvs:
+            print(f"TV: {NEG}{descrever_tv(tv_escolhida())}{RST}")
+        else:
+            print(f"{DIM}Nenhuma TV ainda: comece em ➕ Adicionar uma TV{RST}")
+
+    def trocar():
+        if not tvs:
+            raise ToonsError("Nenhuma TV configurada ainda.")
+        i = escolher("Qual TV controlar?", [descrever_tv(tv) for tv in tvs], tvs.index(tv_escolhida()) + 1)
+        if i is not None:
+            c["tv_atual"] = i
+            salvar_cfg()
+            ok(f"Controlando: {tvs[i]['nome']}")
+
+    def editar():
+        if not tvs:
+            raise ToonsError("Nenhuma TV configurada ainda.")
+        i = escolher("Qual TV?", [descrever_tv(tv) for tv in tvs])
+        if i is None:
+            return
+        j = escolher(tvs[i]["nome"], ["Renomear", "Apagar"])
+        if j == 0:
+            tvs[i]["nome"] = perguntar("Novo nome", tvs[i]["nome"]).strip() or tvs[i]["nome"]
+        elif j == 1 and confirmar(f"Apagar '{tvs[i]['nome']}'?", False):
+            del tvs[i]
+            c["tv_atual"] = 0
+        else:
+            return
+        salvar_cfg()
+        ok("Feito.")
+
+    def checar_ir():
+        problema = ir_disponivel()
+        if problema:
+            aviso(f"Não dá: {problema}.")
+            info("Sem infravermelho, dá para controlar Smart TVs pelo Wi-Fi.")
+            return
+        faixas = _tapi(["termux-infrared-frequencies"], 20)
+        texto = ", ".join(f"{f.get('min', 0) // 1000}–{f.get('max', 0) // 1000} kHz" for f in faixas
+                          if isinstance(f, dict))
+        ok(f"Sim! Este celular tem emissor infravermelho ({texto or 'frequências não informadas'}).")
+
+    menu("📺 Controle da TV", [
+        ("⏻ Ligar / desligar a TV", lambda: ok(tv_comando("alternar"))),
+        ("🎮 Controle remoto (volume, canal, setas, OK)", tela_controle_tv),
+        ("➕ Adicionar uma TV (infravermelho ou Wi-Fi)", adicionar_tv),
+        (lambda: f"🔀 Trocar de TV ({len(tvs)})", trocar),
+        ("📝 Renomear ou apagar uma TV", editar),
+        ("📲 Atalho na tela inicial (Termux:Widget)", atalho_tv),
+        ("📴 Desligar TVs por perto (TV-B-Gone)", desligar_tvs_por_perto),
+        ("❓ Meu celular tem infravermelho?", checar_ir),
+    ], cabecalho=cabecalho)
+
+
+# ── Controle de outros aparelhos por infravermelho (som, projetor, ar-condicionado) ──
+
+APARELHOS = {
+    "som": {
+        "icone": "🔊", "nome": "🔊 Soundbar / aparelho de som", "nome_curto": "Som", "alvo": "o som",
+        "padrao_nome": "Som da sala", "energia": {"Power"},
+        "botoes": [
+            [("Power", "⏻ Liga/desliga"), ("Mute", "🔇 Mudo")],
+            [("Vol_dn", "🔉 Vol −"), ("Vol_up", "🔊 Vol +")],
+            [("Prev", "⏮ Ant"), ("Play", "▶ Play"), ("Next", "⏭ Próx")],
+            [("Pause", "⏸ Pausa")],
+            [("sair", "✖ Sair")],
+        ],
+        "dicas": ["toque nos botões", "arraste para cima ou para baixo: volume", "p liga/desliga", "setas",
+                  "+/- volume", "m mudo", "Esc sai"],
+    },
+    "projetor": {
+        "icone": "🎬", "nome": "🎬 Projetor / TV box / conversor", "nome_curto": "Projetor/TV box",
+        "alvo": "o aparelho", "padrao_nome": "Projetor", "energia": {"Power"},
+        "botoes": [
+            [("Power", "⏻ Liga/desliga"), ("Mute", "🔇 Mudo")],
+            [("Up", " ▲ ")],
+            [("Left", " ◀ "), ("Ok", " OK "), ("Right", " ▶ ")],
+            [("Down", " ▼ ")],
+            [("Menu", "☰ Menu"), ("Back", "↩ Voltar"), ("Input", "⇄ Fonte")],
+            [("Vol_dn", "🔉 Vol −"), ("Vol_up", "🔊 Vol +")],
+            [("sair", "✖ Sair")],
+        ],
+        "dicas": ["toque nos botões", "arraste: volume", "p liga/desliga", "setas e Enter navegam", "+/- volume",
+                  "m mudo", "Esc sai"],
+    },
+    "ar": {
+        "icone": "🧊", "nome": "🧊 Ar-condicionado", "nome_curto": "Ar-condicionado", "alvo": "o ar-condicionado",
+        "padrao_nome": "Ar da sala", "energia": {"Off"},
+        "botoes": [
+            [("Off", "⏻ Desligar")],
+            [("Cool_lo", "🧊 Mais frio"), ("Cool_hi", "🧊 Menos frio")],
+            [("Heat_hi", "🔥 Mais quente"), ("Heat_lo", "🔥 Menos quente")],
+            [("Dh", "💧 Desumidificar")],
+            [("sair", "✖ Sair")],
+        ],
+        "dicas": ["toque nos botões", "p desliga", "Esc sai"],
+    },
+}
+
+
+def _aparelhos() -> list:
+    return cfg().setdefault("aparelhos", [])
+
+
+def aparelho_escolhido(nome: str | None = None) -> dict:
+    aps = _aparelhos()
+    if not aps:
+        raise ToonsError("Nenhum aparelho configurado. Adicione em 📲 Celular e sistema → 🎛️ Controle de outros "
+                         "aparelhos.")
+    if nome:
+        achado = next((a for a in aps if a["nome"].casefold() == nome.casefold()), None)
+        if achado is None:
+            raise ToonsError(f"Não achei '{nome}'. Aparelhos: {', '.join(a['nome'] for a in aps)}")
+        return achado
+    i = cfg().get("aparelho_atual", 0)
+    return aps[i] if isinstance(i, int) and 0 <= i < len(aps) else aps[0]
+
+
+def descrever_aparelho(ap: dict) -> str:
+    conf = APARELHOS.get(ap["categoria"], {})
+    extra = ap.get("modelo") or ""
+    return f"{ap['nome']} · {conf.get('nome_curto', ap['categoria'])}" + (f" ({extra})" if extra else "")
+
+
+def _rotulos(layout: list) -> dict:
+    return {acao: rotulo for fileira in layout for acao, rotulo in fileira}
+
+
+def _atalhos_aparelho(ativo) -> dict:
+    """Teclas de atalho do controle, só para os botões que o aparelho tem."""
+    candidatos = {
+        "p": ("Power", "Off"), "P": ("Power", "Off"), "+": ("Vol_up",), "=": ("Vol_up",), "-": ("Vol_dn",),
+        "m": ("Mute",), "M": ("Mute",), "cima": ("Up",), "baixo": ("Down",), "esq": ("Left",), "dir": ("Right",),
+        "enter": ("Ok", "Play"), " ": ("Ok", "Play"), "backspace": ("Back",), "b": ("Back",), "i": ("Input",),
+        "e": ("Input",),
+    }
+    atalhos = {}
+    for tecla, nomes in candidatos.items():
+        achado = next((n for n in nomes if ativo(n)), None)
+        if achado:
+            atalhos[tecla] = achado
+    return atalhos
+
+
+def aparelho_comando(acao: str, nome: str | None = None) -> str:
+    """Um botão só, de qualquer lugar (atalho da tela inicial, linha de comando)."""
+    ap = aparelho_escolhido(nome)
+    codigo = _codigo_ir(ap.get("codigos", {}), acao)
+    if codigo is None:
+        raise ToonsError(f"O aparelho '{ap['nome']}' não tem o botão '{acao}'.")
+    ir_transmitir(codigo)
+    return f"✔ {acao} ({ap['nome']})"
+
+
+@submenu
+def tela_controle_aparelho(ap: dict | None = None) -> None:
+    """Controle remoto na tela de um aparelho por infravermelho (só os botões que ele tem ficam acesos)."""
+    ap = ap or aparelho_escolhido()
+    conf = APARELHOS[ap["categoria"]]
+    botoes = ap.get("codigos", {})
+    rotulos = _rotulos(conf["botoes"])
+
+    def ativo(acao: str) -> bool:
+        return acao == "sair" or _codigo_ir(botoes, acao) is not None
+
+    def rotular(acao: str) -> str:
+        return rotulos.get(acao, acao).strip()
+
+    def acionar(acao: str) -> str:
+        codigo = _codigo_ir(botoes, acao)
+        if codigo is None:
+            raise ToonsError(f"Esse aparelho não tem o botão '{rotular(acao)}'.")
+        ir_transmitir(codigo)
+        return f"✔ {rotular(acao)}"
+
+    volume = ("Vol_up", "Vol_dn") if ativo("Vol_up") and ativo("Vol_dn") else None
+    subtitulo = conf["nome_curto"] + (f" · {ap['modelo']}" if ap.get("modelo") else "")
+    _painel_controle(f"{conf['icone']} {ap['nome']}", subtitulo, conf["botoes"], ativo, conf["energia"],
+                     conf["dicas"], acionar, rotular, _atalhos_aparelho(ativo), volume)
+
+
+# ── Adicionar e configurar os aparelhos ──
+
+def _modelos_do_arquivo(arquivo: str) -> list:
+    """[(nome do controle, {botão: código})] da biblioteca universal, um por modelo."""
+    modelos = []
+    for controle, codigos in ler_arquivo_ir(_biblioteca_ir(arquivo)):
+        if not controle:
+            continue
+        botoes = {}
+        for nome, codigo in codigos:
+            botoes.setdefault(nome, codigo)
+        modelos.append((controle, botoes))
+    return modelos
+
+
+def _novo_aparelho_ir(categoria: str) -> dict | None:
+    problema = ir_disponivel()
+    if problema:
+        raise ToonsError(f"Sem infravermelho: {problema}.")
+    cat, conf = _CATEGORIAS_IR[categoria], APARELHOS[categoria]
+    desligar, alvo = cat["desligar"], conf["alvo"]
+    info("Preparando a lista de modelos (na primeira vez baixa a biblioteca universal)...")
+    modelos = _modelos_do_arquivo(cat["arquivo"])
+    marcas = sorted({m.split()[0] for m, _ in modelos}, key=str.casefold)
+    i = escolher("Qual a marca?", marcas + ["🔎 Não sei / outra marca: busca automática (testa centenas)",
+                                            "📄 Importar um arquivo .ir ou colar um código"])
+    if i is None:
+        return None
+    if i == len(marcas) + 1:
+        imp = _importar_codigos_ir(alvo, desligar)
+        return {"categoria": categoria, **imp} if imp else None
+    if i < len(marcas):
+        desses = [(m, c) for m, c in modelos if m.split()[0] == marcas[i]]
+        if len(desses) > 1:
+            j = escolher(f"Qual modelo {marcas[i]}?", [m for m, _ in desses])
+            if j is None:
+                return None
+            modelo, codigos = desses[j]
+        else:
+            modelo, codigos = desses[0]
+        codigo = _codigo_ir(codigos, desligar)
+        while True:
+            if codigo is not None:
+                info(f"Aponte o topo do celular para {alvo} (de perto). Vou mandar o desligar.")
+                pausar()
+                ir_transmitir(codigo)
+                if confirmar("Funcionou (desligou ou ligou)?", True):
+                    return {"categoria": categoria, "codigos": codigos, "modelo": modelo}
+            elif confirmar("Esse modelo não tem botão de desligar para testar. Usar assim mesmo?", True):
+                return {"categoria": categoria, "codigos": codigos, "modelo": modelo}
+            j = escolher("E agora?", ["Tentar de novo", "Busca automática (testa centenas)", "Cancelar"])
+            if j == 1:
+                break
+            if j != 0:
+                return None
+    achado = busca_automatica_ir(categoria, alvo)
+    if not achado:
+        return None
+    return {"categoria": categoria, "codigos": achado["botoes"], "modelo": achado["origem"]}
+
+
+def adicionar_aparelho() -> None:
+    cats = list(APARELHOS)
+    i = escolher("Que aparelho você quer controlar?", [APARELHOS[c]["nome"] for c in cats])
+    if i is None:
+        return
+    cat = cats[i]
+    if cat == "ar":
+        info("No ar-condicionado, o controle universal tem presets: desligar, mais/menos frio, mais/menos quente e "
+             "desumidificar (não é grau a grau).")
+    novo = _novo_aparelho_ir(cat)
+    if not novo:
+        return
+    aps = _aparelhos()
+    nome = perguntar("Nome desse aparelho", APARELHOS[cat]["padrao_nome"]).strip() or APARELHOS[cat]["nome_curto"]
+    while any(a["nome"].casefold() == nome.casefold() for a in aps):
+        nome += " 2"
+    aps.append({"nome": nome, **novo})
+    cfg()["aparelho_atual"] = len(aps) - 1
+    salvar_cfg()
+    ok(f"Pronto! {descrever_aparelho(aps[-1])}")
+    info("Use '🎮 Controle remoto'. Dá para pôr um atalho na tela inicial (Termux:Widget) e usar no terminal "
+         "(toons aparelho ...).")
+
+
+def atalho_aparelho(ap: dict) -> None:
+    pasta = HOME / ".shortcuts"
+    (pasta / "tasks").mkdir(parents=True, exist_ok=True)
+    inicio = f"#!{PREFIX or '/data/data/com.termux/files/usr'}/bin/bash\n"
+    desligar = _CATEGORIAS_IR[ap["categoria"]]["desligar"]
+    atalhos = {pasta / "tasks" / f"{ap['nome']} desligar.sh": desligar,
+               pasta / f"{ap['nome']} controle.sh": "controle"}
+    for arquivo, acao in atalhos.items():
+        arquivo.write_text(inicio + shlex.join([sys.executable, str(SCRIPT), "aparelho", ap["nome"], acao]) + "\n",
+                           "utf-8")
+        os.chmod(arquivo, 0o700)
+    ok(f"Atalhos criados: '{ap['nome']} desligar' e '{ap['nome']} controle'.")
+    info("Instale o app Termux:Widget (mesma loja do Termux) e ponha o widget dele na tela inicial.")
+
+
+@submenu
+def menu_aparelhos():
+    c = cfg()
+    aps = _aparelhos()
+
+    def cabecalho():
+        if aps:
+            print(f"Aparelho: {NEG}{descrever_aparelho(aparelho_escolhido())}{RST}")
+        else:
+            print(f"{DIM}Nenhum aparelho ainda: comece em ➕ Adicionar{RST}")
+
+    def trocar():
+        if not aps:
+            raise ToonsError("Nenhum aparelho configurado ainda.")
+        i = escolher("Qual aparelho controlar?", [descrever_aparelho(a) for a in aps],
+                     aps.index(aparelho_escolhido()) + 1)
+        if i is not None:
+            c["aparelho_atual"] = i
+            salvar_cfg()
+            ok(f"Controlando: {aps[i]['nome']}")
+
+    def editar():
+        if not aps:
+            raise ToonsError("Nenhum aparelho configurado ainda.")
+        i = escolher("Qual aparelho?", [descrever_aparelho(a) for a in aps])
+        if i is None:
+            return
+        j = escolher(aps[i]["nome"], ["Renomear", "Apagar"])
+        if j == 0:
+            aps[i]["nome"] = perguntar("Novo nome", aps[i]["nome"]).strip() or aps[i]["nome"]
+        elif j == 1 and confirmar(f"Apagar '{aps[i]['nome']}'?", False):
+            del aps[i]
+            c["aparelho_atual"] = 0
+        else:
+            return
+        salvar_cfg()
+        ok("Feito.")
+
+    def atalho():
+        if not aps:
+            raise ToonsError("Nenhum aparelho configurado ainda.")
+        atalho_aparelho(aparelho_escolhido())
+
+    menu("📡 Controle de outros aparelhos (som, projetor, ar)", [
+        ("🎮 Controle remoto", tela_controle_aparelho),
+        ("➕ Adicionar aparelho (som, projetor, ar-condicionado)", adicionar_aparelho),
+        (lambda: f"🔀 Trocar de aparelho ({len(aps)})", trocar),
+        ("📝 Renomear ou apagar", editar),
+        ("📲 Atalho na tela inicial (Termux:Widget)", atalho),
+    ], cabecalho=cabecalho)
+
+
 @submenu
 def menu_celular():
     menu("📲 Celular e sistema", [
@@ -15803,6 +17599,8 @@ def menu_celular():
         ("🔁 Conversor de arquivos (imagem, vídeo, áudio, PDF)", menu_conversor_arquivos),
         ("🤖 Automação por eventos (Wi-Fi, carregador, horário)", menu_automacao),
         ("📲 Espelhar e transmitir a tela (scrcpy ou link pela internet)", menu_espelhar),
+        ("📺 Controle da TV (infravermelho do celular ou Wi-Fi)", menu_tv),
+        ("📡 Controle de outros aparelhos (som, projetor, ar)", menu_aparelhos),
     ])
 
 
@@ -22044,6 +23842,10 @@ def _indice_busca() -> list:
         ("🔄 Conversor de arquivos", "converter imagem pdf video gif audio word excel powerpoint jpg png webp", menu_conversor_arquivos),
         ("🤖 Automação por eventos (Tasker)", "automacao tasker evento gatilho horario wifi carregador bateria", menu_automacao),
         ("📱 Espelhar a tela (scrcpy)", "espelhar scrcpy tela espelhamento mostrar", menu_espelhar),
+        ("📺 Controle da TV", "tv televisao controle remoto infravermelho ir sensor ligar desligar smart samsung lg "
+         "roku android google tcl philips sony volume canal", menu_tv),
+        ("📡 Controle de outros aparelhos (som, projetor, ar)", "som soundbar projetor ar condicionado "
+         "ar-condicionado tv box conversor infravermelho ir controle remoto universal flipper", menu_aparelhos),
         ("🖥️ Resolução da tela", "resolucao tela dpi densidade pixel diminuir baixar jogo app leve desempenho fps "
                                  "lag travando wm size", menu_resolucao),
         ("📡 Modem (AT / 3GPP)", "modem at comando 3gpp sinal operadora", menu_modem),
@@ -22230,6 +24032,13 @@ def main(argv=None) -> int:
     p = sub.add_parser("player", help="controla a música que está tocando (abrir, pausar, próxima...)")
     p.add_argument("acao", nargs="?", default="abrir", choices=["abrir", "pausar", "proxima", "anterior", "parar"])
     p.add_argument("--vigiar", action="store_true", help=argparse.SUPPRESS)  # o vigia da notificação
+    p = sub.add_parser("tv", help="controla a TV (infravermelho ou Wi-Fi): alternar, ligar, desligar, vol+, mudo...")
+    p.add_argument("acao", nargs="?", default="alternar", choices=[*TV_TECLAS, "controle"])
+    p.add_argument("--tv", metavar="NOME", help="qual TV (padrão: a escolhida no menu)")
+    p = sub.add_parser("aparelho", help="controla som/projetor/ar por infravermelho (botão ou 'controle')")
+    p.add_argument("nome", help="nome do aparelho configurado no menu")
+    p.add_argument("acao", nargs="?", default="controle", help="botão (Power, Off, Vol_up...) ou 'controle'")
+    sub.add_parser("tvbgone", help="desliga as TVs por perto (estilo TV-B-Gone)")
     sub.add_parser("atualizar", help="atualiza Termux, pacotes Python, distros e o Termux-Toons")
     sub.add_parser("limpar", help="otimização rápida: limpa caches e temporários com segurança")
     sub.add_parser("doctor", help="diagnóstico do ambiente")
@@ -22321,6 +24130,28 @@ def main(argv=None) -> int:
                 mpv(*{"pausar": ["cycle", "pause"], "proxima": ["playlist-next"],
                       "anterior": ["playlist-prev"]}[args.acao])
                 mpv.fechar()
+        elif args.comando == "tv":
+            if args.acao == "controle":
+                tela_controle_tv(tv_escolhida(args.tv))
+            else:
+                try:
+                    print(tv_comando(args.acao, args.tv))
+                except ToonsError as e:
+                    if not sys.stdout.isatty():  # atalho da tela inicial (sem terminal): avisa numa notificação
+                        notificar_seguro("📺 TV", f"✖ {e}")
+                    raise
+        elif args.comando == "aparelho":
+            if args.acao == "controle":
+                tela_controle_aparelho(aparelho_escolhido(args.nome))
+            else:
+                try:
+                    print(aparelho_comando(args.acao, args.nome))
+                except ToonsError as e:
+                    if not sys.stdout.isatty():
+                        notificar_seguro("🎛️ Aparelho", f"✖ {e}")
+                    raise
+        elif args.comando == "tvbgone":
+            desligar_tvs_por_perto()
         elif args.comando == "limpar":
             otimizacao_rapida(interativo=False)
         elif args.comando == "atualizar":
