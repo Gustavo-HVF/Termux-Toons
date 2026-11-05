@@ -60,6 +60,7 @@ import hmac
 import importlib
 import importlib.util
 import io
+import ipaddress
 import json
 import math
 import operator
@@ -996,6 +997,7 @@ PADRAO_CFG = {
     "midia_transmissoes": 3,
     "site_porta": 8097,
     "sites": {},
+    "site_avisar_visitas": False,
     "adb_endereco": "",
     "x11_usuarios": {},
     "x11_gpu": False,
@@ -4916,12 +4918,50 @@ def _caminho_termux() -> Path:
 MAX_SITES = 5  # quantos sites podem ficar no ar ao mesmo tempo
 SITES_DIR = DATA_DIR / "sites"  # cópia do arquivo quando você publica só uma página (uma pasta por site)
 VISITAS_DIR = DATA_DIR / "visitas"  # registro de quem acessou cada site (uma linha JSON por acesso)
-VISITAS_MAX = 2 * 1024 * 1024  # acima disso o registro é cortado para não crescer sem fim
+VISITAS_GUARDADAS = VISITAS_DIR / "antigos"  # registro de um site que deu lugar a outro no mesmo espaço
+VISITAS_MAX = 2 * 1024 * 1024  # acima disso o registro perde as visitas mais antigas (fica com a metade mais nova)
+IPS_CACHE = VISITAS_DIR / "ips.json"  # operadora e cidade dos IPs já consultados (não pergunta de novo)
 _lock_visitas = threading.Lock()  # o servidor é multithread; grava uma visita de cada vez
+# Caracteres que mexem no terminal (ESC, \r, \n...) e os que invertem a direção do texto (U+202E...).
+# Tudo o que vem de quem acessa (endereço, User-Agent, Referer) passa por aqui antes de ir para a tela.
+_SEM_CONTROLE = dict.fromkeys([*range(0x20), *range(0x7F, 0xA0), 0x200E, 0x200F,
+                               *range(0x202A, 0x202F), *range(0x2066, 0x206A)])
+_ESCAPAR_CONTROLE = {c: f"\\x{c:02x}" for c in (*range(0x20), *range(0x7F, 0xA0))}  # no log, à vista
+_ip_celular = ["", float("-inf")]  # IP deste celular no Wi-Fi e quando foi visto (muda se trocar de rede)
 
 
 def _arquivo_visitas(n: int) -> Path:
     return VISITAS_DIR / f"{n}.jsonl"
+
+
+def _texto_seguro(valor, limite: int = 300) -> str:
+    """Texto que veio de fora sem caracteres de controle e com tamanho limitado: um ESC escondido no
+    User-Agent ou no endereço não pode apagar a tela nem mudar as cores de quem lê o registro."""
+    texto = str(valor if valor is not None else "").translate(_SEM_CONTROLE).strip()
+    return texto[:limite] + "…" if len(texto) > limite else texto
+
+
+def _ip_valido(texto: str) -> str:
+    """O IP escrito do jeito certo, ou "" se não for um IP (cabeçalho vazio ou inventado)."""
+    try:
+        return str(ipaddress.ip_address((texto or "").strip()))
+    except ValueError:
+        return ""
+
+
+def _ip_deste_celular() -> str:
+    if time.monotonic() - _ip_celular[1] > 60:
+        _ip_celular[:] = [ip_local(), time.monotonic()]
+    return _ip_celular[0]
+
+
+def _encurtar_registro(arq: Path) -> None:
+    """Fica com a metade mais nova do registro e troca o arquivo de uma vez (nunca fica pela metade)."""
+    dados = arq.read_bytes()
+    corte = dados.find(b"\n", max(0, len(dados) - VISITAS_MAX // 2))
+    tmp = arq.with_name(arq.name + ".tmp")
+    tmp.write_bytes(dados[corte + 1:] if corte >= 0 else b"")
+    tmp.replace(arq)
 
 
 class _HandlerSite(SimpleHTTPRequestHandler):
@@ -4929,6 +4969,9 @@ class _HandlerSite(SimpleHTTPRequestHandler):
     nem mostra arquivos ocultos (.git, .env...). Também anota quem acessou (IP, país, aparelho)."""
     server_version = f"TermuxToons/{VERSION}"
     arquivo_visitas: Path | None = None  # para onde anotar as visitas (um processo por site)
+    nome_site = ""  # aparece no aviso de visitante novo
+    vistos: set = set()  # IPs que já abriram uma página: o aviso é só para quem é novo
+    _ultimo_aviso = 0.0
 
     def list_directory(self, path):
         self.send_error(404, "Página não encontrada")
@@ -4943,63 +4986,116 @@ class _HandlerSite(SimpleHTTPRequestHandler):
 
     def end_headers(self):
         self.send_header("Cache-Control", "no-cache")  # quem abre o link vê sempre a versão mais nova
+        # O Chrome não põe mais o modelo do aparelho no User-Agent; ele só manda se o site pedir.
+        # O pedido vale nos acessos seguintes (outra página, imagem, ícone) e só em HTTPS, ou seja, pelo túnel.
+        self.send_header("Accept-CH", "Sec-CH-UA-Model, Sec-CH-UA-Platform-Version")
         super().end_headers()
 
-    def _ip_real(self) -> str:
-        """O IP de quem abriu o link. Pelo túnel da Cloudflare o endereço direto é 127.0.0.1;
-        o IP de verdade vem no cabeçalho CF-Connecting-IP (ou X-Forwarded-For)."""
-        cab = self.headers
-        cf = cab.get("CF-Connecting-IP")
-        if cf and cf.strip():
-            return cf.strip()
-        xff = cab.get("X-Forwarded-For")
-        if xff and xff.strip():
-            return xff.split(",")[0].strip()
-        return self.client_address[0]
+    def _origem(self) -> tuple:
+        """(IP, por onde veio, país) de quem fez este pedido.
 
-    def _pela_internet(self) -> bool:
-        """Veio pelo túnel da Cloudflare (internet) ou pela mesma rede Wi-Fi?"""
-        return bool(self.headers.get("CF-Connecting-IP") or self.headers.get("X-Forwarded-For"))
+        Pelo túnel da Cloudflare a conexão chega do próprio celular (127.0.0.1, é o cloudflared) e o IP de verdade
+        vem no cabeçalho CF-Connecting-IP, com o país no CF-IPCountry. Esses cabeçalhos só valem quando a conexão
+        vem mesmo do cloudflared: qualquer aparelho no Wi-Fi pode mandá-los para fingir outro IP ou outro país.
+        Calculado a cada pedido: o cloudflared reaproveita a mesma conexão para visitantes diferentes."""
+        direto = str(self.client_address[0]) if self.client_address else ""
+        cab = getattr(self, "headers", None)  # não existe num pedido malformado (antes de ler os cabeçalhos)
+        try:
+            endereco = ipaddress.ip_address(direto)
+        except ValueError:
+            return _texto_seguro(direto, 60) or "?", "wifi", ""
+        if endereco.is_loopback and cab is not None:
+            ip = _ip_valido(cab.get("CF-Connecting-IP", ""))
+            if not ip:  # no X-Forwarded-For o visitante pode escrever o que quiser no começo; o proxy anota no fim
+                ips = [_ip_valido(p) for p in cab.get("X-Forwarded-For", "").split(",")]
+                ip = next((p for p in reversed(ips) if p), "")
+            if ip:
+                pais = (cab.get("CF-IPCountry") or "").strip().upper()
+                return ip, "internet", pais if re.fullmatch(r"[A-Z][A-Z0-9]", pais) else ""
+        if endereco.is_loopback or direto == _ip_deste_celular():
+            return direto, "celular", ""  # aberto neste próprio celular
+        return direto, "wifi" if endereco.is_private or endereco.is_link_local else "direto", ""
 
     def log_request(self, code="-", size="-"):
         super().log_request(code, size)  # mantém a linha no log do serviço (com o IP real)
-        with contextlib.suppress(Exception):
+        try:
             self._anotar_visita(code)
+        except Exception as e:  # noqa: BLE001 — anotar a visita nunca pode derrubar o site
+            log(f"Não consegui anotar a visita: {e!r}")
 
     def log_message(self, fmt, *args):
-        log(f"{self._ip_real()} {fmt % args}")
+        ip, via, _ = self._origem()
+        mensagem = (fmt % args).translate(_ESCAPAR_CONTROLE)  # como o http.server faz: nada de ESC cru no log
+        log(f"{ip}{' (túnel)' if via == 'internet' else ''} {mensagem}")
 
     def _anotar_visita(self, codigo) -> None:
         arq = type(self).arquivo_visitas
-        if not arq:
-            return
+        cab = getattr(self, "headers", None)
+        if not arq or cab is None or not getattr(self, "command", None):
+            return  # pedido malformado (robô testando a porta): não é uma visita
+        ip, via, pais = self._origem()
+        caminho = urllib.parse.unquote(urllib.parse.urlsplit(self.path or "").path)
+        idioma = (cab.get("Accept-Language") or "").split(",")[0].split(";")[0].strip()
         reg = {
             "t": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "ip": self._ip_real(),
-            "pais": (self.headers.get("CF-IPCountry") or "").strip().upper(),
-            "via": "internet" if self._pela_internet() else "wifi",
-            "metodo": getattr(self, "command", "") or "",
-            "caminho": urllib.parse.unquote(urllib.parse.urlsplit(self.path or "").path),
-            "codigo": int(codigo) if str(codigo).isdigit() else str(codigo),
-            "agente": (self.headers.get("User-Agent") or "").strip(),
-            "ref": (self.headers.get("Referer") or "").strip(),
+            "ip": ip,
+            "pais": pais,
+            "via": via,
+            "metodo": _texto_seguro(self.command, 10),
+            "caminho": _texto_seguro(caminho, 200) or "/",
+            "codigo": int(codigo) if isinstance(codigo, int) or str(codigo).isdigit() else 0,
+            "agente": _texto_seguro(cab.get("User-Agent"), 400),
+            "ref": _ref_externo(_texto_seguro(cab.get("Referer"), 300), cab.get("Host") or ""),
+            "idioma": idioma if re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", idioma) else "",
         }
+        for chave, cabecalho in (("modelo", "Sec-CH-UA-Model"), ("plataforma", "Sec-CH-UA-Platform"),
+                                 ("versao_so", "Sec-CH-UA-Platform-Version"), ("marcas", "Sec-CH-UA")):
+            valor = _texto_seguro(cab.get(cabecalho), 200)
+            valor = valor if chave == "marcas" else valor.strip('"')  # a lista de marcas tem aspas por dentro
+            if valor:
+                reg[chave] = valor
         linha = json.dumps(reg, ensure_ascii=False) + "\n"
         with _lock_visitas:
             arq.parent.mkdir(parents=True, exist_ok=True)
             with open(arq, "a", encoding="utf-8") as f:
                 f.write(linha)
-            if arq.stat().st_size > VISITAS_MAX:  # corta pelas últimas ~4000 visitas
-                ultimas = arq.read_text("utf-8", errors="replace").splitlines()[-4000:]
-                arq.write_text("\n".join(ultimas) + "\n", encoding="utf-8")
+            if arq.stat().st_size > VISITAS_MAX:
+                _encurtar_registro(arq)
+        self._avisar_se_novo(reg)
+
+    def _avisar_se_novo(self, reg: dict) -> None:
+        """Notificação no celular quando alguém novo (um IP que ainda não tinha aberto o site) abre uma página."""
+        cls = type(self)
+        if reg["via"] == "celular" or not _eh_visualizacao(reg) or _robo(reg["agente"]):
+            return
+        with _lock_visitas:
+            if reg["ip"] in cls.vistos:
+                return
+            cls.vistos.add(reg["ip"])
+            if time.monotonic() - cls._ultimo_aviso < 3:  # muitos de uma vez (robô?): não enche de notificação
+                return
+            cls._ultimo_aviso = time.monotonic()
+        if not ler_json(CONFIG_FILE, {}).get("site_avisar_visitas"):  # lido na hora: ligar/desligar vale já
+            return
+        onde = _pais_por_extenso(reg["pais"]) if reg["via"] == "internet" else _VIAS.get(reg["via"], "")
+        texto = f"{onde} · {_descrever_agente(reg['agente'], reg)} · IP {reg['ip']}"
+        titulo_n = f"👀 Alguém abriu o site {cls.nome_site}".strip()
+
+        def avisar():
+            with contextlib.suppress(Exception):
+                notificar_seguro(titulo_n, texto)
+        threading.Thread(target=avisar, daemon=True).start()
 
 
-def servir_site(pasta: str, porta: int, visitas: str | None = None) -> None:
+def servir_site(pasta: str, porta: int, visitas: str | None = None, nome: str = "") -> None:
     """Sobe o site em primeiro plano (é o que roda dentro do tmux)."""
     pasta = str(Path(os.path.expanduser(pasta)).resolve())
     if not Path(pasta).is_dir():
         raise ToonsError(f"Pasta não encontrada: {pasta}")
     _HandlerSite.arquivo_visitas = Path(visitas) if visitas else None
+    _HandlerSite.nome_site = nome or Path(pasta).name
+    if _HandlerSite.arquivo_visitas:  # quem já tinha vindo antes não é "visitante novo"
+        _HandlerSite.vistos = {v["ip"] for v in _ler_visitas(_HandlerSite.arquivo_visitas) if _eh_visualizacao(v)}
     with ThreadingHTTPServer(("0.0.0.0", porta), lambda *a, **k: _HandlerSite(*a, directory=pasta, **k)) as servidor:
         log(f"Site de {pasta} em http://{ip_local()}:{porta}  (Ctrl+C para parar)")
         servidor.serve_forever()
@@ -5088,117 +5184,274 @@ def _escolher_site(msg: str) -> int | None:
 # ── Quem acessou o site (visitas, IP e aparelho) ─────────────────────
 
 _PAISES = {
-    "BR": "Brasil", "PT": "Portugal", "US": "Estados Unidos", "AR": "Argentina",
-    "ES": "Espanha", "FR": "França", "DE": "Alemanha", "GB": "Reino Unido",
-    "IT": "Itália", "JP": "Japão", "CN": "China", "IN": "Índia", "RU": "Rússia",
-    "CA": "Canadá", "MX": "México", "CL": "Chile", "CO": "Colômbia", "UY": "Uruguai",
-    "PY": "Paraguai", "AO": "Angola", "MZ": "Moçambique", "NL": "Holanda",
-    "AU": "Austrália", "ZA": "África do Sul", "IE": "Irlanda", "CH": "Suíça",
+    "BR": "Brasil", "PT": "Portugal", "AO": "Angola", "MZ": "Moçambique", "CV": "Cabo Verde",
+    "GW": "Guiné-Bissau", "ST": "São Tomé e Príncipe", "TL": "Timor-Leste", "MO": "Macau",
+    "AR": "Argentina", "BO": "Bolívia", "CL": "Chile", "CO": "Colômbia", "EC": "Equador", "GY": "Guiana",
+    "PE": "Peru", "PY": "Paraguai", "SR": "Suriname", "UY": "Uruguai", "VE": "Venezuela", "GF": "Guiana Francesa",
+    "MX": "México", "US": "Estados Unidos", "CA": "Canadá", "CU": "Cuba", "DO": "República Dominicana",
+    "PR": "Porto Rico", "PA": "Panamá", "CR": "Costa Rica", "GT": "Guatemala", "HN": "Honduras",
+    "SV": "El Salvador", "NI": "Nicarágua", "HT": "Haiti", "JM": "Jamaica",
+    "ES": "Espanha", "FR": "França", "DE": "Alemanha", "IT": "Itália", "GB": "Reino Unido", "IE": "Irlanda",
+    "NL": "Holanda", "BE": "Bélgica", "LU": "Luxemburgo", "CH": "Suíça", "AT": "Áustria", "PL": "Polônia",
+    "CZ": "Tchéquia", "SK": "Eslováquia", "HU": "Hungria", "RO": "Romênia", "BG": "Bulgária", "GR": "Grécia",
+    "SE": "Suécia", "NO": "Noruega", "DK": "Dinamarca", "FI": "Finlândia", "IS": "Islândia", "EE": "Estônia",
+    "LV": "Letônia", "LT": "Lituânia", "UA": "Ucrânia", "BY": "Belarus", "MD": "Moldávia", "RU": "Rússia",
+    "RS": "Sérvia", "HR": "Croácia", "SI": "Eslovênia", "BA": "Bósnia", "AL": "Albânia", "MK": "Macedônia do Norte",
+    "MT": "Malta", "CY": "Chipre", "TR": "Turquia", "GE": "Geórgia", "AM": "Armênia", "AZ": "Azerbaijão",
+    "IL": "Israel", "PS": "Palestina", "LB": "Líbano", "JO": "Jordânia", "SY": "Síria", "IQ": "Iraque",
+    "IR": "Irã", "SA": "Arábia Saudita", "AE": "Emirados Árabes", "QA": "Catar", "KW": "Kuwait", "OM": "Omã",
+    "EG": "Egito", "MA": "Marrocos", "DZ": "Argélia", "TN": "Tunísia", "LY": "Líbia", "NG": "Nigéria",
+    "GH": "Gana", "SN": "Senegal", "CI": "Costa do Marfim", "CM": "Camarões", "KE": "Quênia", "ET": "Etiópia",
+    "TZ": "Tanzânia", "UG": "Uganda", "ZA": "África do Sul", "ZW": "Zimbábue", "CD": "Congo (RDC)",
+    "IN": "Índia", "PK": "Paquistão", "BD": "Bangladesh", "LK": "Sri Lanka", "NP": "Nepal", "CN": "China",
+    "HK": "Hong Kong", "TW": "Taiwan", "JP": "Japão", "KR": "Coreia do Sul", "KP": "Coreia do Norte",
+    "MN": "Mongólia", "KZ": "Cazaquistão", "UZ": "Uzbequistão", "TH": "Tailândia", "VN": "Vietnã",
+    "MY": "Malásia", "SG": "Singapura", "ID": "Indonésia", "PH": "Filipinas", "KH": "Camboja",
+    "MM": "Mianmar", "AU": "Austrália", "NZ": "Nova Zelândia",
 }
+# por onde o pedido chegou (o que _HandlerSite._origem anota)
+_VIAS = {"internet": "pela internet (túnel)", "wifi": "na mesma rede Wi-Fi", "celular": "neste celular",
+         "direto": "direto pelo IP público"}
+# Erros que todo navegador provoca sozinho (ícone, robots...): não são "tentativas suspeitas".
+_ERROS_COMUNS = ("/favicon.ico", "/apple-touch-icon", "/robots.txt", "/sitemap.xml", "/manifest.json",
+                 "/site.webmanifest", "/browserconfig.xml", "/.well-known/")
+# (trecho do User-Agent, nome): prévias de link dos apps de conversa, buscadores e varreduras da internet
+_ROBOS = (
+    ("whatsapp", "WhatsApp (prévia do link)"), ("telegrambot", "Telegram (prévia do link)"),
+    ("facebookexternalhit", "Facebook/Instagram (prévia do link)"), ("facebookcatalog", "Facebook"),
+    ("meta-externalagent", "Meta"), ("twitterbot", "X/Twitter (prévia do link)"),
+    ("discordbot", "Discord (prévia do link)"), ("slackbot", "Slack (prévia do link)"),
+    ("linkedinbot", "LinkedIn (prévia do link)"), ("skypeuripreview", "Skype/Teams (prévia do link)"),
+    ("microsoftpreview", "Microsoft (prévia do link)"), ("snap url preview", "Snapchat (prévia do link)"),
+    ("pinterestbot", "Pinterest"), ("redditbot", "Reddit"), ("applebot", "Apple (Siri/Spotlight)"),
+    ("googlebot", "Google"), ("google-inspectiontool", "Google"), ("googleother", "Google"),
+    ("adsbot-google", "Google"), ("bingbot", "Bing"), ("bingpreview", "Bing"), ("yandex", "Yandex"),
+    ("baiduspider", "Baidu"), ("duckduckbot", "DuckDuckGo"), ("petalbot", "Huawei Petal"),
+    ("ahrefsbot", "Ahrefs"), ("semrushbot", "Semrush"), ("mj12bot", "Majestic"), ("dotbot", "Moz"),
+    ("gptbot", "OpenAI (GPTBot)"), ("chatgpt-user", "ChatGPT"), ("oai-searchbot", "OpenAI"),
+    ("claudebot", "Anthropic (ClaudeBot)"), ("claude-user", "Claude"), ("perplexity", "Perplexity"),
+    ("bytespider", "ByteDance/TikTok"), ("censys", "Censys (varredura)"), ("zgrab", "varredura da internet"),
+    ("masscan", "varredura (masscan)"), ("nmap", "varredura (nmap)"), ("expanse", "varredura (Palo Alto)"),
+    ("internet-measurement", "varredura da internet"), ("shodan", "Shodan (varredura)"),
+    ("headlesschrome", "navegador automatizado"), ("phantomjs", "navegador automatizado"),
+    ("uptimerobot", "UptimeRobot (monitor)"),
+)
+# programas (não navegadores): (trecho, nome)
+_PROGRAMAS = (
+    ("curl/", "curl"), ("wget/", "wget"), ("python-requests", "script Python"), ("python-urllib", "script Python"),
+    ("aiohttp", "script Python"), ("httpx", "script Python"), ("go-http-client", "programa em Go"),
+    ("okhttp", "app Android (OkHttp)"), ("java/", "programa Java"), ("node-fetch", "Node.js"), ("axios", "Node.js"),
+    ("undici", "Node.js"), ("postmanruntime", "Postman"), ("powershell", "PowerShell"), ("libwww-perl", "Perl"),
+)
 
 
 def _bandeira(cc: str) -> str:
     """Emoji da bandeira a partir do código de 2 letras do país (BR -> 🇧🇷)."""
     cc = (cc or "").upper()
-    if len(cc) == 2 and cc.isalpha():
+    if cc == "T1":
+        return "🧅"  # rede Tor
+    if len(cc) == 2 and cc.isalpha() and cc != "XX":
         return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in cc)
     return "🏳️"
 
 
 def _pais_por_extenso(cc: str) -> str:
     cc = (cc or "").upper()
-    if not cc:
-        return "país desconhecido"
-    nome = _PAISES.get(cc, cc)
-    return f"{_bandeira(cc)} {nome}"
+    if not cc or cc == "XX":
+        return "🏳️ país desconhecido"
+    if cc == "T1":
+        return "🧅 rede Tor (anônima)"
+    return f"{_bandeira(cc)} {_PAISES.get(cc, cc)}"
 
 
-def _descrever_agente(ua: str) -> str:
-    """Transforma o 'User-Agent' num rótulo curto: aparelho e navegador de quem acessou."""
-    u = (ua or "")
+def _robo(ua: str) -> str:
+    """O nome do robô/programa, se o User-Agent não for de uma pessoa num navegador; senão ""."""
+    ul = (ua or "").lower()
+    if not ul:
+        return "programa sem identificação"
+    for trecho, nome in _ROBOS:
+        if trecho in ul:
+            return nome
+    for trecho, nome in _PROGRAMAS:
+        if ul.startswith(trecho) or f" {trecho}" in ul:
+            return nome
+    # Robôs costumam se apresentar como "(compatible; XyzBot/1.0; +http://...)". Só "bot" no texto não basta:
+    # há celular chamado CUBOT.
+    if ("compatible;" in ul or "+http" in ul or "mozilla" not in ul) and re.search(r"bot|spider|crawl|scan", ul):
+        return "robô/rastreador"
+    if "mozilla" not in ul and "opera" not in ul:
+        return "programa (não é navegador)"
+    return ""
+
+
+def _modelo_android(ua: str) -> str:
+    """Modelo do celular escrito no User-Agent (SM-S918B, moto g84...); "" se não tiver."""
+    achado = re.search(r"\(([^)]*android[^)]*)\)", ua or "", re.I)
+    if not achado:
+        return ""
+    depois_do_android = False
+    for parte in (p.strip() for p in achado.group(1).split(";")):
+        pl = parte.lower()
+        if pl.startswith("android"):
+            depois_do_android = True
+            continue
+        # "K" é o que o Chrome escreve desde 2023 no lugar do modelo; o resto é idioma, "wv", "Mobile"...
+        if not depois_do_android or not parte or pl in ("k", "u", "wv", "mobile", "tablet", "linux", "tv") \
+                or pl.startswith("rv:") or re.fullmatch(r"[a-z]{2}[-_][a-z]{2}", pl):
+            continue
+        return _nome_do_modelo(re.sub(r"\s*build/.*$", "", parte, flags=re.I))
+    return ""
+
+
+def _nome_do_modelo(modelo: str) -> str:
+    """'SM-S918B' → 'Samsung SM-S918B' (o código do modelo diz a marca)."""
+    modelo = re.sub(r"^samsung[ -]+", "", (modelo or "").strip(), flags=re.I)
+    for prefixo, marca in (("SM-", "Samsung"), ("XT", "Motorola"), ("LM-", "LG"), ("CPH", "OPPO"),
+                           ("RMX", "realme"), ("AFT", "Fire TV")):
+        if modelo.upper().startswith(prefixo):
+            return f"{marca} {modelo}"[:40]
+    return modelo[:40]
+
+
+def _marca_dos_dicas(marcas: str) -> str:
+    """Navegador pelo cabeçalho Sec-CH-UA ('"Brave";v="130", ...'): acha o Brave e o Opera, que se dizem Chrome."""
+    for nome, versao in re.findall(r'"([^"]+)";\s*v="(\d+)', marcas or ""):
+        if "brand" in nome.lower() or nome in ("Chromium", "Android WebView"):
+            continue
+        nome = {"Google Chrome": "Chrome", "Microsoft Edge": "Edge"}.get(nome, nome)
+        return f"{nome} {versao}"
+    return ""
+
+
+def _versao_curta(v: str, casas: int = 2) -> str:
+    """'14.0.0' → '14' (casas=1), '8.1.0' → '8.1', '17_5_1' → '17.5'."""
+    partes = [p for p in re.split(r"[._]", v or "") if p.isdigit()][:casas]
+    while len(partes) > 1 and partes[-1] == "0":
+        partes.pop()
+    return ".".join(partes)
+
+
+# (procura no User-Agent, nome, versão). Os navegadores de dentro dos apps vêm antes: todos se dizem Chrome/Safari.
+_NAVEGADORES = (
+    (r"instagram", "dentro do Instagram", ""),
+    (r"fban|fbav|fb_iab|fb4a", "dentro do Facebook", ""),
+    (r"musical_ly|bytedancewebview|tiktok", "dentro do TikTok", ""),
+    (r"snapchat", "dentro do Snapchat", ""),
+    (r" line/", "dentro do LINE", ""),
+    (r"gsa/", "app do Google", ""),
+    (r"edg(?:a|ios)?/", "Edge", r"edg(?:a|ios)?/(\d+)"),
+    (r"opr/|opios/|opera", "Opera", r"(?:opr|opios|version)/(\d+)"),
+    (r"samsungbrowser", "Samsung Internet", r"samsungbrowser/(\d+)"),
+    (r"yabrowser", "Yandex", r"yabrowser/(\d+)"),
+    (r"ucbrowser", "UC Browser", r"ucbrowser/(\d+)"),
+    (r"miuibrowser", "Mi Browser", ""),
+    (r"vivaldi", "Vivaldi", r"vivaldi/(\d+)"),
+    (r"duckduckgo|\bddg/", "DuckDuckGo", ""),
+    (r"firefox|fxios", "Firefox", r"(?:firefox|fxios)/(\d+)"),
+    (r"; wv\)", "navegador dentro de um app", ""),
+    (r"crios|chrome", "Chrome", r"(?:crios|chrome)/(\d+)"),
+    (r"safari", "Safari", r"version/(\d+(?:\.\d+)?)"),
+)
+
+
+def _descrever_agente(ua: str, dicas: dict | None = None) -> str:
+    """Transforma o 'User-Agent' num rótulo curto: sistema, aparelho e navegador de quem acessou.
+    `dicas` são os Client Hints (modelo, versão do sistema, marca do navegador), quando o navegador mandou."""
+    dicas = dicas or {}
+    u = ua or ""
     ul = u.lower()
-    if "android" in ul:
-        so = "Android"
-    elif "iphone" in ul:
-        so = "iPhone"
+    robo = _robo(u)
+    if robo:
+        return f"🤖 {robo}"
+
+    def versao(padrao: str) -> str:
+        achado = re.search(padrao, ul)
+        return achado.group(1).replace("_", ".") if achado else ""
+
+    plataforma, versao_so = dicas.get("plataforma", ""), dicas.get("versao_so", "")
+    principal = versao_so.split(".")[0]
+    if "tizen" in ul:
+        so = "Smart TV Samsung"
+    elif "web0s" in ul or "webos" in ul:
+        so = "Smart TV LG"
+    elif "crkey" in ul:
+        so = "Chromecast"
+    elif "playstation" in ul:
+        so = "PlayStation"
+    elif "xbox" in ul:
+        so = "Xbox"
+    elif "android" in ul:
+        v = versao_so if plataforma == "Android" and versao_so else versao(r"android ([\d.]+)")
+        if "android 10; k)" in ul and plataforma != "Android":
+            v = ""  # User-Agent "congelado" do Chrome: diz Android 10 em qualquer celular
+        maior = v.split(".")[0]
+        so = ("Android " + _versao_curta(v, 1 if maior.isdigit() and int(maior) >= 10 else 2)).strip()
     elif "ipad" in ul:
-        so = "iPad"
+        v = _versao_curta(versao(r"cpu os ([\d_]+)"))
+        so = "iPad" + (f" · iPadOS {v}" if v else "")
+    elif "iphone" in ul or "ipod" in ul:
+        v = _versao_curta(versao(r"iphone os ([\d_]+)"))
+        so = "iPhone" + (f" · iOS {v}" if v else "")
     elif "windows" in ul:
-        so = "Windows"
+        if plataforma == "Windows" and principal.isdigit():
+            so = "Windows 11" if int(principal) >= 13 else "Windows 10"
+        else:
+            nt = versao(r"windows nt ([\d.]+)")
+            so = {"10.0": "Windows 10/11", "6.3": "Windows 8.1", "6.2": "Windows 8", "6.1": "Windows 7"}.get(nt, "Windows")
     elif "mac os x" in ul or "macintosh" in ul:
-        so = "Mac"
+        so = f"macOS {_versao_curta(versao_so)}" if plataforma == "macOS" and versao_so else "Mac"
     elif "cros" in ul:
-        so = "ChromeOS"
+        so = "Chromebook"
     elif "linux" in ul:
         so = "Linux"
     else:
-        so = ""
-    if "edg/" in ul or "edga/" in ul or "edgios/" in ul:
-        nav = "Edge"
-    elif "opr/" in ul or "opera" in ul:
-        nav = "Opera"
-    elif "samsungbrowser" in ul:
-        nav = "Samsung Internet"
-    elif "firefox" in ul or "fxios" in ul:
-        nav = "Firefox"
-    elif "chrome" in ul or "crios" in ul:
-        nav = "Chrome"
-    elif "safari" in ul:
-        nav = "Safari"
-    elif "curl" in ul:
-        nav = "curl"
-    elif "wget" in ul:
-        nav = "wget"
-    elif "python" in ul:
-        nav = "script Python"
-    elif any(p in ul for p in ("bot", "spider", "crawl")):
-        nav = "robô/rastreador"
-    else:
-        nav = ""
-    partes = [p for p in (so, nav) if p]
+        so = plataforma
+    aparelho = _nome_do_modelo(dicas.get("modelo", "")) or (_modelo_android(u) if "android" in ul else "")
+    nav = ""
+    for procura, nome, padrao_versao in _NAVEGADORES:
+        if re.search(procura, ul):
+            nav = f"{nome} {versao(padrao_versao)}".strip() if padrao_versao else nome
+            break
+    marca = _marca_dos_dicas(dicas.get("marcas", ""))
+    if marca and (nav.startswith("Chrome") or not nav):  # o Brave e outros só se revelam aqui
+        nav = marca
+    partes = [p.strip() for p in (so, aparelho, nav) if p and p.strip()]
     if partes:
-        return " · ".join(partes)
+        return " · ".join(dict.fromkeys(partes))
     return (u[:45] + "…") if len(u) > 46 else (u or "desconhecido")
 
 
-def _ler_visitas(n: int) -> list:
-    """Lê o registro de visitas do site n (lista de dicionários, do mais antigo ao mais novo)."""
-    arq = _arquivo_visitas(n)
-    if not arq.exists():
-        return []
-    visitas = []
-    for linha in arq.read_text("utf-8", errors="replace").splitlines():
-        linha = linha.strip()
-        if not linha:
-            continue
-        with contextlib.suppress(Exception):
-            visitas.append(json.loads(linha))
-    return visitas
+def _familia(aparelho: str) -> str:
+    """'Android 14 · Samsung SM-S918B · Chrome 130' → 'Android' (para contar por tipo de aparelho)."""
+    return re.sub(r"\s+[\d./]+$", "", aparelho.split(" · ")[0])
 
 
-def _sites_com_visitas() -> list:
-    if not VISITAS_DIR.is_dir():
-        return []
-    ns = {int(p.stem) for p in VISITAS_DIR.glob("*.jsonl") if p.stem.isdigit()}
-    return sorted(n for n in ns if _arquivo_visitas(n).stat().st_size > 0)
-
-
-def _escolher_site_para_visitas(msg: str) -> int | None:
-    """Site para ver/limpar visitas: os que estão no ar e os que já têm registro."""
-    candidatos = sorted(set(sites_no_ar()) | set(_sites_com_visitas()))
-    if not candidatos:
-        info("Nenhuma página publicada e nenhum registro de visitas ainda.")
+def _visita_de_linha(linha: str) -> dict | None:
+    """Uma linha do registro já limpa (registros antigos podem ter ESC e outros controles gravados)."""
+    try:
+        v = json.loads(linha)
+    except ValueError:
         return None
-    if len(candidatos) == 1:
-        return candidatos[0]
-    rotulos = []
-    for n in candidatos:
-        nome = _dados_site(n)["nome"]
-        qtd = len({v.get("ip") for v in _ler_visitas(n) if v.get("ip")})
-        extra = "no ar" if n in sites_no_ar() else "fora do ar"
-        rotulos.append(f"{n}. {nome}  {DIM}({qtd} visitante(s), {extra}){RST}")
-    i = escolher(msg, rotulos)
-    return None if i is None else candidatos[i]
+    if not isinstance(v, dict):
+        return None
+    limites = {"t": 19, "ip": 60, "pais": 2, "via": 10, "metodo": 10, "caminho": 200, "agente": 400,
+               "ref": 300, "idioma": 20, "modelo": 60, "plataforma": 30, "versao_so": 30, "marcas": 200}
+    limpa = {k: _texto_seguro(v.get(k), limite) for k, limite in limites.items()}
+    cod = v.get("codigo")
+    limpa["codigo"] = int(cod) if isinstance(cod, int) or str(cod).isdigit() else 0
+    limpa["caminho"] = limpa["caminho"] or "/"
+    if limpa["via"] not in _VIAS or (limpa["via"] == "wifi" and limpa["ip"] in ("127.0.0.1", "::1")):
+        limpa["via"] = "celular" if limpa["ip"] in ("127.0.0.1", "::1") else "wifi"
+    return limpa
+
+
+def _ler_visitas(arq: Path) -> list:
+    """Lê um registro de visitas (lista de dicionários, do mais antigo ao mais novo)."""
+    try:
+        texto = arq.read_text("utf-8", errors="replace")
+    except OSError:
+        return []
+    return [v for v in map(_visita_de_linha, texto.splitlines()) if v]
 
 
 def _eh_pagina(caminho: str) -> bool:
@@ -5206,80 +5459,467 @@ def _eh_pagina(caminho: str) -> bool:
     return c.endswith("/") or c.endswith((".html", ".htm")) or "." not in c.rsplit("/", 1)[-1]
 
 
-def ver_visitas_do_site(n: int | None = None) -> None:
-    """Mostra quem acessou o site: IP, país, aparelho/navegador e páginas abertas, por visitante."""
-    n = n or _escolher_site_para_visitas("Ver quem acessou qual site?")
-    if n is None:
-        return
-    visitas = _ler_visitas(n)
-    nome = _dados_site(n)["nome"]
-    if not visitas:
-        info(f"Site '{nome}': ninguém acessou ainda (ou o registro foi limpo).")
-        if n not in sites_no_ar():
-            print(f"  {DIM}Este site está fora do ar. Publique de novo para voltar a registrar visitas.{RST}")
-        return
-    # Agrupa por IP (o visitante). Mantém a ordem do último acesso de cada um.
-    por_ip: dict = {}
+def _eh_visualizacao(v: dict) -> bool:
+    """Abriu uma página (não uma imagem, CSS ou JS) e deu certo? É o que conta como 'página vista'."""
+    cod = v.get("codigo")
+    return v.get("metodo") == "GET" and isinstance(cod, int) and 0 < cod < 400 and _eh_pagina(v.get("caminho"))
+
+
+def _ref_externo(ref: str, host: str = "") -> str:
+    """De que site a pessoa veio (instagram.com, wa.me...). Navegar dentro do próprio site não conta."""
+    try:
+        partes = urllib.parse.urlsplit(ref or "")
+    except ValueError:
+        return ""
+    nome = (partes.hostname or "").lower()
+    if not nome or partes.netloc.lower() == (host or "").lower() or nome.endswith(".trycloudflare.com"):
+        return ""
+    with contextlib.suppress(ValueError):
+        if not ipaddress.ip_address(nome).is_global:
+            return ""  # o próprio site aberto pelo IP do Wi-Fi
+    return nome.removeprefix("www.")
+
+
+def _quando(t: str, segundos: bool = False) -> str:
+    """'2026-11-04 14:32:10' → 'hoje 14:32', 'ontem 09:10', '03/11 22:15' ou '03/11/2025 22:15'."""
+    try:
+        d = datetime.strptime(t, "%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return t or "?"
+    hoje = date.today()
+    dia = ("hoje" if d.date() == hoje else "ontem" if d.date() == hoje - timedelta(days=1)
+           else f"{d:%d/%m}" if d.year == hoje.year else f"{d:%d/%m/%Y}")
+    return f"{dia} {d:%H:%M:%S}" if segundos else f"{dia} {d:%H:%M}"
+
+
+def _agrupar_visitantes(visitas: list) -> list:
+    """Junta os pedidos por visitante: mesmo IP e mesmo navegador (numa casa, cada aparelho conta à parte).
+    Devolve do que acessou por último ao mais antigo."""
+    grupos: dict = {}
     for v in visitas:
-        ip = v.get("ip") or "?"
-        d = por_ip.setdefault(ip, {"acessos": 0, "paginas": [], "primeiro": v.get("t", ""),
-                                   "ultimo": v.get("t", ""), "pais": "", "via": "", "agente": ""})
-        d["acessos"] += 1
-        d["ultimo"] = v.get("t", d["ultimo"])
-        if v.get("pais"):
-            d["pais"] = v["pais"]
-        if v.get("via"):
-            d["via"] = v["via"]
-        if v.get("agente"):
-            d["agente"] = v["agente"]
-        cam = v.get("caminho") or "/"
-        if _eh_pagina(cam) and cam not in d["paginas"]:
-            d["paginas"].append(cam)
-    ordenados = sorted(por_ip.items(), key=lambda kv: kv[1]["ultimo"], reverse=True)
-    total_acessos = sum(d["acessos"] for _, d in ordenados)
-    desde = min((d["primeiro"] for _, d in ordenados if d["primeiro"]), default="")
+        g = grupos.setdefault((v["ip"] or "?", v["agente"]), {
+            "ip": v["ip"] or "?", "agente": v["agente"], "via": v["via"], "pais": "", "primeiro": v["t"],
+            "ultimo": v["t"], "pedidos": 0, "vistas": 0, "paginas": [], "erros": [], "refs": [], "idioma": "",
+            "dicas": {}, "robo": _robo(v["agente"]), "acessos": []})
+        g["pedidos"] += 1
+        g["ultimo"] = v["t"] or g["ultimo"]
+        g["acessos"].append(v)
+        for campo in ("pais", "via", "idioma"):
+            if v[campo]:
+                g[campo] = v[campo]
+        for campo in ("modelo", "plataforma", "versao_so", "marcas"):
+            if v[campo]:
+                g["dicas"][campo] = v[campo]
+        ref = _ref_externo(v["ref"]) if "://" in v["ref"] else v["ref"]
+        if ref and ref not in g["refs"]:
+            g["refs"].append(ref)
+        if _eh_visualizacao(v):
+            g["vistas"] += 1
+            if v["caminho"] not in g["paginas"]:
+                g["paginas"].append(v["caminho"])
+        elif v["codigo"] >= 400 and not v["caminho"].lower().startswith(_ERROS_COMUNS):
+            alvo = v["caminho"] if v["metodo"] in ("GET", "HEAD") else f"{v['metodo']} {v['caminho']}"
+            if alvo not in g["erros"]:
+                g["erros"].append(alvo)
+    for g in grupos.values():
+        g["aparelho"] = _descrever_agente(g["agente"], g["dicas"])
+    return sorted(grupos.values(), key=lambda g: g["ultimo"], reverse=True)
+
+
+def _qtd(n: int, singular: str, plural: str | None = None) -> str:
+    """1 → '1 página', 3 → '3 páginas'."""
+    return f"{n} {singular if n == 1 else plural or singular + 's'}"
+
+
+def _contagem(itens) -> str:
+    """'A, A, B' → 'A 2 · B 1' (do mais comum ao menos)."""
+    contagem: dict = {}
+    for item in itens:
+        contagem[item] = contagem.get(item, 0) + 1
+    return " · ".join(f"{k} {n}" for k, n in sorted(contagem.items(), key=lambda kv: -kv[1])[:6])
+
+
+def _registros_de_visitas() -> list:
+    """Todos os registros: dos sites no ar, dos que saíram do ar e dos guardados quando um site deu
+    lugar a outro no mesmo espaço. [{arq, nome, situacao, n}]"""
+    no_ar = set(sites_no_ar())
+    regs = []
+    for n in range(1, MAX_SITES + 1):
+        arq = _arquivo_visitas(n)
+        try:
+            tem_registro = arq.stat().st_size > 0
+        except OSError:
+            tem_registro = False
+        if n in no_ar or tem_registro:
+            regs.append({"arq": arq, "nome": _dados_site(n)["nome"], "n": n,
+                         "situacao": "no ar" if n in no_ar else "fora do ar"})
+    if VISITAS_GUARDADAS.is_dir():
+        for arq in sorted(VISITAS_GUARDADAS.glob("*.jsonl"), reverse=True):
+            quando, _, nome = arq.stem.partition("_")
+            with contextlib.suppress(ValueError):
+                quando = f"{datetime.strptime(quando, '%Y%m%d-%H%M%S'):%d/%m/%Y}"
+            regs.append({"arq": arq, "nome": nome or arq.stem, "n": None, "situacao": f"guardado em {quando}"})
+    return regs
+
+
+def _escolher_registro(msg: str, todos: bool = False):
+    """Qual registro ver ou limpar. Com `todos`, a última opção é 'Todos' (devolve a lista inteira)."""
+    regs = _registros_de_visitas()
+    if not regs:
+        info("Nenhuma página publicada e nenhum registro de visitas ainda.")
+        return None
+    if len(regs) == 1:
+        return regs if todos else regs[0]
+    rotulos = []
+    for r in regs:
+        pessoas = sum(1 for g in _agrupar_visitantes(_ler_visitas(r["arq"])) if not g["robo"] and g["via"] != "celular")
+        prefixo = f"{r['n']}. " if r["n"] else "📦 "
+        rotulos.append(f"{prefixo}{r['nome']}  {DIM}({_qtd(pessoas, 'visitante')}, {r['situacao']}){RST}")
+    i = escolher(msg, rotulos + ([f"Todos ({len(regs)})"] if todos else []))
+    if i is None:
+        return None
+    if todos:
+        return regs if i == len(regs) else [regs[i]]
+    return regs[i]
+
+
+def _guardar_visitas_antigas(n: int, nome: str) -> None:
+    """O espaço n vai receber outro site: guarda as visitas do anterior à parte, para não misturar."""
+    arq = _arquivo_visitas(n)
+    try:
+        if arq.stat().st_size == 0:
+            return
+    except OSError:
+        return
+    VISITAS_GUARDADAS.mkdir(parents=True, exist_ok=True)
+    nome_arq = re.sub(r"[^\w.-]+", "_", nome).strip("_")[:60] or f"site{n}"
+    arq.replace(VISITAS_GUARDADAS / f"{datetime.now():%Y%m%d-%H%M%S}_{nome_arq}.jsonl")
+    info(f"As visitas de '{nome}' foram guardadas à parte (veja em 'Site publicado: ver quem acessou').")
+
+
+def _info_ips() -> dict:
+    """Operadora e cidade já consultadas, por IP."""
+    dados = ler_json(IPS_CACHE, {})
+    return dados if isinstance(dados, dict) else {}
+
+
+def _ip_da_internet(ip: str) -> bool:
+    with contextlib.suppress(ValueError):
+        return ipaddress.ip_address(ip).is_global
+    return False
+
+
+def _consultar_ip(ip: str) -> dict:
+    """Operadora, cidade e estado aproximados de um IP público (ipwho.is; se falhar, ipinfo.io)."""
+    with contextlib.suppress(ToonsError):
+        d = pedir_json(f"https://ipwho.is/{urllib.parse.quote(ip)}?lang=pt-BR", timeout=12)
+        if isinstance(d, dict) and d.get("success"):
+            con = d.get("connection") or {}
+            return {"operadora": con.get("isp") or con.get("org") or "", "cidade": d.get("city") or "",
+                    "estado": d.get("region_code") or d.get("region") or "", "pais": d.get("country_code") or ""}
+    d = pedir_json(f"https://ipinfo.io/{urllib.parse.quote(ip)}/json", timeout=12)
+    if not isinstance(d, dict) or d.get("bogon"):
+        raise ToonsError("resposta sem dados")
+    return {"operadora": re.sub(r"^AS\d+\s+", "", d.get("org") or ""), "cidade": d.get("city") or "",
+            "estado": d.get("region") or "", "pais": d.get("country") or ""}
+
+
+def _texto_ip(info_ip: dict | None) -> str:
+    if not info_ip:
+        return ""
+    lugar = "/".join(p for p in (info_ip.get("cidade"), info_ip.get("estado")) if p)
+    return " · ".join(_texto_seguro(p, 80) for p in (info_ip.get("operadora"), lugar) if p)
+
+
+def _consultar_operadoras(grupos: list) -> None:
+    """Pergunta na internet a operadora e a cidade aproximada de quem veio pela internet (fica guardado)."""
+    cache = _info_ips()
+    ips = list(dict.fromkeys(g["ip"] for g in grupos if not g["robo"] and _ip_da_internet(g["ip"])))
+    faltam = [ip for ip in ips if time.time() - cache.get(ip, {}).get("em", 0) > 30 * 86400][:40]
+    if not ips:
+        info("Ninguém veio pela internet ainda: no Wi-Fi o IP é da sua própria rede.")
+        return
+    if faltam:
+        aviso(f"Os {len(faltam)} IP(s) serão enviados ao ipwho.is (ou ao ipinfo.io) para a consulta.")
+        if not confirmar("Consultar agora?", True):
+            return
+        for i, ip in enumerate(faltam, 1):
+            print(f"\r  {DIM}consultando {i}/{len(faltam)}...{RST}\033[K", end="", flush=True)
+            try:
+                cache[ip] = {**_consultar_ip(ip), "em": time.time()}
+            except ToonsError as e:
+                print()
+                aviso(f"{ip}: {e}")
+            time.sleep(0.3)  # sem pressa: os serviços gratuitos limitam os pedidos
+        print("\r\033[K", end="")
+        gravar_json(IPS_CACHE, cache, privado=True)
+    for ip in ips:
+        texto = _texto_ip(cache.get(ip))
+        print(f"  {NEG}{ip}{RST}  {texto or DIM + 'sem dados' + RST}")
+    info("A cidade é aproximada: costuma ser onde fica a central da operadora, não a casa da pessoa.")
+
+
+def _imprimir_visitante(pos: int, g: dict, ips: dict) -> None:
+    pais = _pais_por_extenso(g["pais"]) if g["via"] == "internet" else ""
+    print(f"\n  {NEG}{pos}. {g['ip']}{RST}   {CIANO}{pais + ' · ' if pais else ''}{_VIAS.get(g['via'], '')}{RST}")
+    extra = f" · idioma {g['idioma']}" if g["idioma"] else ""
+    print(f"     {g['aparelho']}{DIM}{extra}{RST}")
+    operadora = _texto_ip(ips.get(g["ip"]))
+    if operadora:
+        print(f"     {DIM}Operadora: {operadora}{RST}")
+    print(f"     {NEG}{_qtd(g['vistas'], 'página vista', 'páginas vistas')}{RST} "
+          f"{DIM}({_qtd(g['pedidos'], 'pedido')}){RST} · "
+          f"chegou {_quando(g['primeiro'])} · último {_quando(g['ultimo'])}")
+    if g["paginas"]:
+        print(f"     Páginas: {', '.join(g['paginas'][:6])}" + (f" (+{len(g['paginas']) - 6})" if len(g["paginas"]) > 6 else ""))
+    if g["refs"]:
+        print(f"     Veio de: {', '.join(g['refs'][:3])}")
+    if g["erros"]:
+        print(f"     {AMAR}Tentou abrir o que não existe:{RST} {', '.join(g['erros'][:4])}"
+              + (f" (+{len(g['erros']) - 4})" if len(g["erros"]) > 4 else ""))
+
+
+def _linha_acesso(v: dict, novo: bool = False) -> str:
+    """Um pedido numa linha: quando, quem, o que abriu e se deu certo."""
+    cod = v["codigo"]
+    cor = VERD if 0 < cod < 300 else CIANO if cod < 400 else AMAR if cod < 500 else VERM
+    quem = f"{_bandeira(v['pais'])} {v['ip']}" if v["via"] == "internet" else f"{v['ip']} ({_VIAS[v['via']]})"
+    marca = f"{MAG}★ novo{RST} " if novo else ""
+    metodo = "" if v["metodo"] == "GET" else f"{v['metodo']} "
+    return (f"  {DIM}{_quando(v['t'], True)}{RST}  {marca}{quem}  {metodo}{v['caminho']}  {cor}{cod or '?'}{RST}  "
+            f"{DIM}{_descrever_agente(v['agente'], v)}{RST}")
+
+
+def _detalhes_visitante(g: dict, ips: dict) -> None:
     print()
-    info(f"Site '{nome}': {len(ordenados)} visitante(s) e {total_acessos} acesso(s)"
-         + (f", desde {desde}." if desde else "."))
-    if not any(d["via"] == "internet" for _, d in ordenados):
-        print(f"  {DIM}Nenhum acesso pelo túnel da Cloudflare ainda — todos foram pela mesma rede Wi-Fi. "
-              f"O IP real de quem está na internet só aparece com o túnel ligado.{RST}")
-    for pos, (ip, d) in enumerate(ordenados, 1):
-        via = "Internet (túnel Cloudflare)" if d["via"] == "internet" else "Mesma rede Wi-Fi"
-        pais = _pais_por_extenso(d["pais"]) if d["via"] == "internet" else "rede local"
+    pais = _pais_por_extenso(g["pais"]) if g["via"] == "internet" else ""
+    print(f"  {NEG}{g['ip']}{RST}   {CIANO}{pais + ' · ' if pais else ''}{_VIAS.get(g['via'], '')}{RST}")
+    linhas = [
+        ("Aparelho", g["aparelho"]),
+        ("Operadora", _texto_ip(ips.get(g["ip"]))),
+        ("Idioma do navegador", g["idioma"]),
+        ("Veio de", ", ".join(g["refs"])),
+        ("Chegou", _quando(g["primeiro"], True)),
+        ("Último acesso", _quando(g["ultimo"], True)),
+        ("Páginas vistas", f"{g['vistas']} ({_qtd(g['pedidos'], 'pedido')}, contando imagens, CSS e JS)"),
+        ("User-Agent", g["agente"] or "(nenhum)"),
+    ]
+    for rotulo, valor in linhas:
+        if valor:
+            print(f"  {CIANO}{rotulo}:{RST} {valor}")
+    acessos = g["acessos"]
+    print(f"\n  {NEG}Tudo o que abriu{RST} {DIM}(do mais antigo ao mais novo"
+          + (f"; os {len(acessos) - 60} primeiros ficaram de fora" if len(acessos) > 60 else "") + f"){RST}")
+    for v in acessos[-60:]:
+        cod = v["codigo"]
+        cor = VERD if 0 < cod < 300 else CIANO if cod < 400 else AMAR
+        print(f"  {DIM}{_quando(v['t'], True)}{RST}  {v['metodo']:<4} {v['caminho']}  {cor}{cod or '?'}{RST}")
+
+
+def _ao_vivo(arq: Path, visitas: list) -> None:
+    """Mostra cada pedido no momento em que chega, até apertar Enter ou Ctrl+C."""
+    vistos = {v["ip"] for v in visitas if _eh_visualizacao(v)}
+    info("Acompanhando os acessos na hora. " + ("Enter ou Ctrl+C para parar." if termios else "Ctrl+C para parar."))
+    try:
+        pos = arq.stat().st_size
+    except OSError:
+        pos = 0
+    try:
+        while True:
+            if termios is not None and sys.stdin.isatty() and select.select([sys.stdin], [], [], 1.0)[0]:
+                sys.stdin.readline()
+                return
+            if termios is None or not sys.stdin.isatty():
+                time.sleep(1)
+            try:
+                tamanho = arq.stat().st_size
+            except OSError:
+                tamanho = 0
+            if tamanho < pos:  # o registro foi limpo ou encurtado: continua do fim
+                pos = tamanho
+            if tamanho == pos:
+                continue
+            with open(arq, "rb") as f:
+                f.seek(pos)
+                bloco = f.read(tamanho - pos)
+            fim = bloco.rfind(b"\n") + 1  # uma linha que ainda está sendo escrita fica para a próxima volta
+            pos += fim
+            for linha in bloco[:fim].decode("utf-8", errors="replace").splitlines():
+                v = _visita_de_linha(linha)
+                if not v:
+                    continue
+                novo = _eh_visualizacao(v) and v["ip"] not in vistos and v["via"] != "celular" and not _robo(v["agente"])
+                if _eh_visualizacao(v):
+                    vistos.add(v["ip"])
+                print(_linha_acesso(v, novo), flush=True)
+    except KeyboardInterrupt:
         print()
-        print(f"  {NEG}{pos}. {ip}{RST}   {CIANO}{pais}{RST} · {via}")
-        print(f"     Aparelho: {NEG}{_descrever_agente(d['agente'])}{RST}")
-        quando = d["primeiro"][11:] if d["primeiro"] else "?"
-        ate = d["ultimo"][11:] if d["ultimo"] else "?"
-        dia = d["ultimo"][:10] if d["ultimo"] else ""
-        print(f"     Acessos: {NEG}{d['acessos']}{RST}   1º: {quando}   último: {ate}"
-              + (f"  ({dia})" if dia else ""))
-        if d["paginas"]:
-            print(f"     Páginas: {', '.join(d['paginas'][:8])}"
-                  + (f" (+{len(d['paginas']) - 8})" if len(d["paginas"]) > 8 else ""))
+
+
+def _celula_planilha(valor) -> str:
+    """Texto para a planilha: o Excel trata '=...', '+...', '-...' e '@...' como fórmula (quem acessou escolhe o
+    User-Agent e o endereço, então pode tentar)."""
+    texto = str(valor if valor is not None else "")
+    return "'" + texto if texto[:1] in ("=", "+", "-", "@", "\t", "\r") else texto
+
+
+def _exportar_visitas(reg: dict, visitas: list) -> None:
+    ips = _info_ips()
+    nome = re.sub(r"[^\w.-]+", "_", reg["nome"]).strip("_")[:40] or "site"
+    destino = pasta_saida() / f"visitas_{nome}_{datetime.now():%Y%m%d-%H%M}.csv"
+    with open(destino, "w", newline="", encoding="utf-8-sig") as arq:  # utf-8-sig: o Excel abre com acentos
+        escritor = csv.writer(arq, delimiter=";")
+        escritor.writerow(["data e hora", "IP", "país", "por onde", "método", "endereço aberto", "código",
+                           "aparelho e navegador", "idioma", "veio de", "operadora e cidade", "User-Agent"])
+        for v in visitas:
+            escritor.writerow([_celula_planilha(x) for x in (
+                v["t"], v["ip"], _pais_por_extenso(v["pais"]).split(" ", 1)[1] if v["via"] == "internet" else "",
+                _VIAS.get(v["via"], v["via"]), v["metodo"], v["caminho"], v["codigo"] or "",
+                _descrever_agente(v["agente"], v).removeprefix("🤖 "), v["idioma"],
+                _ref_externo(v["ref"]) if "://" in v["ref"] else v["ref"],
+                _texto_ip(ips.get(v["ip"])), v["agente"])])
+    ok(f"Planilha salva ({len(visitas)} pedidos): {destino}")
+
+
+def _resumo_visitas(reg: dict, visitas: list, grupos: list, limite: int | None = 12) -> list:
+    """Imprime o resumo e a lista de visitantes. Devolve as pessoas (sem robôs e sem este celular)."""
+    pessoas = [g for g in grupos if not g["robo"] and g["via"] != "celular"]
+    robos = [g for g in grupos if g["robo"]]
+    deste_celular = [g for g in grupos if not g["robo"] and g["via"] == "celular"]
+    ips = _info_ips()
+    vistas = sum(g["vistas"] for g in pessoas)
+    desde = visitas[0]["t"] if visitas else ""
     print()
-    info("O IP identifica a conexão de quem acessou (operadora/Wi-Fi), não a pessoa pelo nome. "
-         "Isto é o registro de acessos ao seu próprio site, como todo servidor web guarda.")
+    info(f"Site '{reg['nome']}' ({reg['situacao']}): {NEG}{_qtd(len(pessoas), 'visitante')}{RST} e "
+         f"{NEG}{_qtd(vistas, 'página vista', 'páginas vistas')}{RST}" + (f", desde {_quando(desde)}." if desde else "."))
+    if pessoas:
+        print(f"  {CIANO}Por onde:{RST} {_contagem(_VIAS[g['via']] for g in pessoas)}")
+        da_internet = [g for g in pessoas if g["via"] == "internet"]
+        if da_internet:
+            print(f"  {CIANO}Países:{RST} {_contagem(_pais_por_extenso(g['pais']) for g in da_internet)}")
+        print(f"  {CIANO}Aparelhos:{RST} {_contagem(_familia(g['aparelho']) for g in pessoas)}")
+        refs = [r for g in pessoas for r in g["refs"]]
+        if refs:
+            print(f"  {CIANO}Vieram de:{RST} {_contagem(refs)}")
+    if robos:
+        print(f"  {DIM}🤖 Robôs, prévias de link e programas: {_contagem(g['robo'] for g in robos)}{RST}")
+    erros = [e for g in grupos if g["via"] != "celular" for e in g["erros"]]
+    if erros:
+        print(f"  {AMAR}⚠ Tentaram abrir o que não existe{RST} {DIM}(robôs procurando falhas, é comum):{RST} "
+              f"{_contagem(erros)}")
+    if deste_celular:
+        n = sum(g["pedidos"] for g in deste_celular)
+        print(f"  {DIM}+ {_qtd(n, 'pedido feito', 'pedidos feitos')} neste celular (por você), que "
+              f"{'não entra' if n == 1 else 'não entram'} na conta.{RST}")
+    if not any(g["via"] == "internet" for g in pessoas) and reg["situacao"] == "no ar":
+        print(f"  {DIM}Ninguém veio pela internet ainda. O IP real e o país de quem está longe aparecem com o "
+              f"túnel ligado ('Site publicado: liberar para a internet').{RST}")
+    mostrar = pessoas if limite is None else pessoas[:limite]
+    for pos, g in enumerate(mostrar, 1):
+        _imprimir_visitante(pos, g, ips)
+    if len(pessoas) > len(mostrar):
+        print(f"\n  {DIM}… e mais {len(pessoas) - len(mostrar)} visitante(s): escolha 'Ver todos os visitantes'.{RST}")
+    return pessoas
+
+
+def ver_visitas_do_site() -> None:
+    """Mostra quem acessou o site: IP, país, aparelho/navegador, páginas vistas e de onde veio, por visitante."""
+    reg = _escolher_registro("Ver quem acessou qual site?")
+    if reg is None:
+        return
+    limite = 12
+    while True:
+        visitas = _ler_visitas(reg["arq"])
+        if not visitas:
+            info(f"Site '{reg['nome']}': ninguém acessou ainda (ou o registro foi limpo).")
+            if reg["situacao"] != "no ar":
+                print(f"  {DIM}Este site está fora do ar. Publique de novo para voltar a registrar visitas.{RST}")
+                return
+            if not confirmar("Ficar esperando e mostrar cada acesso na hora?", True):
+                return
+            _ao_vivo(reg["arq"], [])
+            continue
+        grupos = _agrupar_visitantes(visitas)
+        pessoas = _resumo_visitas(reg, visitas, grupos, limite)
+        print()
+        info("O IP identifica a conexão (operadora ou Wi-Fi), não a pessoa pelo nome. Isto é o registro de acessos "
+             "ao seu próprio site, como todo servidor web guarda.")
+        acoes = [("🔍 Tudo o que um visitante abriu (detalhes)", "detalhes"),
+                 ("🕒 Últimos acessos, um por linha", "ultimos"),
+                 ("📡 Acompanhar ao vivo (cada acesso na hora)", "vivo"),
+                 ("🌐 Operadora e cidade aproximada (consulta na internet)", "operadora"),
+                 ("💾 Salvar tudo numa planilha (.csv)", "csv"),
+                 ("🔄 Atualizar", "atualizar")]
+        if limite is not None and len(pessoas) > limite:
+            acoes.insert(1, (f"📋 Ver todos os {len(pessoas)} visitantes", "todos"))
+        i = escolher("E agora?", [a for a, _ in acoes])
+        if i is None:
+            return
+        acao = acoes[i][1]
+        if acao == "detalhes":
+            lista = pessoas + [g for g in grupos if g not in pessoas]
+            rotulos = [f"{_bandeira(g['pais']) + ' ' if g['via'] == 'internet' else ''}{g['ip']}  "
+                       f"{DIM}{g['aparelho']} · {g['vistas']} pág. · {_quando(g['ultimo'])}{RST}" for g in lista]
+            j = escolher("Qual visitante?", rotulos)
+            if j is not None:
+                _detalhes_visitante(lista[j], _info_ips())
+                pausar()
+        elif acao == "todos":
+            limite = None
+        elif acao == "ultimos":
+            print(f"\n  {NEG}Últimos {min(40, len(visitas))} pedidos{RST} {DIM}(do mais antigo ao mais novo){RST}")
+            for v in visitas[-40:]:
+                print(_linha_acesso(v))
+            pausar()
+        elif acao == "vivo":
+            _ao_vivo(reg["arq"], visitas)
+        elif acao == "operadora":
+            _consultar_operadoras(grupos)
+            pausar()
+        elif acao == "csv":
+            _exportar_visitas(reg, visitas)
+            pausar()
+        limpar()
+        titulo("👀 Quem acessou o site")
+
+
+def alternar_aviso_visitas() -> None:
+    """Liga ou desliga a notificação no celular quando alguém novo abre um site publicado."""
+    c = cfg()
+    info("Quando alguém que ainda não tinha aberto o site entra nele, aparece uma notificação no celular com "
+         "o país, o aparelho e o IP. Robôs, prévias de link e os acessos deste celular não avisam.")
+    c["site_avisar_visitas"] = confirmar("Avisar quando alguém novo abrir o link?", not c.get("site_avisar_visitas"))
+    salvar_cfg()
+    if not c["site_avisar_visitas"]:
+        ok("Aviso de visitas desligado.")
+        return
+    ok("Aviso de visitas ligado. Vale na hora para os sites no ar.")
+    if not tem("termux-notification"):
+        aviso("Para a notificação aparecer, instale o Termux:API: 'pkg install termux-api' e o app Termux:API.")
+    if sites_no_ar():
+        print(f"  {DIM}Um site que já estava no ar antes desta versão do Termux-Toons precisa ser publicado de "
+              f"novo para avisar.{RST}")
 
 
 def limpar_visitas_do_site() -> None:
     """Apaga o registro de visitas de um site (ou de todos)."""
-    com = _sites_com_visitas()
-    if not com:
+    regs = [r for r in _registros_de_visitas() if r["arq"].exists()]
+    if not regs:
         info("Não há registro de visitas para apagar.")
         return
-    alvos = com
-    if len(com) > 1:
-        rotulos = [f"{n}. {_dados_site(n)['nome']}" for n in com] + [f"Todos ({len(com)})"]
-        i = escolher("Limpar o registro de qual site?", rotulos)
+    alvos = regs
+    if len(regs) > 1:
+        rotulos = [f"{r['n']}. {r['nome']}" if r["n"] else f"📦 {r['nome']} ({r['situacao']})" for r in regs]
+        i = escolher("Limpar o registro de qual site?", rotulos + [f"Todos ({len(regs)})"])
         if i is None:
             return
-        alvos = com if i == len(com) else [com[i]]
+        alvos = regs if i == len(regs) else [regs[i]]
     if not confirmar(f"Apagar o registro de visitas de {len(alvos)} site(s)?", False):
         return
-    for n in alvos:
-        _arquivo_visitas(n).unlink(missing_ok=True)
+    for r in alvos:
+        r["arq"].unlink(missing_ok=True)
+    if len(alvos) == len(regs):
+        IPS_CACHE.unlink(missing_ok=True)  # sem visitas, as operadoras guardadas não servem para nada
     ok("Registro de visitas apagado.")
 
 
@@ -5382,9 +6022,12 @@ def publicar_site() -> None:
     porta = _porta_do_site(n, anterior)
     if porta != anterior and servico_ativo(tunel):
         parar_servico(tunel)  # apontava para a porta antiga
+    nome_antes = cfg()["sites"].get(str(n), {}).get("nome")
+    if nome_antes and nome_antes != alvo.name:  # outro site no mesmo espaço: não mistura as visitas
+        _guardar_visitas_antigas(n, nome_antes)
     cfg()["sites"][str(n)] = {"nome": alvo.name, "pagina": pagina, "porta": porta}
     salvar_cfg()
-    if not iniciar_servico(servico, cmd_self("site", str(pasta), "--porta", str(porta),
+    if not iniciar_servico(servico, cmd_self("site", str(pasta), "--porta", str(porta), "--nome", alvo.name,
                                              "--visitas", str(_arquivo_visitas(n))), reiniciar=True):
         return
     if not servico_ativo(tunel) and confirmar("Liberar para a internet (pessoas fora do seu Wi-Fi)?", True):
@@ -5545,7 +6188,9 @@ def menu_arquivos():
         ("Sites publicados: ver os links", mostrar_links_do_site),
         ("Site publicado: QR code do link (gerar e baixar)", qr_do_site),
         ("Site publicado: liberar para a internet (túnel)", liberar_site),
-        ("Site publicado: ver quem acessou (IP, país e aparelho)", ver_visitas_do_site),
+        ("Site publicado: 👀 ver quem acessou (IP, país, aparelho e páginas)", ver_visitas_do_site),
+        (lambda: "Site publicado: avisar quando alguém novo abrir o link "
+                 f"({'ligado' if cfg().get('site_avisar_visitas') else 'desligado'})", alternar_aviso_visitas),
         ("Site publicado: limpar o registro de visitas", limpar_visitas_do_site),
         ("Site publicado: tirar do ar", parar_site),
         *itens_servico("http-arquivos", "Compartilhar pasta via HTTP", http_iniciar),
@@ -24271,6 +24916,7 @@ def main(argv=None) -> int:
     p.add_argument("pasta")
     p.add_argument("--porta", type=int)
     p.add_argument("--visitas", help="arquivo onde anotar quem acessou (IP, país, aparelho)")
+    p.add_argument("--nome", default="", help="nome do site (aparece no aviso de visitante novo)")
     p = sub.add_parser("trote", help="sobe a página do trote/screamer em primeiro plano")
     p.add_argument("--porta", type=int)
     p = sub.add_parser("tela", help="transmite a tela do celular para o navegador (link secreto)")
@@ -24353,7 +24999,7 @@ def main(argv=None) -> int:
         elif args.comando == "arquivos":
             gerenciador_arquivos(args.pasta)
         elif args.comando == "site":
-            servir_site(args.pasta, args.porta or cfg()["site_porta"], args.visitas)
+            servir_site(args.pasta, args.porta or cfg()["site_porta"], args.visitas, args.nome)
         elif args.comando == "trote":
             servir_trote(args.porta or cfg()["trote_porta"])
         elif args.comando == "tela":
