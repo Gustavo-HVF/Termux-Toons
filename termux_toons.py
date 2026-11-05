@@ -13,7 +13,7 @@ Reúne em um único menu:
       Samba, HTTP, backup e página HTML num link
    7. Música, rádio e podcasts: yt-dlp para baixar; player com tela 'Tocando agora' e notificação com botões;
       equalizador de 10 bandas; rádios do mundo todo com legenda automática (whisper.cpp); podcasts
-   8. Vídeos do TikTok, YouTube e outros sites com yt-dlp
+   8. Vídeos do TikTok, YouTube e outros sites com yt-dlp; reduzir a resolução (4K → 1080p/720p)
    9. Compartilhar filmes por link: arquivo do celular ou qualquer link de vídeo, com player próprio,
       troca de trilha de áudio e conversão na hora (servidor de vídeo + túnel)
   10. Calculadora científica com botões (setas + Enter)
@@ -7789,10 +7789,23 @@ def menu_videos():
         i = escolher("Qual vídeo?", [f"{v.name} ({bytes_humanos(tamanho(v))})" for v in videos])
         if i is None:
             return
+        arq = videos[i]
+        faixa = (sondar_video(arq) or {}).get("video") or [None]
+        nivel = nivel_video(faixa[0])
+        if nivel > 1080:  # 4K trava em muito celular: oferece uma cópia mais leve antes de abrir
+            largura, altura = _dimensoes(faixa[0])
+            j = escolher(f"Este vídeo é {nome_nivel(nivel)} ({largura}x{altura}) e pode travar no celular.", [
+                "Abrir assim mesmo", "📉 Fazer uma cópia mais leve (1080p, 720p...) e abrir"])
+            if j is None:
+                return
+            if j == 1:
+                arq = reduzir_resolucao(arq, perguntar_modo=False)
+                if arq is None:
+                    return
         if tem("termux-open"):
-            abrir_no_android(str(videos[i]))  # abre no player de vídeo do Android
+            abrir_no_android(str(arq))  # abre no player de vídeo do Android
         else:
-            info(f"Arquivo: {videos[i]}")
+            info(f"Arquivo: {arq}")
 
     def mudar_pasta():
         c["pasta_videos"] = perguntar("Pasta dos vídeos", c["pasta_videos"])
@@ -7804,6 +7817,7 @@ def menu_videos():
         ("Buscar no YouTube e baixar", buscar_baixar),
         ("Abrir vídeo baixado no player do Android", abrir),
         ("Assistir um link sem baixar (VLC, MX Player...)", assistir_link_no_celular),
+        ("📉 Reduzir a resolução de um vídeo (4K → 1080p, 720p...: para de travar)", reduzir_resolucao),
         (lambda: f"Pasta dos vídeos ({c['pasta_videos']})", mudar_pasta),
         ("Instalar dependências (yt-dlp, ffmpeg)", lambda: garantir_deps_musica(com_player=False)),
     ])
@@ -8022,11 +8036,16 @@ PAGINA_FILME = r"""<!doctype html>
  function toca(tipo) { try { return !!v.canPlayType(tipo); } catch (e) { return false; } }
  var podeH264 = toca('video/mp4; codecs="avc1.640028"');
  var acodec = !toca('audio/mp4; codecs="mp4a.40.2"') && toca('audio/mp4; codecs="opus"') ? 'opus' : 'aac';
+ var NIVEIS = {4320: '8K', 2160: '4K', 1440: '1440p', 1080: '1080p', 720: '720p', 480: '480p', 360: '360p'};
+ var DICA_NIVEL = {2160: 'bem mais leve que o 8K', 1440: 'quase a imagem do 4K', 1080: 'imagem ótima, bem mais leve',
+                   720: 'leve: para quando trava', 480: 'bem leve: internet lenta', 360: 'o mais leve'};
+ function nomeNivel(n) { return NIVEIS[n] || (n + 'p'); }
 
  // ── Estado ──
  var E = {
   audio: C.audio_padrao || 0, legenda: C.legenda_padrao, modo: '', base: 0, iniciado: false, geracao: 0,
   falhas: 0, forcar: false, alvo: null, arrasto: null, tam: 1, atraso: 0, vel: 1, ultimaLegenda: -1, reconexao: null,
+  q: 0, carregouEm: 0,
   recod: !!(C.video && podeH264 && (!C.video.copiavel || (C.video.codecs && !toca('video/mp4; codecs="' + C.video.codecs + '"'))))
  };
  var sessao = Math.random().toString(36).slice(2, 10);
@@ -8044,10 +8063,16 @@ PAGINA_FILME = r"""<!doctype html>
  if (salvo.tam) E.tam = salvo.tam;
  if (salvo.at) E.atraso = salvo.at;
  try { var vol = JSON.parse(localStorage.getItem('toons:vol')); if (vol) { v.volume = vol.v; v.muted = vol.m; } } catch (e) {}
+ try { var qSalva = +localStorage.getItem('toons:qualidade'); if (NIVEIS[qSalva]) E.q = qSalva; } catch (e) {}
+
+ // Qualidade menor (vídeo 4K que trava, internet lenta): o celular que compartilhou converte a imagem na hora.
+ // A escolha vale para os próximos vídeos neste aparelho; vídeo que já é menor continua no original.
+ function podeReduzir() { return !!(C.transmissao && C.video && C.video.nivel > 360 && podeH264 && !ehSafari); }
+ function reduzindo() { return !!(E.q && podeReduzir() && C.video.nivel > E.q); }
 
  // Arquivo original (com HTTP Range) quando o navegador o toca; senão, conversão na hora. Sem ffmpeg no
  // celular, ou no Safari com MP4 (ele toca AC3 e HEVC e troca a trilha sozinho), tenta o original mesmo assim.
- function direto() { return !E.forcar && ((C.direto && C.audios.length <= 1) || !C.transmissao || (ehSafari && C.mp4)); }
+ function direto() { return !E.forcar && !reduzindo() && ((C.direto && C.audios.length <= 1) || !C.transmissao || (ehSafari && C.mp4)); }
  function trilhasNativas() { return E.modo === 'direto' && v.audioTracks && v.audioTracks.length > 1; }
  function podeTrocarAudio() { return C.audios.length > 1 && (C.transmissao || (ehSafari && C.mp4)); }
  function agora() { return (E.modo === 'transmissao' ? E.base : 0) + (v.currentTime || 0); }
@@ -8060,7 +8085,7 @@ PAGINA_FILME = r"""<!doctype html>
 
  // ── Carregar e pular ──
  function carregar(t, tocar) {
-  E.iniciado = true;
+  E.iniciado = true; E.carregouEm = Date.now();
   esconderCartao();
   var d = duracao(), minha = ++E.geracao;
   t = Math.max(0, d ? Math.min(t || 0, d - 1) : (t || 0));
@@ -8079,7 +8104,8 @@ PAGINA_FILME = r"""<!doctype html>
   var abrir = function (k) {
    if (minha !== E.geracao) return;
    E.base = k;
-   v.src = BASE + '/stream?a=' + E.audio + '&t=' + k.toFixed(3) + '&ac=' + acodec + '&s=' + sessao + (E.recod ? '&v=h264' : '');
+   v.src = BASE + '/stream?a=' + E.audio + '&t=' + k.toFixed(3) + '&ac=' + acodec + '&s=' + sessao + (E.recod ? '&v=h264' : '')
+     + (reduzindo() ? '&q=' + E.q : '');
    v.defaultPlaybackRate = v.playbackRate = E.vel;
    atualizarTempo();
    if (tocar) tocarVideo();
@@ -8133,6 +8159,16 @@ PAGINA_FILME = r"""<!doctype html>
  v.addEventListener('play', atualizarPlay);
  v.addEventListener('pause', function () { P.classList.remove('tocando'); atualizarPlay(); mostrarControles(); if (E.iniciado) salvar(); });
  v.addEventListener('waiting', function () { if (E.iniciado) P.classList.add('carregando'); });
+ var travadas = [], dicaQualidade = false;
+ v.addEventListener('waiting', function () {  // travou várias vezes num vídeo grande: sugere uma qualidade menor
+  if (!E.iniciado || v.seeking || dicaQualidade || reduzindo() || !podeReduzir() || C.video.nivel <= 720) return;
+  var t = Date.now();
+  if (t - E.carregouEm < 5000) return;  // o começo (e cada pulo) sempre espera um pouco
+  travadas = travadas.filter(function (x) { return t - x < 60000; }).concat(t);
+  if (travadas.length < 3) return;
+  dicaQualidade = true;
+  aviso('Travando? Em Ajustes → Qualidade dá para ver em ' + (C.video.nivel > 1080 ? '1080p ou 720p' : '720p') + '.', 7000);
+ });
  v.addEventListener('seeking', function () { P.classList.add('carregando'); });
  v.addEventListener('seeked', function () { P.classList.remove('carregando'); desenharLegenda(); });
  v.addEventListener('canplay', function () { if (v.paused || !E.iniciado) P.classList.remove('carregando'); });
@@ -8370,6 +8406,15 @@ PAGINA_FILME = r"""<!doctype html>
     {rotulo: 'Zerar', acao: function () { E.atraso = 0; salvar(); desenharLegenda(); mostrarPainel('sincronia'); }}
    ]};
   },
+  qualidade: function () {
+   var itens = [{rotulo: 'Original', sub: nomeNivel(C.video.nivel) + ' · a melhor imagem', sel: !reduzindo(),
+                 acao: function () { mudarQualidade(0); }}];
+   [2160, 1440, 1080, 720, 480, 360].forEach(function (n) {
+    if (n < C.video.nivel) itens.push({rotulo: nomeNivel(n), sub: DICA_NIVEL[n], sel: reduzindo() && E.q === n,
+                                       acao: function () { mudarQualidade(n); }});
+   });
+   return {titulo: 'Qualidade', voltar: 'ajustes', itens: itens};
+  },
   velocidade: function () {
    return {titulo: 'Velocidade', voltar: 'ajustes', itens: [0.5, 0.75, 1, 1.25, 1.5, 2].map(function (x) {
     return {rotulo: x === 1 ? 'Normal' : String(x).replace('.', ',') + 'x', sel: x === E.vel,
@@ -8378,7 +8423,11 @@ PAGINA_FILME = r"""<!doctype html>
   },
   ajustes: function () {
    var itens = [{rotulo: 'Velocidade', dir: E.vel === 1 ? 'Normal' : String(E.vel).replace('.', ',') + 'x', acao: function () { mostrarPainel('velocidade'); }}];
-   if (C.transmissao && C.video && C.video.copiavel && podeH264 && !direto() && !ehSafari) {
+   if (podeReduzir()) {
+    itens.push({rotulo: 'Qualidade', sub: 'menor = menos travamentos (o celular que compartilhou converte na hora)',
+                dir: reduzindo() ? nomeNivel(E.q) : 'Original', acao: function () { mostrarPainel('qualidade'); }});
+   }
+   if (C.transmissao && C.video && C.video.copiavel && podeH264 && !direto() && !ehSafari && !reduzindo()) {
     itens.push({rotulo: 'Imagem', sub: E.recod ? 'recodificada: toca em mais aparelhos, mas pesa no celular que transmite'
                                               : 'original: melhor qualidade', dir: E.recod ? 'Compatível' : 'Original',
      acao: function () { E.recod = !E.recod; fecharPainel(); aviso(E.recod ? 'Imagem compatível' : 'Imagem original'); if (E.iniciado) carregar(agora(), !v.paused); }});
@@ -8412,6 +8461,13 @@ PAGINA_FILME = r"""<!doctype html>
    painel.appendChild(el);
   });
   painel.classList.add('ver'); mostrarControles();
+ }
+
+ function mudarQualidade(n) {
+  E.q = n; fecharPainel();
+  try { localStorage.setItem('toons:qualidade', String(n)); } catch (e) {}
+  aviso(n ? 'Qualidade: ' + nomeNivel(n) + ' (convertendo na hora…)' : 'Qualidade original', 3000);
+  if (E.iniciado) carregar(agora(), !v.paused);
  }
 
  function trocarAudio(i) {
@@ -9066,9 +9122,10 @@ def tem_encoder(nome: str) -> bool:
 
 
 def comando_transmissao(fontes: list, sonda, audio: int = 0, inicio: float = 0.0,
-                        recodificar: bool = False, audio_codec: str = "aac") -> list:
+                        recodificar: bool = False, audio_codec: str = "aac", nivel_max: int = 0) -> list:
     """ffmpeg que gera um MP4 fragmentado (toca enquanto chega) a partir de `inicio` segundos, com a trilha
-    de áudio `audio`. A imagem é copiada (leve); só é recodificada se o navegador não toca o formato.
+    de áudio `audio`. A imagem é copiada (leve); só é recodificada se o navegador não toca o formato ou se
+    quem assiste pediu uma resolução menor (`nivel_max`: 1080, 720...), para um vídeo 4K não travar.
     Com [vídeo, áudio] (página do YouTube, por exemplo) junta as duas fontes."""
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
     for fonte in fontes:
@@ -9078,9 +9135,13 @@ def comando_transmissao(fontes: list, sonda, audio: int = 0, inicio: float = 0.0
     cmd += ["-map", "0:v:0?", "-map", f"{len(fontes) - 1}:a:{audio}?", "-sn", "-dn", "-map_metadata", "-1",
             "-map_chapters", "-1"]
     video = sonda["video"][0] if sonda and sonda["video"] else None
-    if video and (recodificar or not _video_copiavel(video)):
-        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "24", "-maxrate", "4M", "-bufsize", "8M",
-                "-vf", "scale=-2:'min(720,ih)'", "-pix_fmt", "yuv420p", "-g", "48"]
+    reduzir = bool(video and nivel_max in NIVEIS_VIDEO and nivel_video(video) > nivel_max)
+    if video and (recodificar or reduzir or not _video_copiavel(video)):
+        nivel = nivel_max if reduzir else 720  # só para o navegador tocar: até 720p, como sempre
+        teto = TETO_BITRATE[min(nivel, nivel_video(video) or nivel)]
+        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "24", "-maxrate", teto,
+                "-bufsize", f"{int(teto[:-1]) * 2}M", "-vf", filtro_reduzir(video, nivel, rapido=True, fps30=reduzir),
+                "-pix_fmt", "yuv420p", "-g", "48"]
     else:
         cmd += ["-c:v", "copy"]
         if video and video.get("codec_name") == "hevc":
@@ -9571,7 +9632,8 @@ def config_do_player(item: dict, fontes: list, sonda) -> dict:
         "remoto": eh_link(fonte),
         "mp4": _arquivo_unico(fontes, sonda) and (extensao_de(fontes[0]) in (".mp4", ".m4v", ".mov")
                                                   or "mp4" in (sonda["formato"].get("format_name", "") if sonda else "")),
-        "video": {"codecs": _codecs_navegador(video), "copiavel": _video_copiavel(video)} if video else None,
+        "video": {"codecs": _codecs_navegador(video), "copiavel": _video_copiavel(video),
+                  "nivel": nivel_video(video)} if video else None,
         "audios": [{"rotulo": _rotulo_faixa(f)} for f in audios],
         "audio_padrao": audio_padrao,
         "legendas": [{"rotulo": l["rotulo"]} for l in legendas],
@@ -9730,8 +9792,10 @@ class _HandlerMidia(BaseHTTPRequestHandler):
         inicio = max(0.0, _numero(consulta, "t", 0))
         sessao_player = re.sub(r"[^a-z0-9]", "", consulta.get("s", [""])[0])[:16] or "x"
         chave = f"{item['token']}:{sessao_player}"
+        nivel_max = int(_numero(consulta, "q", 0))  # resolução pedida no player (⚙ Ajustes → Qualidade)
         cmd = comando_transmissao(fontes, sonda, audio, inicio, consulta.get("v", [""])[0] == "h264",
-                                  "opus" if consulta.get("ac", [""])[0] == "opus" else "aac")
+                                  "opus" if consulta.get("ac", [""])[0] == "opus" else "aac",
+                                  nivel_max if nivel_max in NIVEIS_VIDEO else 0)
         processo = None
         with _TRANSMISSOES_TRAVA:
             antigo = _TRANSMISSOES.pop(chave, None)
@@ -10031,18 +10095,27 @@ def abrir_no_android(alvo: str, pacote: str | None = None) -> None:
     ok("Abrindo no app de vídeo...")
 
 
-def endereco_para_assistir(url: str) -> str:
-    """Link de arquivo passa direto; página (YouTube, TikTok...) vira o endereço do vídeo pelo yt-dlp."""
+def _eh_arquivo_de_video(url: str) -> bool:
+    """O link é o próprio arquivo de vídeo (e não uma página, como a do YouTube)?"""
     try:
         dados = info_link(url)
     except OSError:
-        dados = {"status": 0, "tipo": ""}
-    if dados["status"] and dados["status"] < 400 and not dados["tipo"].startswith("text/"):
+        return False
+    return bool(dados["status"]) and dados["status"] < 400 and not dados["tipo"].startswith("text/")
+
+
+def endereco_para_assistir(url: str, nivel: int | None = None, pagina: bool | None = None) -> str:
+    """Link de arquivo passa direto; página (YouTube, TikTok...) vira o endereço do vídeo pelo yt-dlp,
+    na maior resolução até `nivel` (720 = até 720p) quando o site tem várias."""
+    if pagina is None:
+        pagina = not _eh_arquivo_de_video(url)
+    if not pagina:
         return url
     if not garantir_deps_musica(com_player=False):
         raise ToonsError("Sem o yt-dlp não consigo achar o vídeo dessa página.")
     info("É uma página: procurando o endereço do vídeo com o yt-dlp...")
-    proc = rodar(["yt-dlp", "-g", "-f", "b", "--no-warnings", "--no-playlist", url], capturar=True, timeout=120)
+    proc = rodar(["yt-dlp", "-g", "-f", "b", *(["-S", f"res:{nivel}"] if nivel else []), "--no-warnings",
+                  "--no-playlist", url], capturar=True, timeout=120)
     enderecos = (proc.stdout or "").split()
     if proc.returncode != 0 or not enderecos:
         raise ToonsError("O yt-dlp não achou um vídeo nesse link. " + (proc.stderr or "").strip()[-300:])
@@ -10058,10 +10131,21 @@ def assistir_link_no_celular(url: str | None = None) -> None:
         return
     if not eh_link(url):
         raise ToonsError("O link precisa começar com http:// ou https://")
-    alvo = endereco_para_assistir(url)
+    pagina, nivel = not _eh_arquivo_de_video(url), None
+    if pagina:  # o site tem várias resoluções: dá para pedir uma mais leve
+        opcoes = [("Melhor disponível", None), ("Até 1080p", 1080), ("Até 720p — se costuma travar", 720),
+                  ("Até 480p — bem leve, gasta menos internet", 480)]
+        j = escolher("Qualidade", [o for o, _ in opcoes])
+        if j is None:
+            return
+        nivel = opcoes[j][1]
+    alvo = endereco_para_assistir(url, nivel, pagina)
     i = escolher("Abrir em qual app?", ["VLC", "Escolher o app (MX Player, Just Player...)"])
     if i is not None:
         abrir_no_android(alvo, VLC_ANDROID if i == 0 else None)
+        if not pagina:
+            print(f"  {DIM}É um arquivo só, na resolução em que foi feito. Se travar (4K), '📉 Reduzir a resolução de "
+                  f"um vídeo' baixa este link já em 1080p ou 720p.{RST}")
 
 
 # ── Conversão para MP4 (ffmpeg) ──────────────────────────────────────
@@ -10147,6 +10231,391 @@ def converter_para_mp4(origem: Path):
 
 
 # ── Menu ─────────────────────────────────────────────────────────────
+
+# ── Reduzir a resolução (4K → 1080p, 720p...) ─────────────────────────
+# Vídeo 4K trava em muito celular, TV box e notebook: o aparelho não dá conta de decodificar tanta imagem
+# (e pela internet são muitos dados). Numa resolução menor ele toca liso e ocupa bem menos espaço.
+# Serve tanto para fazer uma cópia mais leve (arquivo ou link) quanto para o player converter na hora.
+
+# nível → (caixa deitada em que a imagem cabe, nome). Um filme de cinema 3840x1600 é 4K; um vídeo em pé
+# 1080x1920 é 1080p: vale a maior caixa padrão que contém a imagem, deitada ou em pé.
+NIVEIS_VIDEO = {4320: (7680, 4320, "8K"), 2160: (3840, 2160, "4K"), 1440: (2560, 1440, "1440p (2K)"),
+                1080: (1920, 1080, "1080p (Full HD)"), 720: (1280, 720, "720p (HD)"), 480: (854, 480, "480p"),
+                360: (640, 360, "360p")}
+DICAS_NIVEL = {2160: "a nitidez de uma TV 4K, bem mais leve que o 8K",
+               1440: "quase a imagem do 4K, um pouco mais leve",
+               1080: "imagem ótima e bem mais leve: o melhor equilíbrio",
+               720: "leve: roda liso em quase todo celular",
+               480: "bem leve: celular fraco ou pouco espaço",
+               360: "o mais leve de todos"}
+TETO_BITRATE = {4320: "30M", 2160: "16M", 1440: "9M", 1080: "6M", 720: "4M", 480: "2M", 360: "1M"}
+SERVICO_REDUZIR = "reduzir-video"  # conversão em segundo plano (uma de cada vez)
+ESTADO_REDUZIR = DATA_DIR / "reduzir_video.json"  # o que está sendo convertido (para mostrar e cancelar)
+AUDIO_NO_MP4 = ("aac", "mp3", "ac3", "eac3", "alac")
+_FILTROS: dict = {}
+
+
+def tem_filtro(nome: str) -> bool:
+    if nome not in _FILTROS:
+        _FILTROS[nome] = bool(re.search(rf"^\s*\S+\s+{re.escape(nome)}\s", saida(
+            ["ffmpeg", "-hide_banner", "-filters"], timeout=20), re.M))
+    return _FILTROS[nome]
+
+
+def _dimensoes(faixa) -> tuple:
+    try:
+        return int(faixa.get("width") or 0), int(faixa.get("height") or 0)
+    except (AttributeError, TypeError, ValueError):
+        return 0, 0
+
+
+def nivel_video(faixa) -> int:
+    """Em que resolução o vídeo está (2160 = 4K, 1080, 720...); 0 se não der para saber."""
+    largura, altura = _dimensoes(faixa)
+    if not largura or not altura:
+        return 0
+    longo, curto = max(largura, altura), min(largura, altura)
+    for nivel in sorted(NIVEIS_VIDEO):  # 7% de folga: 4096x2160 (cinema) ainda é 4K, 2048x1080 é 1080p
+        caixa_l, caixa_a, _ = NIVEIS_VIDEO[nivel]
+        if longo <= caixa_l * 1.07 and curto <= caixa_a * 1.07:
+            return nivel
+    return max(NIVEIS_VIDEO)
+
+
+def nome_nivel(nivel: int) -> str:
+    return NIVEIS_VIDEO[nivel][2] if nivel in NIVEIS_VIDEO else f"{nivel}p" if nivel else "?"
+
+
+def niveis_menores(nivel: int) -> list:
+    """As resoluções que dá para escolher abaixo da do vídeo (da maior para a menor)."""
+    return [n for n in sorted(NIVEIS_VIDEO, reverse=True) if n < nivel and n <= 2160]
+
+
+def quadros_por_segundo(faixa) -> float:
+    for chave in ("avg_frame_rate", "r_frame_rate"):
+        num, _, den = str((faixa or {}).get(chave) or "").partition("/")
+        with contextlib.suppress(ValueError, ZeroDivisionError):
+            fps = float(num) / float(den or 1)
+            if 0 < fps < 1000:
+                return fps
+    return 0.0
+
+
+def eh_hdr(faixa) -> bool:
+    return (faixa or {}).get("color_transfer") in ("smpte2084", "arib-std-b67")
+
+
+def filtro_reduzir(faixa: dict, nivel: int, rapido: bool = False, fps30: bool = False) -> str:
+    """Filtro do ffmpeg que deixa a imagem no `nivel` (sem esticar o que já é menor), em 8 bits. Na cópia
+    (`rapido` falso), as cores do HDR são convertidas para uma tela comum quando o ffmpeg tem o zscale; na
+    conversão na hora isso pesaria demais no celular (e sem o zscale as cores ficam um pouco apagadas)."""
+    filtros = []
+    if nivel_video(faixa) > nivel:
+        caixa_l, caixa_a, _ = NIVEIS_VIDEO[nivel]
+        # deitado cabe em 1280x720; em pé, em 720x1280 (iw/ih já vêm girados pelo ffmpeg)
+        filtros.append(f"scale=w='if(gte(iw,ih),{caixa_l},{caixa_a})':h='if(gte(iw,ih),{caixa_a},{caixa_l})'"
+                       f":force_original_aspect_ratio=decrease:force_divisible_by=2"
+                       f":flags={'bilinear' if rapido else 'bicubic'}")
+    if fps30 and quadros_por_segundo(faixa) > 31:
+        filtros.append("fps=30")
+    if not rapido and eh_hdr(faixa) and tem_filtro("zscale") and tem_filtro("tonemap"):
+        tin = "smpte2084" if faixa.get("color_transfer") == "smpte2084" else "arib-std-b67"
+        filtros.append(f"zscale=tin={tin}:min=bt2020nc:pin=bt2020:t=linear:npl=100,format=gbrpf32le,"
+                       "zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv")
+    filtros.append("format=yuv420p")  # 8 bits: o que todo aparelho decodifica sem esforço
+    return ",".join(filtros)
+
+
+def comando_reduzir(fonte: str, sonda: dict, nivel: int, fps30: bool, destino: Path) -> list:
+    """ffmpeg que grava `destino` na resolução `nivel`: imagem em H.264 (o mais leve de tocar), todas as trilhas
+    de áudio e legendas. MKV continua MKV (guarda tudo como está); o resto vira MP4."""
+    video = sonda["video"][0]
+    mkv = destino.suffix.lower() == ".mkv"
+    crf = {1440: 21, 1080: 21, 720: 22, 480: 23, 360: 24}.get(nivel, 22)
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
+           *_opcoes_entrada(fonte), "-map", f"0:{video.get('index', 0)}", "-map_metadata", "0", "-map_chapters", "0",
+           "-vf", filtro_reduzir(video, nivel, fps30=fps30), "-c:v", "libx264", "-preset", "veryfast",
+           "-crf", str(crf), "-profile:v", "high"]
+    if mkv:
+        cmd += ["-map", "0:a?", "-map", "0:s?", "-map", "0:t?", "-c:a", "copy", "-c:s", "copy", "-c:t", "copy"]
+    else:
+        for n, faixa in enumerate(sonda["audio"]):
+            cmd += ["-map", f"0:a:{n}"]
+            cmd += [f"-c:a:{n}", "copy"] if faixa.get("codec_name") in AUDIO_NO_MP4 else \
+                [f"-c:a:{n}", "aac", f"-b:a:{n}", "192k"]
+        textos = [n for n, f in enumerate(sonda["legendas"]) if f.get("codec_name") in CODECS_LEGENDA_TEXTO]
+        for k, n in enumerate(textos):  # legenda em imagem (PGS, VobSub) não cabe no MP4
+            cmd += ["-map", f"0:s:{n}", f"-c:s:{k}", "mov_text"]
+        cmd += ["-movflags", "+faststart"]
+    return cmd + ["-max_muxing_queue_size", "4096", "-f", "matroska" if mkv else "mp4",
+                  str(destino.with_name(destino.name + ".part"))]
+
+
+def _relogio(segundos) -> str:
+    s = max(0, int(segundos or 0))
+    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+
+
+def _texto_andamento(feito: float, duracao: float | None, decorrido: float, colunas: int = 80) -> tuple:
+    """(texto, porcentagem ou None) do andamento de uma conversão."""
+    velocidade = feito / decorrido if decorrido > 0 else 0.0
+    if not duracao:
+        return f"{_relogio(feito)} convertidos · {numero_br(velocidade, 1)}x", None
+    pct = max(0.0, min(100.0, feito / duracao * 100))
+    texto = f"{pct:.0f}% · {_relogio(feito)} de {_relogio(duracao)} · {numero_br(velocidade, 1)}x"
+    if velocidade > 0 and feito > 5:
+        texto += f" · faltam ~{_hms((duracao - feito) / velocidade)}"
+    cheias = max(0, min(20, colunas - len(texto) - 6))
+    barra = "█" * round(cheias * pct / 100) + "░" * (cheias - round(cheias * pct / 100))
+    return (f"{barra} {texto}" if barra else texto), pct
+
+
+def _ffmpeg_com_andamento(cmd: list, duracao: float | None, avisar) -> tuple:
+    """Roda o ffmpeg (com -progress pipe:1) e chama avisar(texto, pct) a cada atualização.
+    Devolve (código de saída, últimas mensagens de erro). Ctrl+C para o ffmpeg e repassa a interrupção."""
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                            text=True, errors="replace")
+    erros, feito, inicio = [], 0.0, time.monotonic()
+    try:
+        for linha in proc.stdout:
+            chave, igual, valor = linha.strip().partition("=")
+            if not igual or not re.fullmatch(r"[a-z0-9_]+", chave):
+                if linha.strip():
+                    erros = (erros + [linha.strip()])[-6:]
+                continue
+            if chave == "out_time_us" and valor.isdigit():
+                feito = int(valor) / 1_000_000
+            elif chave == "progress":
+                avisar(*_texto_andamento(feito, duracao, time.monotonic() - inicio, largura_tela()))
+        proc.wait()
+    except BaseException:
+        proc.terminate()
+        try:
+            proc.wait(5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+        raise
+    return proc.returncode, "\n".join(erros)
+
+
+def _destino_reduzido(fonte: str, nivel: int) -> Path:
+    """Ao lado do original (ou em Download/Termux-Toons/Convertidos), com a resolução no nome."""
+    if eh_link(fonte):
+        nome = urllib.parse.unquote(os.path.basename(urllib.parse.urlsplit(fonte).path)) or "video"
+        pasta = pasta_videos() if garantir_storage() or pasta_videos().exists() else pasta_saida("Convertidos")
+    else:
+        nome, pasta = Path(fonte).name, Path(fonte).parent
+        if not os.access(pasta, os.W_OK):
+            pasta = pasta_saida("Convertidos")
+    pasta.mkdir(parents=True, exist_ok=True)
+    base = Path(nome)
+    extensao = ".mkv" if base.suffix.lower() == ".mkv" else ".mp4"
+    tronco = re.sub(r"\s*\[\d+p\]$", "", base.stem if base.suffix else nome)
+    tronco = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", tronco).strip(" .")[:120] or "video"  # o Android recusa esses
+    destino, n = pasta / f"{tronco} [{nivel}p]{extensao}", 2
+    while destino.exists():
+        destino, n = pasta / f"{tronco} [{nivel}p] ({n}){extensao}", n + 1
+    return destino
+
+
+def executar_reducao(fonte: str, nivel: int, destino: Path, fps30: bool = False, sonda=None,
+                     segundo_plano: bool = False) -> Path:
+    """Faz a cópia mais leve. Na tela mostra o andamento; em segundo plano escreve no log e na notificação."""
+    sonda = sonda or sondar_video(fonte)
+    if not sonda or not sonda["video"]:
+        raise ToonsError("Não consegui ler a imagem desse vídeo (o ffprobe não abriu o arquivo ou o link).")
+    duracao = _duracao(sonda)
+    parcial = destino.with_name(destino.name + ".part")  # só vira o arquivo final se terminar sem erro
+    gravar_json(ESTADO_REDUZIR, {"fonte": fonte, "destino": str(destino), "nivel": nivel, "inicio": time.time()})
+    ultimo = {"pct": -5.0, "quando": 0.0}
+
+    def avisar(texto: str, pct) -> None:
+        if not segundo_plano:
+            print(f"\r  {texto}\033[K", end="", flush=True)
+            return
+        agora = time.monotonic()
+        if pct is not None and pct - ultimo["pct"] < 2 and agora - ultimo["quando"] < 60:
+            return
+        ultimo.update(pct=pct if pct is not None else ultimo["pct"], quando=agora)
+        log(texto)
+        if tem("termux-notification"):
+            with contextlib.suppress(ToonsError, OSError):
+                _tapi(["termux-notification", "--id", "toons-reduzir", "--ongoing", "--alert-once",
+                       "--title", f"📉 Reduzindo para {nome_nivel(nivel)}", "--content", f"{destino.name}\n{texto}"],
+                      15, json_saida=False)
+
+    cmd = comando_reduzir(fonte, sonda, nivel, fps30, destino)
+    try:
+        with manter_acordado():
+            codigo, erros = _ffmpeg_com_andamento(cmd, duracao, avisar)
+    except BaseException:
+        parcial.unlink(missing_ok=True)
+        ESTADO_REDUZIR.unlink(missing_ok=True)
+        if not segundo_plano:
+            print()
+        raise
+    finally:
+        if segundo_plano and tem("termux-notification-remove"):
+            rodar(["termux-notification-remove", "toons-reduzir"], capturar=True, mostrar=False, timeout=10)
+    if not segundo_plano:
+        print()
+    ESTADO_REDUZIR.unlink(missing_ok=True)
+    if codigo != 0 or not parcial.exists() or parcial.stat().st_size == 0:
+        parcial.unlink(missing_ok=True)
+        raise ToonsError("O ffmpeg não conseguiu converter este vídeo." + (f"\n{erros[-400:]}" if erros else ""))
+    parcial.replace(destino)
+    return destino
+
+
+def reduzir_video_cli(fonte: str, nivel: int, destino: str | None, fps30: bool) -> None:
+    """O que roda em segundo plano (tmux): converte e avisa por notificação quando terminar."""
+    destino_p = Path(destino) if destino else _destino_reduzido(fonte, nivel)
+    log(f"Reduzindo {fonte} para {nome_nivel(nivel)} → {destino_p}")
+    try:
+        pronto = executar_reducao(fonte, nivel, destino_p, fps30, segundo_plano=True)
+    except ToonsError as e:
+        log(f"Falhou: {e}")
+        notificar_seguro("❌ Não deu para reduzir o vídeo", str(e).splitlines()[0])
+        raise
+    tamanho_txt = bytes_humanos(pronto.stat().st_size)
+    log(f"Pronto: {pronto} ({tamanho_txt})")
+    if tem("termux-notification"):
+        with contextlib.suppress(ToonsError, OSError):
+            _tapi(["termux-notification", "--id", "toons-reduzido", "--title", f"✅ Vídeo pronto em {nome_nivel(nivel)}",
+                   "--content", f"{pronto.name} ({tamanho_txt}). Toque para abrir.",
+                   "--action", shlex.join(["termux-open", "--content-type", "video/*", str(pronto)])],
+                  15, json_saida=False)
+    else:
+        notificar_seguro(f"✅ Vídeo pronto em {nome_nivel(nivel)}", f"{pronto.name} ({tamanho_txt})")
+
+
+def _andamento_em_segundo_plano() -> bool:
+    """Se há uma conversão em segundo plano, mostra como está e deixa cancelar. Devolve True se ainda roda."""
+    if not servico_ativo(SERVICO_REDUZIR):
+        return False
+    estado = ler_json(ESTADO_REDUZIR, {})
+    while servico_ativo(SERVICO_REDUZIR):
+        linhas = []
+        with contextlib.suppress(OSError):
+            linhas = [l for l in log_de(SERVICO_REDUZIR).read_text("utf-8", errors="replace").splitlines()
+                      if "%" in l or "convertidos" in l]
+        nome = Path(estado.get("destino", "")).name or "vídeo"
+        info(f"Em andamento, em segundo plano: {nome} ({nome_nivel(int(estado.get('nivel') or 0))})")
+        print(f"  {linhas[-1].split('] ', 1)[-1] if linhas else 'começando...'}")
+        i = escolher("E agora?", ["🔄 Atualizar o andamento", "⏹ Cancelar a conversão", "Voltar"])
+        if i == 1 and confirmar("Cancelar? O que já foi convertido é apagado.", False):
+            parar_servico(SERVICO_REDUZIR)
+            if estado.get("destino"):
+                Path(estado["destino"] + ".part").unlink(missing_ok=True)
+            ESTADO_REDUZIR.unlink(missing_ok=True)
+            if tem("termux-notification-remove"):
+                rodar(["termux-notification-remove", "toons-reduzir"], capturar=True, mostrar=False, timeout=10)
+            ok("Conversão cancelada.")
+            return False
+        if i != 0:
+            return True
+    ok("A conversão terminou.")
+    return False
+
+
+def _escolher_fonte_para_reduzir():
+    """Arquivo do celular ou link da internet. Página de vídeo (YouTube...) vai para o download com qualidade."""
+    i = escolher("Qual vídeo?", ["📁 Um vídeo do celular",
+                                 "🌐 Um link de vídeo (baixa já na resolução menor, sem baixar o 4K)"])
+    if i is None:
+        return None
+    if i == 0:
+        arq = escolher_arquivo("Qual vídeo?", tuple(sorted(EXTENSOES_VIDEO_TORBOX | set(EXT_VIDEO))))
+        return str(arq) if arq else None
+    link = perguntar("Link do vídeo").strip()
+    if not link:
+        return None
+    if not eh_link(link):
+        raise ToonsError("O link precisa começar com http:// ou https://")
+    if not _eh_arquivo_de_video(link):
+        info("Esse link é de uma página de vídeo (YouTube, TikTok...): o próprio site tem resoluções menores, "
+             "então é só baixar já na qualidade que você quer.")
+        escolha = escolher_formato_video()
+        if escolha and baixar_video(link, *escolha):
+            ok(f"Salvo em {pasta_videos()}")
+        return None
+    return link
+
+
+def reduzir_resolucao(fonte: str | Path | None = None, perguntar_modo: bool = True) -> Path | None:
+    """Faz uma cópia do vídeo numa resolução menor (4K → 1080p, 720p...), que toca sem travar.
+    Devolve o arquivo novo quando a conversão acontece aqui mesmo (em segundo plano, devolve None)."""
+    if _andamento_em_segundo_plano():
+        return None
+    if not garantir_cmd("ffmpeg"):
+        return None
+    fonte = str(fonte) if fonte else _escolher_fonte_para_reduzir()
+    if not fonte:
+        return None
+    info("Lendo o vídeo...")
+    sonda = sondar_video(fonte)
+    if not sonda or not sonda["video"]:
+        raise ToonsError("Não consegui ler a imagem desse vídeo (o ffprobe não abriu o arquivo ou o link).")
+    video = sonda["video"][0]
+    nivel, (largura, altura), fps = nivel_video(video), _dimensoes(video), quadros_por_segundo(video)
+    resumo = [f"{largura}x{altura} ({nome_nivel(nivel)})", str(video.get("codec_name", "?")).upper()]
+    if fps:
+        resumo.append(f"{numero_br(fps, 0)} quadros/s")
+    if eh_hdr(video):
+        resumo.append("HDR")
+    duracao = _duracao(sonda)
+    if duracao:
+        resumo.append(_hms(duracao) if duracao >= 60 else f"{duracao:.0f} s")
+    if not eh_link(fonte):
+        resumo.append(bytes_humanos(Path(fonte).stat().st_size))
+    print(f"  🎬 {NEG}{Path(urllib.parse.urlsplit(fonte).path).name if eh_link(fonte) else Path(fonte).name}{RST}")
+    print(f"     {' · '.join(resumo)}")
+    opcoes = niveis_menores(nivel)
+    if not opcoes:
+        info(f"Este vídeo já está em {nome_nivel(nivel)}: não dá para ficar mais leve sem estragar a imagem.")
+        return None
+    padrao = opcoes.index(1080) + 1 if 1080 in opcoes else 1
+    i = escolher("Para qual resolução?", [f"{nome_nivel(n)} — {DICAS_NIVEL[n]}" for n in opcoes], str(padrao))
+    if i is None:
+        return None
+    alvo = opcoes[i]
+    fps30 = fps > 31 and confirmar(f"O vídeo tem {numero_br(fps, 0)} quadros por segundo. Baixar para 30 "
+                                   "(fica ainda mais leve, quase não se nota)?", True)
+    if eh_hdr(video):
+        if tem_filtro("zscale") and tem_filtro("tonemap"):
+            info("O vídeo é HDR: as cores são ajustadas para uma tela comum.")
+        else:
+            aviso("O vídeo é HDR e este ffmpeg não tem o filtro zscale: as cores podem ficar um pouco apagadas.")
+    destino = _destino_reduzido(fonte, alvo)
+    if nivel >= 2160:
+        aviso("Converter 4K no celular é pesado: um filme pode levar mais tempo do que dura. Deixe carregando.")
+    segundo_plano = False
+    if perguntar_modo:
+        modo = escolher("Como converter?", [
+            "Em segundo plano: pode usar o celular, e uma notificação avisa quando terminar",
+            "Aqui, acompanhando o andamento (Ctrl+C cancela)"])
+        if modo is None:
+            return None
+        segundo_plano = modo == 0
+    if segundo_plano:
+        comando = cmd_self(SERVICO_REDUZIR, fonte, "--nivel", str(alvo), "--saida", str(destino),
+                           *(["--fps30"] if fps30 else []))
+        if iniciar_servico(SERVICO_REDUZIR, comando):
+            ok(f"Convertendo em segundo plano para {destino.name}.")
+            info("O andamento aparece na notificação e aqui mesmo, em 'Reduzir a resolução de um vídeo'.")
+        return None
+    info(f"Convertendo para {nome_nivel(alvo)}: {destino}")
+    try:
+        pronto = executar_reducao(fonte, alvo, destino, fps30, sonda)
+    except KeyboardInterrupt:
+        aviso("Conversão cancelada.")
+        return None
+    antes = f"{bytes_humanos(Path(fonte).stat().st_size)} → " if not eh_link(fonte) else ""
+    ok(f"Pronto: {pronto.name} ({antes}{bytes_humanos(pronto.stat().st_size)})")
+    print(f"  {DIM}{pronto.parent}{RST}")
+    return pronto
+
 
 def videos_para_compartilhar() -> list:
     """[(data, tamanho, caminho)] dos vídeos nas pastas de vídeo/downloads/filmes, os mais novos primeiro."""
@@ -10395,6 +10864,10 @@ def menu_midia():
         sonda = sondar_video(arq)
         if sonda:
             mostrar_faixas(sonda)
+            if sonda["video"] and nivel_video(sonda["video"][0]) > 1080:
+                print(f"  {DIM}Vídeo {nome_nivel(nivel_video(sonda['video'][0]))}: se travar para quem assiste, no player "
+                      f"use Ajustes → Qualidade (este celular converte na hora) ou faça antes uma cópia mais leve em "
+                      f"'📉 Reduzir a resolução de um filme'.{RST}")
         problemas = problemas_de_reproducao(arq, sonda)
         if problemas:
             print()
@@ -10583,6 +11056,7 @@ def menu_midia():
         ("🍿 Catálogo do TorBox (todos os seus filmes e séries num link só)", menu_torbox),
         ("Meus links (copiar, enviar, assistir, apagar)", ver_links),
         ("Converter filme para MP4 compatível", converter),
+        ("📉 Reduzir a resolução de um filme (4K → 1080p, 720p...)", reduzir_resolucao),
         *itens_servico("midia", "Servidor de vídeo", iniciar_servidor),
         ("Túnel para a internet: ligar", iniciar_tunel),
         ("Túnel para a internet: desligar", lambda: parar_servico("tunel-midia")),
@@ -24904,6 +25378,11 @@ def main(argv=None) -> int:
     p.add_argument("alvos", nargs="+")
     p.add_argument("--formato", choices=list(FORMATOS_VIDEO), help="padrão: o último escolhido no menu")
     p.add_argument("--qualidade", choices=list(QUALIDADES_VIDEO), help="padrão: a última escolhida no menu")
+    p = sub.add_parser(SERVICO_REDUZIR, help="cópia de um vídeo (arquivo ou link) numa resolução menor")
+    p.add_argument("fonte")
+    p.add_argument("--nivel", type=int, choices=sorted(NIVEIS_VIDEO), default=1080, help="resolução: 1080, 720...")
+    p.add_argument("--saida", help="arquivo de destino (padrão: ao lado do original)")
+    p.add_argument("--fps30", action="store_true", help="também baixa para 30 quadros por segundo")
     p = sub.add_parser("midia", help="servidor de vídeo (links de compartilhamento) em primeiro plano")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--porta", type=int)
@@ -24985,6 +25464,8 @@ def main(argv=None) -> int:
             falhas = sum(not baixar_video(alvo, args.formato, args.qualidade) for alvo in args.alvos)
             if falhas:
                 raise ToonsError(f"{falhas} download(s) falharam.")
+        elif args.comando == SERVICO_REDUZIR:
+            reduzir_video_cli(args.fonte, args.nivel, args.saida, args.fps30)
         elif args.comando == "midia":
             servir_midia(args.host, args.porta or cfg()["midia_porta"])
         elif args.comando == "desktop":
