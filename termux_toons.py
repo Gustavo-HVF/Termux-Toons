@@ -4700,25 +4700,79 @@ def menu_proxy():
 # dele (dados móveis, Wi-Fi, a VPN...), reescreve os links para a navegação continuar passando por ele, e devolve
 # o conteúdo já pronto. Para o site, quem acessou foi o celular. É só a biblioteca padrão.
 #
+# Os endereços ficam no formato /p/<esquema>/<site>/<caminho> (ex.: /p/https/pt.wikipedia.org/wiki/Brasil). Como o
+# caminho do site é o mesmo, os links relativos, os formulários e as listas de vídeo (HLS/DASH) funcionam sozinhos.
+# Uma página de apoio (/_tt/nav.js) desenha a barra de endereço e faz os pedidos feitos por JavaScript também
+# passarem pelo celular.
+#
+# Integração com o VLC Web (github.com/Gustavo-HVF/VLC-WEB): o celular baixa o reprodutor do GitHub e o serve em
+# /vlc/. Os vídeos e músicas achados nas páginas abrem nele com um toque, e continuam vindo pela conexão do
+# celular (por links /m/... assinados, que o reprodutor consegue ler sem o cookie, com avanço por Range).
+#
 # Diferença para o proxy: o proxy precisa ser configurado no sistema do PC; este é só uma página da web, abre em
 # qualquer aparelho (celular, PC, TV, tablet) sem configurar nada. Em troca, sites muito dependentes de
-# JavaScript (apps, redes sociais modernas) abrem mal: ele é bom para pesquisar, ler notícias, Wikipédia, etc.
+# JavaScript (apps, redes sociais modernas) podem abrir mal: ele é bom para pesquisar, ler notícias, Wikipédia...
 
 SERVICO_NAVEGADOR = "navegador"
 NAV_TIMEOUT = 30                        # segundos para cada pedido a um site
 NAV_MAX_REESCREVER = 8 * 1024 * 1024    # até aqui a página é baixada para reescrever os links; acima, passa direto
 NAV_MAX_CORPO = 25 * 1024 * 1024        # tamanho máximo de um envio (POST) do visitante
 NAV_BLOCO = 1 << 16
-NAV_TIPOS_TEXTO = ("text/html", "application/xhtml", "text/css")
-NAV_BUSCA = "https://html.duckduckgo.com/html/"   # busca que funciona sem JavaScript
-# cabeçalhos da resposta do site que NÃO podem ir para o visitante (atrapalham a reescrita, travam a página num
-# iframe ou vazam detalhes da conexão). O corpo é reescrito/recalculado, então tamanho e codificação também saem.
-NAV_CORTAR_RESP = {
-    "content-security-policy", "content-security-policy-report-only", "x-frame-options", "x-xss-protection",
-    "strict-transport-security", "public-key-pins", "public-key-pins-report-only", "expect-ct",
-    "cross-origin-opener-policy", "cross-origin-embedder-policy", "cross-origin-resource-policy",
-    "content-length", "transfer-encoding", "content-encoding", "connection", "keep-alive", "upgrade",
-    "set-cookie", "report-to", "nel", "alt-svc", "accept-ch", "permissions-policy", "feature-policy",
+NAV_MAX_SESSOES = 60                    # visitantes com cookies próprios guardados ao mesmo tempo
+# buscas que funcionam sem JavaScript (a primeira é a padrão)
+NAV_BUSCAS = {
+    "ddg": ("DuckDuckGo", "https://html.duckduckgo.com/html/", "q"),
+    "bing": ("Bing", "https://www.bing.com/search", "q"),
+    "google": ("Google", "https://www.google.com/search", "q"),
+    "wiki": ("Wikipédia", "https://pt.wikipedia.org/w/index.php", "search"),
+}
+NAV_BUSCA = NAV_BUSCAS["ddg"][1]
+NAV_ATALHOS = [
+    ("Wikipédia", "https://pt.wikipedia.org"),
+    ("Agência Brasil", "https://agenciabrasil.ebc.com.br"),
+    ("CNN (texto)", "https://lite.cnn.com"),
+    ("DuckDuckGo", "https://html.duckduckgo.com/html/"),
+    ("GitHub", "https://github.com"),
+    ("Tempo", "https://wttr.in/?lang=pt"),
+]
+# cabeçalhos do visitante que NÃO vão para o site: os da conexão com o navegador, os nossos cookies e os que o
+# túnel da Cloudflare acrescenta (CF-Connecting-IP, X-Forwarded-For... contariam ao site o IP de quem está
+# navegando, justamente o que o navegador existe para não mostrar).
+NAV_NAO_REPASSAR = {
+    "host", "cookie", "connection", "keep-alive", "proxy-connection", "proxy-authorization", "te", "trailer",
+    "transfer-encoding", "upgrade", "content-length", "accept-encoding", "referer", "origin", "forwarded", "via",
+    "x-real-ip", "true-client-ip", "cdn-loop", "service-worker", "purpose", "x-purpose",
+}
+NAV_NAO_REPASSAR_PREFIXOS = ("sec-", "cf-", "x-forwarded", "proxy-")
+# cabeçalhos da resposta do site que passam para o visitante quando o conteúdo vai sem mexer (imagem, vídeo,
+# script...). O resto fica: os que travam a página, vazam detalhes da conexão ou apagariam os dados do navegador
+# (Clear-Site-Data valeria para TODOS os sites abertos por aqui, que dividem o mesmo endereço).
+NAV_PASSAR_FLUXO = ("Content-Type", "Content-Encoding", "Content-Length", "Content-Disposition", "Content-Range",
+                    "Accept-Ranges", "Content-Language", "Last-Modified", "ETag", "Expires", "Cache-Control", "Age")
+NAV_TIPOS_HLS = ("application/vnd.apple.mpegurl", "application/x-mpegurl", "application/mpegurl",
+                 "audio/mpegurl", "audio/x-mpegurl", "video/mpegurl", "video/x-mpegurl")
+NAV_TIPO_DASH = "application/dash+xml"
+NAV_TIPOS_GENERICOS = ("", "application/octet-stream", "binary/octet-stream", "text/plain", "application/x-download",
+                       "application/force-download", "application/unknown")
+NAV_EXT_VIDEO = {"mp4", "m4v", "webm", "mkv", "mov", "ogv", "avi", "wmv", "flv", "mpg", "mpeg", "ts", "m2ts", "mts",
+                 "3gp", "vob", "divx", "rmvb"}
+NAV_EXT_AUDIO = {"mp3", "m4a", "m4b", "aac", "wav", "flac", "ogg", "oga", "opus", "wma", "mka", "weba", "ac3", "dts",
+                 "amr", "aiff"}
+
+VLC_WEB_REPO = "Gustavo-HVF/VLC-WEB"
+VLC_WEB_SITE = f"https://github.com/{VLC_WEB_REPO}"
+VLC_WEB_ZIP = f"{VLC_WEB_SITE}/archive/HEAD.zip"   # a branch principal; o GitHub redireciona para o commit atual
+VLC_WEB_DIR = DATA_DIR / "vlc-web"
+# do repositório, só o que o site usa (o app Android, o README e as ferramentas ficam de fora)
+VLC_WEB_ITENS = {"index.html", "receiver.html", "favicon.ico", "manifest.webmanifest", "css", "js", "assets",
+                 "vendor"}
+VLC_WEB_TIPOS = {
+    ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8", ".json": "application/json",
+    ".webmanifest": "application/manifest+json", ".wasm": "application/wasm", ".svg": "image/svg+xml",
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp",
+    ".ico": "image/x-icon", ".woff": "font/woff", ".woff2": "font/woff2", ".ttf": "font/ttf",
+    ".txt": "text/plain; charset=utf-8", ".md": "text/plain; charset=utf-8", ".map": "application/json",
 }
 
 
@@ -4732,6 +4786,8 @@ def _destino_navegador_ok(ip: str) -> bool:
         alvo = ipaddress.ip_address(ip.split("%")[0])
     except ValueError:
         return False
+    if isinstance(alvo, ipaddress.IPv6Address) and alvo.ipv4_mapped:
+        alvo = alvo.ipv4_mapped   # ::ffff:127.0.0.1 é o próprio celular
     return not (alvo.is_loopback or alvo.is_private or alvo.is_link_local or alvo.is_multicast
                 or alvo.is_reserved or alvo.is_unspecified)
 
@@ -4834,43 +4890,183 @@ class _AbreNavTLS(urllib.request.HTTPSHandler):
 
 
 def _abridor_navegador(jar) -> urllib.request.OpenerDirector:
-    return urllib.request.build_opener(
-        _AbreNav(), _AbreNavTLS(context=ssl.create_default_context()),
-        urllib.request.HTTPCookieProcessor(jar))
+    """Abridor montado à mão, só com http e https: o build_opener padrão também lê file:// e ftp:// (arquivos do
+    celular e a rede local, por fora do bloqueio) e usaria um proxy das variáveis de ambiente. Os
+    redirecionamentos não são seguidos aqui: voltam para o navegador do visitante, para o endereço na barra ficar
+    certo e os links relativos da página nova funcionarem."""
+    abridor = urllib.request.OpenerDirector()
+    for manipulador in (_AbreNav(), _AbreNavTLS(context=ssl.create_default_context()),
+                        urllib.request.HTTPCookieProcessor(jar), urllib.request.HTTPErrorProcessor(),
+                        urllib.request.HTTPDefaultErrorHandler(), urllib.request.UnknownHandler()):
+        abridor.add_handler(manipulador)
+    return abridor
 
 
-# ── Buscar a página e preparar o conteúdo ────────────────────────────
+# Cada visitante (cada navegador que abriu o link) tem os próprios cookies dos sites: sem isso, quem entrasse
+# numa conta deixaria todos os outros visitantes logados nela.
+_NAV_SESSOES: dict = {}
+_NAV_SESSOES_LOCK = threading.Lock()
 
-def _buscar_site(opener, url: str, metodo: str, corpo: bytes | None, tipo_corpo: str | None, idioma: str):
-    cabecalhos = {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": idioma.strip() or "pt-BR,pt;q=0.9,en;q=0.8",
-        "Accept-Encoding": "gzip, deflate",
-    }
-    if tipo_corpo:
-        cabecalhos["Content-Type"] = tipo_corpo
-    req = urllib.request.Request(url, data=corpo, headers=cabecalhos, method=metodo)
-    return opener.open(req, timeout=NAV_TIMEOUT)
 
+def _sessao_navegador(sid: str) -> urllib.request.OpenerDirector:
+    with _NAV_SESSOES_LOCK:
+        sessao = _NAV_SESSOES.get(sid)
+        if sessao is None:
+            if len(_NAV_SESSOES) >= NAV_MAX_SESSOES:
+                del _NAV_SESSOES[min(_NAV_SESSOES, key=lambda k: _NAV_SESSOES[k][1])]
+            sessao = _NAV_SESSOES[sid] = [_abridor_navegador(http.cookiejar.CookieJar()), 0.0]
+        sessao[1] = time.time()
+        return sessao[0]
+
+
+def _esquecer_sessao_navegador(sid: str) -> None:
+    with _NAV_SESSOES_LOCK:
+        _NAV_SESSOES.pop(sid, None)
+
+
+# ── Endereços: real ⇄ caminho no navegador ───────────────────────────
+
+def _assinatura_midia(token: str, esquema: str, netloc: str) -> str:
+    """Assinatura dos links /m/ (vídeos abertos no VLC Web): vale para um site, sem precisar do cookie."""
+    return hmac.new(token.encode(), f"{esquema}://{netloc.lower()}".encode(), hashlib.sha256).hexdigest()[:20]
+
+
+def _nav_link(url: str, assinar_com: str | None = None) -> str | None:
+    """https://site/caminho?x → /p/https/site/caminho?x (ou /m/<assinatura>/https/site/... com assinar_com).
+    Devolve None para o que não é http(s)."""
+    try:
+        partes = urllib.parse.urlsplit(url.strip())
+    except (ValueError, AttributeError):
+        return None
+    esquema = partes.scheme.lower()
+    netloc = partes.netloc.rsplit("@", 1)[-1]   # sem usuário:senha
+    if esquema not in ("http", "https") or not netloc or "/" in netloc:
+        return None
+    caminho = partes.path or "/"
+    if not caminho.startswith("/"):
+        caminho = "/" + caminho
+    prefixo = f"/m/{_assinatura_midia(assinar_com, esquema, netloc)}/" if assinar_com else "/p/"
+    return (f"{prefixo}{esquema}/{netloc}{caminho}" + (f"?{partes.query}" if partes.query else "")
+            + (f"#{partes.fragment}" if partes.fragment else ""))
+
+
+def _nav_real(caminho: str, consulta: str = "") -> str | None:
+    """O contrário de _nav_link: /p/https/site/x (ou /m/<assinatura>/https/site/x) → https://site/x."""
+    achado = re.match(r"/(?:p|m/[0-9a-f]{8,64})/(https?)/([^/?#]+)(/[^?#]*)?$", caminho)
+    if not achado:
+        return None
+    return (f"{achado.group(1)}://{urllib.parse.unquote(achado.group(2))}{achado.group(3) or '/'}"
+            + (f"?{consulta}" if consulta else ""))
+
+
+def _url_real(texto: str) -> str | None:
+    """Aceita um endereço real (https://...) ou um caminho do navegador (/p/..., /m/...) e devolve o real."""
+    texto = (texto or "").strip()
+    if texto.startswith(("/p/", "/m/")):
+        partes = urllib.parse.urlsplit(texto)
+        return _nav_real(partes.path, partes.query)
+    if re.match(r"(?i)https?://[^/\s]", texto):
+        return texto
+    return None
+
+
+def _url_para_rede(url: str) -> str:
+    """Deixa o endereço só com ASCII (acentos no caminho, nomes de site com acento) para o http.client."""
+    partes = urllib.parse.urlsplit(url)
+    host = partes.hostname or ""
+    if not host:
+        raise ValueError("endereço sem o nome do site")
+    if not host.isascii():
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError:
+            raise ValueError(f"nome de site inválido: {host}") from None
+    netloc = f"[{host}]" if ":" in host else host
+    if partes.port:
+        netloc += f":{partes.port}"
+    caminho = urllib.parse.quote(partes.path or "/", safe="/%:@!$&'()*+,;=~-._")
+    consulta = urllib.parse.quote(partes.query, safe="=&%:@!$'()*+,;/?~-._[]{}|^`")
+    return urllib.parse.urlunsplit((partes.scheme.lower(), netloc, caminho, consulta, ""))
+
+
+_NAV_ESQUEMAS_FORA = re.compile(
+    r"(?i)(?:data|javascript|vbscript|mailto|tel|sms|blob|about|intent|magnet|geo|market|whatsapp|tg|file|chrome):")
+
+
+def _proxiar(base_url: str, alvo: str | None, assinar_com: str | None = None) -> str | None:
+    """Transforma um link da página num link que passa pelo celular. Devolve None para o que deve ficar como
+    está (âncoras, data:, javascript:, mailto:...)."""
+    alvo = (alvo or "").strip()
+    if not alvo or alvo.startswith("#") or _NAV_ESQUEMAS_FORA.match(alvo):
+        return None
+    try:
+        absoluto = urllib.parse.urljoin(base_url, alvo)
+    except ValueError:
+        return None
+    return _nav_link(absoluto, assinar_com)
+
+
+def _endereco_digitado(termo: str, motor: str = "ddg") -> str:
+    """O que a pessoa digitou na barra: um endereço (com ou sem https://) ou uma busca."""
+    termo = termo.strip()
+    if re.match(r"(?i)[a-z][a-z0-9+.\-]*://", termo):
+        return termo
+    if re.match(r"(?i)^(?:\d{1,3}(?:\.\d{1,3}){3}|(?:[\w¡-￿](?:[\w¡-￿-]*[\w¡-￿])?\.)+"
+                r"[a-z¡-￿]{2,}|localhost)(?::\d{1,5})?(?:[/?#]\S*)?$", termo):
+        return "https://" + termo
+    _, base, campo = NAV_BUSCAS.get(motor) or NAV_BUSCAS["ddg"]
+    return url_com(base, **{campo: termo})
+
+
+def _tipo_midia(tipo_base: str, url: str) -> str | None:
+    """'video', 'audio', 'hls' ou 'dash' quando o endereço é uma mídia (pelo tipo ou, se genérico, pela extensão)."""
+    ext = posixpath.splitext(urllib.parse.urlsplit(url).path)[1].lower().lstrip(".")
+    generico = tipo_base in NAV_TIPOS_GENERICOS
+    if tipo_base in NAV_TIPOS_HLS or (generico and ext in ("m3u8", "m3u")):
+        return "hls"
+    if tipo_base == NAV_TIPO_DASH or (generico and ext == "mpd"):
+        return "dash"
+    if tipo_base.startswith("video/") or (generico and ext in NAV_EXT_VIDEO):
+        return "video"
+    if tipo_base.startswith("audio/") or (generico and ext in NAV_EXT_AUDIO):
+        return "audio"
+    return None
+
+
+def _modo_reescrita(tipo_base: str, url: str) -> str | None:
+    """Que conteúdo tem links para reescrever: 'html', 'css', 'm3u' (listas HLS/M3U) ou 'mpd' (DASH)."""
+    if tipo_base in ("text/html", "application/xhtml+xml"):
+        return "html"
+    if tipo_base == "text/css":
+        return "css"
+    ext = posixpath.splitext(urllib.parse.urlsplit(url).path)[1].lower()
+    if tipo_base in NAV_TIPOS_HLS or (ext in (".m3u8", ".m3u") and tipo_base in NAV_TIPOS_GENERICOS):
+        return "m3u"
+    if tipo_base == NAV_TIPO_DASH or (ext == ".mpd" and tipo_base in NAV_TIPOS_GENERICOS + ("application/xml",
+                                                                                           "text/xml")):
+        return "mpd"
+    return None
+
+
+# ── Preparar o conteúdo ──────────────────────────────────────────────
 
 def _descomprimir(dados: bytes, codificacao: str | None) -> bytes:
     codificacao = (codificacao or "").lower().strip()
     try:
-        if codificacao == "gzip":
+        if codificacao in ("gzip", "x-gzip"):
             return gzip.decompress(dados)
         if codificacao == "deflate":
             try:
                 return zlib.decompress(dados)
             except zlib.error:
                 return zlib.decompress(dados, -zlib.MAX_WBITS)
-    except (OSError, zlib.error):
+    except (OSError, EOFError, zlib.error):
         return dados
     return dados
 
 
 def _charset_da_pagina(ctype: str, dados: bytes) -> str:
-    achado = re.search(r"charset=([\w-]+)", ctype or "", re.I)
+    achado = re.search(r"charset=[\"']?([\w-]+)", ctype or "", re.I)
     candidatos = [achado.group(1)] if achado else []
     meta = re.search(rb"""<meta[^>]+charset=["']?\s*([\w-]+)""", dados[:4096], re.I)
     if meta:
@@ -4893,324 +5089,1754 @@ def _de_b64_url(cod: str) -> str:
     return base64.urlsafe_b64decode(cod.encode("ascii")).decode("utf-8", "replace")
 
 
-def _proxiar(base_url: str, alvo: str | None) -> str | None:
-    """Transforma um link da página num link que passa pelo celular (/r/<endereço em base64>).
-    Devolve None para o que deve ficar como está (âncoras, data:, javascript:, mailto:...)."""
-    alvo = (alvo or "").strip()
-    if not alvo or alvo[:1] in ("#",) or alvo.lower().startswith(
-            ("data:", "javascript:", "mailto:", "tel:", "blob:", "about:", "sms:", "intent:", "#")):
-        return None
-    try:
-        absoluto = urllib.parse.urljoin(base_url, alvo)
-    except ValueError:
-        return None
-    esquema = urllib.parse.urlsplit(absoluto).scheme.lower()
-    if esquema not in ("http", "https"):
-        return None
-    return "/r/" + _b64_url(absoluto)
-
-
 # ── Reescrever o HTML e o CSS para a navegação continuar pelo celular ──
+# A página é percorrida tag por tag: só os atributos de dentro das tags mudam. O texto, os comentários e o
+# conteúdo dos <script> ficam como estão (antes, um "x.src = y" dentro de um script virava um link e quebrava o
+# JavaScript da página).
 
-_NAV_ATTR = re.compile(
-    r"""(\s(?:href|src|action|poster|formaction|data-src|data-href|data-url|data-original|background)\s*=\s*)"""
-    r"""(?:"([^"]*)"|'([^']*)'|([^\s"'<>`]+))""", re.I)
-_NAV_SRCSET = re.compile(r"""(\ssrcset\s*=\s*)(?:"([^"]*)"|'([^']*)')""", re.I)
-_NAV_STYLE_ATTR = re.compile(r"""(\sstyle\s*=\s*)(?:"([^"]*)"|'([^']*)')""", re.I)
-_NAV_STYLE_BLOCO = re.compile(r"(<style\b[^>]*>)(.*?)(</style>)", re.I | re.S)
+_NAV_MARCA = re.compile(r"<!--.*?(?:-->|\Z)|<[a-zA-Z][^\s/>]*(?:[^>\"']|\"[^\"]*\"|'[^']*')*>", re.S)
+_NAV_NOME_TAG = re.compile(r"<([a-zA-Z][^\s/>]*)")
+_NAV_ATRIBUTO = re.compile(r"""(\s+)([^\s"'<>/=]+)(?:(\s*=\s*)(?:"([^"]*)"|'([^']*)'|([^\s"'<>`]+)))?""")
+_NAV_FIM_BRUTO = {nome: re.compile(rf"</{nome}\s*>", re.I) for nome in ("script", "style", "textarea", "xmp")}
+_NAV_ATRIB_URL = {"href", "src", "action", "formaction", "poster", "background", "xlink:href", "manifest", "lowsrc",
+                  "data-src", "data-href", "data-url", "data-original", "data-lazy-src", "data-lazy", "data-bg",
+                  "data-background", "data-poster", "data-video", "data-video-src", "data-mp4", "data-file",
+                  "data-hls", "data-m3u8", "data-stream", "data-audio"}
+_NAV_ATRIB_SRCSET = {"srcset", "data-srcset", "imagesrcset", "data-lazy-srcset"}
+_NAV_ATRIB_TIRAR = {"integrity", "ping", "referrerpolicy", "attributionsrc"}
 _NAV_CSS_URL = re.compile(r"""url\(\s*(?:"([^"]*)"|'([^']*)'|([^)\s'"]*))\s*\)""", re.I)
-_NAV_CSS_IMPORT = re.compile(r"""@import\s+(?:url\()?\s*(?:"([^"]*)"|'([^']*)')""", re.I)
+_NAV_CSS_IMPORT = re.compile(r"""@import\s+(?:"([^"]*)"|'([^']*)')""", re.I)
 _NAV_BASE = re.compile(r"""<base\b[^>]*\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`]+))""", re.I)
-_NAV_META_REFRESH = re.compile(
-    r"""(<meta\b[^>]*?http-equiv\s*=\s*["']?refresh["']?[^>]*?content\s*=\s*["'][^"';]*;\s*url\s*=\s*)([^"'>]+)""", re.I)
+_NAV_REFRESH = re.compile(r"(?i)^(\s*\d*\.?\d*\s*[;,]\s*(?:url\s*=\s*)?)(['\"]?)(.+?)\2\s*$")
 
 
-def _reescrever_css(css: str, base: str) -> str:
+def _reescrever_css(css: str, base: str, ligar=_proxiar) -> str:
     def u(m):
-        novo = _proxiar(base, m.group(1) or m.group(2) or m.group(3) or "")
+        novo = ligar(base, m.group(1) or m.group(2) or m.group(3) or "")
         return f'url("{novo}")' if novo else m.group(0)
 
     def imp(m):
-        novo = _proxiar(base, m.group(1) or m.group(2) or "")
+        novo = ligar(base, m.group(1) or m.group(2) or "")
         return f'@import "{novo}"' if novo else m.group(0)
 
     return _NAV_CSS_URL.sub(u, _NAV_CSS_IMPORT.sub(imp, css))
 
 
-def _reescrever_html(pagina: str, base_url: str, com_barra: bool) -> str:
+def _reescrever_srcset(lista: str, base: str, ligar=_proxiar) -> str:
+    saida = []
+    for item in lista.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        pedacos = item.split(None, 1)
+        novo = ligar(base, pedacos[0])
+        saida.append((novo + (" " + pedacos[1] if len(pedacos) > 1 else "")) if novo else item)
+    return ", ".join(saida)
+
+
+def _reescrever_tag(tag: str, nome: str, base: str, ligar) -> str:
+    """Reescreve os atributos de uma tag. Devolve "" para tags que devem sumir (<base>, CSP e referrer em <meta>)."""
+    if nome == "base":
+        return ""
+    nome_original = tag[1:1 + len(nome)]
+    corpo = tag[1 + len(nome):-1]
+    resto = corpo.rstrip()
+    # "<img ... />" fecha a tag; em "<a href=/x/>" a barra é parte do endereço
+    fechada = resto.endswith("/") and (len(resto) == 1 or resto[-2] in " \t\n\r\f\"'")
+    if nome == "meta":
+        baixo = html.unescape(corpo).lower()
+        if re.search(r"http-equiv\s*=\s*[\"']?\s*content-security-policy", baixo) or re.search(
+                r"name\s*=\s*[\"']?\s*referrer\b", baixo):
+            return ""
+    refresh = nome == "meta" and re.search(r"(?i)http-equiv\s*=\s*[\"']?\s*refresh", corpo) is not None
+
+    def atributo(m):
+        espaco, chave = m.group(1), m.group(2)
+        if m.group(3) is None:
+            return m.group(0)
+        valor = next((g for g in (m.group(4), m.group(5), m.group(6)) if g is not None), "")
+        k = chave.lower()
+        if k in _NAV_ATRIB_TIRAR:
+            return ""
+        bruto = html.unescape(valor)   # "a?x=1&amp;y=2" é "a?x=1&y=2" (antes o &amp; ia parar no endereço)
+        if k in _NAV_ATRIB_URL or (k == "data" and nome == "object"):
+            novo = ligar(base, bruto)
+        elif k in _NAV_ATRIB_SRCSET:
+            novo = _reescrever_srcset(bruto, base, ligar)
+        elif k == "style":
+            novo = _reescrever_css(bruto, base, ligar)
+        elif k == "content" and refresh:
+            achado = _NAV_REFRESH.match(bruto)
+            destino = ligar(base, achado.group(3)) if achado else None
+            novo = achado.group(1) + destino if destino else None
+        elif k == "srcdoc" and nome == "iframe":
+            novo = _reescrever_html(bruto, base, ligar, com_script=False)
+        else:
+            return m.group(0)
+        if novo is None or novo == bruto:
+            return m.group(0)
+        return f'{espaco}{chave}="{html.escape(novo, quote=True)}"'
+
+    novo_corpo = _NAV_ATRIBUTO.sub(atributo, resto[:-1] if fechada else corpo)
+    return f"<{nome_original}{novo_corpo}{'/' if fechada else ''}>"
+
+
+def _script_do_navegador(com_barra: bool) -> str:
+    return f'<script src="/_tt/nav.js?v={NAV_JS_VERSAO}" data-barra="{1 if com_barra else 0}"></script>'
+
+
+def _reescrever_html(pagina: str, base_url: str, ligar=_proxiar, com_barra: bool = True,
+                     com_script: bool = True) -> str:
     base = base_url
     achado = _NAV_BASE.search(pagina)
     if achado:
-        href = achado.group(1) or achado.group(2) or achado.group(3) or ""
+        href = html.unescape(achado.group(1) or achado.group(2) or achado.group(3) or "")
         with contextlib.suppress(ValueError):
             base = urllib.parse.urljoin(base_url, href)
-    pagina = _NAV_BASE.sub("", pagina)   # a navegação passa a ser toda absoluta; a <base> original atrapalharia
+    saida, pos = [], 0
+    ponto_head = ponto_html = None
+    while True:
+        m = _NAV_MARCA.search(pagina, pos)
+        if not m:
+            saida.append(pagina[pos:])
+            break
+        saida.append(pagina[pos:m.start()])
+        marca = m.group(0)
+        pos = m.end()
+        if marca.startswith("<!--"):
+            saida.append(marca)
+            continue
+        nome = _NAV_NOME_TAG.match(marca).group(1).lower()
+        saida.append(_reescrever_tag(marca, nome, base, ligar))
+        if nome == "head" and ponto_head is None:
+            ponto_head = len(saida)
+        elif nome == "html" and ponto_html is None:
+            ponto_html = len(saida)
+        fim = _NAV_FIM_BRUTO.get(nome)
+        if fim:   # conteúdo bruto: o CSS do <style> é reescrito; script e textarea ficam intactos
+            f = fim.search(pagina, pos)
+            final = f.start() if f else len(pagina)
+            conteudo = pagina[pos:final]
+            saida.append(_reescrever_css(conteudo, base, ligar) if nome == "style" else conteudo)
+            pos = final
+    if com_script:
+        script = _script_do_navegador(com_barra)
+        if ponto_head is not None:
+            saida.insert(ponto_head, script)
+        elif ponto_html is not None:
+            saida.insert(ponto_html, script)
+        else:   # sem <head> nem <html>: depois do <!doctype>, para a página não cair no modo "quirks"
+            inicio = re.match(r"\s*(?:<!doctype[^>]*>)?", saida[0] if saida else "", re.I)
+            corte = inicio.end() if inicio else 0
+            saida[0:1] = [saida[0][:corte], script, saida[0][corte:]] if saida else [script]
+    return "".join(saida)
 
-    def attr(m):
-        valor = m.group(2) if m.group(2) is not None else m.group(3) if m.group(3) is not None else m.group(4)
-        novo = _proxiar(base, valor or "")
-        return f'{m.group(1)}"{html.escape(novo, quote=True)}"' if novo else m.group(0)
 
-    def srcset(m):
-        lista = m.group(2) if m.group(2) is not None else (m.group(3) or "")
-        saida = []
-        for item in lista.split(","):
-            item = item.strip()
-            if not item:
-                continue
-            pedacos = item.split(None, 1)
-            novo = _proxiar(base, pedacos[0])
-            saida.append((novo + (" " + pedacos[1] if len(pedacos) > 1 else "")) if novo else item)
-        return f'{m.group(1)}"{html.escape(", ".join(saida), quote=True)}"'
+_NAV_M3U_URI = re.compile(r'(URI\s*=\s*")([^"]*)(")', re.I)
 
-    def style_attr(m):
-        css = m.group(2) if m.group(2) is not None else (m.group(3) or "")
-        return f'{m.group(1)}"{html.escape(_reescrever_css(css, base), quote=True)}"'
 
-    def style_bloco(m):
-        return m.group(1) + _reescrever_css(m.group(2), base) + m.group(3)
-
-    def meta_refresh(m):
-        novo = _proxiar(base, m.group(2).strip().strip("'\""))
-        return m.group(1) + html.escape(novo, quote=True) if novo else m.group(0)
-
-    pagina = _NAV_STYLE_BLOCO.sub(style_bloco, pagina)
-    pagina = _NAV_STYLE_ATTR.sub(style_attr, pagina)
-    pagina = _NAV_SRCSET.sub(srcset, pagina)
-    pagina = _NAV_ATTR.sub(attr, pagina)
-    pagina = _NAV_META_REFRESH.sub(meta_refresh, pagina)
-    if com_barra:
-        barra = _BARRA_NAVEGADOR.replace("__URL__", html.escape(base, quote=True)).replace(
-            "__RECARREGAR__", html.escape("/r/" + _b64_url(base), quote=True))
-        if re.search(r"<body\b[^>]*>", pagina, re.I):
-            pagina = re.sub(r"(<body\b[^>]*>)", lambda m: m.group(1) + barra, pagina, count=1, flags=re.I)
+def _reescrever_m3u(texto: str, base: str, ligar=_proxiar) -> str:
+    """Listas HLS (.m3u8) e M3U: cada endereço (linha ou URI="...") passa a vir pelo celular."""
+    linhas = []
+    for linha in texto.splitlines():
+        limpa = linha.strip()
+        if not limpa:
+            linhas.append(linha)
+        elif limpa.startswith("#"):
+            linhas.append(_NAV_M3U_URI.sub(lambda m: m.group(1) + (ligar(base, m.group(2)) or m.group(2))
+                                           + m.group(3), linha))
         else:
-            pagina = barra + pagina
-    return pagina
+            linhas.append(ligar(base, limpa) or linha)
+    return "\n".join(linhas) + "\n"
 
 
-_BARRA_NAVEGADOR = (
-    '<div style="position:fixed;top:0;left:0;right:0;z-index:2147483647;display:flex;gap:6px;align-items:center;'
-    'background:#0d0d0d;border-bottom:1px solid #333;padding:6px 8px;font:14px system-ui,-apple-system,sans-serif;'
-    'box-shadow:0 1px 6px #0008;box-sizing:border-box">'
-    '<a href="/" title="Início" style="color:#6cf;text-decoration:none;font-size:20px;line-height:1">&#8962;</a>'
-    '<form action="/ir" method="get" style="flex:1;display:flex;margin:0">'
-    '<input name="q" value="__URL__" spellcheck="false" autocapitalize="off" autocomplete="off" '
-    'style="flex:1;min-width:0;padding:7px 10px;border-radius:9px;border:1px solid #444;background:#1c1c1c;'
-    'color:#eee;font-size:14px"></form>'
-    '<a href="__RECARREGAR__" title="Recarregar" style="color:#6cf;text-decoration:none;font-size:18px;'
-    'line-height:1">&#8635;</a></div><div style="height:48px"></div>')
+_NAV_MPD_BASE = re.compile(r"(<(?:\w+:)?BaseURL\b[^>]*>)([^<]*)(</(?:\w+:)?BaseURL>)", re.I)
+_NAV_MPD_ATRIB = re.compile(r'(\s(?:media|initialization|sourceURL|xlink:href|href)\s*=\s*")([^"]*)(")', re.I)
 
 
-# ── Páginas próprias do navegador (início e erro) ─────────────────────
+def _reescrever_mpd(texto: str, base: str, ligar=_proxiar) -> str:
+    """Manifesto DASH (.mpd): os endereços absolutos passam pelo celular; os relativos já funcionam sozinhos, porque
+    o caminho no navegador é o mesmo do site. Os modelos ($Number$, $Time$...) ficam intactos."""
+    def absoluto(valor: str) -> str | None:
+        valor = html.unescape(valor.strip())
+        return ligar(base, valor) if re.match(r"(?i)https?://", valor) else None
 
-def _pagina_inicio_navegador() -> bytes:
-    return ("""<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">
-<title>Navegador pelo celular</title><style>
-*{box-sizing:border-box}html,body{margin:0;height:100%}
-body{background:#0e0f13;color:#e8e8e8;font-family:system-ui,-apple-system,sans-serif;display:flex;
- flex-direction:column;align-items:center;justify-content:center;padding:24px;text-align:center}
-h1{font-size:1.5em;margin:.2em 0}p{opacity:.75;margin:.3em 0 1.4em;max-width:460px;line-height:1.5}
-form{display:flex;width:100%;max-width:520px;gap:8px}
-input{flex:1;min-width:0;padding:14px 16px;border-radius:12px;border:1px solid #333;background:#181a20;
- color:#fff;font-size:16px}
-button{padding:0 20px;border:0;border-radius:12px;background:#2a6df0;color:#fff;font-size:16px;cursor:pointer}
-.atalhos{margin-top:18px;display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
-.atalhos a{color:#8bf;text-decoration:none;border:1px solid #333;border-radius:20px;padding:6px 14px;font-size:14px}
-.rodape{margin-top:26px;font-size:12px;opacity:.5;max-width:460px;line-height:1.5}
+    def base_url(m):
+        novo = absoluto(m.group(2))
+        return m.group(1) + html.escape(novo, quote=False) + m.group(3) if novo else m.group(0)
+
+    def atrib(m):
+        novo = absoluto(m.group(2))
+        return m.group(1) + html.escape(novo, quote=True) + m.group(3) if novo else m.group(0)
+
+    return _NAV_MPD_ATRIB.sub(atrib, _NAV_MPD_BASE.sub(base_url, texto))
+
+
+def _motivo_amigavel(erro_rede) -> str:
+    """Explica em português por que o site não abriu."""
+    motivo = getattr(erro_rede, "reason", erro_rede)
+    if isinstance(motivo, socket.gaierror) or "não achei o endereço" in str(motivo):
+        return "não achei esse site. Confira o endereço (ou a internet do celular)."
+    if isinstance(motivo, (socket.timeout, TimeoutError)):
+        return "o site demorou demais para responder."
+    if isinstance(motivo, ConnectionRefusedError):
+        return "o site recusou a conexão."
+    if isinstance(motivo, ssl.SSLCertVerificationError):
+        return "o certificado de segurança do site é inválido (conexão segura recusada)."
+    if isinstance(motivo, ssl.SSLError):
+        return "a conexão segura com o site falhou."
+    if isinstance(motivo, ConnectionResetError):
+        return "a conexão caiu no meio do caminho."
+    return str(motivo) or "erro de rede."
+
+
+# ── Páginas próprias do navegador (início, erro, mídia e VLC Web) ─────
+# Todas funcionam sem internet no aparelho de quem abre (nada de fontes ou scripts de fora) e seguem o tema
+# claro/escuro do sistema.
+
+NAV_CSS = """:root{color-scheme:light dark;--bg:#f3f4f8;--bg2:#fff;--tx:#14161b;--sub:#5d6474;--borda:rgba(15,20,35,.1);
+--campo:#fff;--real:#2f6df6;--real2:#6a4cff;--sombra:0 12px 32px -16px rgba(20,30,60,.32)}
+@media (prefers-color-scheme:dark){:root{--bg:#0b0d12;--bg2:#151820;--tx:#eef0f5;--sub:#99a0b0;--borda:rgba(255,255,255,.09);
+--campo:#1a1e27;--real:#6f9bff;--real2:#9a7bff;--sombra:0 16px 40px -18px rgba(0,0,0,.8)}}
+*{box-sizing:border-box}html,body{margin:0}
+body{min-height:100vh;background:radial-gradient(1100px 560px at 8% -12%,rgba(47,109,246,.18),transparent 62%),
+radial-gradient(900px 520px at 108% 6%,rgba(255,107,0,.13),transparent 60%),var(--bg);background-attachment:fixed;color:var(--tx);
+font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased;
+-webkit-tap-highlight-color:transparent}
+a{color:var(--real);text-decoration:none}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:44px;padding:0 18px;border-radius:14px;
+border:1px solid var(--borda);background:var(--bg2);color:var(--tx);font:inherit;font-weight:650;cursor:pointer;
+text-decoration:none;transition:transform .08s,box-shadow .15s,filter .15s}
+.btn:hover{filter:brightness(1.04)}.btn:active{transform:scale(.97)}
+.btn.prim{background:linear-gradient(135deg,var(--real),var(--real2));color:#fff;border-color:transparent;
+box-shadow:0 10px 22px -10px rgba(47,109,246,.85)}
+.btn.vlc{background:linear-gradient(135deg,#ffa53a,#ff6b00);color:#fff;border-color:transparent;
+box-shadow:0 10px 22px -10px rgba(255,107,0,.85)}
+.cartao{width:100%;max-width:540px;background:var(--bg2);border:1px solid var(--borda);border-radius:26px;box-shadow:var(--sombra);
+padding:30px 26px;text-align:center}
+.centro{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px 16px}
+.cartao h1{font-size:22px;line-height:1.25;margin:16px 0 8px}.cartao p{color:var(--sub);margin:0 auto 6px;max-width:440px}
+.alvo{display:block;margin:14px auto 0;padding:10px 12px;border-radius:12px;background:var(--campo);border:1px solid var(--borda);
+font:12.5px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:var(--sub);word-break:break-all;max-width:460px}
+.acoes{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:22px}
+.selo{width:64px;height:64px;border-radius:20px;display:inline-flex;align-items:center;justify-content:center;font-size:30px;
+background:var(--campo);border:1px solid var(--borda)}
+.selo.vlc{background:linear-gradient(135deg,#ffa53a,#ff6b00);color:#fff;border:0;box-shadow:0 14px 30px -12px rgba(255,107,0,.85)}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}"""
+
+NAV_ICONE = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs><linearGradient id="g" x1="0" y1="0" '
+             'x2="1" y2="1"><stop offset="0" stop-color="#3d7bff"/><stop offset="1" stop-color="#7a4dff"/></linearGradient>'
+             '</defs><rect width="64" height="64" rx="18" fill="url(#g)"/><g fill="none" stroke="#fff" stroke-width="3.2" '
+             'stroke-linecap="round"><circle cx="32" cy="32" r="16"/><path d="M16 32h32M32 16c6 6.5 6 25.5 0 32M32 16c-6 '
+             '6.5-6 25.5 0 32"/></g><rect x="40" y="38" width="15" height="19" rx="3.5" fill="#ff7a00" stroke="#fff" '
+             'stroke-width="2.4"/><path d="M45.5 44.2v6.6l5-3.3z" fill="#fff"/></svg>')
+
+
+NAV_JS = r"""/* Termux-Toons · navegador pelo celular: faz o JavaScript da página também passar pelo celular e desenha a
+   barra de endereço (num Shadow DOM, para o CSS do site não bagunçar a barra nem a barra bagunçar o site). */
+(function () {
+  'use strict';
+  if (window.__ttNav) return;
+  window.__ttNav = true;
+  var euMesmo = document.currentScript;
+  var COM_BARRA = !euMesmo || euMesmo.getAttribute('data-barra') !== '0';
+  var ORIGEM = location.origin;
+  var NOSSO = /^\/(?:p|m|_tt|vlc)\//;
+  var IGNORAR = /^(?:#|(?:data|blob|javascript|vbscript|about|mailto|tel|sms|intent|magnet|geo|market|whatsapp|tg|file|chrome):)/i;
+  var RE_LISTA = /\.(?:m3u8|mpd)$/i;
+  var agendarContagem = function () { /* trocada quando a barra existir */ };
+  var RE_MIDIA = /\.(?:mp4|m4v|webm|mkv|mov|ogv|avi|wmv|flv|mpg|mpeg|ts|m2ts|3gp|vob|mp3|m4a|m4b|aac|wav|flac|ogg|oga|opus|wma|mka|weba|m3u8|m3u|mpd)$/i;
+
+  /* ---------- endereços: real ⇄ caminho no navegador ---------- */
+  function realDoCaminho(caminho, busca, ancora) {
+    var m = /^\/(?:p|m\/[0-9a-f]{8,64})\/(https?)\/([^\/?#]+)(\/[^]*)?$/.exec(caminho);
+    if (!m) return null;
+    var host = m[2];
+    try { host = decodeURIComponent(host); } catch (e) { /* fica */ }
+    return m[1] + '://' + host + (m[3] || '/') + (busca || '') + (ancora || '');
+  }
+  function real() { return realDoCaminho(location.pathname, location.search, location.hash); }
+  function realDe(u) {
+    if (!u) return null;
+    var a;
+    try { a = new URL(u, location.href); } catch (e) { return null; }
+    if (a.origin === ORIGEM) return realDoCaminho(a.pathname, a.search, a.hash);
+    return /^https?:$/.test(a.protocol) ? a.href : null;
+  }
+  function prox(u) {
+    if (u == null || u === '') return u;
+    var s = String(u).trim();
+    if (!s || IGNORAR.test(s) || NOSSO.test(s)) return u;
+    var r = real(), abs;
+    try { abs = new URL(s, r || location.href); } catch (e) { return u; }
+    if (abs.protocol !== 'http:' && abs.protocol !== 'https:') return u;
+    if (abs.origin === ORIGEM) {
+      if (NOSSO.test(abs.pathname)) return abs.pathname + abs.search + abs.hash;
+      if (!r) return u;
+      abs = new URL(abs.pathname + abs.search + abs.hash, new URL(r).origin);
+    }
+    return '/p/' + abs.protocol.slice(0, -1) + '/' + abs.host + abs.pathname + abs.search + abs.hash;
+  }
+  function proxSrcset(v) {
+    if (!v) return v;
+    return String(v).split(',').map(function (parte) {
+      var t = parte.trim();
+      if (!t) return t;
+      var i = t.search(/\s/);
+      return i < 0 ? prox(t) : prox(t.slice(0, i)) + t.slice(i);
+    }).join(', ');
+  }
+
+  /* ---------- mídias pedidas pela página (players HLS/DASH em JavaScript) ---------- */
+  var listasPedidas = [];
+  function anotar(u) {
+    try {
+      var r = realDe(u);
+      if (r && RE_LISTA.test(new URL(r).pathname) && listasPedidas.indexOf(r) < 0) { listasPedidas.push(r); agendarContagem(); }
+    } catch (e) { /* ignora */ }
+  }
+
+  /* ---------- pedidos feitos por JavaScript ---------- */
+  try {
+    var fetchOrig = window.fetch;
+    if (fetchOrig) window.fetch = function (entrada, opcoes) {
+      try {
+        if (typeof entrada === 'string' || entrada instanceof URL) entrada = prox(String(entrada));
+        else if (entrada && entrada.url) { var nu = prox(entrada.url); if (nu !== entrada.url) entrada = new Request(nu, entrada); }
+        anotar(typeof entrada === 'string' ? entrada : entrada && entrada.url);
+      } catch (e) { /* segue com o original */ }
+      return fetchOrig.call(this, entrada, opcoes);
+    };
+  } catch (e) { /* sem fetch */ }
+  try {
+    var abrirXhr = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function (metodo, url) {
+      var args = Array.prototype.slice.call(arguments);
+      try { args[1] = prox(url); anotar(args[1]); } catch (e) { /* segue */ }
+      return abrirXhr.apply(this, args);
+    };
+  } catch (e) { /* sem XHR */ }
+  try {
+    if (navigator.sendBeacon) {
+      var beacon = navigator.sendBeacon.bind(navigator);
+      navigator.sendBeacon = function (url, dados) { return beacon(prox(url), dados); };
+    }
+  } catch (e) { /* ignora */ }
+  var abrirJanela = window.open;
+  try {
+    window.open = function (url) {
+      var args = Array.prototype.slice.call(arguments);
+      if (url) args[0] = prox(url);
+      return abrirJanela.apply(window, args);
+    };
+  } catch (e) { /* ignora */ }
+  ['EventSource', 'Worker', 'SharedWorker'].forEach(function (nome) {
+    try {
+      var Orig = window[nome];
+      if (!Orig) return;
+      var Novo = function (url, opcoes) { return new Orig(prox(url), opcoes); };
+      Novo.prototype = Orig.prototype;
+      window[nome] = Novo;
+    } catch (e) { /* ignora */ }
+  });
+  ['pushState', 'replaceState'].forEach(function (nome) {
+    try {
+      var orig = history[nome];
+      history[nome] = function (estado, titulo, url) {
+        if (url != null) { try { url = prox(url); } catch (e) { /* segue */ } }
+        return orig.call(this, estado, titulo, url);
+      };
+    } catch (e) { /* ignora */ }
+  });
+  /* service workers ficariam presos no endereço do navegador (que é o mesmo para todos os sites) */
+  try {
+    if (navigator.serviceWorker) {
+      navigator.serviceWorker.register = function () { return Promise.reject(new Error('Service workers ficam desligados no navegador pelo celular.')); };
+      navigator.serviceWorker.getRegistrations().then(function (lista) {
+        lista.forEach(function (r) { if (/\/[pm]\//.test(r.scope)) r.unregister(); });
+      }).catch(function () {});
+    }
+  } catch (e) { /* ignora */ }
+
+  /* ---------- atributos com endereço (src, href...) mudados pelo JavaScript ---------- */
+  function prenderSetter(Classe, prop, conv) {
+    try {
+      var proto = Classe && Classe.prototype;
+      var d = proto && Object.getOwnPropertyDescriptor(proto, prop);
+      if (!d || !d.set || !d.configurable) return;
+      Object.defineProperty(proto, prop, {
+        configurable: true, enumerable: d.enumerable, get: d.get,
+        set: function (v) { var nv = v; try { nv = conv(v); } catch (e) { /* segue */ } return d.set.call(this, nv); }
+      });
+    } catch (e) { /* ignora */ }
+  }
+  [['HTMLAnchorElement', 'href'], ['HTMLAreaElement', 'href'], ['HTMLLinkElement', 'href'], ['HTMLImageElement', 'src'],
+   ['HTMLScriptElement', 'src'], ['HTMLIFrameElement', 'src'], ['HTMLMediaElement', 'src'], ['HTMLSourceElement', 'src'],
+   ['HTMLTrackElement', 'src'], ['HTMLEmbedElement', 'src'], ['HTMLFormElement', 'action'], ['HTMLInputElement', 'formAction'],
+   ['HTMLButtonElement', 'formAction'], ['HTMLVideoElement', 'poster'], ['HTMLObjectElement', 'data']
+  ].forEach(function (p) { prenderSetter(window[p[0]], p[1], prox); });
+  prenderSetter(window.HTMLImageElement, 'srcset', proxSrcset);
+  prenderSetter(window.HTMLSourceElement, 'srcset', proxSrcset);
+
+  var ATRIB_URL = { href: 1, src: 1, action: 1, formaction: 1, poster: 1, background: 1, 'data-src': 1, 'xlink:href': 1 };
+  var ATRIB_SRCSET = { srcset: 1, imagesrcset: 1, 'data-srcset': 1 };
+  var setAttrOrig = Element.prototype.setAttribute;
+  function ajustarValor(el, nome, valor) {
+    var n = String(nome).toLowerCase();
+    if (ATRIB_URL[n] || (n === 'data' && el.tagName === 'OBJECT')) return prox(valor);
+    if (ATRIB_SRCSET[n]) return proxSrcset(valor);
+    return valor;
+  }
+  try {
+    Element.prototype.setAttribute = function (nome, valor) {
+      try {
+        var n = String(nome).toLowerCase();
+        if (n === 'integrity') return undefined;
+        valor = ajustarValor(this, n, valor);
+      } catch (e) { /* segue */ }
+      return setAttrOrig.call(this, nome, valor);
+    };
+  } catch (e) { /* ignora */ }
+
+  var SELETOR = '[href],[src],[action],[formaction],[poster],[srcset],[data-src],[data-srcset],object[data],[integrity]';
+  function ajustarElemento(el) {
+    if (!el || el.nodeType !== 1 || !el.getAttribute) return;
+    if (el.hasAttribute('integrity')) el.removeAttribute('integrity');
+    ['href', 'src', 'action', 'formaction', 'poster', 'srcset', 'data-src', 'data-srcset', 'data'].forEach(function (n) {
+      var v = el.getAttribute(n);
+      if (v == null || v === '') return;
+      var nv = ajustarValor(el, n, v);
+      if (nv !== v && nv != null) setAttrOrig.call(el, n, nv);
+    });
+  }
+  try {
+    new MutationObserver(function (lista) {
+      lista.forEach(function (m) {
+        if (m.type === 'attributes') { ajustarElemento(m.target); return; }
+        m.addedNodes.forEach(function (n) {
+          if (n.nodeType !== 1) return;
+          ajustarElemento(n);
+          if (n.querySelectorAll) n.querySelectorAll(SELETOR).forEach(ajustarElemento);
+        });
+      });
+      agendarContagem();
+    }).observe(document.documentElement, {
+      childList: true, subtree: true, attributes: true,
+      attributeFilter: ['href', 'src', 'action', 'formaction', 'poster', 'srcset', 'data-src', 'data-srcset', 'data']
+    });
+  } catch (e) { /* navegador antigo */ }
+
+  /* cliques, formulários e mudanças de endereço que escaparam do resto */
+  document.addEventListener('click', function (e) {
+    try {
+      var a = e.target && e.target.closest && e.target.closest('a[href],area[href]');
+      if (!a) return;
+      var h = a.getAttribute('href');
+      var nv = prox(h);
+      if (nv !== h) setAttrOrig.call(a, 'href', nv);
+    } catch (x) { /* ignora */ }
+  }, true);
+  document.addEventListener('submit', function (e) {
+    try { ajustarElemento(e.target); } catch (x) { /* ignora */ }
+  }, true);
+  try {
+    var enviarForm = HTMLFormElement.prototype.submit;
+    HTMLFormElement.prototype.submit = function () { try { ajustarElemento(this); } catch (e) { /* segue */ } return enviarForm.call(this); };
+  } catch (e) { /* ignora */ }
+  try {
+    if (window.navigation && navigation.addEventListener) {
+      navigation.addEventListener('navigate', function (e) {
+        try {
+          if (!e.cancelable || e.hashChange || e.downloadRequest || e.formData) return;
+          var d = e.destination && e.destination.url;
+          if (!d) return;
+          var u = new URL(d);
+          if (u.origin === ORIGEM || !/^https?:$/.test(u.protocol)) return;
+          e.preventDefault();
+          location.assign(prox(d));
+        } catch (x) { /* ignora */ }
+      });
+    }
+  } catch (e) { /* ignora */ }
+
+  /* ---------- guardar no histórico (fica só neste aparelho) ---------- */
+  var LS = {
+    get: function (k, p) { try { var v = localStorage.getItem('tt:' + k); return v == null ? p : JSON.parse(v); } catch (e) { return p; } },
+    set: function (k, v) { try { localStorage.setItem('tt:' + k, JSON.stringify(v)); } catch (e) { /* cheio ou bloqueado */ } }
+  };
+  function guardarHistorico() {
+    var r = real();
+    if (!r || window.top !== window.self || LS.get('semHist', false)) return;
+    var lista = LS.get('hist', []);
+    if (!Array.isArray(lista)) lista = [];
+    lista = lista.filter(function (x) { return x && x.u !== r; });
+    lista.unshift({ u: r, t: String(document.title || '').trim().slice(0, 140), d: Date.now() });
+    LS.set('hist', lista.slice(0, 40));
+  }
+
+  /* ---------- achar vídeos e músicas na página ---------- */
+  function nomeDe(r) {
+    try {
+      var u = new URL(r);
+      var b = decodeURIComponent(u.pathname.split('/').filter(Boolean).pop() || '') || u.host;
+      return b.length > 90 ? b.slice(0, 87) + '…' : b;
+    } catch (e) { return r; }
+  }
+  function tipoDe(r, tag) {
+    var p = '';
+    try { p = new URL(r).pathname.toLowerCase(); } catch (e) { /* ignora */ }
+    if (/\.m3u8?$/.test(p)) return 'HLS';
+    if (/\.mpd$/.test(p)) return 'DASH';
+    if (tag === 'AUDIO' || /\.(mp3|m4a|m4b|aac|wav|flac|ogg|oga|opus|wma|mka|weba)$/.test(p)) return 'Áudio';
+    return 'Vídeo';
+  }
+  function acharMidias() {
+    var achadas = [], vistos = {};
+    function add(u, rotulo, tag) {
+      if (!u || /^(?:blob|data|mediastream):/i.test(u)) return;
+      var r = realDe(u);
+      if (!r || vistos[r]) return;
+      vistos[r] = 1;
+      achadas.push({ real: r, nome: (rotulo || '').trim() || nomeDe(r), tipo: tipoDe(r, tag), host: (function () { try { return new URL(r).host; } catch (e) { return ''; } })() });
+    }
+    document.querySelectorAll('video,audio').forEach(function (m) {
+      add(m.currentSrc || m.getAttribute('src'), m.getAttribute('title') || m.getAttribute('aria-label'), m.tagName);
+      m.querySelectorAll('source[src]').forEach(function (s) { add(s.getAttribute('src'), '', m.tagName); });
+    });
+    listasPedidas.forEach(function (r) { add(r, '', ''); });
+    document.querySelectorAll('a[href]').forEach(function (a) {
+      var r = realDe(a.getAttribute('href'));
+      var p = '';
+      try { p = r ? new URL(r).pathname : ''; } catch (e) { /* ignora */ }
+      if (r && RE_MIDIA.test(p)) add(r, (a.textContent || '').replace(/\s+/g, ' ').slice(0, 90), '');
+    });
+    return achadas;
+  }
+
+  /* ---------- a barra ---------- */
+  var IC = {
+    voltar: '<path d="M15 5l-7 7 7 7"/>',
+    avancar: '<path d="M9 5l7 7-7 7"/>',
+    inicio: '<path d="M4 11.5 12 5l8 6.5"/><path d="M6.5 10v9h4v-5h3v5h4v-9"/>',
+    recarregar: '<path d="M19 12a7 7 0 1 1-2.05-4.95"/><path d="M19 4.5V9h-4.5"/>',
+    mais: '<circle cx="12" cy="5.5" r="1.3" fill="currentColor"/><circle cx="12" cy="12" r="1.3" fill="currentColor"/><circle cx="12" cy="18.5" r="1.3" fill="currentColor"/>',
+    seguro: '<rect x="5.5" y="10.5" width="13" height="9.5" rx="2.5"/><path d="M8.5 10.5V8a3.5 3.5 0 0 1 7 0v2.5"/>',
+    inseguro: '<path d="M12 4 3 19.5h18z"/><path d="M12 10v4.5"/><path d="M12 17.2v.1"/>',
+    play: '<path d="M8 5.5v13l10.5-6.5z" fill="currentColor" stroke="none"/>',
+    fechar: '<path d="M6.5 6.5l11 11M17.5 6.5l-11 11"/>',
+    copiar: '<rect x="8.5" y="8.5" width="11" height="11" rx="2.5"/><path d="M15.5 8.5V6a1.5 1.5 0 0 0-1.5-1.5H6A1.5 1.5 0 0 0 4.5 6v8A1.5 1.5 0 0 0 6 15.5h2.5"/>',
+    externo: '<path d="M14 4.5h5.5V10"/><path d="M19.5 4.5 11 13"/><path d="M17 14v4a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 5 18V9a1.5 1.5 0 0 1 1.5-1.5h4"/>',
+    posicao: '<rect x="5" y="4.5" width="14" height="15" rx="2.5"/><path d="M5 15.5h14"/>',
+    ocultar: '<path d="M4 12s3-6 8-6 8 6 8 6-3 6-8 6-8-6-8-6z"/><path d="M4.5 4.5l15 15"/>',
+    sair: '<path d="M14 5h3.5A1.5 1.5 0 0 1 19 6.5v11a1.5 1.5 0 0 1-1.5 1.5H14"/><path d="M10 16l-4-4 4-4"/><path d="M6 12h9"/>',
+    globo: '<circle cx="12" cy="12" r="8"/><path d="M4 12h16"/><path d="M12 4c2.5 2.7 2.5 13.3 0 16M12 4c-2.5 2.7-2.5 13.3 0 16"/>',
+    nota: '<path d="M9 18.5V6.5l10-2v12"/><circle cx="6.8" cy="18.5" r="2.2"/><circle cx="16.8" cy="16.5" r="2.2"/>',
+    filme: '<rect x="4" y="5.5" width="16" height="13" rx="2.5"/><path d="M10.2 9.3v5.4l4.6-2.7z" fill="currentColor"/>',
+    lista: '<path d="M5 7h10M5 12h10M5 17h6"/><path d="M17 13.5v5l3.5-2.5z" fill="currentColor"/>'
+  };
+  function svg(nome, tam) {
+    tam = tam || 20;
+    return '<svg viewBox="0 0 24 24" width="' + tam + '" height="' + tam + '" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + IC[nome] + '</svg>';
+  }
+  function esc(t) { return String(t == null ? '' : t).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+
+  var CSS = ':host{all:initial}*{box-sizing:border-box}' +
+    '.r{--bg:rgba(252,252,254,.86);--tx:#16181d;--sub:#5f6676;--campo:rgba(15,20,35,.065);--borda:rgba(15,20,35,.11);--hover:rgba(15,20,35,.075);--painel:#fff;--real:#2f6df6;' +
+    'font:14px/1.3 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;color:var(--tx);-webkit-font-smoothing:antialiased;-webkit-tap-highlight-color:transparent}' +
+    '@media (prefers-color-scheme:dark){.r{--bg:rgba(19,21,27,.84);--tx:#eef0f5;--sub:#9ba2b2;--campo:rgba(255,255,255,.085);--borda:rgba(255,255,255,.12);--hover:rgba(255,255,255,.09);--painel:#1b1e26;--real:#7ea6ff}}' +
+    '.barra{position:fixed;left:0;right:0;top:0;height:52px;display:flex;align-items:center;gap:3px;padding:0 max(6px,env(safe-area-inset-right)) 0 max(6px,env(safe-area-inset-left));background:var(--bg);-webkit-backdrop-filter:saturate(1.8) blur(16px);backdrop-filter:saturate(1.8) blur(16px);border-bottom:1px solid var(--borda);box-shadow:0 8px 24px -16px rgba(0,0,0,.45);transition:transform .22s ease;z-index:2147483647}' +
+    '.barra.baixo{top:auto;bottom:0;height:calc(52px + env(safe-area-inset-bottom));padding-bottom:env(safe-area-inset-bottom);border-bottom:0;border-top:1px solid var(--borda)}' +
+    '.barra.oculta{transform:translateY(-110%)}.barra.baixo.oculta{transform:translateY(110%)}' +
+    '.bt{all:unset;box-sizing:border-box;flex:none;display:inline-flex;align-items:center;justify-content:center;width:38px;height:38px;border-radius:12px;cursor:pointer;color:var(--tx)}' +
+    '.bt:hover{background:var(--hover)}.bt:active{transform:scale(.93)}.bt:focus-visible,.vlc:focus-visible,.item:focus-visible,.acao:focus-visible{outline:2px solid var(--real);outline-offset:1px}' +
+    '.end{flex:1;min-width:0;display:flex;align-items:center;gap:8px;height:38px;margin:0 3px;padding:0 6px 0 11px;border-radius:19px;background:var(--campo);border:1px solid transparent;transition:border-color .15s,background .15s}' +
+    '.end:focus-within{border-color:var(--real);background:var(--painel)}' +
+    '.end input{all:unset;flex:1;min-width:0;height:100%;font-size:15px;color:var(--tx);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}' +
+    '.seg{flex:none;display:inline-flex;color:#1f9d55}.seg.nao{color:#e5484d}' +
+    '.vlc{all:unset;box-sizing:border-box;flex:none;display:inline-flex;align-items:center;gap:6px;height:36px;margin:0 2px;padding:0 12px 0 10px;border-radius:18px;cursor:pointer;color:#fff;font-weight:700;font-size:13px;letter-spacing:.2px;background:linear-gradient(135deg,#ffa53a,#ff6b00);box-shadow:0 6px 16px -6px rgba(255,107,0,.75)}' +
+    '.vlc:active{transform:scale(.95)}.vlc .n{display:none;min-width:18px;height:18px;padding:0 5px;border-radius:9px;background:#fff;color:#e25a00;font-size:11px;font-weight:800;align-items:center;justify-content:center}.vlc.tem .n{display:inline-flex}' +
+    '@media (max-width:560px){.largo{display:none}.vlc .rot{display:none}.vlc{padding:0 9px}}' +
+    '.painel{position:fixed;top:58px;right:8px;width:min(430px,calc(100vw - 16px));max-height:min(74vh,620px);overflow:auto;overscroll-behavior:contain;background:var(--painel);color:var(--tx);border:1px solid var(--borda);border-radius:18px;box-shadow:0 28px 64px -16px rgba(0,0,0,.5);padding:6px;display:none;z-index:2147483647}' +
+    '.painel.baixo{top:auto;bottom:calc(60px + env(safe-area-inset-bottom))}.painel.aberto{display:block;animation:surge .16s ease}' +
+    '@keyframes surge{from{opacity:0;transform:translateY(-6px) scale(.98)}}' +
+    '.item{all:unset;box-sizing:border-box;display:flex;align-items:center;gap:12px;width:100%;padding:11px 12px;border-radius:12px;cursor:pointer;font-size:14px;color:var(--tx)}.item:hover{background:var(--hover)}.item svg{flex:none;color:var(--sub)}' +
+    '.sep{height:1px;background:var(--borda);margin:5px 8px}' +
+    '.cab{display:flex;align-items:center;gap:10px;padding:8px 6px 8px 12px}.cab b{flex:1;font-size:15px}.cab small{display:block;font-weight:400;color:var(--sub);font-size:12px;margin-top:1px}' +
+    '.mid{display:flex;align-items:center;gap:11px;padding:9px 8px 9px 10px;border-radius:14px}.mid:hover{background:var(--hover)}' +
+    '.mid .ic{flex:none;width:42px;height:42px;border-radius:12px;display:flex;align-items:center;justify-content:center;color:#fff;background:linear-gradient(135deg,#ffa53a,#ff6b00)}.mid .ic.au{background:linear-gradient(135deg,#7c5cff,#3d7bff)}' +
+    '.mid .tx{flex:1;min-width:0}.mid .nm{font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mid .ds{font-size:12px;color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}' +
+    '.acao{all:unset;box-sizing:border-box;flex:none;height:34px;padding:0 12px;border-radius:17px;display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;font-weight:650;background:var(--campo);color:var(--tx)}.acao.forte{background:#ff6b00;color:#fff}.acao.so{width:34px;padding:0;justify-content:center}' +
+    '.vazio{padding:6px 14px 8px;color:var(--sub);font-size:13.5px;line-height:1.5}' +
+    '.colar{display:flex;gap:6px;padding:4px 8px 8px}.colar input{all:unset;box-sizing:border-box;flex:1;min-width:0;height:38px;padding:0 12px;border-radius:12px;background:var(--campo);font-size:14px;color:var(--tx)}' +
+    '.pe{display:flex;gap:6px;justify-content:space-between;align-items:center;padding:8px 8px 4px;font-size:12px;color:var(--sub)}' +
+    '.aviso{position:fixed;left:50%;bottom:28px;transform:translate(-50%,16px);opacity:0;background:rgba(17,18,22,.94);color:#fff;padding:10px 16px;border-radius:12px;font-size:13.5px;transition:.2s;pointer-events:none;z-index:2147483647;max-width:calc(100vw - 32px)}.aviso.ver{opacity:1;transform:translate(-50%,0)}' +
+    '.bolha{position:fixed;right:12px;top:12px;width:44px;height:44px;border-radius:22px;display:none;align-items:center;justify-content:center;cursor:pointer;background:var(--bg);-webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);border:1px solid var(--borda);box-shadow:0 10px 26px -10px rgba(0,0,0,.5);color:var(--tx);z-index:2147483647}' +
+    '.bolha.ver{display:flex}.bolha.baixo{top:auto;bottom:calc(14px + env(safe-area-inset-bottom))}' +
+    '@media (prefers-reduced-motion:reduce){.barra,.aviso{transition:none}.painel.aberto{animation:none}}';
+
+  function montarBarra() {
+    if (!COM_BARRA || window.top !== window.self || !document.documentElement.attachShadow || !real()) return;
+    var hospede = document.createElement('tt-navegador-celular');
+    setAttrOrig.call(hospede, 'style', 'all:initial!important;display:block!important;position:static!important');
+    var raiz = hospede.attachShadow({ mode: 'closed' });
+    raiz.innerHTML = '<style>' + CSS + '</style><div class="r">' +
+      '<div class="barra" role="toolbar" aria-label="Navegador pelo celular">' +
+      '<button class="bt largo" data-a="voltar" title="Voltar" aria-label="Voltar">' + svg('voltar') + '</button>' +
+      '<button class="bt largo" data-a="avancar" title="Avançar" aria-label="Avançar">' + svg('avancar') + '</button>' +
+      '<a class="bt" href="/" title="Página inicial" aria-label="Página inicial">' + svg('inicio') + '</a>' +
+      '<form class="end" autocomplete="off"><span class="seg" title="">' + svg('seguro', 16) + '</span>' +
+      '<input name="q" enterkeyhint="go" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="Endereço ou busca"></form>' +
+      '<button class="bt largo" data-a="recarregar" title="Recarregar" aria-label="Recarregar">' + svg('recarregar') + '</button>' +
+      '<button class="vlc" data-a="midias" title="Tocar no VLC Web" aria-label="Tocar no VLC Web">' + svg('play', 16) + '<span class="rot">VLC</span><span class="n">0</span></button>' +
+      '<button class="bt" data-a="menu" title="Mais opções" aria-label="Mais opções">' + svg('mais') + '</button>' +
+      '</div><div class="painel" data-p="menu"></div><div class="painel" data-p="midias"></div>' +
+      '<button class="bolha" data-a="mostrar" title="Mostrar a barra" aria-label="Mostrar a barra">' + svg('globo', 22) + '</button>' +
+      '<div class="aviso" role="status"></div></div>';
+    var $ = function (s) { return raiz.querySelector(s); };
+    var barra = $('.barra'), campo = $('input'), form = $('form'), seg = $('.seg'), vlc = $('.vlc'), bolha = $('.bolha');
+    var painelMenu = $('[data-p="menu"]'), painelMidias = $('[data-p="midias"]'), aviso = $('.aviso');
+    var espaco = document.createElement('tt-espaco');
+    var embaixo = !!LS.get('barraBaixo', false), escondida = !!LS.get('barraOculta', false), avisoTimer = 0;
+
+    function mostrarEndereco() {
+      var r = real() || '';
+      var bonito = r;
+      try { bonito = decodeURI(r); } catch (e) { /* fica */ }
+      if (raiz.activeElement !== campo) campo.value = bonito;
+      var https = /^https:/i.test(r);
+      seg.className = 'seg' + (https ? '' : ' nao');
+      seg.innerHTML = svg(https ? 'seguro' : 'inseguro', 16);
+      seg.title = https ? 'Conexão segura entre o celular e o site' : 'Sem criptografia entre o celular e o site (http)';
+    }
+    function avisar(t) {
+      aviso.textContent = t;
+      aviso.classList.add('ver');
+      clearTimeout(avisoTimer);
+      avisoTimer = setTimeout(function () { aviso.classList.remove('ver'); }, 2200);
+    }
+    function copiar(t) {
+      var feito = function () { avisar('Endereço copiado'); };
+      if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(t).then(feito, function () { copiarVelho(t); feito(); }); return; }
+      copiarVelho(t); feito();
+    }
+    function copiarVelho(t) {
+      var ta = document.createElement('textarea');
+      ta.value = t; ta.style.cssText = 'position:fixed;opacity:0;top:0;left:0';
+      document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); } catch (e) { /* sem cópia */ }
+      ta.remove();
+    }
+    function posicionar() {
+      barra.classList.toggle('baixo', embaixo);
+      painelMenu.classList.toggle('baixo', embaixo);
+      painelMidias.classList.toggle('baixo', embaixo);
+      bolha.classList.toggle('baixo', embaixo);
+      barra.style.display = escondida ? 'none' : '';
+      bolha.classList.toggle('ver', escondida);
+      setAttrOrig.call(espaco, 'style', 'all:initial!important;display:block!important;height:' + (escondida ? 0 : 52) + 'px!important');
+      if (document.body && espaco.parentNode !== document.body) {
+        if (embaixo) document.body.appendChild(espaco); else document.body.insertBefore(espaco, document.body.firstChild);
+      } else if (document.body) {
+        if (embaixo && espaco !== document.body.lastChild) document.body.appendChild(espaco);
+        if (!embaixo && espaco !== document.body.firstChild) document.body.insertBefore(espaco, document.body.firstChild);
+      }
+    }
+    function fechar() { painelMenu.classList.remove('aberto'); painelMidias.classList.remove('aberto'); }
+    function abrir(p) { var ja = p.classList.contains('aberto'); fechar(); if (!ja) p.classList.add('aberto'); }
+    function linkVlc(r, nome) { return '/_tt/vlc?u=' + encodeURIComponent(r) + (nome ? '&titulo=' + encodeURIComponent(nome) : ''); }
+
+    function desenharMenu() {
+      painelMenu.innerHTML =
+        '<a class="item" href="/">' + svg('inicio') + 'Página inicial</a>' +
+        '<a class="item" href="/vlc/">' + svg('play') + 'Abrir o VLC Web</a>' +
+        '<div class="sep"></div>' +
+        '<button class="item" data-a="copiar">' + svg('copiar') + 'Copiar o endereço do site</button>' +
+        '<button class="item" data-a="direto">' + svg('externo') + 'Abrir direto, sem passar pelo celular</button>' +
+        '<div class="sep"></div>' +
+        '<button class="item" data-a="posicao">' + svg('posicao') + (embaixo ? 'Barra no topo da tela' : 'Barra embaixo da tela') + '</button>' +
+        '<button class="item" data-a="esconder">' + svg('ocultar') + 'Esconder a barra</button>' +
+        '<div class="sep"></div>' +
+        '<a class="item" href="/sair">' + svg('sair') + 'Sair deste aparelho</a>';
+    }
+    function desenharMidias() {
+      var lista = acharMidias();
+      var h = '<div class="cab"><b>Tocar no VLC Web<small>O vídeo continua vindo pela conexão do celular</small></b>' +
+        '<button class="acao so" data-a="fechar" aria-label="Fechar">' + svg('fechar', 18) + '</button></div>';
+      if (!lista.length) {
+        h += '<p class="vazio">Nenhum vídeo ou áudio achado nesta página ainda. Se o vídeo só aparece depois do play, toque play e abra de novo. Ou cole o link de um vídeo:</p>';
+      }
+      lista.forEach(function (m, i) {
+        var au = m.tipo === 'Áudio';
+        h += '<div class="mid"><span class="ic' + (au ? ' au' : '') + '">' + svg(au ? 'nota' : m.tipo === 'Vídeo' ? 'filme' : 'lista', 22) + '</span>' +
+          '<span class="tx"><div class="nm" title="' + esc(m.nome) + '">' + esc(m.nome) + '</div><div class="ds">' + esc(m.tipo) + ' · ' + esc(m.host) + '</div></span>' +
+          '<button class="acao so" data-a="copiar-midia" data-i="' + i + '" title="Copiar o link" aria-label="Copiar o link">' + svg('copiar', 17) + '</button>' +
+          '<a class="acao forte" href="' + esc(linkVlc(m.real, m.nome)) + '">' + svg('play', 14) + 'VLC</a></div>';
+      });
+      h += '<form class="colar" data-f="colar"><input name="u" placeholder="Colar o link de um vídeo ou música" inputmode="url" autocomplete="off" spellcheck="false">' +
+        '<button class="acao forte" type="submit">' + svg('play', 14) + 'Tocar</button></form>' +
+        '<div class="pe"><span>Legendas, equalizador, faixas de áudio e mais.</span><a class="acao" href="/vlc/">Abrir o VLC Web</a></div>';
+      painelMidias.innerHTML = h;
+      painelMidias.__lista = lista;
+    }
+    var contagemTimer = 0;
+    agendarContagem = function () {
+      clearTimeout(contagemTimer);
+      contagemTimer = setTimeout(function () {
+        var n = acharMidias().length;
+        vlc.classList.toggle('tem', n > 0);
+        vlc.querySelector('.n').textContent = n > 99 ? '99+' : String(n);
+        vlc.title = n ? n + (n === 1 ? ' mídia nesta página: tocar no VLC Web' : ' mídias nesta página: tocar no VLC Web') : 'Abrir o VLC Web';
+      }, 700);
+    };
+
+    raiz.addEventListener('click', function (e) {
+      var alvo = e.target.closest('[data-a]');
+      if (!alvo) return;
+      var a = alvo.getAttribute('data-a');
+      if (a === 'voltar') history.back();
+      else if (a === 'avancar') history.forward();
+      else if (a === 'recarregar') location.reload();
+      else if (a === 'menu') { desenharMenu(); abrir(painelMenu); }
+      else if (a === 'midias') { desenharMidias(); abrir(painelMidias); }
+      else if (a === 'fechar') fechar();
+      else if (a === 'copiar') { copiar(real() || location.href); fechar(); }
+      else if (a === 'copiar-midia') { var m = (painelMidias.__lista || [])[+alvo.getAttribute('data-i')]; if (m) copiar(m.real); }
+      else if (a === 'direto') { fechar(); (abrirJanela || window.open).call(window, real() || location.href, '_blank', 'noopener,noreferrer'); }
+      else if (a === 'posicao') { embaixo = !embaixo; LS.set('barraBaixo', embaixo); fechar(); posicionar(); }
+      else if (a === 'esconder') { escondida = true; LS.set('barraOculta', true); fechar(); posicionar(); avisar('Toque no globo para mostrar a barra de novo'); }
+      else if (a === 'mostrar') { escondida = false; LS.set('barraOculta', false); posicionar(); }
+    });
+    raiz.addEventListener('submit', function (e) {
+      e.preventDefault();
+      if (e.target === form) {
+        var v = campo.value.trim();
+        if (v) location.href = '/ir?q=' + encodeURIComponent(v) + '&motor=' + encodeURIComponent(LS.get('motor', 'ddg'));
+      } else if (e.target.getAttribute('data-f') === 'colar') {
+        var u = e.target.querySelector('input').value.trim();
+        if (u) location.href = linkVlc(u, '');
+      }
+    });
+    campo.addEventListener('focus', function () { setTimeout(function () { campo.select(); }, 0); });
+    campo.addEventListener('blur', mostrarEndereco);
+    document.addEventListener('click', function (e) { if (e.target !== hospede) fechar(); });
+    document.addEventListener('keydown', function (e) { if (e.key === 'Escape') fechar(); });
+    var ultimoY = window.scrollY || 0;
+    window.addEventListener('scroll', function () {
+      var y = window.scrollY || 0, d = y - ultimoY;
+      ultimoY = y;
+      if (escondida || raiz.activeElement === campo || painelMenu.classList.contains('aberto') || painelMidias.classList.contains('aberto')) return;
+      if (d > 8 && y > 90) barra.classList.add('oculta');
+      else if (d < -8 || y < 40) barra.classList.remove('oculta');
+    }, { passive: true });
+    window.addEventListener('popstate', mostrarEndereco);
+    ['pushState', 'replaceState'].forEach(function (nome) {
+      var orig = history[nome];
+      history[nome] = function () { var r = orig.apply(this, arguments); try { mostrarEndereco(); } catch (e) { /* ignora */ } return r; };
+    });
+
+    document.documentElement.appendChild(hospede);
+    mostrarEndereco();
+    posicionar();
+    agendarContagem();
+    window.addEventListener('load', function () { posicionar(); agendarContagem(); });
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', iniciar);
+  else iniciar();
+  function iniciar() {
+    try { guardarHistorico(); } catch (e) { /* ignora */ }
+    try { montarBarra(); } catch (e) { /* a página continua sem a barra */ }
+  }
+  window.addEventListener('load', function () {
+    try { var h = LS.get('hist', []); if (Array.isArray(h) && h[0] && h[0].u === real() && document.title) { h[0].t = String(document.title).trim().slice(0, 140); LS.set('hist', h); } } catch (e) { /* ignora */ }
+  });
+})();
+"""
+NAV_JS_VERSAO = hashlib.sha1(NAV_JS.encode()).hexdigest()[:10]
+
+NAV_PAGINA_INICIO = r"""<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="referrer" content="same-origin"><meta name="color-scheme" content="light dark">
+<link rel="icon" href="/_tt/icone.svg" type="image/svg+xml">
+<title>Navegador pelo celular</title><style>__CSS__
+.topo{display:flex;align-items:center;justify-content:space-between;gap:10px;max-width:980px;margin:0 auto;padding:max(14px,env(safe-area-inset-top)) 18px 0}
+.marca{display:flex;align-items:center;gap:10px;font-weight:750;letter-spacing:.2px}
+.marca .logo{width:34px;height:34px;border-radius:11px}
+.chip{display:inline-flex;align-items:center;gap:6px;height:32px;padding:0 12px;border-radius:16px;background:var(--bg2);border:1px solid var(--borda);font-size:13px;color:var(--sub);white-space:nowrap}
+.chip i{width:8px;height:8px;border-radius:4px;background:#22c55e;box-shadow:0 0 0 3px rgba(34,197,94,.18)}
+main{max-width:980px;margin:0 auto;padding:10px 18px 40px}
+.heroi{text-align:center;padding:clamp(28px,8vh,84px) 0 26px}
+.heroi .logo{width:76px;height:76px;border-radius:24px;box-shadow:0 18px 40px -16px rgba(47,109,246,.75)}
+.heroi h1{font-size:clamp(26px,5vw,38px);line-height:1.15;margin:18px 0 8px;letter-spacing:-.5px}
+.heroi p{margin:0 auto;max-width:540px;color:var(--sub)}
+.busca{display:flex;align-items:center;gap:8px;max-width:640px;margin:24px auto 0;padding:6px 6px 6px 16px;border-radius:22px;background:var(--campo);border:1px solid var(--borda);box-shadow:var(--sombra);transition:border-color .15s,box-shadow .15s}
+.busca:focus-within{border-color:var(--real);box-shadow:0 0 0 4px rgba(47,109,246,.16),var(--sombra)}
+.busca svg{flex:none;color:var(--sub)}
+.busca input{flex:1;min-width:0;height:46px;border:0;outline:0;background:none;color:var(--tx);font:inherit;font-size:17px}
+.busca .btn{height:46px;border-radius:17px}
+.motores{display:flex;flex-wrap:wrap;justify-content:center;gap:6px;margin:14px 0 0}
+.motor{height:32px;padding:0 13px;border-radius:16px;border:1px solid var(--borda);background:transparent;color:var(--sub);font:inherit;font-size:13px;cursor:pointer}
+.motor[aria-pressed="true"]{background:var(--tx);color:var(--bg);border-color:transparent;font-weight:650}
+h2{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:15px;margin:34px 2px 12px;color:var(--sub);font-weight:650;text-transform:uppercase;letter-spacing:.7px}
+h2 button{font:inherit;font-size:12.5px;text-transform:none;letter-spacing:0;color:var(--real);background:none;border:0;cursor:pointer;padding:4px 6px}
+.grade{display:grid;grid-template-columns:repeat(auto-fill,minmax(112px,1fr));gap:10px}
+.atalho{position:relative;display:flex;flex-direction:column;align-items:center;gap:9px;padding:16px 8px 13px;border-radius:18px;background:var(--bg2);border:1px solid var(--borda);color:var(--tx);text-align:center;font-size:13px;font-weight:600;transition:transform .12s,box-shadow .15s}
+.atalho:hover{transform:translateY(-2px);box-shadow:var(--sombra)}
+.atalho .av{position:relative;width:46px;height:46px;border-radius:14px;display:flex;align-items:center;justify-content:center;color:#fff;font-size:19px;font-weight:800;overflow:hidden}
+.atalho .av img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;padding:9px;background:#fff}
+.atalho span.nm{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.atalho .tirar{position:absolute;top:6px;right:6px;width:24px;height:24px;border-radius:12px;border:0;background:#e5484d;color:#fff;font-size:15px;line-height:24px;cursor:pointer;display:none}
+.editando .atalho .tirar{display:block}
+.atalho.novo{border-style:dashed;color:var(--sub);cursor:pointer;font:inherit;font-size:13px;font-weight:600}
+.atalho.novo .av{background:var(--campo);color:var(--sub)}
+.cartao-vlc{position:relative;overflow:hidden;margin-top:34px;padding:22px;border-radius:24px;background:linear-gradient(135deg,rgba(255,165,58,.16),rgba(255,107,0,.08)),var(--bg2);border:1px solid rgba(255,122,0,.35);box-shadow:var(--sombra)}
+.cartao-vlc:before{content:"";position:absolute;right:-60px;top:-60px;width:220px;height:220px;border-radius:50%;background:radial-gradient(circle,rgba(255,122,0,.28),transparent 70%)}
+.cartao-vlc .lin{position:relative;display:flex;align-items:flex-start;gap:16px}
+.cartao-vlc .ic{flex:none;width:58px;height:58px;border-radius:18px;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#ffa53a,#ff6b00);color:#fff;box-shadow:0 12px 26px -10px rgba(255,107,0,.8)}
+.cartao-vlc h3{margin:2px 0 4px;font-size:20px}
+.cartao-vlc p{margin:0;color:var(--sub)}
+.cartao-vlc .estado{display:inline-flex;align-items:center;gap:7px;margin-top:10px;font-size:13px;color:var(--sub)}
+.cartao-vlc .estado i{width:8px;height:8px;border-radius:4px;background:#a3a3a3}
+.cartao-vlc .estado.ok i{background:#22c55e}.cartao-vlc .estado.novo i{background:#ff7a00}.cartao-vlc .estado.erro i{background:#e5484d}
+.cartao-vlc .acoes{position:relative;display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:18px}
+.cartao-vlc form{position:relative;display:flex;gap:8px;margin-top:12px}
+.cartao-vlc form input{flex:1;min-width:0;height:44px;padding:0 14px;border-radius:14px;border:1px solid var(--borda);background:var(--campo);color:var(--tx);font:inherit}
+.barra-prog{position:relative;height:6px;border-radius:3px;background:var(--campo);overflow:hidden;margin-top:12px;display:none}
+.barra-prog b{position:absolute;left:0;top:0;bottom:0;width:0;background:linear-gradient(90deg,#ffa53a,#ff6b00);transition:width .3s}
+.hist{display:flex;flex-direction:column;gap:2px;padding:6px;border-radius:20px;background:var(--bg2);border:1px solid var(--borda)}
+.hist a{display:flex;align-items:center;gap:12px;padding:10px 12px;border-radius:14px;color:var(--tx)}
+.hist a:hover{background:var(--campo)}
+.hist .av{flex:none;width:34px;height:34px;border-radius:10px;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:14px}
+.hist .tx{flex:1;min-width:0}.hist .t{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hist .u{font-size:12.5px;color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hist .q{flex:none;font-size:12px;color:var(--sub)}
+.nada{padding:18px;text-align:center;color:var(--sub);font-size:14px}
+.rodape{max-width:980px;margin:0 auto;padding:10px 18px max(28px,env(safe-area-inset-bottom));text-align:center;font-size:12.5px;color:var(--sub);line-height:1.6}
+.rodape a{color:var(--sub);text-decoration:underline}
+@media (max-width:560px){.cartao-vlc .lin{flex-direction:column}.chip .longo{display:none}}
+@media (min-width:561px){.chip .curto{display:none}}
+[hidden]{display:none!important}
 </style></head><body>
-<h1>&#127760; Navegador pelo celular</h1>
-<p>Digite um endereço ou uma busca. Quem carrega a página &#233; o celular, pela conex&#227;o dele.</p>
-<form action="/ir" method="get" autocomplete="off">
- <input name="q" placeholder="site.com ou o que voc&#234; quer pesquisar" autofocus spellcheck="false"
-  autocapitalize="off">
- <button type="submit">Ir</button></form>
-<div class="atalhos">
- <a href="/ir?q=https://pt.wikipedia.org">Wikip&#233;dia</a>
- <a href="/ir?q=https://lite.cnn.com">Not&#237;cias</a>
- <a href="/ir?q=https://html.duckduckgo.com/html/">Buscar</a>
- <a href="/ir?q=https://www.google.com">Google</a></div>
-<p class="rodape">Bom para pesquisar, ler not&#237;cias e textos. Sites que dependem muito de JavaScript
- (apps, redes sociais, v&#237;deos) podem abrir mal. Os sites veem o IP do celular.</p>
-</body></html>""").encode("utf-8")
+<header class="topo"><div class="marca">__LOGO__<span>Navegador pelo celular</span></div>
+<span class="chip" id="saida" title="Por onde o celular abre os sites"><i></i><span class="longo"></span><span class="curto"></span></span></header>
+<main>
+<section class="heroi">__LOGO_GRANDE__
+<h1>Para onde vamos?</h1>
+<p>Digite um endereço ou uma busca. Quem abre o site é o celular, pela conexão dele, e a página chega pronta aqui.</p>
+<form class="busca" action="/ir" method="get" autocomplete="off" role="search">
+<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/></svg>
+<input name="q" id="q" placeholder="site.com ou o que você quer pesquisar" autofocus spellcheck="false" autocapitalize="off" enterkeyhint="go" aria-label="Endereço ou busca">
+<input type="hidden" name="motor" id="motor" value="ddg">
+<button class="btn prim" type="submit">Ir</button></form>
+<div class="motores" id="motores" role="group" aria-label="Buscar com"></div>
+</section>
+
+<h2><span>Atalhos</span><button type="button" id="editar">Editar</button></h2>
+<div class="grade" id="atalhos"></div>
+
+<section class="cartao-vlc" aria-labelledby="vlc-t">
+<div class="lin"><span class="ic"><svg viewBox="0 0 24 24" width="30" height="30"><path d="M8 5.5v13l10.5-6.5z" fill="currentColor"/></svg></span>
+<div><h3 id="vlc-t">VLC Web</h3>
+<p>Toque os vídeos e músicas dos sites que você abrir aqui, com legendas, equalizador, troca de faixa de áudio, velocidade e efeitos. Tudo continua vindo pela conexão do celular.</p>
+<span class="estado" id="vlc-estado"><i></i><span>Verificando…</span></span></div></div>
+<div class="barra-prog" id="vlc-prog"><b></b></div>
+<div class="acoes"><a class="btn vlc" href="/vlc/">&#9654;&nbsp; Abrir o VLC Web</a>
+<button class="btn" type="button" id="vlc-atualizar" hidden>Atualizar</button>
+<a class="btn" href="/ir?q=__REPO__">Ver no GitHub</a></div>
+<form id="vlc-link" autocomplete="off"><input name="u" placeholder="Colar o link de um vídeo, música ou lista (.m3u8)" inputmode="url" spellcheck="false" aria-label="Link de vídeo">
+<button class="btn vlc" type="submit">Tocar</button></form>
+</section>
+
+<h2><span>Visitados recentemente</span><button type="button" id="limpar">Limpar</button></h2>
+<div class="hist" id="hist"></div>
+</main>
+<footer class="rodape">Os sites veem o IP do celular, e os dados gastos são os do celular. Sites que dependem muito de JavaScript
+(apps, redes sociais) podem abrir mal.<br>
+<a href="#" id="semhist"></a> · <a href="/sair">Sair deste aparelho</a> · Termux-Toons __VERSAO__</footer>
+<script>
+(function () {
+  var CFG = __CONFIG__;
+  try { if (location.search) history.replaceState(null, '', '/'); } catch (e) {}
+  var LS = {
+    get: function (k, p) { try { var v = localStorage.getItem('tt:' + k); return v == null ? p : JSON.parse(v); } catch (e) { return p; } },
+    set: function (k, v) { try { localStorage.setItem('tt:' + k, JSON.stringify(v)); } catch (e) {} }
+  };
+  var $ = function (id) { return document.getElementById(id); };
+  function esc(t) { return String(t == null ? '' : t).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+  function host(u) { try { return new URL(u).host.replace(/^www\./, ''); } catch (e) { return u; } }
+  function cor(t) { var h = 0; for (var i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) >>> 0; return 'hsl(' + (h % 360) + ',62%,48%)'; }
+  function proxied(u) { try { var x = new URL(u); return '/p/' + x.protocol.slice(0, -1) + '/' + x.host + x.pathname + x.search; } catch (e) { return '/'; } }
+  function ir(u) { return '/ir?q=' + encodeURIComponent(u); }
+
+  /* saída */
+  $('saida').querySelector('.longo').textContent = 'Saindo ' + CFG.saida;
+  $('saida').querySelector('.curto').textContent = CFG.saida_curta;
+
+  /* buscas */
+  var motor = LS.get('motor', 'ddg');
+  if (!CFG.buscas.some(function (b) { return b[0] === motor; })) motor = 'ddg';
+  function desenharMotores() {
+    $('motor').value = motor;
+    $('motores').innerHTML = CFG.buscas.map(function (b) {
+      return '<button type="button" class="motor" data-m="' + esc(b[0]) + '" aria-pressed="' + (b[0] === motor) + '">' + esc(b[1]) + '</button>';
+    }).join('');
+  }
+  $('motores').addEventListener('click', function (e) {
+    var b = e.target.closest('[data-m]'); if (!b) return;
+    motor = b.getAttribute('data-m'); LS.set('motor', motor); desenharMotores(); $('q').focus();
+  });
+  desenharMotores();
+
+  /* atalhos */
+  function favoritos() { var f = LS.get('fav', null); return Array.isArray(f) ? f : CFG.atalhos.map(function (a) { return { n: a[0], u: a[1] }; }); }
+  function avatar(n, u) {
+    return '<span class="av" style="background:' + cor(host(u)) + '">' + esc((n || host(u)).charAt(0).toUpperCase()) +
+      '<img alt="" loading="lazy" src="' + esc(proxied(new URL('/favicon.ico', u).href)) + '" onerror="this.remove()"></span>';
+  }
+  function desenharAtalhos() {
+    var f = favoritos();
+    $('atalhos').innerHTML = f.map(function (a, i) {
+      return '<a class="atalho" href="' + esc(ir(a.u)) + '" title="' + esc(a.u) + '">' + avatar(a.n, a.u) +
+        '<span class="nm">' + esc(a.n || host(a.u)) + '</span><button class="tirar" type="button" data-i="' + i + '" aria-label="Tirar">&times;</button></a>';
+    }).join('') + '<button class="atalho novo" type="button" id="novo"><span class="av">+</span><span class="nm">Adicionar</span></button>';
+  }
+  $('atalhos').addEventListener('click', function (e) {
+    var t = e.target.closest('.tirar');
+    if (t) { e.preventDefault(); var f = favoritos(); f.splice(+t.getAttribute('data-i'), 1); LS.set('fav', f); desenharAtalhos(); return; }
+    if (e.target.closest('#novo')) {
+      var u = prompt('Endereço do site (ex.: g1.globo.com)');
+      if (!u || !u.trim()) return;
+      u = u.trim(); if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+      try { new URL(u); } catch (x) { alert('Endereço inválido.'); return; }
+      var n = prompt('Nome do atalho', host(u)) || host(u);
+      var f2 = favoritos(); f2.push({ n: n.trim().slice(0, 40), u: u }); LS.set('fav', f2); desenharAtalhos();
+    }
+  });
+  $('editar').addEventListener('click', function () {
+    var on = $('atalhos').classList.toggle('editando');
+    this.textContent = on ? 'Pronto' : 'Editar';
+  });
+  desenharAtalhos();
+
+  /* histórico */
+  function quando(d) {
+    var s = (Date.now() - d) / 1000;
+    if (s < 60) return 'agora';
+    if (s < 3600) return Math.floor(s / 60) + ' min';
+    if (s < 86400) return Math.floor(s / 3600) + ' h';
+    if (s < 172800) return 'ontem';
+    return new Date(d).toLocaleDateString('pt-BR', { day: '2-digit', month: 'short' });
+  }
+  function desenharHist() {
+    var h = LS.get('hist', []); if (!Array.isArray(h)) h = [];
+    var sem = LS.get('semHist', false);
+    $('semhist').textContent = sem ? 'Voltar a guardar o histórico' : 'Não guardar o histórico';
+    $('limpar').hidden = !h.length;
+    if (!h.length) { $('hist').innerHTML = '<div class="nada">' + (sem ? 'O histórico está desligado neste aparelho.' : 'Os sites que você abrir aparecem aqui (só neste aparelho).') + '</div>'; return; }
+    $('hist').innerHTML = h.slice(0, 10).map(function (x) {
+      return '<a href="' + esc(proxied(x.u)) + '"><span class="av" style="background:' + cor(host(x.u)) + '">' + esc(host(x.u).charAt(0).toUpperCase()) + '</span>' +
+        '<span class="tx"><div class="t">' + esc(x.t || host(x.u)) + '</div><div class="u">' + esc(x.u.replace(/^https?:\/\//, '')) + '</div></span><span class="q">' + esc(quando(x.d)) + '</span></a>';
+    }).join('');
+  }
+  $('limpar').addEventListener('click', function () { LS.set('hist', []); desenharHist(); });
+  $('semhist').addEventListener('click', function (e) { e.preventDefault(); var s = !LS.get('semHist', false); LS.set('semHist', s); if (s) LS.set('hist', []); desenharHist(); });
+  desenharHist();
+
+  /* VLC Web */
+  var timer = 0;
+  function estadoVlc(e) {
+    var el = $('vlc-estado'), txt = el.querySelector('span'), prog = $('vlc-prog'), at = $('vlc-atualizar');
+    el.className = 'estado';
+    at.hidden = true;
+    prog.style.display = e.baixando ? 'block' : 'none';
+    if (e.baixando) {
+      txt.textContent = 'Baixando do GitHub… ' + Math.round((e.progresso || 0) * 100) + '%';
+      prog.firstChild.style.width = Math.max(4, Math.round((e.progresso || 0) * 100)) + '%';
+      clearTimeout(timer); timer = setTimeout(atualizarEstado, 800);
+      return;
+    }
+    if (e.erro) { el.classList.add('erro'); txt.textContent = e.erro; at.hidden = false; at.textContent = 'Tentar de novo'; return; }
+    if (!e.instalado) { txt.textContent = 'Será baixado do GitHub na primeira vez que você abrir (cerca de 1 MB).'; return; }
+    var d = e.data ? new Date(e.data).toLocaleDateString('pt-BR') : '';
+    if (e.atualizacao) { el.classList.add('novo'); txt.textContent = 'Versão nova disponível no GitHub.'; at.hidden = false; at.textContent = 'Atualizar'; }
+    else { el.classList.add('ok'); txt.textContent = 'Pronto no celular' + (e.sha ? ' · versão ' + e.sha.slice(0, 7) : '') + (d ? ' · ' + d : ''); }
+  }
+  function atualizarEstado() {
+    fetch('/_tt/vlc-estado', { credentials: 'same-origin', cache: 'no-store' }).then(function (r) { return r.json(); })
+      .then(estadoVlc).catch(function () { $('vlc-estado').querySelector('span').textContent = 'Não consegui ver o estado do VLC Web.'; });
+  }
+  $('vlc-atualizar').addEventListener('click', function () {
+    fetch('/_tt/vlc-instalar', { method: 'POST', credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(estadoVlc).catch(function () {});
+  });
+  $('vlc-link').addEventListener('submit', function (e) {
+    e.preventDefault();
+    var u = this.u.value.trim(); if (!u) return;
+    if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+    location.href = '/_tt/vlc?u=' + encodeURIComponent(u);
+  });
+  atualizarEstado();
+})();
+</script></body></html>
+"""
 
 
-def _pagina_erro_navegador(mensagem: str, alvo: str = "") -> bytes:
-    onde = f'<p class="alvo">{html.escape(alvo)}</p>' if alvo else ""
+def _logo(tamanho: int, classe: str = "logo") -> str:
+    return NAV_ICONE.replace("<svg ", f'<svg class="{classe}" width="{tamanho}" height="{tamanho}" aria-hidden="true" ', 1)
+
+
+def _pagina_simples(titulo: str, corpo: str, extra_css: str = "", script: str = "") -> bytes:
     return (f"""<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Não deu</title><style>
-html,body{{margin:0;height:100%}}body{{background:#0e0f13;color:#e8e8e8;font-family:system-ui,sans-serif;
- display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;text-align:center}}
-h1{{font-size:1.3em}}p{{opacity:.8;max-width:460px;line-height:1.5}}.alvo{{opacity:.5;font-size:13px;word-break:break-all}}
-a{{color:#8bf;text-decoration:none;border:1px solid #333;border-radius:20px;padding:8px 18px;margin-top:14px}}
-</style></head><body><h1>&#128533; {html.escape(mensagem)}</h1>{onde}
-<a href="/">&#8962; Voltar ao in&#237;cio</a></body></html>""").encode("utf-8")
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="color-scheme" content="light dark">
+<meta name="referrer" content="same-origin"><link rel="icon" href="/_tt/icone.svg" type="image/svg+xml">
+<title>{html.escape(titulo)}</title><style>{NAV_CSS}{extra_css}</style></head><body>
+<div class="centro"><div class="cartao">{corpo}</div></div>{script}</body></html>""").encode("utf-8")
+
+
+def _json_no_html(dados) -> str:
+    return json.dumps(dados, ensure_ascii=False).replace("</", "<\\/")
+
+
+def _pagina_inicio_navegador(saida: str = "") -> bytes:
+    cfg_pagina = {"saida": _nome_saida(saida), "saida_curta": {"ssh": "Túnel SSH", "tor": "Tor"}.get(saida, "Direto"),
+                  "atalhos": [list(a) for a in NAV_ATALHOS],
+                  "buscas": [[k, v[0]] for k, v in NAV_BUSCAS.items()]}
+    return (NAV_PAGINA_INICIO.replace("__CSS__", NAV_CSS).replace("__LOGO_GRANDE__", _logo(76))
+            .replace("__LOGO__", _logo(34)).replace("__REPO__", urllib.parse.quote(VLC_WEB_SITE, safe=""))
+            .replace("__VERSAO__", html.escape(VERSION)).replace("__CONFIG__", _json_no_html(cfg_pagina))
+            ).encode("utf-8")
+
+
+def _pagina_erro_navegador(mensagem: str, alvo: str = "", icone: str = "&#128533;", voltar: bool = True) -> bytes:
+    onde = f'<code class="alvo">{html.escape(alvo)}</code>' if alvo else ""
+    botoes = ['<button class="btn prim" type="button" onclick="location.reload()">Tentar de novo</button>'] if alvo else []
+    if voltar:
+        botoes.append('<button class="btn" type="button" onclick="history.length>1?history.back():location.assign(\'/\')">'
+                      'Voltar</button>')
+    botoes.append('<a class="btn" href="/">Início</a>')
+    if alvo.startswith(("http://", "https://")):
+        botoes.append(f'<a class="btn" href="{html.escape(alvo, quote=True)}" target="_blank" rel="noopener noreferrer">'
+                      'Abrir direto, sem o celular</a>')
+    return _pagina_simples("Não deu", f'<div class="selo">{icone}</div><h1>{html.escape(mensagem)}</h1>{onde}'
+                                      f'<div class="acoes">{"".join(botoes)}</div>')
+
+
+def _pagina_sem_acesso() -> bytes:
+    return _pagina_simples("Link inválido", f"""{_logo(64)}<h1>Este navegador precisa do link completo</h1>
+<p>Abra o link que recebeu (ele termina em <b>?t=…</b>). Se não tiver, peça a quem ligou o navegador no Termux-Toons.</p>
+<p>Se você usava este link e ele parou, foi criado um link novo.</p>""")
+
+
+def _pagina_midia_navegador(real: str, tipo: str, link: str, tamanho: str = "") -> bytes:
+    nome = urllib.parse.unquote(posixpath.basename(urllib.parse.urlsplit(real).path)) or urllib.parse.urlsplit(real).netloc
+    rotulos = {"video": ("Vídeo", "&#127916;"), "audio": ("Música / áudio", "&#127925;"),
+               "hls": ("Transmissão ou lista (HLS / M3U)", "&#128225;"), "dash": ("Transmissão (MPEG-DASH)", "&#128225;")}
+    rotulo, icone = rotulos.get(tipo, ("Mídia", "&#127916;"))
+    vlc = "/_tt/vlc?" + urllib.parse.urlencode({"u": real, "titulo": nome})
+    baixar = link + ("&" if "?" in link else "?") + "__tt=baixar"
+    tag = "audio" if tipo == "audio" else "video"
+    detalhe = " · ".join(x for x in (rotulo, urllib.parse.urlsplit(real).netloc, tamanho) if x)
+    corpo = f"""<div class="selo vlc">{icone}</div><h1>{html.escape(nome)}</h1><p>{html.escape(detalhe)}</p>
+<p>Este link é uma mídia. No VLC Web ela toca com legendas, equalizador, troca de faixa de áudio e velocidade, e
+continua vindo pela conexão do celular.</p>
+<div class="acoes"><a class="btn vlc" href="{html.escape(vlc, quote=True)}">&#9654;&nbsp; Assistir no VLC Web</a>
+<button class="btn" type="button" id="aqui">Tocar aqui</button>
+<a class="btn" href="{html.escape(baixar, quote=True)}">Baixar</a>
+<button class="btn" type="button" id="copiar">Copiar o link</button></div>
+<{tag} id="player" controls playsinline preload="none" style="display:none;width:100%;margin-top:20px;border-radius:16px;
+background:#000;max-height:60vh" src="{html.escape(link, quote=True)}"></{tag}>
+<p id="msg" style="margin-top:12px;font-size:13px"></p>"""
+    script = f"""<script>
+(function () {{
+  var p = document.getElementById('player'), msg = document.getElementById('msg'), tipo = {json.dumps(tipo)};
+  document.getElementById('aqui').onclick = function () {{
+    if ((tipo === 'hls' && !p.canPlayType('application/vnd.apple.mpegurl')) || tipo === 'dash') {{
+      msg.textContent = 'Este navegador não toca esse formato sozinho: use o VLC Web.'; return; }}
+    p.style.display = 'block'; p.play().catch(function () {{}});
+  }};
+  p.onerror = function () {{ msg.textContent = 'O navegador não conseguiu tocar aqui. Tente no VLC Web, que converte formatos como MKV e AC-3.'; }};
+  document.getElementById('copiar').onclick = function () {{
+    var t = {_json_no_html(real)};
+    var ok = function () {{ msg.textContent = 'Link copiado.'; }};
+    if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(t).then(ok, function () {{ prompt('Copie o link:', t); }});
+    else prompt('Copie o link:', t);
+  }};
+}})();
+</script>"""
+    return _pagina_simples(nome, corpo, script=script)
+
+
+def _pagina_preparar_vlc() -> bytes:
+    corpo = f"""<div class="selo vlc">&#9654;</div><h1>Preparando o VLC Web…</h1>
+<p id="txt">O celular está baixando o VLC Web do GitHub ({html.escape(VLC_WEB_REPO)}). É só na primeira vez, cerca de 1 MB.</p>
+<div style="height:8px;border-radius:4px;background:var(--campo);overflow:hidden;margin:20px auto 0;max-width:360px;border:1px solid var(--borda)">
+<b id="barra" style="display:block;height:100%;width:3%;background:linear-gradient(90deg,#ffa53a,#ff6b00);transition:width .3s"></b></div>
+<div class="acoes"><button class="btn" type="button" id="denovo" hidden>Tentar de novo</button><a class="btn" href="/">Início</a></div>"""
+    script = """<script>
+(function () {
+  var txt = document.getElementById('txt'), barra = document.getElementById('barra'), denovo = document.getElementById('denovo');
+  function ver(e) {
+    if (e.instalado && !e.baixando) { location.reload(); return; }
+    if (e.erro && !e.baixando) { txt.textContent = e.erro; denovo.hidden = false; return; }
+    barra.style.width = Math.max(3, Math.round((e.progresso || 0) * 100)) + '%';
+    setTimeout(estado, 700);
+  }
+  function estado() { fetch('/_tt/vlc-estado', { cache: 'no-store', credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(ver).catch(function () { setTimeout(estado, 2000); }); }
+  function instalar() { denovo.hidden = true; fetch('/_tt/vlc-instalar', { method: 'POST', credentials: 'same-origin' }).then(function (r) { return r.json(); }).then(ver).catch(function () { setTimeout(estado, 1500); }); }
+  denovo.onclick = instalar;
+  instalar();
+})();
+</script>"""
+    return _pagina_simples("Preparando o VLC Web", corpo, script=script)
+
+
+# ── VLC Web: baixar do GitHub e guardar no celular ───────────────────
+
+_VLC_ESTADO = {"baixando": False, "progresso": 0.0, "erro": "", "remoto": None, "remoto_quando": 0.0,
+               "verificando": False}
+_VLC_LOCK = threading.Lock()
+
+
+def vlc_web_versao() -> dict | None:
+    try:
+        return json.loads((VLC_WEB_DIR / ".versao.json").read_text("utf-8"))
+    except (OSError, ValueError):
+        return {"sha": "", "data": ""} if vlc_web_instalado() else None
+
+
+def vlc_web_instalado() -> bool:
+    return (VLC_WEB_DIR / "index.html").is_file()
+
+
+def vlc_web_versao_remota(timeout: float = 12) -> str | None:
+    """O commit mais novo do VLC Web no GitHub, sem baixar nada: o link do zip redireciona para .../zip/<commit>."""
+    abridor = urllib.request.OpenerDirector()   # sem seguir o redirecionamento
+    for manipulador in (urllib.request.HTTPSHandler(), urllib.request.ProxyHandler(), urllib.request.HTTPErrorProcessor(),
+                        urllib.request.HTTPDefaultErrorHandler()):
+        abridor.add_handler(manipulador)
+    try:
+        with abridor.open(urllib.request.Request(VLC_WEB_ZIP, method="HEAD", headers={"User-Agent": USER_AGENT}),
+                          timeout=timeout):
+            return None
+    except urllib.error.HTTPError as e:
+        achado = re.search(r"/([0-9a-f]{40})(?:$|[/?#])", e.headers.get("Location") or "")
+        return achado.group(1) if achado else None
+    except OSError:
+        return None
+
+
+def instalar_vlc_web(progresso=None) -> dict:
+    """Baixa o VLC Web do GitHub (o zip da branch principal) e guarda só os arquivos do site em
+    ~/.termux_toons/vlc-web. A versão antiga só é trocada depois que a nova chegou inteira."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    temp = DATA_DIR / "vlc-web.zip.part"
+    novo = DATA_DIR / "vlc-web.novo"
+    velho = DATA_DIR / "vlc-web.velho"
+    pedido = urllib.request.Request(VLC_WEB_ZIP, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(pedido, timeout=60) as resposta, open(temp, "wb") as arq:
+            total, feito = int(resposta.headers.get("Content-Length") or 0), 0
+            while True:
+                bloco = resposta.read(1 << 16)
+                if not bloco:
+                    break
+                arq.write(bloco)
+                feito += len(bloco)
+                if progresso:
+                    progresso(feito, total)
+    except urllib.error.HTTPError as e:
+        temp.unlink(missing_ok=True)
+        raise ToonsError(f"O GitHub respondeu HTTP {e.code} ao baixar o VLC Web.") from None
+    except OSError as e:
+        temp.unlink(missing_ok=True)
+        raise ToonsError(f"Não consegui baixar o VLC Web do GitHub: {e}") from None
+    shutil.rmtree(novo, ignore_errors=True)
+    novo.mkdir(parents=True)
+    raiz = novo.resolve()
+    try:
+        with zipfile.ZipFile(temp) as z:
+            commit = z.comment.decode("ascii", "ignore").strip()
+            for item in z.infolist():
+                partes = item.filename.split("/", 1)   # "VLC-WEB-<commit>/js/app.js"
+                if len(partes) < 2 or not partes[1] or partes[1].split("/", 1)[0] not in VLC_WEB_ITENS:
+                    continue
+                destino = (novo / partes[1]).resolve()
+                if raiz not in destino.parents:   # nada de "../" saindo da pasta
+                    continue
+                if item.is_dir():
+                    destino.mkdir(parents=True, exist_ok=True)
+                    continue
+                destino.parent.mkdir(parents=True, exist_ok=True)
+                with z.open(item) as origem, open(destino, "wb") as saida_arq:
+                    shutil.copyfileobj(origem, saida_arq)
+    except (zipfile.BadZipFile, OSError) as e:
+        shutil.rmtree(novo, ignore_errors=True)
+        raise ToonsError(f"O arquivo do VLC Web veio com defeito ({e}). Tente de novo.") from None
+    finally:
+        temp.unlink(missing_ok=True)
+    if not (novo / "index.html").is_file():
+        shutil.rmtree(novo, ignore_errors=True)
+        raise ToonsError("O zip do VLC Web não trouxe o index.html.")
+    versao = {"sha": commit if re.fullmatch(r"[0-9a-f]{40}", commit) else "",
+              "data": datetime.now().isoformat(timespec="seconds"), "repo": VLC_WEB_REPO}
+    (novo / ".versao.json").write_text(json.dumps(versao), "utf-8")
+    shutil.rmtree(velho, ignore_errors=True)
+    if VLC_WEB_DIR.exists():
+        VLC_WEB_DIR.replace(velho)
+    novo.replace(VLC_WEB_DIR)
+    shutil.rmtree(velho, ignore_errors=True)
+    with _VLC_LOCK:
+        if versao["sha"]:
+            _VLC_ESTADO["remoto"], _VLC_ESTADO["remoto_quando"] = versao["sha"], time.time()
+    return versao
+
+
+def remover_vlc_web() -> None:
+    shutil.rmtree(VLC_WEB_DIR, ignore_errors=True)
+
+
+def _vlc_instalar_no_fundo() -> None:
+    """Começa a baixar o VLC Web numa thread (o servidor continua respondendo enquanto isso)."""
+    with _VLC_LOCK:
+        if _VLC_ESTADO["baixando"]:
+            return
+        _VLC_ESTADO.update(baixando=True, progresso=0.0, erro="")
+
+    def progresso(feito, total):
+        with _VLC_LOCK:
+            _VLC_ESTADO["progresso"] = min(0.99, feito / total) if total else min(0.95, feito / 1_300_000)
+
+    def trabalho():
+        try:
+            versao = instalar_vlc_web(progresso)
+            log(f"VLC Web baixado do GitHub (versão {versao.get('sha', '')[:7] or '?'}).")
+            with _VLC_LOCK:
+                _VLC_ESTADO["erro"] = ""
+        except Exception as e:  # noqa: BLE001 — o erro aparece na página
+            log(f"VLC Web: não consegui baixar ({e})")
+            with _VLC_LOCK:
+                _VLC_ESTADO["erro"] = str(e)
+        finally:
+            with _VLC_LOCK:
+                _VLC_ESTADO.update(baixando=False, progresso=1.0)
+
+    threading.Thread(target=trabalho, name="vlc-web", daemon=True).start()
+
+
+def _vlc_estado_json() -> dict:
+    """Estado para as páginas. De 6 em 6 horas, olha no fundo se o GitHub tem versão nova."""
+    versao = vlc_web_versao()
+    with _VLC_LOCK:
+        estado = dict(_VLC_ESTADO)
+        verificar = (versao is not None and not estado["verificando"]
+                     and time.time() - estado["remoto_quando"] > 6 * 3600)
+        if verificar:
+            _VLC_ESTADO["verificando"] = True
+
+    if verificar:
+        def olhar():
+            remoto = vlc_web_versao_remota()
+            with _VLC_LOCK:
+                _VLC_ESTADO.update(verificando=False, remoto_quando=time.time())
+                if remoto:
+                    _VLC_ESTADO["remoto"] = remoto
+        threading.Thread(target=olhar, name="vlc-web-versao", daemon=True).start()
+    sha = (versao or {}).get("sha") or ""
+    return {"instalado": versao is not None, "sha": sha, "data": (versao or {}).get("data", ""),
+            "baixando": estado["baixando"], "progresso": round(estado["progresso"], 3), "erro": estado["erro"],
+            "atualizacao": bool(sha and estado["remoto"] and estado["remoto"] != sha), "repo": VLC_WEB_SITE}
+
+
+# ── O servidor ───────────────────────────────────────────────────────
+
+class _CorpoInvalido(Exception):
+    """O envio do visitante é grande demais ou veio num formato que não lemos (a resposta já foi dada)."""
 
 
 class _HandlerNavegador(BaseHTTPRequestHandler):
     server_version = "TermuxToons"
+    protocol_version = "HTTP/1.1"   # mantém a conexão aberta entre os pedidos (as páginas carregam bem mais rápido)
+    timeout = 90                    # conexões paradas fecham sozinhas
     token = ""
     com_barra = True
-    opener: urllib.request.OpenerDirector | None = None
+    saida = ""
 
     def log_message(self, formato, *args):
         pass
 
+    # ── utilidades ──
     def _consulta(self) -> dict:
         return urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
 
-    def _tem_token_valido(self, valor: str) -> bool:
+    def _param(self, nome: str) -> str:
+        return (self._consulta().get(nome) or [""])[0]
+
+    def _cookie(self, nome: str) -> str:
+        # leitura à mão: os sites abertos por aqui gravam cookies próprios por JavaScript, e um cookie estranho
+        # fazia o SimpleCookie desistir da linha inteira (e o visitante perdia o acesso)
+        for parte in (self.headers.get("Cookie") or "").split(";"):
+            chave, _, valor = parte.strip().partition("=")
+            if chave == nome:
+                return valor.strip().strip('"')
+        return ""
+
+    def _token_ok(self, valor: str) -> bool:
         return bool(self.token) and bool(valor) and hmac.compare_digest(valor.encode(), self.token.encode())
 
     def _autorizar(self) -> tuple:
         """(autorizado, veio_pelo_link). O link secreto traz ?t=...; depois disso um cookie mantém o acesso."""
-        if self._tem_token_valido((self._consulta().get("t") or [""])[0]):
+        if self._token_ok(self._param("t")):
             return True, True
-        bisc = http.cookies.SimpleCookie(self.headers.get("Cookie", "")).get("navtk")
-        return (bool(bisc) and self._tem_token_valido(bisc.value)), False
+        return self._token_ok(self._cookie("navtk")), False
+
+    def _sessao(self) -> str:
+        sid = self._cookie("navsid")
+        if not re.fullmatch(r"[\w-]{16,64}", sid):
+            sid = secrets.token_urlsafe(18)
+            self._novos_cookies.append(f"navsid={sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
+        return sid
+
+    def _abridor(self, midia: bool = False) -> urllib.request.OpenerDirector:
+        if midia and not self._cookie("navsid"):
+            return _sessao_navegador("_midia")   # o VLC Web pede sem cookies: usa uma sessão só para as mídias
+        return _sessao_navegador(self._sessao())
+
+    def _origem_publica(self) -> str:
+        """Como o visitante chega aqui (http://IP:porta no Wi-Fi, https://... pelo túnel)."""
+        host = self.headers.get("Host") or f"{ip_local()}:{self.server.server_address[1]}"
+        if not re.fullmatch(r"[\w.\-]+(?::\d+)?|\[[0-9a-fA-F:.]+\](?::\d+)?", host):
+            host = f"{ip_local()}:{self.server.server_address[1]}"
+        seguro = (self.headers.get("X-Forwarded-Proto", "").lower() == "https"
+                  or "https" in self.headers.get("CF-Visitor", ""))
+        return ("https://" if seguro else "http://") + host
+
+    def _comecar(self, codigo: int) -> None:
+        self._respondeu = True
+        self.send_response(codigo)
+        for cookie in self._novos_cookies:
+            self.send_header("Set-Cookie", cookie)
+        # os pedidos de uma página vão todos para cá, então "same-origin" manda o Referer só para nós: é com ele
+        # que acertamos o site quando o JavaScript pede um caminho como "/api/..."
+        self.send_header("Referrer-Policy", "same-origin")
 
     def _responder(self, codigo: int, corpo: bytes = b"", tipo: str = "text/html; charset=utf-8",
-                   extra: dict | None = None, cookie: bool = False) -> None:
-        self.send_response(codigo)
+                   extra: dict | None = None) -> None:
+        self._comecar(codigo)
         self.send_header("Content-Type", tipo)
         self.send_header("Content-Length", str(len(corpo)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Referrer-Policy", "no-referrer")
-        if cookie and self.token:
-            self.send_header("Set-Cookie", f"navtk={self.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800")
+        if "Cache-Control" not in (extra or {}):
+            self.send_header("Cache-Control", "no-store")
         for chave, valor in (extra or {}).items():
             self.send_header(chave, valor)
         self.end_headers()
-        if self.command != "HEAD":
+        if self.command != "HEAD" and corpo:
             self.wfile.write(corpo)
+
+    def _json(self, dados, codigo: int = 200) -> None:
+        self._responder(codigo, json.dumps(dados, ensure_ascii=False).encode("utf-8"),
+                        "application/json; charset=utf-8")
+
+    def _ir_para(self, destino: str, codigo: int = 303) -> None:
+        self._responder(codigo, b"", extra={"Location": destino})
+
+    def _ler_corpo(self) -> bytes:
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            self._responder(411, _pagina_erro_navegador("Este envio veio num formato que o navegador não lê."))
+            self.close_connection = True
+            raise _CorpoInvalido
+        tamanho = int(self.headers.get("Content-Length") or 0)
+        if tamanho > NAV_MAX_CORPO:
+            self._responder(413, _pagina_erro_navegador(
+                f"O envio é grande demais (máximo de {NAV_MAX_CORPO // (1024 * 1024)} MB)."))
+            self.close_connection = True
+            raise _CorpoInvalido
+        self._corpo_lido = True
+        return self.rfile.read(tamanho) if tamanho > 0 else b""
 
     def do_GET(self):
         self._tratar()
 
-    do_POST = do_HEAD = do_GET
+    do_POST = do_HEAD = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_GET
 
+    # ── rotas ──
     def _tratar(self):
-        caminho = urllib.parse.urlsplit(self.path).path
-        if caminho == "/favicon.ico":
-            self._responder(204, b"", "image/x-icon")
-            return
-        autorizado, pelo_link = self._autorizar()
-        if not autorizado:
-            self._responder(403, _pagina_erro_navegador("Link inválido. Peça o link do navegador para quem o criou."))
-            return
+        self._novos_cookies, self._respondeu, self._corpo_lido = [], False, False
+        partes = urllib.parse.urlsplit(self.path)
+        caminho, consulta = partes.path, partes.query
         try:
-            if caminho == "/":
-                self._responder(200, _pagina_inicio_navegador(), cookie=pelo_link)
-            elif caminho == "/ir":
-                self._ir(pelo_link)
-            elif caminho == "/sair":
-                self._responder(200, _pagina_erro_navegador("Pronto."),
-                                extra={"Set-Cookie": "navtk=; Path=/; Max-Age=0"})
-            elif caminho.startswith("/r/"):
-                self._navegar(caminho[3:], pelo_link)
+            if self.headers.get("Service-Worker"):
+                self._responder(403, b"", "text/plain")   # service workers ficam desligados
+            elif caminho in ("/favicon.ico", "/_tt/icone.svg"):
+                self._icone(caminho)
+            elif caminho.startswith("/m/"):
+                self._midia(caminho, consulta)   # link assinado do VLC Web: vale sem o cookie
             else:
-                self._responder(404, _pagina_erro_navegador("Página não encontrada."))
-        except (BrokenPipeError, ConnectionResetError):
+                autorizado, pelo_link = self._autorizar()
+                if not autorizado:
+                    self._responder(403, _pagina_sem_acesso())
+                    return
+                if pelo_link:
+                    self._novos_cookies.append(
+                        f"navtk={self.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
+                self._rotear(caminho, consulta)
+        except _CorpoInvalido:
             pass
+        except (BrokenPipeError, ConnectionResetError, TimeoutError):
+            self.close_connection = True
         except Exception as e:  # noqa: BLE001 — um erro numa página nunca pode derrubar o navegador
-            log(f"Navegador: erro inesperado ({e!r})")
-            with contextlib.suppress(OSError):
-                self._responder(500, _pagina_erro_navegador("Algo deu errado ao abrir a página."))
+            log(f"Navegador: erro inesperado em {caminho} ({e!r})")
+            self.close_connection = True
+            if not self._respondeu:
+                with contextlib.suppress(OSError):
+                    self._responder(500, _pagina_erro_navegador("Algo deu errado ao abrir a página."))
+        finally:
+            # um envio que não lemos ficaria no meio da conexão e embaralharia o próximo pedido
+            if not self._corpo_lido and (int(self.headers.get("Content-Length") or 0) > 0
+                                         or self.headers.get("Transfer-Encoding")):
+                self.close_connection = True
 
-    def _ir(self, cookie: bool) -> None:
-        termo = (self._consulta().get("q") or [""])[0].strip()
-        if not termo:
-            self._responder(303, b"", extra={"Location": "/"}, cookie=cookie)
-            return
-        if re.match(r"[a-z][a-z0-9+.\-]*://", termo, re.I):
-            url = termo
-        elif " " not in termo and re.search(r"\.[a-z]{2,}$", termo.split("/")[0], re.I):
-            url = "https://" + termo
+    def _rotear(self, caminho: str, consulta: str) -> None:
+        if caminho == "/":
+            self._responder(200, _pagina_inicio_navegador(self.saida))
+        elif caminho == "/ir":
+            self._ir()
+        elif caminho.startswith("/p/"):
+            self._proxy(caminho[3:], consulta)
+        elif caminho.startswith("/r/"):   # links do formato antigo (/r/<endereço em base64>)
+            self._link_antigo(caminho[3:], consulta)
+        elif caminho == "/_tt/nav.js":
+            versao_certa = self._param("v") == NAV_JS_VERSAO
+            self._responder(200, NAV_JS.encode("utf-8"), "text/javascript; charset=utf-8",
+                            {"Cache-Control": "public, max-age=604800, immutable" if versao_certa else "no-cache"})
+        elif caminho == "/_tt/vlc":
+            self._abrir_no_vlc()
+        elif caminho == "/_tt/assinar":
+            real = _url_real(self._param("u"))
+            link = _nav_link(real, self.token) if real else None
+            if link:
+                self._json({"url": self._origem_publica() + link})
+            else:
+                self._json({"erro": "endereço inválido (só http:// e https://)"}, 400)
+        elif caminho == "/_tt/vlc-estado":
+            self._json(_vlc_estado_json())
+        elif caminho == "/_tt/vlc-instalar":
+            if self.command != "POST":
+                self._json({"erro": "use POST"}, 405)
+                return
+            self._ler_corpo()
+            _vlc_instalar_no_fundo()
+            self._json(_vlc_estado_json())
+        elif caminho == "/vlc":
+            self._ir_para("/vlc/" + (f"?{consulta}" if consulta else ""), 301)
+        elif caminho.startswith("/vlc/"):
+            self._vlc_arquivo(caminho[5:])
+        elif caminho == "/sair":
+            sid = self._cookie("navsid")
+            if sid:
+                _esquecer_sessao_navegador(sid)
+            self._novos_cookies += ["navtk=; Path=/; Max-Age=0", "navsid=; Path=/; Max-Age=0",
+                                    "navsite=; Path=/; Max-Age=0"]
+            self._responder(200, _pagina_simples("Pronto", f"""{_logo(64)}<h1>Este aparelho saiu</h1>
+<p>Os cookies dos sites abertos por aqui foram apagados do celular. Para voltar, abra o link do navegador de novo.</p>"""))
         else:
-            url = url_com(NAV_BUSCA, q=termo)
-        self._responder(303, b"", extra={"Location": "/r/" + _b64_url(url)}, cookie=cookie)
+            self._sem_rota(caminho, consulta)
 
-    def _navegar(self, cod: str, cookie: bool) -> None:
+    def _icone(self, caminho: str) -> None:
+        if caminho == "/favicon.ico":   # o ícone que o navegador pede sozinho: o do site aberto, se houver
+            origem = self._site_do_referer()
+            if origem:
+                self._ir_para(f"/p/{origem[0]}/{origem[1]}/favicon.ico", 302)
+                return
+        self._responder(200, NAV_ICONE.encode("utf-8"), "image/svg+xml", {"Cache-Control": "public, max-age=86400"})
+
+    def _site_do_referer(self) -> tuple | None:
+        """(esquema, site) da página que fez o pedido, pelo Referer (ou pelo último site aberto, no cookie)."""
+        ref = urllib.parse.urlsplit(self.headers.get("Referer") or "")
+        achado = re.match(r"/(?:p|m/[0-9a-f]{8,64})/(https?)/([^/?#]+)", ref.path)
+        if achado and (not ref.netloc or ref.netloc == self.headers.get("Host")):
+            return achado.group(1), achado.group(2)
+        achado = re.fullmatch(r"(https?)/([^/;]+)", self._cookie("navsite"))
+        return (achado.group(1), achado.group(2)) if achado else None
+
+    def _sem_rota(self, caminho: str, consulta: str) -> None:
+        """Caminho que não é nosso, como "/api/busca": quase sempre um pedido do JavaScript da página para o próprio
+        site. Mandamos para o site certo (307 mantém o método e o envio)."""
+        origem = self._site_do_referer()
+        if origem:
+            self._ir_para(f"/p/{origem[0]}/{origem[1]}{caminho}" + (f"?{consulta}" if consulta else ""), 307)
+        else:
+            self._responder(404, _pagina_erro_navegador("Página não encontrada."))
+
+    def _ir(self) -> None:
+        termo = self._param("q").strip()
+        if not termo:
+            self._ir_para("/")
+            return
+        url = _endereco_digitado(termo, self._param("motor") or "ddg")
+        destino = _nav_link(url)
+        if not destino:
+            self._responder(400, _pagina_erro_navegador("O navegador só abre endereços http:// e https://.", url))
+            return
+        self._ir_para(destino)
+
+    def _link_antigo(self, cod: str, consulta: str) -> None:
         try:
-            alvo = _de_b64_url(cod)
+            alvo = _de_b64_url(cod.split("/", 1)[0])
         except (ValueError, UnicodeDecodeError):
+            alvo = ""
+        extra = [(k, v) for k, v in urllib.parse.parse_qsl(consulta, keep_blank_values=True)
+                 if not (k == "t" and self._token_ok(v))]
+        if extra:   # um formulário GET: os campos preenchidos trocam a busca do endereço
+            p = urllib.parse.urlsplit(alvo)
+            alvo = urllib.parse.urlunsplit((p.scheme, p.netloc, p.path, urllib.parse.urlencode(extra), ""))
+        destino = _nav_link(alvo)
+        if destino:
+            self._ir_para(destino, 301)
+        else:
+            self._responder(400, _pagina_erro_navegador("Endereço inválido."))
+
+    def _abrir_no_vlc(self) -> None:
+        """/_tt/vlc?u=<vídeo>: abre o vídeo no VLC Web, por um link /m/ (que o reprodutor lê sem o cookie)."""
+        real = _url_real(self._param("u"))
+        if not real:
+            self._ir_para("/vlc/")
+            return
+        link = _nav_link(real, self.token)
+        if not link:
+            self._responder(400, _pagina_erro_navegador("Esse link não é http:// nem https://.", real))
+            return
+        params = {"url": self._origem_publica() + link, "play": "1"}
+        titulo = self._param("titulo").strip()
+        if titulo:
+            params["title"] = titulo[:200]
+        self._ir_para("/vlc/?" + urllib.parse.urlencode(params))
+
+    def _vlc_arquivo(self, relativo: str) -> None:
+        if not vlc_web_instalado():
+            if relativo in ("", "index.html"):
+                self._responder(200, _pagina_preparar_vlc())
+            else:
+                self._responder(404, b"", "text/plain")
+            return
+        relativo = urllib.parse.unquote(relativo)
+        if relativo == "" or relativo.endswith("/"):
+            relativo += "index.html"
+        raiz = VLC_WEB_DIR.resolve()
+        arquivo = (raiz / relativo).resolve()
+        if (raiz not in arquivo.parents or not arquivo.is_file()
+                or any(p.startswith(".") for p in arquivo.relative_to(raiz).parts)):
+            self._responder(404, _pagina_erro_navegador("Esse arquivo não faz parte do VLC Web."))
+            return
+        dados = arquivo.read_bytes()
+        if arquivo == raiz / "index.html":
+            # o VLC Web passa a saber que está no navegador pelo celular: os links de rede que a pessoa abrir
+            # (e a busca de rádios, podcasts e legendas) também vão pela conexão do celular
+            dados = dados.replace(b"</head>", _script_vlc_integracao().encode("utf-8") + b"</head>", 1)
+        self._responder(200, dados, VLC_WEB_TIPOS.get(arquivo.suffix.lower(), "application/octet-stream"),
+                        {"Cache-Control": "no-cache"})
+
+    # ── buscar o site ──
+    def _midia(self, caminho: str, consulta: str) -> None:
+        achado = re.match(r"/m/([0-9a-f]{20})/(https?)/([^/?#]+)", caminho)
+        if not achado or not self._token_ok(self.token) or not hmac.compare_digest(
+                achado.group(1), _assinatura_midia(self.token, achado.group(2), urllib.parse.unquote(achado.group(3)))):
+            self._responder(403, b"link de midia invalido", "text/plain")
+            return
+        if self.command == "OPTIONS" and self.headers.get("Access-Control-Request-Method"):
+            self._responder(204, b"", "text/plain", {
+                "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
+                "Access-Control-Allow-Headers": self.headers.get("Access-Control-Request-Headers") or "*",
+                "Access-Control-Max-Age": "600", "Cache-Control": "max-age=600"})
+            return
+        self._proxy(caminho[achado.start(2):], consulta, midia=True)
+
+    def _proxy(self, resto: str, consulta: str, midia: bool = False) -> None:
+        esquema, _, resto = resto.partition("/")
+        site_cod, barra, caminho = resto.partition("/")
+        site = urllib.parse.unquote(site_cod)
+        if esquema not in ("http", "https") or not site or "@" in site or "/" in site:
             self._responder(400, _pagina_erro_navegador("Endereço inválido."))
             return
-        extra = [(k, v) for k, v in urllib.parse.parse_qsl(urllib.parse.urlsplit(self.path).query) if k != "t"]
-        if extra:  # veio de um formulário GET: o navegador troca a query do endereço pelos campos preenchidos
-            partes = urllib.parse.urlsplit(alvo)
-            alvo = urllib.parse.urlunsplit((partes.scheme, partes.netloc, partes.path,
-                                            urllib.parse.urlencode(extra), ""))
-        corpo = tipo_corpo = None
-        if self.command == "POST":
-            tamanho = int(self.headers.get("Content-Length") or 0)
-            corpo = self.rfile.read(min(tamanho, NAV_MAX_CORPO)) if tamanho else b""
-            tipo_corpo = self.headers.get("Content-Type")
+        if not barra:   # /p/https/site → /p/https/site/ (os links relativos precisam da barra)
+            prefixo = self.path.split("?", 1)[0]
+            self._ir_para(prefixo + "/" + (f"?{consulta}" if consulta else ""), 301)
+            return
+        # tira da busca os parâmetros nossos, sem mexer no resto (links assinados quebram se a busca mudar)
+        acao, fica = "", []
+        for pedaco in consulta.split("&") if consulta else []:
+            chave, _, valor = pedaco.partition("=")
+            chave = urllib.parse.unquote_plus(chave)
+            if chave == "__tt":
+                acao = urllib.parse.unquote_plus(valor)
+            elif not (chave == "t" and self._token_ok(urllib.parse.unquote_plus(valor))):
+                fica.append(pedaco)
+        url = f"{esquema}://{site}/{caminho}" + ("?" + "&".join(fica) if fica else "")
+        corpo = None
+        cabecalhos = self._cabecalhos_para_site(url)
+        if self.command not in ("GET", "HEAD", "OPTIONS"):
+            corpo = self._ler_corpo()
+            if self.headers.get("Content-Type"):
+                cabecalhos["Content-Type"] = self.headers["Content-Type"]
         try:
-            resposta = _buscar_site(self.opener, alvo, self.command if self.command != "HEAD" else "GET",
-                                    corpo, tipo_corpo, self.headers.get("Accept-Language") or "")
+            pedido = urllib.request.Request(_url_para_rede(url), data=corpo, headers=cabecalhos, method=self.command)
+        except ValueError as e:
+            self._responder(400, _pagina_erro_navegador(f"Endereço inválido: {e}", url))
+            return
+        try:
+            resposta = self._abridor(midia).open(pedido, timeout=NAV_TIMEOUT)
         except urllib.error.HTTPError as e:
-            resposta = e   # a própria página de erro do site; reescrevemos e mostramos
+            resposta = e   # a própria resposta do site (erro ou redirecionamento): entregamos como veio
         except urllib.error.URLError as e:
-            motivo = e.reason
-            if isinstance(motivo, PermissionError):
+            if isinstance(e.reason, PermissionError):
                 self._responder(403, _pagina_erro_navegador(
-                    "Esse endereço aponta para a rede local ou para o próprio celular; o navegador não abre esses.", alvo))
+                    "Esse endereço aponta para a rede local ou para o próprio celular; o navegador não abre esses.",
+                    url, "&#128274;"))
             else:
-                self._responder(502, _pagina_erro_navegador(f"Não consegui abrir o site: {motivo}", alvo))
+                self._responder(502, _pagina_erro_navegador(f"Não consegui abrir: {_motivo_amigavel(e)}", url))
+            return
+        except PermissionError:
+            self._responder(403, _pagina_erro_navegador("Destino na rede local bloqueado.", url, "&#128274;"))
             return
         except (OSError, http.client.HTTPException, ValueError) as e:
-            self._responder(502, _pagina_erro_navegador(f"Não consegui abrir o site: {e}", alvo))
+            self._responder(502, _pagina_erro_navegador(f"Não consegui abrir: {_motivo_amigavel(e)}", url))
             return
         with contextlib.closing(resposta):
-            self._entregar(resposta, cookie)
+            self._entregar(resposta, url, acao, midia)
 
-    def _entregar(self, resposta, cookie: bool) -> None:
-        final = resposta.geturl() or ""
-        status = getattr(resposta, "status", None) or 200
-        cabecalhos = resposta.headers
-        ctype = cabecalhos.get("Content-Type", "")
-        base_tipo = ctype.split(";")[0].strip().lower()
-        if base_tipo.startswith(NAV_TIPOS_TEXTO):
-            bruto = resposta.read(NAV_MAX_REESCREVER + 1)
-            if len(bruto) <= NAV_MAX_REESCREVER:
-                dados = _descomprimir(bruto, cabecalhos.get("Content-Encoding"))
-                texto = dados.decode(_charset_da_pagina(ctype, dados), "replace")
-                if base_tipo == "text/css":
-                    saida = _reescrever_css(texto, final)
-                    tipo = "text/css; charset=utf-8"
-                else:
-                    saida = _reescrever_html(texto, final, self.com_barra)
-                    tipo = "text/html; charset=utf-8"
-                self._responder(status if 200 <= status < 600 else 200, saida.encode("utf-8", "replace"),
-                                tipo, cookie=cookie)
+    def _eh_navegacao(self) -> bool:
+        """O visitante abriu o endereço na aba (e não é um <video>, uma imagem ou um fetch da página)? O
+        Sec-Fetch-Dest só vem em https; no Wi-Fi (http) vale o Accept, que só as navegações mandam com text/html."""
+        destino = self.headers.get("Sec-Fetch-Dest")
+        if destino:
+            return destino == "document"
+        return "text/html" in (self.headers.get("Accept") or "")
+
+    def _referer_real(self) -> str | None:
+        ref = urllib.parse.urlsplit(self.headers.get("Referer") or "")
+        if ref.netloc and ref.netloc != self.headers.get("Host"):
+            return None
+        return _nav_real(ref.path, ref.query)
+
+    def _cabecalhos_para_site(self, url: str) -> dict:
+        cab = {}
+        for chave, valor in self.headers.items():
+            baixa = chave.lower()
+            if baixa in NAV_NAO_REPASSAR or baixa.startswith(NAV_NAO_REPASSAR_PREFIXOS):
+                continue
+            cab[chave] = valor
+        if not any(k.lower() == "user-agent" for k in cab):
+            cab["User-Agent"] = USER_AGENT
+        if not any(k.lower() == "accept-language" for k in cab):
+            cab["Accept-Language"] = "pt-BR,pt;q=0.9,en;q=0.8"
+        cab["Accept-Encoding"] = "gzip, deflate"
+        referer = self._referer_real()
+        if referer:   # como um navegador faria: o endereço inteiro para o mesmo site, só a origem para os outros
+            de, para = urllib.parse.urlsplit(referer), urllib.parse.urlsplit(url)
+            origem = f"{de.scheme}://{de.netloc}"
+            if (de.scheme, de.netloc.lower()) == (para.scheme, para.netloc.lower()):
+                cab["Referer"] = referer
+            elif not (de.scheme == "https" and para.scheme == "http"):
+                cab["Referer"] = origem + "/"
+            if self.command not in ("GET", "HEAD") and self.headers.get("Origin"):
+                cab["Origin"] = origem
+        return cab
+
+    def _entregar(self, resposta, url: str, acao: str, midia: bool) -> None:
+        status = getattr(resposta, "status", None) or getattr(resposta, "code", None) or 200
+        cab = resposta.headers
+        ligar_lista = (lambda base, alvo: _proxiar(base, alvo, self.token)) if midia else _proxiar
+        extra_cors = {"Access-Control-Allow-Origin": "*", "Access-Control-Expose-Headers":
+                      "Content-Length, Content-Range, Content-Type, Content-Disposition, Accept-Ranges"} if midia else {}
+        if status in (301, 302, 303, 307, 308):
+            destino = cab.get("Location")
+            novo = ligar_lista(url, destino) if destino else None
+            if destino:
+                self._responder(status, b"", extra={"Location": novo or destino, **extra_cors})
                 return
-            # grande demais para reescrever: entrega como veio (começando pelo que já foi lido)
-            self._fluxo(status, cabecalhos, resposta, cookie, prefixo=bruto)
-            return
-        self._fluxo(status, cabecalhos, resposta, cookie)
-
-    def _fluxo(self, status: int, cabecalhos, resposta, cookie: bool, prefixo: bytes = b"") -> None:
-        """Repassa um conteúdo que não é página (imagem, vídeo, fonte, script...) sem mexer, em blocos."""
-        self.send_response(status if 200 <= status < 600 else 200)
-        passar = ("Content-Type", "Content-Encoding", "Content-Length", "Content-Disposition", "Content-Range",
-                  "Accept-Ranges", "Last-Modified", "ETag", "Expires", "Age")
-        enviou_tamanho = False
-        for chave in passar:
-            valor = cabecalhos.get(chave)
-            if valor and chave.lower() not in NAV_CORTAR_RESP:
+        if status == 304:
+            self._comecar(304)
+            for chave in ("ETag", "Last-Modified", "Cache-Control", "Expires"):
+                if cab.get(chave):
+                    self.send_header(chave, cab[chave])
+            for chave, valor in extra_cors.items():
                 self.send_header(chave, valor)
-                enviou_tamanho = enviou_tamanho or chave == "Content-Length"
-        if not enviou_tamanho and prefixo:
-            pass  # sem Content-Length: a conexão fecha no fim (HTTP/1.0), o navegador entende
-        self.send_header("Cache-Control", cabecalhos.get("Cache-Control", "no-store"))
-        if cookie and self.token:
-            self.send_header("Set-Cookie", f"navtk={self.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800")
-        self.end_headers()
-        if self.command == "HEAD":
+            self.end_headers()
             return
-        with contextlib.suppress(OSError):
+        tipo = cab.get("Content-Type", "")
+        tipo_base = tipo.split(";")[0].strip().lower()
+        if acao == "baixar":
+            self._fluxo(status, cab, resposta, baixar=url, extra=extra_cors)
+            return
+        tipo_midia = _tipo_midia(tipo_base, url)
+        if tipo_midia and self.command == "GET" and acao != "direto" and 200 <= status < 300 and self._eh_navegacao():
+            # abriu um link de vídeo/música direto: em vez de despejar o arquivo, oferece o VLC Web
+            tamanho = cab.get("Content-Length")
+            self._responder(200, _pagina_midia_navegador(url, tipo_midia, _nav_link(url) or "",
+                                                         bytes_humanos(int(tamanho)) if (tamanho or "").isdigit()
+                                                         else ""))
+            return
+        modo = _modo_reescrita(tipo_base, url)
+        codificacao = (cab.get("Content-Encoding") or "").lower().strip()
+        if not modo or self.command == "HEAD" or codificacao not in ("", "identity", "gzip", "x-gzip", "deflate"):
+            self._fluxo(status, cab, resposta, reescrito=bool(modo), extra=extra_cors)
+            return
+        bruto = resposta.read(NAV_MAX_REESCREVER + 1)
+        if len(bruto) > NAV_MAX_REESCREVER:   # grande demais: vai como veio
+            self._fluxo(status, cab, resposta, prefixo=bruto, extra=extra_cors)
+            return
+        dados = _descomprimir(bruto, codificacao)
+        texto = dados.decode(_charset_da_pagina(tipo, dados), "replace")
+        extra = dict(extra_cors)
+        if modo == "html":
+            saida = _reescrever_html(texto, url, _proxiar, self.com_barra)
+            tipo_saida = "text/html; charset=utf-8"
+            partes = urllib.parse.urlsplit(url)
+            self._novos_cookies.append(f"navsite={partes.scheme}/{partes.netloc}; Path=/; SameSite=Lax")
+        elif modo == "css":
+            saida, tipo_saida = _reescrever_css(texto, url), "text/css; charset=utf-8"
+            extra["Cache-Control"] = cab.get("Cache-Control") or "no-store"
+        elif modo == "m3u" and texto.lstrip("﻿ \r\n\t").startswith("#EXTM3U"):
+            saida, tipo_saida = _reescrever_m3u(texto, url, ligar_lista), tipo or "application/vnd.apple.mpegurl"
+        elif modo == "mpd" and "<MPD" in texto[:4096]:
+            saida, tipo_saida = _reescrever_mpd(texto, url, ligar_lista), tipo or NAV_TIPO_DASH
+        else:   # parecia uma lista, mas não é: entrega o conteúdo como veio (já descomprimido)
+            self._responder(status if 200 <= status < 600 else 200, dados, tipo or "application/octet-stream", extra)
+            return
+        if cab.get("Content-Language"):
+            extra["Content-Language"] = cab["Content-Language"]
+        self._responder(status if 200 <= status < 600 else 200, saida.encode("utf-8", "replace"), tipo_saida, extra)
+
+    def _fluxo(self, status: int, cab, resposta, prefixo: bytes = b"", reescrito: bool = False,
+               baixar: str = "", extra: dict | None = None) -> None:
+        """Repassa o conteúdo sem mexer (imagem, vídeo, fonte, script...), em blocos. O cabeçalho Content-Encoding
+        vai junto: antes ele era cortado e scripts e SVGs comprimidos chegavam ilegíveis."""
+        self._comecar(status if 200 <= status < 600 else 200)
+        tem_tamanho = False
+        for chave in NAV_PASSAR_FLUXO:
+            valor = cab.get(chave)
+            if not valor:
+                continue
+            if reescrito and chave in ("Content-Length", "Content-Encoding", "ETag"):
+                continue   # resposta a HEAD de uma página: o GET viria reescrito, com outro tamanho
+            if baixar and chave == "Content-Disposition":
+                continue
+            self.send_header(chave, valor)
+            tem_tamanho = tem_tamanho or chave == "Content-Length"
+        if not cab.get("Cache-Control"):
+            self.send_header("Cache-Control", "no-store")
+        if baixar:
+            nome = cab.get_filename() if hasattr(cab, "get_filename") else None
+            nome = nome or urllib.parse.unquote(posixpath.basename(urllib.parse.urlsplit(baixar).path)) or "arquivo"
+            self.send_header("Content-Disposition", "attachment; filename*=UTF-8''" + urllib.parse.quote(nome))
+        for chave, valor in (extra or {}).items():
+            self.send_header(chave, valor)
+        sem_corpo = self.command == "HEAD" or status in (204, 304) or 100 <= status < 200
+        if not sem_corpo and not tem_tamanho:
+            self.send_header("Connection", "close")   # sem o tamanho, o fim do conteúdo é o fim da conexão
+            self.close_connection = True
+        self.end_headers()
+        if sem_corpo:
+            return
+        try:
             if prefixo:
                 self.wfile.write(prefixo)
             while True:
@@ -5218,6 +6844,14 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
                 if not bloco:
                     break
                 self.wfile.write(bloco)
+        except (OSError, http.client.HTTPException):
+            self.close_connection = True   # o site ou o visitante caiu no meio: a conexão não serve mais
+
+
+def _script_vlc_integracao() -> str:
+    dados = {"nome": "Termux-Toons", "versao": VERSION, "assinar": "/_tt/assinar?u=", "inicio": "/",
+             "vlc": "/_tt/vlc?u="}
+    return f"<script>window.TERMUX_TOONS={_json_no_html(dados)};</script>"
 
 
 def _saida_navegador() -> tuple | None:
@@ -5237,12 +6871,13 @@ def servir_navegador(porta: int) -> None:
         raise ToonsError("Crie o navegador pelo menu primeiro (ele gera o link secreto).")
     saida = _saida_navegador()
     _ConexaoNav.saida = _ConexaoNavTLS.saida = saida
-    _HandlerNavegador.opener = _abridor_navegador(http.cookiejar.CookieJar())
     _HandlerNavegador.token = c["navegador_token"]
     _HandlerNavegador.com_barra = bool(c.get("navegador_barra", True))
+    _HandlerNavegador.saida = c.get("navegador_saida") or ""
     with ThreadingHTTPServer(("0.0.0.0", porta), _HandlerNavegador) as servidor:
         log(f"Navegador pelo celular em http://{ip_local()}:{porta}"
             + (f" · saindo {_nome_saida(c.get('navegador_saida'))}" if saida else "")
+            + (" · VLC Web pronto em /vlc/" if vlc_web_instalado() else " · o VLC Web é baixado no primeiro uso")
             + "  (Ctrl+C para parar)")
         servidor.serve_forever()
 
@@ -5260,6 +6895,29 @@ def links_do_navegador() -> list:
     return links
 
 
+def _link_com_caminho(link: str, caminho: str) -> str:
+    """http://ip:porta/?t=X + /vlc/ → http://ip:porta/vlc/?t=X"""
+    base, _, token = link.partition("/?t=")
+    return f"{base}{caminho}{'&' if '?' in caminho else '?'}t={token}"
+
+
+def _oferecer_link(link: str, texto_envio: str, nome_qr: str, link_teste: str | None = None) -> None:
+    i = escolher("E agora?", ["Copiar o link", "Mostrar QR code", "Enviar (WhatsApp, Telegram...)",
+                              "Abrir aqui para testar", "Nada"])
+    if i == 0:
+        copiar_texto(link)
+    elif i == 1:
+        mostrar_qr(link, nome_qr)
+    elif i == 2:
+        if tem("termux-share"):
+            _tapi(["termux-share", "-a", "send"], 30, entrada=f"{texto_envio}\n{link}", json_saida=False)
+        else:
+            copiar_texto(link)
+            info("Sem o Termux:API para compartilhar: o link foi copiado.")
+    elif i == 3:
+        abrir_link(link_teste or link)
+
+
 def mostrar_links_navegador(oferecer_acoes: bool = True) -> None:
     if not servico_ativo(SERVICO_NAVEGADOR):
         info("O navegador está parado.")
@@ -5268,22 +6926,11 @@ def mostrar_links_navegador(oferecer_acoes: bool = True) -> None:
     print(f"\n{NEG}🌐 Navegador pelo celular{RST} {DIM}(abra o link e navegue; os sites são carregados pelo celular){RST}")
     for onde, link in links:
         print(f"  {CIANO}{onde}:{RST}\n  {NEG}{link}{RST}")
+    print(f"  {DIM}▶ VLC Web pelo mesmo link: {_link_com_caminho(links[-1][1], '/vlc/')}{RST}")
     if len(links) == 1:
         print(f"  {DIM}Para abrir fora do seu Wi-Fi, ligue o navegador escolhendo 'qualquer lugar'.{RST}")
-    if not oferecer_acoes:
-        return
-    link = links[-1][1]
-    i = escolher("E agora?", ["Copiar o link", "Mostrar QR code", "Enviar (WhatsApp, Telegram...)",
-                              "Abrir aqui para testar", "Nada"])
-    if i == 0:
-        copiar_texto(link)
-    elif i == 1:
-        mostrar_qr(link, "navegador")
-    elif i == 2 and tem("termux-share"):
-        _tapi(["termux-share", "-a", "send"], 30, entrada=f"🌐 Navegue pela internet do meu celular:\n{link}",
-              json_saida=False)
-    elif i == 3:
-        abrir_link(links[0][1])
+    if oferecer_acoes:
+        _oferecer_link(links[-1][1], "🌐 Navegue pela internet do meu celular:", "navegador", links[0][1])
 
 
 def _reiniciar_navegador() -> None:
@@ -5336,7 +6983,7 @@ def novo_link_navegador() -> None:
     c = cfg()
     c["navegador_token"] = secrets.token_urlsafe(18)
     salvar_cfg()
-    ok("Link novo criado: o antigo parou de funcionar.")
+    ok("Link novo criado: o antigo (e os vídeos abertos no VLC Web por ele) pararam de funcionar.")
     _reiniciar_navegador()
     if servico_ativo(SERVICO_NAVEGADOR):
         mostrar_links_navegador()
@@ -5354,6 +7001,116 @@ def usar_saida_no_navegador(chave: str | None) -> None:
     salvar_cfg()
     ok(f"Navegador saindo {_nome_saida(chave)}.")
     _reiniciar_navegador()
+
+
+# ── VLC Web no navegador ──────────────────────────────────────────────
+
+def _descricao_vlc_web() -> str:
+    versao = vlc_web_versao()
+    if versao is None:
+        return "ainda não baixado"
+    sha = (versao.get("sha") or "")[:7]
+    data = (versao.get("data") or "")[:10]
+    return "no celular" + (f" · versão {sha}" if sha else "") + (f" · {data}" if data else "")
+
+
+def atualizar_vlc_web(perguntar_antes: bool = False) -> bool:
+    """Baixa (ou atualiza) o VLC Web do GitHub, com barra de progresso no terminal."""
+    versao = vlc_web_versao()
+    if versao and perguntar_antes:
+        info("Olhando no GitHub se há versão nova...")
+        remoto = vlc_web_versao_remota()
+        if remoto and remoto == versao.get("sha"):
+            ok(f"O VLC Web já está na versão mais nova ({remoto[:7]}).")
+            if not confirmar("Baixar de novo mesmo assim?", False):
+                return True
+        elif remoto:
+            info(f"Versão nova no GitHub: {remoto[:7]} (no celular: {(versao.get('sha') or '?')[:7]}).")
+    info(f"Baixando o VLC Web de {VLC_WEB_SITE} ...")
+    t0, ultimo = time.time(), [0.0]
+
+    def progresso(feito, total):
+        agora = time.time()
+        if agora - ultimo[0] < 0.25 and feito != total:
+            return
+        ultimo[0] = agora
+        if total:
+            frac = feito / total
+            barra = "█" * int(frac * 25) + "░" * (25 - int(frac * 25))
+            print(f"\r  {barra} {frac * 100:5.1f}%  {bytes_humanos(feito)}/{bytes_humanos(total)}   ", end="", flush=True)
+        else:
+            print(f"\r  {bytes_humanos(feito)}  {bytes_humanos(feito / max(agora - t0, 0.001))}/s   ", end="", flush=True)
+
+    try:
+        nova = instalar_vlc_web(progresso)
+    finally:
+        print()
+    tamanho = sum(f.stat().st_size for f in VLC_WEB_DIR.rglob("*") if f.is_file())
+    ok(f"VLC Web pronto no celular (versão {(nova.get('sha') or '?')[:7]}, {bytes_humanos(tamanho)}). "
+       "Abra pelo navegador: /vlc/")
+    return True
+
+
+def enviar_video_ao_vlc_web() -> None:
+    """Gera um link que abre um vídeo no VLC Web, carregado pela conexão do celular."""
+    if not servico_ativo(SERVICO_NAVEGADOR):
+        aviso("Ligue o navegador primeiro: o link passa por ele.")
+        return
+    alvo = perguntar("Link do vídeo, música ou lista (.m3u8, .mpd)").strip()
+    if not alvo:
+        return
+    if not re.match(r"(?i)https?://", alvo):
+        alvo = "https://" + alvo
+    link = _link_com_caminho(links_do_navegador()[-1][1], "/_tt/vlc?" + urllib.parse.urlencode({"u": alvo}))
+    print(f"\n  {CIANO}Abre no VLC Web:{RST}\n  {NEG}{link}{RST}")
+    _oferecer_link(link, "▶ Assista pelo VLC Web:", "vlc-web")
+
+
+@submenu
+def menu_vlc_web_navegador():
+    def abrir():
+        if not servico_ativo(SERVICO_NAVEGADOR):
+            aviso("Ligue o navegador primeiro: o VLC Web é servido por ele.")
+            return
+        link = _link_com_caminho(links_do_navegador()[-1][1], "/vlc/")
+        print(f"\n  {CIANO}VLC Web:{RST}\n  {NEG}{link}{RST}")
+        if not vlc_web_instalado():
+            info("Ele é baixado do GitHub na primeira vez que o link for aberto (cerca de 1 MB).")
+        _oferecer_link(link, "▶ VLC Web pelo meu celular:", "vlc-web",
+                       _link_com_caminho(links_do_navegador()[0][1], "/vlc/"))
+
+    def remover():
+        if vlc_web_versao() is None:
+            info("O VLC Web não está no celular.")
+        elif confirmar("Apagar o VLC Web do celular? (ele é baixado de novo quando alguém abrir /vlc/)", False):
+            remover_vlc_web()
+            ok("VLC Web apagado.")
+
+    def como_funciona():
+        _explicar([
+            f"O VLC Web ({VLC_WEB_SITE}) é um reprodutor de mídia completo que roda no navegador: lista de "
+            "reprodução, legendas (e busca de legendas), equalizador, troca de faixa de áudio, velocidade, filtros "
+            "de vídeo e conversão de formatos como MKV, AVI e AC-3.",
+            "O celular baixa o VLC Web do GitHub e o serve no próprio navegador pelo celular, em /vlc/. Na barra "
+            "das páginas, o botão laranja ▶ VLC mostra os vídeos e músicas achados na página: um toque e eles "
+            "abrem no VLC Web.",
+            "O vídeo continua vindo pela conexão do celular, com avanço e retrocesso, e o VLC Web consegue ler as "
+            "faixas de áudio e legendas, aplicar efeitos e gravar (o que costuma falhar com vídeos de outros sites).",
+            "Os links de rede abertos dentro do VLC Web (Mídia → Abrir rede, rádios, podcasts e busca de legendas) "
+            "também passam pelo celular. Os links de vídeo valem enquanto o link do navegador for o mesmo.",
+        ])
+
+    def cabecalho():
+        print(f"{DIM}VLC Web: {_descricao_vlc_web()} · {VLC_WEB_SITE}{RST}")
+
+    menu("▶ VLC Web no navegador pelo celular", [
+        ("Como funciona", como_funciona),
+        (lambda: "Baixar o VLC Web do GitHub" if vlc_web_versao() is None else "Atualizar o VLC Web (do GitHub)",
+         lambda: atualizar_vlc_web(perguntar_antes=True)),
+        ("Mostrar o link do VLC Web", abrir),
+        ("Mandar um vídeo para o VLC Web (link pronto para abrir)", enviar_video_ao_vlc_web),
+        ("Apagar o VLC Web do celular", remover),
+    ], cabecalho=cabecalho)
 
 
 @submenu
@@ -5376,7 +7133,7 @@ def menu_navegador_web():
     def alternar_barra():
         c["navegador_barra"] = not c.get("navegador_barra", True)
         salvar_cfg()
-        ok(f"Barra de endereço no topo das páginas {'ligada' if c['navegador_barra'] else 'desligada'}.")
+        ok(f"Barra de endereço nas páginas {'ligada' if c['navegador_barra'] else 'desligada'}.")
         _reiniciar_navegador()
 
     def como_funciona():
@@ -5386,12 +7143,17 @@ def menu_navegador_web():
             "celular (é o IP dele que aparece).",
             "Abre em qualquer aparelho (celular, PC, TV, tablet) sem instalar nem configurar nada: é só abrir o "
             "link. Serve para pesquisar, ler notícias, Wikipédia, abrir um site bloqueado na outra rede...",
-            "Como ele reescreve as páginas, sites muito dependentes de JavaScript (apps, redes sociais, players de "
-            "vídeo, login em muitos serviços) podem abrir mal ou não abrir. Para navegar 'de verdade' no PC, use o "
-            "Proxy; para ver a sua própria tela, a Transmissão da tela.",
-            "A saída pode ser direto, pelo túnel SSH (sai pelo seu servidor) ou pelo Tor (esconde o IP). Com senha "
-            "no link (o ?t=...), só quem tem o link abre; o endereço fixo e o túnel da Cloudflare dão um link que "
-            "funciona pela internet.",
+            "A página inicial tem busca (DuckDuckGo, Bing, Google ou Wikipédia), atalhos que dá para editar e os "
+            "sites visitados (guardados só no aparelho de quem navega). Nas páginas, a barra tem voltar, início, "
+            "endereço, recarregar e o botão ▶ VLC, e pode ficar no topo, embaixo ou escondida.",
+            "Vídeos e músicas abrem no VLC Web (reprodutor do github.com/Gustavo-HVF/VLC-WEB), servido pelo "
+            "próprio celular: veja '▶ VLC Web' neste menu.",
+            "Como ele reescreve as páginas, sites muito dependentes de JavaScript (apps, redes sociais, login em "
+            "muitos serviços) podem abrir mal ou não abrir. Para navegar 'de verdade' no PC, use o Proxy; para ver "
+            "a sua própria tela, a Transmissão da tela.",
+            "A saída pode ser direto, pelo túnel SSH (sai pelo seu servidor) ou pelo Tor (esconde o IP). Só quem "
+            "tem o link (o ?t=...) abre; cada aparelho tem os próprios cookies dos sites. O endereço fixo e o túnel "
+            "da Cloudflare dão um link que funciona pela internet. Nunca abre a rede local nem o próprio celular.",
         ])
 
     def cabecalho():
@@ -5400,16 +7162,18 @@ def menu_navegador_web():
             print(f"{DIM}Ligado · {onde} · saída {_nome_saida(c.get('navegador_saida'))}{RST}")
         else:
             print(f"{DIM}Desligado.{RST}")
+        print(f"{DIM}VLC Web: {_descricao_vlc_web()}{RST}")
 
     menu("🌐 Navegador pelo celular (abrir sites pela conexão dele)", [
         ("Como funciona", como_funciona),
         (lambda: "Ligar o navegador" + (" (ligado)" if servico_ativo(SERVICO_NAVEGADOR) else ""), ligar_navegador),
         (lambda: f"Mostrar o link ({'no ar' if servico_ativo(SERVICO_NAVEGADOR) else 'parado'})",
          mostrar_links_navegador),
+        (lambda: f"▶ VLC Web: tocar os vídeos dos sites ({_descricao_vlc_web()})", menu_vlc_web_navegador),
         ("Gerar link novo (o antigo para de funcionar)", novo_link_navegador),
         ("Desligar (e fechar o túnel)", parar_navegador),
         (lambda: f"Saída: {_nome_saida(c.get('navegador_saida'))} (ou pelo túnel SSH / Tor)", mudar_saida),
-        (lambda: f"Barra de endereço no topo ({'ligada' if c.get('navegador_barra', True) else 'desligada'})",
+        (lambda: f"Barra de endereço nas páginas ({'ligada' if c.get('navegador_barra', True) else 'desligada'})",
          alternar_barra),
         (lambda: f"Porta ({c['navegador_porta']})", mudar_porta),
         ("Status e log", lambda: status_servico(SERVICO_NAVEGADOR)),
@@ -28103,6 +29867,8 @@ def main(argv=None) -> int:
     p.add_argument("--porta", type=int)
     p = sub.add_parser(SERVICO_NAVEGADOR, help="navegador pelo celular: abre sites pela conexão dele (primeiro plano)")
     p.add_argument("--porta", type=int)
+    p = sub.add_parser("vlc-web", help="baixa ou atualiza do GitHub o VLC Web usado pelo navegador pelo celular")
+    p.add_argument("--remover", action="store_true", help="apaga o VLC Web do celular")
     sub.add_parser(SERVICO_TUNEL_FIXO, help="túnel da Cloudflare com endereço fixo (token do painel) em primeiro plano")
     p = sub.add_parser(SERVICO_REDUZIR, help="cópia de um vídeo (arquivo ou link) numa resolução menor")
     p.add_argument("fonte")
@@ -28194,6 +29960,12 @@ def main(argv=None) -> int:
             servir_proxy(args.porta or cfg()["proxy_porta"])
         elif args.comando == SERVICO_NAVEGADOR:
             servir_navegador(args.porta or cfg()["navegador_porta"])
+        elif args.comando == "vlc-web":
+            if args.remover:
+                remover_vlc_web()
+                ok("VLC Web apagado.")
+            else:
+                atualizar_vlc_web()
         elif args.comando == SERVICO_TUNEL_FIXO:
             rodar_tunel_fixo()
         elif args.comando == SERVICO_REDUZIR:
