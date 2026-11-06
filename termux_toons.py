@@ -930,29 +930,165 @@ def garantir_modulo(modulo: str, pip_nome: str | None = None, pkg_nome: str | No
     return False
 
 
+# Nome de cada atalho que o termux-setup-storage cria em ~/storage → pasta na memória do celular
+_ATALHOS_STORAGE = {"downloads": "Download", "dcim": "DCIM", "pictures": "Pictures", "music": "Music",
+                    "movies": "Movies", "documents": "Documents", "shared": ""}
+
+
+def armazenamento_ok() -> bool:
+    """O Termux enxerga a memória do celular? ~/storage/shared é o atalho que o termux-setup-storage cria; sem a
+    permissão (ou com ela revogada), ele não existe ou não abre."""
+    compartilhado = HOME / "storage" / "shared"
+    try:  # tem que levar para fora do Termux: uma pasta 'shared' de verdade aqui dentro não conta
+        return (compartilhado.is_dir() and not compartilhado.resolve().is_relative_to(HOME)
+                and os.access(compartilhado, os.W_OK | os.X_OK))
+    except OSError:
+        return False
+
+
+def _na_memoria_do_celular(pasta: Path) -> bool:
+    """A pasta fica na memória do celular (~/storage/..., /storage/..., /sdcard/...)?"""
+    p = Path(os.path.expanduser(str(pasta))).absolute()
+    base = HOME / "storage"
+    return p == base or base in p.parents or str(p).startswith(("/storage/", "/sdcard"))
+
+
+def _resgatar_downloads_presos() -> int:
+    """Versões antigas, sem a permissão de armazenamento, criavam ~/storage/downloads como uma pasta de verdade
+    DENTRO do Termux, e os vídeos e músicas baixados ficavam lá, sem aparecer no gerenciador de arquivos. Com o
+    acesso funcionando, leva esses arquivos para a pasta certa da memória do celular. Devolve quantos moveu."""
+    compartilhado = (HOME / "storage" / "shared").resolve()
+    origens = []
+    with contextlib.suppress(OSError):  # só os nomes dos atalhos, que era o que o erro antigo criava
+        origens += [(p, p.name) for p in (HOME / "storage").iterdir()
+                    if p.name in _ATALHOS_STORAGE and p.name != "shared" and p.is_dir() and not p.is_symlink()]
+    with contextlib.suppress(OSError):  # o que foi guardado antes de refazer o ~/storage
+        for antigo in DATA_DIR.glob("storage-antigo-*"):
+            origens += [(p, p.name) for p in antigo.iterdir() if p.is_dir() and not p.is_symlink()]
+    movidos = 0
+    for origem, nome in origens:
+        destino_base = compartilhado / _ATALHOS_STORAGE.get(nome, f"Download/{nome}")
+        for raiz, _pastas, arquivos in os.walk(origem):  # os.walk não entra em atalhos: só arquivos de verdade
+            for arquivo in arquivos:
+                atual = Path(raiz) / arquivo
+                if atual.is_symlink():
+                    continue
+                alvo = destino_base / atual.relative_to(origem)
+                alvo.parent.mkdir(parents=True, exist_ok=True)
+                n = 2
+                while alvo.exists():
+                    alvo = alvo.with_name(f"{atual.stem} ({n}){atual.suffix}")
+                    n += 1
+                try:
+                    shutil.move(str(atual), str(alvo))
+                    movidos += 1
+                except OSError as e:
+                    aviso(f"Não consegui mover {atual.name}: {e}")
+        if not any(p.is_file() and not p.is_symlink() for p in origem.rglob("*")):
+            shutil.rmtree(origem, ignore_errors=True)
+        if origem.parent == HOME / "storage" and not origem.exists() and nome in _ATALHOS_STORAGE:
+            with contextlib.suppress(OSError):  # devolve o atalho que deveria estar ali
+                origem.symlink_to(destino_base)
+    for antigo in DATA_DIR.glob("storage-antigo-*"):
+        if not any(p.is_file() and not p.is_symlink() for p in antigo.rglob("*")):
+            shutil.rmtree(antigo, ignore_errors=True)
+    if movidos:
+        ok(f"{movidos} arquivo(s) baixado(s) antes, que tinham ficado presos dentro do Termux, foram para a "
+           f"memória do celular ({destino_base if len(origens) == 1 else compartilhado}).")
+        _avisar_galeria([destino_base])
+    return movidos
+
+
 def garantir_storage() -> bool:
-    """Garante acesso a ~/storage (termux-setup-storage)."""
-    if (HOME / "storage").exists():
+    """Garante acesso à memória do celular (~/storage, criado pelo termux-setup-storage)."""
+    if armazenamento_ok():
+        _resgatar_downloads_presos()
         return True
-    aviso("Sem acesso ao armazenamento compartilhado (~/storage).")
-    if IS_TERMUX and tem("termux-setup-storage") and confirmar("Rodar termux-setup-storage agora?", True):
-        rodar(["termux-setup-storage"])
-        info("Aceite a permissão no Android...")
-        for _ in range(20):
-            if (HOME / "storage").exists():
-                return True
-            time.sleep(1)
-    return (HOME / "storage").exists()
+    base = HOME / "storage"
+    aviso("O Termux não tem acesso à memória do celular: sem isso, o que você baixa não vai para a pasta Download.")
+    if not (IS_TERMUX and tem("termux-setup-storage") and sys.stdin.isatty()):
+        return False
+    if not confirmar("Dar o acesso agora (termux-setup-storage)?", True):
+        return False
+    guardado = None
+    if base.exists() or base.is_symlink():
+        # O termux-setup-storage refaz ~/storage do zero e apaga o que houver lá dentro: guarda antes.
+        guardado = DATA_DIR / f"storage-antigo-{datetime.now():%Y%m%d-%H%M%S}"
+        guardado.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(base), str(guardado))
+    rodar(["termux-setup-storage"])
+    info("Aceite a permissão no Android...")
+    for _ in range(30):
+        if armazenamento_ok():
+            break
+        time.sleep(1)
+    if not armazenamento_ok():
+        if guardado and not (base.exists() or base.is_symlink()):
+            shutil.move(str(guardado), str(base))  # não deu certo: tudo volta como estava
+        aviso("A permissão não foi concedida. Em Configurações do Android → Apps → Termux → Permissões, "
+              "libere 'Arquivos e mídia' (ou 'Armazenamento') e tente de novo.")
+        return False
+    _resgatar_downloads_presos()
+    return True
+
+
+def pasta_para_salvar(pasta: Path) -> Path | None:
+    """Prepara a pasta dos downloads. Uma pasta da memória do celular só é usada com o acesso funcionando: criá-la
+    sem o acesso faria uma pasta com esse nome DENTRO do Termux, e o arquivo sumiria de vista."""
+    pasta = Path(os.path.expanduser(str(pasta)))
+    if _na_memoria_do_celular(pasta) and not garantir_storage():
+        reserva = HOME / "Download"
+        aviso(f"Sem o acesso, não dá para salvar em {pasta}.")
+        if sys.stdin.isatty() and not confirmar(f"Salvar dentro do Termux, em {reserva}? (no app Arquivos do Android, "
+                                                "ela aparece no menu lateral, em 'Termux')", True):
+            return None
+        pasta = reserva
+    pasta.mkdir(parents=True, exist_ok=True)
+    return pasta
+
+
+def onde_fica(pasta: Path) -> str:
+    """Onde a pasta fica de verdade, do jeito que a pessoa encontra no gerenciador de arquivos."""
+    pasta = Path(os.path.expanduser(str(pasta)))
+    if _na_memoria_do_celular(pasta) and not armazenamento_ok():
+        return "⚠ sem acesso à memória do celular"
+    with contextlib.suppress(OSError):
+        real = pasta.resolve()
+        return f"{real}, dentro do Termux" if real.is_relative_to(HOME) else str(real)
+    return str(pasta)
+
+
+def _avisar_galeria(caminhos: list) -> None:
+    """Pede ao Android para indexar os arquivos novos: sem isso, em alguns celulares eles não aparecem na Galeria
+    nem em 'Downloads' do app de arquivos, mesmo estando na pasta certa."""
+    if caminhos and tem("termux-media-scan"):
+        rodar(["termux-media-scan", "-r", *map(str, caminhos)], capturar=True, mostrar=False, timeout=60)
+
+
+def relatar_baixados(lista: Path) -> list:
+    """Lê os caminhos finais que o yt-dlp anotou (--print-to-file after_move:filepath), avisa a Galeria e mostra
+    onde cada arquivo ficou."""
+    try:
+        linhas = lista.read_text("utf-8", errors="replace").splitlines()
+    except OSError:
+        linhas = []
+    lista.unlink(missing_ok=True)
+    arquivos = [a for a in dict.fromkeys(Path(l.strip()) for l in linhas if l.strip()) if a.exists()]
+    _avisar_galeria(arquivos)
+    for arq in arquivos:
+        ok(f"Salvo em: {onde_fica(arq)}")
+    return arquivos
 
 
 def pasta_download() -> Path:
     """A pasta Download do celular, com o caminho que a pessoa reconhece.
     ~/storage/downloads é um atalho para /storage/emulated/0/Download; o Android mostra
     o atalho como se estivesse dentro do Termux (/data/data/com.termux/...), então aqui
-    resolvemos para o caminho real. Cai em alternativas quando o atalho ainda não existe."""
+    resolvemos para o caminho real. Cai em alternativas quando o atalho ainda não existe
+    (e ignora uma pasta 'downloads' de verdade dentro do Termux, que não é a do celular)."""
     for p in (HOME / "storage" / "downloads", Path("/storage/emulated/0/Download"), Path("/sdcard/Download")):
         try:
-            if p.exists():
+            if p.exists() and (p.is_symlink() or not p.is_relative_to(HOME)):
                 return p.resolve()
         except OSError:
             continue
@@ -998,6 +1134,9 @@ PADRAO_CFG = {
     "site_porta": 8097,
     "sites": {},
     "site_avisar_visitas": False,
+    "tunel_fixo_token": "",  # token do túnel criado no painel da Cloudflare (endereço fixo com o seu domínio)
+    "tunel_fixo_painel": [],  # endereços que o painel mandou (o cloudflared escreve no log): [{host, porta}]
+    "tunel_fixo_manuais": [],  # endereços anotados à mão
     "adb_endereco": "",
     "x11_usuarios": {},
     "x11_gpu": False,
@@ -1653,6 +1792,314 @@ def abrir_tunel(nome: str, porta: int, aviso_txt: str | None = None) -> None:
     aviso("A URL ainda não apareceu; veja o log do túnel em alguns segundos.")
 
 
+# ── Endereço fixo: túnel da Cloudflare com o seu domínio ─────────────
+# O túnel rápido (trycloudflare.com) ganha um endereço novo toda vez que liga. Com um domínio seu na Cloudflare
+# (a conta é grátis; só o domínio é pago), o painel cria um túnel com endereço fixo, como site.seudominio.com.br,
+# e entrega um token. Aqui o cloudflared roda com esse token, e cada endereço cadastrado no painel aponta para
+# uma porta deste celular (um site publicado, o servidor de filmes, a API...). O cloudflared escreve no log a
+# configuração que recebe do painel; é de lá que o app descobre os endereços, sem precisar digitar nada.
+
+SERVICO_TUNEL_FIXO = "tunel-fixo"
+_REGRAS_LOG: dict = {"chave": None, "regras": None}
+
+
+def _dados_token(token: str) -> dict | None:
+    """O token do painel é um JSON em base64 com a conta (a), o túnel (t) e o segredo (s)."""
+    bruto = token + "=" * (-len(token) % 4)
+    try:
+        dados = json.loads(base64.urlsafe_b64decode(bruto) if re.search(r"[-_]", token) else base64.b64decode(bruto))
+    except ValueError:
+        return None
+    return dados if isinstance(dados, dict) and {"a", "t", "s"} <= dados.keys() else None
+
+
+def _id_curto(token: str) -> str:
+    return str((_dados_token(token or "") or {}).get("t", "?"))[:8] + "…"
+
+
+def token_do_tunel(texto: str) -> str | None:
+    """Acha o token no que a pessoa colou: só o token ou o comando inteiro que o painel mostra
+    ('cloudflared service install eyJ...' ou 'cloudflared tunnel run --token eyJ...')."""
+    for achado in re.findall(r"eyJ[A-Za-z0-9+/_=-]{40,}", texto or ""):
+        if _dados_token(achado):
+            return achado
+    return None
+
+
+def _porta_do_servico(servico: str) -> int | None:
+    """'http://localhost:8097' → 8097. Só vale o que aponta para este celular."""
+    achado = re.match(r"https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])(?::(\d+))?(?:/|$)", servico or "", re.I)
+    if not achado:
+        return None
+    return int(achado.group(1) or (443 if servico.lower().startswith("https") else 80))
+
+
+def _regras_do_log(texto: str) -> list | None:
+    """Os endereços que o painel mandou, da última linha 'Updated to new configuration' do cloudflared:
+    [{'host', 'porta', 'servico'}]. None se o log ainda não tiver essa linha."""
+    linhas = [l for l in texto.splitlines() if "Updated to new configuration" in l]
+    if not linhas:
+        return None
+    linha, regras = linhas[-1], []
+    achado = re.search(r'config="((?:[^"\\]|\\.)*)"', linha)
+    config = None
+    if achado:
+        with contextlib.suppress(ValueError):
+            config = json.loads(json.loads(f'"{achado.group(1)}"'))
+    if isinstance(config, dict):
+        pares = [(r.get("hostname"), r.get("service")) for r in config.get("ingress") or [] if isinstance(r, dict)]
+    else:  # outro formato de log: procura os pares direto no texto
+        pares = re.findall(r'hostname\\*"\s*:\s*\\*"([^"\\]+)\\*".*?service\\*"\s*:\s*\\*"([^"\\]+)', linha)
+    for host, servico in pares:
+        porta = _porta_do_servico(servico or "")
+        if host and "*" not in host and porta:
+            regras.append({"host": host.strip().lower(), "porta": porta, "servico": servico})
+    return regras
+
+
+def regras_tunel_fixo() -> list:
+    """Os endereços fixos e a porta de cada um: os que o painel mandou (lidos do log e guardados para quando o
+    túnel estiver desligado) e os anotados à mão. [{'host', 'porta', 'origem'}]"""
+    c = cfg()
+    arq = log_de(SERVICO_TUNEL_FIXO)
+    with contextlib.suppress(OSError):
+        estado = arq.stat()
+        chave = (estado.st_mtime_ns, estado.st_size)
+        if _REGRAS_LOG["chave"] != chave:
+            _REGRAS_LOG.update(chave=chave, regras=_regras_do_log(arq.read_text("utf-8", errors="replace")))
+        regras = _REGRAS_LOG["regras"]
+        if regras is not None:
+            painel = [{"host": r["host"], "porta": r["porta"]} for r in regras]
+            if painel != c.get("tunel_fixo_painel"):
+                c["tunel_fixo_painel"] = painel
+                salvar_cfg()
+    vistos, lista = set(), []
+    for origem, chave in (("painel", "tunel_fixo_painel"), ("à mão", "tunel_fixo_manuais")):
+        for r in c.get(chave) or []:
+            if r.get("host") and r.get("porta") and r["host"] not in vistos:
+                vistos.add(r["host"])
+                lista.append({"host": r["host"], "porta": int(r["porta"]), "origem": origem})
+    return lista
+
+
+def host_fixo(porta: int) -> str | None:
+    """https://endereço fixo cadastrado para esta porta (ligado ou não)."""
+    if not cfg().get("tunel_fixo_token"):
+        return None
+    return next((f"https://{r['host']}" for r in regras_tunel_fixo() if r["porta"] == porta), None)
+
+
+def endereco_fixo(porta: int) -> str | None:
+    """https://endereço fixo que leva a esta porta agora (com o túnel fixo ligado)."""
+    if not cfg().get("tunel_fixo_token") or not servico_ativo(SERVICO_TUNEL_FIXO):
+        return None
+    return host_fixo(porta)
+
+
+def rodar_tunel_fixo() -> None:
+    """O que roda em segundo plano: o cloudflared com o token. O token vai pela variável TUNNEL_TOKEN (não fica
+    na linha de comando nem no log)."""
+    token = cfg().get("tunel_fixo_token")
+    if not token:
+        raise ToonsError("Nenhum token configurado. Use 'Endereço fixo → Colar o token do túnel'.")
+    programa = shutil.which("cloudflared")
+    if not programa:
+        raise ToonsError("O cloudflared não está instalado (pkg install cloudflared).")
+    sys.stdout.flush()
+    os.execve(programa, [programa, "tunnel", "--no-autoupdate", "run"], {**os.environ, "TUNNEL_TOKEN": token})
+
+
+def _o_que_roda_na_porta(porta: int) -> str:
+    c, no_ar = cfg(), sites_no_ar()
+    for n in [*no_ar, *(k for k in range(1, MAX_SITES + 1) if k not in no_ar and str(k) in c["sites"])]:
+        if _dados_site(n)["porta"] == porta:
+            return f"Site {n}: {_dados_site(n)['nome']} ({'no ar' if n in no_ar else 'fora do ar'})"
+    for nome, chave, servico in (("Servidor de filmes", "midia_porta", "midia"), ("API pessoal", "web_porta", "web"),
+                                 ("Transmissão da tela", "tela_porta", "tela"), ("Trote", "trote_porta", "trote")):
+        if c.get(chave) == porta:
+            return nome + ("" if servico_ativo(servico) else " (desligado)")
+    return "nada do Termux-Toons nessa porta agora"
+
+
+def _portas_uteis() -> list:
+    """(porta, o que é) do que dá para apontar um endereço fixo agora."""
+    c, lista = cfg(), [(_dados_site(n)["porta"], f"Site {n}: {_dados_site(n)['nome']}") for n in sites_no_ar()]
+    if not lista:
+        lista.append((c["site_porta"], "o 1º site que você publicar"))
+    lista.append((c["midia_porta"], "Servidor de filmes (Compartilhar filme por link)"))
+    lista.append((c["web_porta"], "API pessoal (Servidor web)"))
+    return lista
+
+
+def mostrar_enderecos_fixos(testar: bool = False) -> None:
+    regras = regras_tunel_fixo()
+    ligado = servico_ativo(SERVICO_TUNEL_FIXO)
+    if not regras:
+        info("Nenhum endereço ainda. No painel da Cloudflare, no seu túnel, cadastre um endereço (Public Hostname / "
+             "rota de aplicativo publicado): Type HTTP e URL localhost:PORTA. As portas daqui:")
+        for porta, nome in _portas_uteis():
+            print(f"  {NEG}localhost:{porta}{RST}  {DIM}→ {nome}{RST}")
+        if ligado:
+            print(f"  {DIM}Depois de salvar no painel, o endereço aparece aqui sozinho em alguns segundos.{RST}")
+        return
+    info(f"Túnel fixo {'ligado' if ligado else 'DESLIGADO'}. Endereços:")
+    for r in regras:
+        print(f"  {NEG}https://{r['host']}{RST}  {DIM}→ localhost:{r['porta']} → {_o_que_roda_na_porta(r['porta'])}"
+              f"{' (anotado à mão)' if r['origem'] != 'painel' else ''}{RST}")
+        if testar:
+            print(f"     {_testar_endereco_fixo(r['host'])}")
+
+
+def _testar_endereco_fixo(host: str) -> str:
+    """Abre o endereço pela internet e explica o resultado."""
+    try:
+        with urllib.request.urlopen(urllib.request.Request(f"https://{host}/", headers={"User-Agent": USER_AGENT}),
+                                    timeout=20) as resposta:
+            return f"{VERD}✔ abre (HTTP {resposta.status}){RST}"
+    except urllib.error.HTTPError as e:
+        corpo = e.read(4000).decode("utf-8", errors="replace")
+        if e.code == 404:
+            return f"{VERD}✔ chega no celular{RST} {DIM}(HTTP 404: a página inicial não existe, mas o caminho funciona){RST}"
+        if "1033" in corpo or e.code == 530:
+            return f"{VERM}✖ o túnel não está conectado{RST} {DIM}(ligue o túnel fixo neste menu){RST}"
+        if e.code == 502:
+            return f"{AMAR}⚠ o túnel chegou no celular, mas nada respondeu nessa porta{RST} {DIM}(ligue o site/servidor){RST}"
+        return f"{AMAR}⚠ HTTP {e.code}{RST}"
+    except (OSError, ValueError) as e:
+        motivo = str(getattr(e, "reason", e))
+        dica = " (o domínio ainda não aponta para a Cloudflare? pode levar algumas horas)" if "resolve" in motivo.lower() \
+            or "name or service" in motivo.lower() else ""
+        return f"{VERM}✖ não abriu: {motivo}{RST}{DIM}{dica}{RST}"
+
+
+def ligar_tunel_fixo() -> bool:
+    """Liga o túnel fixo em segundo plano e confere se a Cloudflare aceitou o token."""
+    if not cfg().get("tunel_fixo_token"):
+        raise ToonsError("Cole primeiro o token do túnel ('Endereço fixo → Colar o token do túnel').")
+    if not garantir_cmd("cloudflared"):
+        return False
+    if servico_ativo(SERVICO_TUNEL_FIXO):
+        info("O túnel fixo já está ligado.")
+        mostrar_enderecos_fixos()
+        return True
+    log_de(SERVICO_TUNEL_FIXO).unlink(missing_ok=True)  # para ler só o que acontecer agora
+    if not iniciar_servico(SERVICO_TUNEL_FIXO, cmd_self(SERVICO_TUNEL_FIXO), reiniciar=True):
+        return False
+    info("Conectando à Cloudflare...")
+    texto = ""
+    for _ in range(40):
+        with contextlib.suppress(OSError):
+            texto = log_de(SERVICO_TUNEL_FIXO).read_text("utf-8", errors="replace")
+        if re.search(r"Unauthorized|token is not valid|Invalid tunnel secret|tunnel not found|failed to unmarshal",
+                     texto, re.I):
+            parar_servico(SERVICO_TUNEL_FIXO)
+            raise ToonsError("A Cloudflare recusou o token. No painel, abra o túnel e copie o comando de novo "
+                             "(se você apagou o túnel ou trocou o token, o antigo deixa de valer).")
+        if "Registered tunnel connection" in texto:
+            ok("Túnel fixo conectado.")
+            time.sleep(2)  # a configuração do painel chega logo depois
+            break
+        time.sleep(1)
+    else:
+        aviso("Ainda não conectou. Confira a internet e veja 'Status e log do túnel' daqui a pouco.")
+    mostrar_enderecos_fixos()
+    return True
+
+
+def explicar_tunel_fixo() -> None:
+    portas = ", ".join(f"{p} ({n.split(':')[0]})" for p, n in _portas_uteis())
+    passos = [
+        "Você precisa de um domínio seu com o DNS na Cloudflare. A conta é grátis; o domínio é pago (um .com.br "
+        "custa uns R$ 40 por ano no registro.br). Ao adicionar o domínio na Cloudflare, ela mostra dois servidores "
+        "DNS: coloque-os no lugar dos atuais lá onde você registrou o domínio.",
+        "No painel da Cloudflare: Zero Trust → Networks (Redes) → Tunnels → Create a tunnel → Cloudflared. Dê um "
+        "nome e avance. Na tela de instalação, copie o comando de qualquer sistema: ele contém o token, que começa "
+        "com eyJ. Não precisa instalar nada no computador.",
+        "Aqui: 'Colar o token do túnel'. Pode colar o comando inteiro: o app acha o token.",
+        f"De volta ao painel, cadastre o endereço (Public Hostname / rota de aplicativo publicado): subdomínio "
+        f"(ex.: site), o seu domínio, Type HTTP e URL localhost:PORTA. Portas daqui: {portas}. Dá para cadastrar "
+        "vários, um para cada coisa.",
+        "Ligue o túnel fixo aqui. O endereço passa a aparecer nos links do site e do filme, no QR code e em 'Copiar "
+        "o link', e não muda mais, mesmo depois de reiniciar o celular.",
+        "Opcional, para ver a cidade e o estado de quem acessa o site: no painel do domínio, em Rules → Settings → "
+        "Managed Transforms, ligue 'Add visitor location headers'.",
+    ]
+    for i, passo in enumerate(passos, 1):
+        print(f"  {NEG}{i}.{RST} " + textwrap.fill(passo, max(30, min(largura_tela(), 90) - 5),
+                                                    subsequent_indent="     "))
+        print()
+
+
+@submenu
+def menu_tunel_fixo():
+    c = cfg()
+
+    def configurar():
+        info("Cole o comando que o painel da Cloudflare mostra ao criar o túnel, ou só o token (começa com eyJ). "
+             "Ele fica só neste celular, no config.json (permissão 600).")
+        token = token_do_tunel(perguntar("Comando ou token do túnel"))
+        if not token:
+            raise ToonsError("Não achei um token de túnel aí. Ele começa com eyJ e é bem comprido; copie de novo o "
+                             "comando da tela de instalação do túnel no painel.")
+        trocou = token != c.get("tunel_fixo_token")
+        c["tunel_fixo_token"] = token
+        if trocou:
+            c["tunel_fixo_painel"] = []  # endereços de outro túnel não valem para este
+        salvar_cfg()
+        ok(f"Token guardado (túnel {_id_curto(token)}).")
+        if trocou and servico_ativo(SERVICO_TUNEL_FIXO):
+            parar_servico(SERVICO_TUNEL_FIXO)
+        if confirmar("Ligar o túnel fixo agora?", True):
+            ligar_tunel_fixo()
+
+    def anotar():
+        info("Use só se o endereço cadastrado no painel não aparecer sozinho em 'Ver os endereços'.")
+        host = re.sub(r"^https?://|/.*$", "", perguntar("Endereço (ex.: site.seudominio.com.br)").strip().lower())
+        if not re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", host):
+            raise ToonsError("Escreva só o endereço, como site.seudominio.com.br.")
+        opcoes = _portas_uteis()
+        i = escolher("O que esse endereço abre? (a mesma porta que está no painel)",
+                     [f"{n} · localhost:{p}" for p, n in opcoes] + ["Outra porta..."])
+        if i is None:
+            return
+        porta = opcoes[i][0] if i < len(opcoes) else perguntar_int("Porta", 8097, 1, 65535)
+        c["tunel_fixo_manuais"] = [r for r in c.get("tunel_fixo_manuais") or [] if r.get("host") != host]
+        c["tunel_fixo_manuais"].append({"host": host, "porta": porta})
+        salvar_cfg()
+        ok(f"https://{host} → localhost:{porta}")
+
+    def apagar():
+        if not confirmar("Apagar o token e os endereços fixos deste celular? (o túnel continua existindo no painel)"):
+            return
+        if servico_ativo(SERVICO_TUNEL_FIXO):
+            parar_servico(SERVICO_TUNEL_FIXO)
+        c["tunel_fixo_token"], c["tunel_fixo_painel"], c["tunel_fixo_manuais"] = "", [], []
+        salvar_cfg()
+        ok("Token e endereços apagados.")
+
+    def ver():
+        mostrar_enderecos_fixos(testar=bool(regras_tunel_fixo()) and confirmar("Testar cada endereço pela internet?", True))
+
+    def cabecalho():
+        if c.get("tunel_fixo_token"):
+            enderecos = ", ".join(r["host"] for r in regras_tunel_fixo()) or "nenhum endereço ainda"
+            estado = "ligado" if servico_ativo(SERVICO_TUNEL_FIXO) else "desligado"
+            print(f"{DIM}Túnel {_id_curto(c['tunel_fixo_token'])} {estado} · {enderecos}{RST}")
+        else:
+            print(f"{DIM}Ainda não configurado: comece pelo passo a passo.{RST}")
+
+    menu("🔗 Endereço fixo (seu domínio, pela Cloudflare)", [
+        ("Como criar o endereço fixo (passo a passo)", explicar_tunel_fixo),
+        (lambda: "Colar o token do túnel" + (" (já configurado: trocar)" if c.get("tunel_fixo_token") else ""), configurar),
+        (lambda: "Ligar o túnel fixo" + (" (ligado)" if servico_ativo(SERVICO_TUNEL_FIXO) else ""), ligar_tunel_fixo),
+        ("Desligar o túnel fixo", lambda: parar_servico(SERVICO_TUNEL_FIXO)),
+        ("Ver os endereços e o que cada um abre (e testar)", ver),
+        ("Anotar um endereço à mão (se não aparecer sozinho)", anotar),
+        ("Status e log do túnel", lambda: status_servico(SERVICO_TUNEL_FIXO)),
+        ("Apagar o token e os endereços", apagar),
+    ], cabecalho=cabecalho)
+
+
 @submenu
 def menu_web():
     c = cfg()
@@ -1685,6 +2132,8 @@ def menu_web():
         print(f"  Rede Wi-Fi: http://{ip_local()}:{porta}")
         if url_tunel() and servico_ativo("tunel"):
             print(f"  Internet:   {url_tunel()}")
+        if endereco_fixo(porta):
+            print(f"  Endereço fixo: {endereco_fixo(porta)}")
         print(f"\n  Token: {NEG}{c['api_token']}{RST}")
         print(f"\n{DIM}Exemplos:{RST}")
         print(f"  curl -H 'Authorization: Bearer {c['api_token']}' http://{ip_local()}:{porta}/api/status")
@@ -4955,6 +5404,22 @@ def _ip_deste_celular() -> str:
     return _ip_celular[0]
 
 
+def _utf8_do_cabecalho(valor) -> str:
+    """O http.server lê os cabeçalhos como Latin-1; a Cloudflare manda a cidade em UTF-8 ('São Paulo')."""
+    texto = str(valor or "").strip()
+    if "%" in texto:
+        texto = urllib.parse.unquote(texto)
+    with contextlib.suppress(UnicodeError):
+        return texto.encode("latin-1").decode("utf-8")
+    return texto
+
+
+def _lugar(d: dict) -> str:
+    """'São Paulo/SP' (cidade e estado que a Cloudflare informou), ou ""."""
+    cidade, estado = d.get("cidade") or "", d.get("estado") or ""
+    return "/".join(p for p in (cidade, "" if estado == cidade else estado) if p)
+
+
 def _encurtar_registro(arq: Path) -> None:
     """Fica com a metade mais nova do registro e troca o arquivo de uma vez (nunca fica pela metade)."""
     dados = arq.read_bytes()
@@ -5048,6 +5513,11 @@ class _HandlerSite(SimpleHTTPRequestHandler):
             "ref": _ref_externo(_texto_seguro(cab.get("Referer"), 300), cab.get("Host") or ""),
             "idioma": idioma if re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*", idioma) else "",
         }
+        if via == "internet":  # só com 'Add visitor location headers' ligado no painel do seu domínio
+            for chave, cabecalhos in (("cidade", ("cf-ipcity",)), ("estado", ("cf-region-code", "cf-region"))):
+                valor = next((v for v in (_utf8_do_cabecalho(cab.get(c)) for c in cabecalhos) if v), "")
+                if valor:
+                    reg[chave] = _texto_seguro(valor, 60)
         for chave, cabecalho in (("modelo", "Sec-CH-UA-Model"), ("plataforma", "Sec-CH-UA-Platform"),
                                  ("versao_so", "Sec-CH-UA-Platform-Version"), ("marcas", "Sec-CH-UA")):
             valor = _texto_seguro(cab.get(cabecalho), 200)
@@ -5077,7 +5547,8 @@ class _HandlerSite(SimpleHTTPRequestHandler):
             cls._ultimo_aviso = time.monotonic()
         if not ler_json(CONFIG_FILE, {}).get("site_avisar_visitas"):  # lido na hora: ligar/desligar vale já
             return
-        onde = _pais_por_extenso(reg["pais"]) if reg["via"] == "internet" else _VIAS.get(reg["via"], "")
+        onde = (" · ".join(p for p in (_pais_por_extenso(reg["pais"]), _lugar(reg)) if p) if reg["via"] == "internet"
+                else _VIAS.get(reg["via"], ""))
         texto = f"{onde} · {_descrever_agente(reg['agente'], reg)} · IP {reg['ip']}"
         titulo_n = f"👀 Alguém abriu o site {cls.nome_site}".strip()
 
@@ -5143,6 +5614,9 @@ def links_do_site(n: int) -> list:
     tunel = _tunel_site(n)
     if servico_ativo(tunel) and url_tunel(tunel):
         links.append(("Internet", f"{url_tunel(tunel)}{caminho}"))
+    fixo = endereco_fixo(site["porta"])
+    if fixo:  # por último: é o que vai para o QR code e para 'Copiar o link'
+        links.append(("Internet (endereço fixo)", f"{fixo}{caminho}"))
     return links
 
 
@@ -5154,7 +5628,7 @@ def _mostrar_links(n: int) -> None:
     print(f"  {NEG}{n}. {_dados_site(n)['nome']}{RST}")
     for onde, link in links_do_site(n):
         print(f"  {CIANO}{onde}:{RST}\n  {NEG}{link}{RST}")
-    if not servico_ativo(_tunel_site(n)):
+    if not servico_ativo(_tunel_site(n)) and not endereco_fixo(_dados_site(n)["porta"]):
         print(f"  {DIM}Para quem está fora da sua rede Wi-Fi, use 'Site publicado: liberar para a internet'.{RST}")
 
 
@@ -5435,7 +5909,8 @@ def _visita_de_linha(linha: str) -> dict | None:
     if not isinstance(v, dict):
         return None
     limites = {"t": 19, "ip": 60, "pais": 2, "via": 10, "metodo": 10, "caminho": 200, "agente": 400,
-               "ref": 300, "idioma": 20, "modelo": 60, "plataforma": 30, "versao_so": 30, "marcas": 200}
+               "ref": 300, "idioma": 20, "modelo": 60, "plataforma": 30, "versao_so": 30, "marcas": 200,
+               "cidade": 60, "estado": 60}
     limpa = {k: _texto_seguro(v.get(k), limite) for k, limite in limites.items()}
     cod = v.get("codigo")
     limpa["codigo"] = int(cod) if isinstance(cod, int) or str(cod).isdigit() else 0
@@ -5500,11 +5975,12 @@ def _agrupar_visitantes(visitas: list) -> list:
         g = grupos.setdefault((v["ip"] or "?", v["agente"]), {
             "ip": v["ip"] or "?", "agente": v["agente"], "via": v["via"], "pais": "", "primeiro": v["t"],
             "ultimo": v["t"], "pedidos": 0, "vistas": 0, "paginas": [], "erros": [], "refs": [], "idioma": "",
+            "cidade": "", "estado": "",
             "dicas": {}, "robo": _robo(v["agente"]), "acessos": []})
         g["pedidos"] += 1
         g["ultimo"] = v["t"] or g["ultimo"]
         g["acessos"].append(v)
-        for campo in ("pais", "via", "idioma"):
+        for campo in ("pais", "via", "idioma", "cidade", "estado"):
             if v[campo]:
                 g[campo] = v[campo]
         for campo in ("modelo", "plataforma", "versao_so", "marcas"):
@@ -5660,7 +6136,7 @@ def _consultar_operadoras(grupos: list) -> None:
 
 
 def _imprimir_visitante(pos: int, g: dict, ips: dict) -> None:
-    pais = _pais_por_extenso(g["pais"]) if g["via"] == "internet" else ""
+    pais = " · ".join(p for p in (_pais_por_extenso(g["pais"]), _lugar(g)) if p) if g["via"] == "internet" else ""
     print(f"\n  {NEG}{pos}. {g['ip']}{RST}   {CIANO}{pais + ' · ' if pais else ''}{_VIAS.get(g['via'], '')}{RST}")
     extra = f" · idioma {g['idioma']}" if g["idioma"] else ""
     print(f"     {g['aparelho']}{DIM}{extra}{RST}")
@@ -5683,7 +6159,8 @@ def _linha_acesso(v: dict, novo: bool = False) -> str:
     """Um pedido numa linha: quando, quem, o que abriu e se deu certo."""
     cod = v["codigo"]
     cor = VERD if 0 < cod < 300 else CIANO if cod < 400 else AMAR if cod < 500 else VERM
-    quem = f"{_bandeira(v['pais'])} {v['ip']}" if v["via"] == "internet" else f"{v['ip']} ({_VIAS[v['via']]})"
+    quem = (f"{_bandeira(v['pais'])} {v['ip']}" + (f" {_lugar(v)}" if _lugar(v) else "") if v["via"] == "internet"
+            else f"{v['ip']} ({_VIAS[v['via']]})")
     marca = f"{MAG}★ novo{RST} " if novo else ""
     metodo = "" if v["metodo"] == "GET" else f"{v['metodo']} "
     return (f"  {DIM}{_quando(v['t'], True)}{RST}  {marca}{quem}  {metodo}{v['caminho']}  {cor}{cod or '?'}{RST}  "
@@ -5695,6 +6172,7 @@ def _detalhes_visitante(g: dict, ips: dict) -> None:
     pais = _pais_por_extenso(g["pais"]) if g["via"] == "internet" else ""
     print(f"  {NEG}{g['ip']}{RST}   {CIANO}{pais + ' · ' if pais else ''}{_VIAS.get(g['via'], '')}{RST}")
     linhas = [
+        ("Cidade (informada pela Cloudflare)", _lugar(g)),
         ("Aparelho", g["aparelho"]),
         ("Operadora", _texto_ip(ips.get(g["ip"]))),
         ("Idioma do navegador", g["idioma"]),
@@ -5770,13 +6248,14 @@ def _exportar_visitas(reg: dict, visitas: list) -> None:
     with open(destino, "w", newline="", encoding="utf-8-sig") as arq:  # utf-8-sig: o Excel abre com acentos
         escritor = csv.writer(arq, delimiter=";")
         escritor.writerow(["data e hora", "IP", "país", "por onde", "método", "endereço aberto", "código",
-                           "aparelho e navegador", "idioma", "veio de", "operadora e cidade", "User-Agent"])
+                           "aparelho e navegador", "idioma", "veio de", "cidade (Cloudflare)", "operadora e cidade",
+                           "User-Agent"])
         for v in visitas:
             escritor.writerow([_celula_planilha(x) for x in (
                 v["t"], v["ip"], _pais_por_extenso(v["pais"]).split(" ", 1)[1] if v["via"] == "internet" else "",
                 _VIAS.get(v["via"], v["via"]), v["metodo"], v["caminho"], v["codigo"] or "",
                 _descrever_agente(v["agente"], v).removeprefix("🤖 "), v["idioma"],
-                _ref_externo(v["ref"]) if "://" in v["ref"] else v["ref"],
+                _ref_externo(v["ref"]) if "://" in v["ref"] else v["ref"], _lugar(v),
                 _texto_ip(ips.get(v["ip"])), v["agente"])])
     ok(f"Planilha salva ({len(visitas)} pedidos): {destino}")
 
@@ -5797,6 +6276,9 @@ def _resumo_visitas(reg: dict, visitas: list, grupos: list, limite: int | None =
         da_internet = [g for g in pessoas if g["via"] == "internet"]
         if da_internet:
             print(f"  {CIANO}Países:{RST} {_contagem(_pais_por_extenso(g['pais']) for g in da_internet)}")
+            lugares = [_lugar(g) for g in da_internet if _lugar(g)]
+            if lugares:
+                print(f"  {CIANO}Cidades:{RST} {_contagem(lugares)}")
         print(f"  {CIANO}Aparelhos:{RST} {_contagem(_familia(g['aparelho']) for g in pessoas)}")
         refs = [r for g in pessoas for r in g["refs"]]
         if refs:
@@ -5926,8 +6408,18 @@ def limpar_visitas_do_site() -> None:
 def liberar_site() -> None:
     """Liga o túnel da Cloudflare de um site publicado (para quem está fora do Wi-Fi)."""
     n = _escolher_site("Liberar qual site para a internet?")
-    if n is not None:
-        abrir_tunel(_tunel_site(n), _dados_site(n)["porta"])
+    if n is None:
+        return
+    porta = _dados_site(n)["porta"]
+    if host_fixo(porta):
+        i = escolher("Por qual endereço?", [f"Endereço fixo: {host_fixo(porta)}",
+                                            "Link temporário (trycloudflare.com, muda toda vez que liga)"])
+        if i is None:
+            return
+        if i == 0:
+            ligar_tunel_fixo()
+            return
+    abrir_tunel(_tunel_site(n), porta)
 
 
 def qr_do_site(n: int | None = None) -> None:
@@ -6022,6 +6514,9 @@ def publicar_site() -> None:
     porta = _porta_do_site(n, anterior)
     if porta != anterior and servico_ativo(tunel):
         parar_servico(tunel)  # apontava para a porta antiga
+    if porta != anterior and host_fixo(anterior):
+        aviso(f"O endereço fixo {host_fixo(anterior)} aponta para a porta {anterior}, que estava ocupada: o site foi "
+              f"para a {porta}. No painel da Cloudflare, troque a URL desse endereço para localhost:{porta}.")
     nome_antes = cfg()["sites"].get(str(n), {}).get("nome")
     if nome_antes and nome_antes != alvo.name:  # outro site no mesmo espaço: não mistura as visitas
         _guardar_visitas_antigas(n, nome_antes)
@@ -6030,8 +6525,15 @@ def publicar_site() -> None:
     if not iniciar_servico(servico, cmd_self("site", str(pasta), "--porta", str(porta), "--nome", alvo.name,
                                              "--visitas", str(_arquivo_visitas(n))), reiniciar=True):
         return
-    if not servico_ativo(tunel) and confirmar("Liberar para a internet (pessoas fora do seu Wi-Fi)?", True):
+    fixo = host_fixo(porta)
+    if fixo:  # o endereço que não muda tem preferência sobre o link temporário
+        if not servico_ativo(SERVICO_TUNEL_FIXO) and confirmar(f"Ligar o endereço fixo ({fixo})?", True):
+            ligar_tunel_fixo()
+    elif not servico_ativo(tunel) and confirmar("Liberar para a internet (pessoas fora do seu Wi-Fi)?", True):
         abrir_tunel(tunel, porta)
+    if not fixo and cfg().get("tunel_fixo_token"):
+        print(f"  {DIM}Para este site ter o seu endereço fixo, cadastre no painel da Cloudflare um endereço com a URL "
+              f"localhost:{porta}.{RST}")
     print()
     _mostrar_links(n)
     _, link = links_do_site(n)[-1]
@@ -6193,6 +6695,9 @@ def menu_arquivos():
                  f"({'ligado' if cfg().get('site_avisar_visitas') else 'desligado'})", alternar_aviso_visitas),
         ("Site publicado: limpar o registro de visitas", limpar_visitas_do_site),
         ("Site publicado: tirar do ar", parar_site),
+        (lambda: "🔗 Endereço fixo com o seu domínio (Cloudflare)" + (f" ({', '.join(r['host'] for r in regras_tunel_fixo())})"
+                                                                     if cfg().get("tunel_fixo_token") and regras_tunel_fixo() else ""),
+         menu_tunel_fixo),
         *itens_servico("http-arquivos", "Compartilhar pasta via HTTP", http_iniciar),
         ("rclone: instalar e configurar nuvem (Drive, Dropbox, OneDrive...)", rclone_config),
         ("rclone: copiar/sincronizar pasta com a nuvem", rclone_copiar),
@@ -6372,7 +6877,7 @@ def equalizar_arquivo(arq: Path, cadeia: str) -> bool:
 
 
 def comando_ytdlp(alvo: str, formato: str | None = None, eq: dict | None = None,
-                  lista: Path | None = None) -> list:
+                  lista: Path | None = None, pasta: Path | None = None) -> list:
     """Melhor áudio, convertido para o formato escolhido, com capa (quando o formato aceita) e metadados. Com
     `eq` o nome do arquivo ganha '(EQ preset)' (quem grava o filtro é baixar_musica); `lista` recebe o caminho
     final de cada arquivo baixado."""
@@ -6385,7 +6890,7 @@ def comando_ytdlp(alvo: str, formato: str | None = None, eq: dict | None = None,
     nome = "%(title)s" + (f" (EQ {nome_eq(eq)})" if cadeia else "")
     return ["yt-dlp", "-f", selecao, "--extract-audio", *opcoes, *(["--embed-thumbnail"] if capa else []),
             *(["--print-to-file", "after_move:filepath", str(lista)] if lista else []),
-            "--add-metadata", "-o", str(pasta_musicas() / f"{nome}.%(ext)s"), alvo]
+            "--add-metadata", "-o", str((pasta or pasta_musicas()) / f"{nome}.%(ext)s"), alvo]
 
 
 def escolher_formato_musica() -> str | None:
@@ -6426,20 +6931,22 @@ def garantir_deps_musica(com_player: bool = True, capa: bool | None = None) -> b
 def baixar_musica(alvo: str, formato: str | None = None, eq: dict | None = None) -> bool:
     if not garantir_deps_musica(com_player=False, capa=True):  # baixar não precisa do player
         return False
-    garantir_storage()
-    pasta_musicas().mkdir(parents=True, exist_ok=True)
+    pasta = pasta_para_salvar(pasta_musicas())
+    if pasta is None:
+        return False
     cadeia = cadeia_eq(eq) if eq else ""
-    if not cadeia:
-        return rodar(comando_ytdlp(alvo, formato)).returncode == 0
-    if (formato or cfg().get("formato_musica")) == "original":
+    if cadeia and (formato or cfg().get("formato_musica")) == "original":
         info("Para gravar o equalizador o áudio precisa ser convertido: vai em Opus.")
     lista = DATA_DIR / "tmp" / f"baixados-{os.getpid()}.txt"
     lista.parent.mkdir(parents=True, exist_ok=True)
     lista.unlink(missing_ok=True)
-    deu_certo = rodar(comando_ytdlp(alvo, formato, eq, lista)).returncode == 0
-    arquivos = [Path(l.strip()) for l in (lista.read_text("utf-8").splitlines() if lista.exists() else []) if l.strip()]
-    lista.unlink(missing_ok=True)
-    return all([equalizar_arquivo(arq, cadeia) for arq in arquivos if arq.exists()]) and deu_certo
+    deu_certo = rodar(comando_ytdlp(alvo, formato, eq, lista, pasta)).returncode == 0
+    arquivos = relatar_baixados(lista)
+    if cadeia:
+        equalizados = all([equalizar_arquivo(arq, cadeia) for arq in arquivos])
+        _avisar_galeria(arquivos)  # o arquivo foi regravado com o equalizador
+        return equalizados and deu_certo
+    return deu_certo
 
 
 def buscar_youtube(termo: str, n: int = 10) -> list:
@@ -7674,7 +8181,7 @@ def menu_musica():
         ("Playlists: criar", criar_playlist),
         ("Playlists: tocar", tocar_playlist),
         ("⏹ Parar a música", parar),
-        (lambda: f"Pasta das músicas ({c['pasta_musicas']})", mudar_pasta),
+        (lambda: f"Pasta das músicas ({onde_fica(pasta_musicas())})", mudar_pasta),
         ("Instalar dependências (yt-dlp, ffmpeg, mpv, mutagen)", garantir_deps_musica),
     ])
 
@@ -7703,13 +8210,15 @@ QUALIDADES_VIDEO = {"melhor": "Melhor disponível", "1080": "1080p (Full HD)", "
                     "480": "480p — economiza espaço e dados", "360": "360p — o menor"}
 
 
-def comando_video(alvo: str, formato: str | None = None, qualidade: str | None = None) -> list:
+def comando_video(alvo: str, formato: str | None = None, qualidade: str | None = None,
+                  pasta: Path | None = None, lista: Path | None = None) -> list:
     """Melhor vídeo + melhor áudio no formato e na qualidade escolhidos (o yt-dlp junta os dois).
     --trim-filenames evita o erro de nome longo demais com legendas do TikTok."""
     c = cfg()
     formato = formato if formato in FORMATOS_VIDEO else c.get("formato_video", "mp4")
     qualidade = qualidade if qualidade in QUALIDADES_VIDEO else c.get("qualidade_video", "melhor")
-    saida_arq = ["--trim-filenames", "150", "-o", str(pasta_videos() / "%(title)s.%(ext)s"), alvo]
+    saida_arq = ["--trim-filenames", "150", *(["--print-to-file", "after_move:filepath", str(lista)] if lista else []),
+                 "-o", str((pasta or pasta_videos()) / "%(title)s.%(ext)s"), alvo]
     if formato == "mp3":
         return ["yt-dlp", "-f", "bestaudio/best", "--extract-audio", "--audio-format", "mp3", "--audio-quality", "320K",
                 "--embed-thumbnail", "--add-metadata", *saida_arq]
@@ -7744,11 +8253,16 @@ def baixar_video(alvo: str, formato: str | None = None, qualidade: str | None = 
     """Baixa um link (TikTok, YouTube, Shorts, playlist...) ou o 1º resultado de uma busca."""
     if not garantir_deps_musica(com_player=False):
         return False
-    garantir_storage()
-    pasta_videos().mkdir(parents=True, exist_ok=True)
+    pasta = pasta_para_salvar(pasta_videos())
+    if pasta is None:
+        return False
     if not alvo.startswith(("http://", "https://")):
         alvo = f"ytsearch1:{alvo}"
-    return rodar(comando_video(alvo, formato, qualidade)).returncode == 0
+    lista = DATA_DIR / "tmp" / f"videos-{os.getpid()}.txt"
+    lista.parent.mkdir(parents=True, exist_ok=True)
+    lista.unlink(missing_ok=True)
+    deu_certo = rodar(comando_video(alvo, formato, qualidade, pasta, lista)).returncode == 0
+    return bool(relatar_baixados(lista)) and deu_certo
 
 
 def videos_locais() -> list:
@@ -7818,7 +8332,7 @@ def menu_videos():
         ("Abrir vídeo baixado no player do Android", abrir),
         ("Assistir um link sem baixar (VLC, MX Player...)", assistir_link_no_celular),
         ("📉 Reduzir a resolução de um vídeo (4K → 1080p, 720p...: para de travar)", reduzir_resolucao),
-        (lambda: f"Pasta dos vídeos ({c['pasta_videos']})", mudar_pasta),
+        (lambda: f"Pasta dos vídeos ({onde_fica(pasta_videos())})", mudar_pasta),
         ("Instalar dependências (yt-dlp, ffmpeg)", lambda: garantir_deps_musica(com_player=False)),
     ])
 
@@ -10019,6 +10533,8 @@ def links_de(item: dict) -> list:
     links = [("Mesma rede Wi-Fi", f"http://{ip_local()}:{porta}/v/{item['token']}")]
     if servico_ativo("tunel-midia") and url_tunel("tunel-midia"):
         links.append(("Internet", f"{url_tunel('tunel-midia')}/v/{item['token']}"))
+    if endereco_fixo(porta):
+        links.append(("Internet (endereço fixo)", f"{endereco_fixo(porta)}/v/{item['token']}"))
     return links
 
 
@@ -10071,8 +10587,9 @@ def mostrar_links(item: dict) -> None:
     for onde, link in links_de(item):
         print(f"  {CIANO}{onde}:{RST}\n  {NEG}{link}{RST}")
     print(f"\n  {DIM}No VLC (todas as trilhas de áudio e legendas): use o mesmo link terminado em /video.{RST}")
-    if not (servico_ativo("tunel-midia") and url_tunel("tunel-midia")):
-        print(f"  {DIM}Para quem está fora da sua rede Wi-Fi, ligue o 'Túnel para a internet' neste menu.{RST}")
+    if not (servico_ativo("tunel-midia") and url_tunel("tunel-midia")) and not endereco_fixo(cfg()["midia_porta"]):
+        print(f"  {DIM}Para quem está fora da sua rede Wi-Fi, ligue o 'Túnel para a internet' neste menu "
+              f"(ou use um endereço fixo).{RST}")
 
 
 def abrir_no_android(alvo: str, pacote: str | None = None) -> None:
@@ -10403,7 +10920,7 @@ def _destino_reduzido(fonte: str, nivel: int) -> Path:
     """Ao lado do original (ou em Download/Termux-Toons/Convertidos), com a resolução no nome."""
     if eh_link(fonte):
         nome = urllib.parse.unquote(os.path.basename(urllib.parse.urlsplit(fonte).path)) or "video"
-        pasta = pasta_videos() if garantir_storage() or pasta_videos().exists() else pasta_saida("Convertidos")
+        pasta = (pasta_para_salvar(pasta_videos()) if sys.stdin.isatty() else None) or pasta_saida("Convertidos")
     else:
         nome, pasta = Path(fonte).name, Path(fonte).parent
         if not os.access(pasta, os.W_OK):
@@ -10759,6 +11276,8 @@ def menu_torbox():
         lista = [("Mesma rede Wi-Fi", f"http://{ip_local()}:{c['midia_porta']}{caminho}")]
         if servico_ativo("tunel-midia") and url_tunel("tunel-midia"):
             lista.append(("Internet", f"{url_tunel('tunel-midia')}{caminho}"))
+        if endereco_fixo(c["midia_porta"]):
+            lista.append(("Internet (endereço fixo)", f"{endereco_fixo(c['midia_porta'])}{caminho}"))
         return lista
 
     def configurar():
@@ -11056,6 +11575,7 @@ def menu_midia():
         ("🍿 Catálogo do TorBox (todos os seus filmes e séries num link só)", menu_torbox),
         ("Meus links (copiar, enviar, assistir, apagar)", ver_links),
         ("Converter filme para MP4 compatível", converter),
+        ("🔗 Endereço fixo com o seu domínio (Cloudflare)", menu_tunel_fixo),
         ("📉 Reduzir a resolução de um filme (4K → 1080p, 720p...)", reduzir_resolucao),
         *itens_servico("midia", "Servidor de vídeo", iniciar_servidor),
         ("Túnel para a internet: ligar", iniciar_tunel),
@@ -25378,6 +25898,7 @@ def main(argv=None) -> int:
     p.add_argument("alvos", nargs="+")
     p.add_argument("--formato", choices=list(FORMATOS_VIDEO), help="padrão: o último escolhido no menu")
     p.add_argument("--qualidade", choices=list(QUALIDADES_VIDEO), help="padrão: a última escolhida no menu")
+    sub.add_parser(SERVICO_TUNEL_FIXO, help="túnel da Cloudflare com endereço fixo (token do painel) em primeiro plano")
     p = sub.add_parser(SERVICO_REDUZIR, help="cópia de um vídeo (arquivo ou link) numa resolução menor")
     p.add_argument("fonte")
     p.add_argument("--nivel", type=int, choices=sorted(NIVEIS_VIDEO), default=1080, help="resolução: 1080, 720...")
@@ -25464,6 +25985,8 @@ def main(argv=None) -> int:
             falhas = sum(not baixar_video(alvo, args.formato, args.qualidade) for alvo in args.alvos)
             if falhas:
                 raise ToonsError(f"{falhas} download(s) falharam.")
+        elif args.comando == SERVICO_TUNEL_FIXO:
+            rodar_tunel_fixo()
         elif args.comando == SERVICO_REDUZIR:
             reduzir_video_cli(args.fonte, args.nivel, args.saida, args.fps30)
         elif args.comando == "midia":
