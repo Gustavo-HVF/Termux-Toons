@@ -7,7 +7,9 @@ Reúne em um único menu:
    1. Servidor web/API pessoal (Flask, FastAPI ou só biblioteca padrão) + Cloudflare Tunnel
    2. Bots de Telegram e Discord rodando 24h (tmux + termux-wake-lock)
    3. Scraping e monitoramento (preço, notícias/RSS, status de site, chuva)
-   4. Rede e segurança em equipamentos seus (nmap, SSH, WireGuard, velocidade, modem AT)
+   4. Rede e segurança em equipamentos seus (nmap, SSH, WireGuard, velocidade, modem AT) e pontes de
+      conexão: proxy para o PC, túnel SSH, Tor, Smart DNS, links públicos (Cloudflare, ngrok...) e
+      redes privadas (Tailscale, ZeroTier)
    5. Linux de verdade com proot-distro (Debian, Ubuntu, Arch...), com desktop no Termux:X11
    6. Arquivos e backup: gerenciador de arquivos (ADB ou root para Android/data), rclone, Syncthing,
       Samba, HTTP, backup e página HTML num link
@@ -46,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import asyncio
 import atexit
 import base64
 import calendar
@@ -57,6 +60,7 @@ import fnmatch
 import getpass
 import hashlib
 import hmac
+import html
 import importlib
 import importlib.util
 import io
@@ -1134,6 +1138,17 @@ PADRAO_CFG = {
     "site_porta": 8097,
     "sites": {},
     "site_avisar_visitas": False,
+    "proxy_porta": 3128,
+    "proxy_usuario": "toons",
+    "proxy_senha": None,  # None: ainda não escolheu; "": sem senha
+    "proxy_saida": "",  # "" direto; "ssh" pelo túnel SSH; "tor" pelo Tor
+    "pontes_portas": {},  # qual porta cada ponte pública está expondo
+    "ssh_ponte_destino": "",  # usuario@servidor do túnel SSH (ssh -D)
+    "ssh_ponte_porta": 22,
+    "ssh_ponte_socks": 1080,
+    "ssh_ponte_lan": False,
+    "tor_onion_porta": None,  # porta publicada como endereço .onion
+    "smartdns_ips": [],
     "tunel_fixo_token": "",  # token do túnel criado no painel da Cloudflare (endereço fixo com o seu domínio)
     "tunel_fixo_painel": [],  # endereços que o painel mandou (o cloudflared escreve no log): [{host, porta}]
     "tunel_fixo_manuais": [],  # endereços anotados à mão
@@ -4112,6 +4127,1448 @@ def _rede_local_24() -> str:
     return ".".join(partes[:3]) + ".0/24" if len(partes) == 4 else "192.168.0.0/24"
 
 
+# ── Proxy: a internet do celular no PC ou no Chromebook ──────────────
+# Um servidor de proxy no próprio celular. O PC (ligado no roteador/hotspot do celular, no cabo USB ou no mesmo
+# Wi-Fi) manda a navegação por ele, e ela sai pela conexão do celular: dados móveis, a VPN dele, etc.
+# Uma porta só atende HTTP (o que Windows e ChromeOS pedem nas configurações, com CONNECT para HTTPS), SOCKS5
+# (Telegram, Firefox, qBittorrent...) e SOCKS4. Só aceita aparelhos de redes locais, nunca da internet, e não deixa
+# ninguém chegar aos serviços deste celular que só escutam em 127.0.0.1.
+
+SERVICO_PROXY = "proxy"
+ESTADO_PROXY = DATA_DIR / "proxy_estado.json"  # o servidor escreve aqui o uso (o menu lê)
+MAX_CONEXOES_PROXY = 400
+# (começo do nome da placa de rede, o que é). Dados móveis (rmnet, ccmni), VPN (tun) e afins ficam de fora:
+# o PC não alcança o celular por elas.
+_PLACAS = ((("ap", "swlan", "softap"), "roteador (hotspot) do celular"),
+           (("rndis", "usb", "ncm"), "cabo USB (ancoragem USB)"),
+           (("bt-pan", "bnep"), "Bluetooth"),
+           (("wlan", "wifi"), "Wi-Fi"),
+           (("eth",), "cabo de rede"))
+_PLACAS_FORA = ("lo", "rmnet", "ccmni", "tun", "ppp", "dummy", "v4-", "clat", "ip6", "sit", "p2p", "rev_rmnet", "seth")
+
+
+def _tipo_da_placa(nome: str, ip: str) -> str | None:
+    nome = nome.lower()
+    if nome.startswith(_PLACAS_FORA):
+        return None
+    for prefixos, tipo in _PLACAS:
+        if nome.startswith(prefixos):
+            if tipo == "Wi-Fi" and nome != "wlan0" and ip.endswith(".1"):
+                return "roteador (hotspot) do celular"  # wlan1/wlan2 com IP .1: é o roteador ligado
+            return tipo
+    return "outra rede"
+
+
+def _placas_ipv4() -> list:
+    """[(ip, nome da placa)] de todas as redes IPv4 do celular (inclusive dados móveis e VPN)."""
+    achados = []
+    texto = saida(["ip", "-o", "-4", "addr", "show"], timeout=10) if tem("ip") else ""
+    for nome, ip in re.findall(r"^\d+:\s+(\S+)\s+inet\s+([\d.]+)/\d+", texto, re.M):
+        achados.append((ip, nome.split("@")[0]))
+    if not achados:  # sem o comando ip: pergunta a cada placa (ioctl SIOCGIFADDR)
+        with contextlib.suppress(ImportError, OSError):
+            import fcntl
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                for _, nome in socket.if_nameindex():
+                    with contextlib.suppress(OSError):
+                        resposta = fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", nome[:15].encode()))
+                        achados.append((socket.inet_ntoa(resposta[20:24]), nome))
+    return achados
+
+
+def enderecos_do_celular() -> list:
+    """[(ip, nome da placa, o que é)] por onde o PC alcança este celular: roteador (hotspot), USB, Wi-Fi..."""
+    lista = []
+    for ip, nome in _placas_ipv4():
+        tipo = _tipo_da_placa(nome, ip)
+        if tipo and not ip.startswith("127.") and (ip, nome) not in [(a, b) for a, b, _ in lista]:
+            lista.append((ip, nome, tipo))
+    if not lista and ip_local() != "127.0.0.1":
+        lista.append((ip_local(), "?", "rede local"))
+    ordem = ["roteador (hotspot) do celular", "cabo USB (ancoragem USB)", "Wi-Fi"]
+    return sorted(lista, key=lambda e: ordem.index(e[2]) if e[2] in ordem else len(ordem))
+
+
+class ServidorProxy:
+    """Proxy HTTP + SOCKS5 + SOCKS4 numa porta só (asyncio, só a biblioteca padrão)."""
+
+    def __init__(self, porta: int, usuario: str = "", senha: str = "", estado: Path | None = None,
+                 saida: tuple | None = None):
+        self.porta, self.usuario, self.senha, self.estado = porta, usuario, senha, estado
+        self.saida = saida  # (host, porta) de um SOCKS5 por onde tudo sai: túnel SSH ou Tor
+        self.inicio = time.time()
+        self.ativas = self.total = self.enviados = self.recebidos = 0
+        self.clientes: dict = {}  # ip -> {"bytes", "ultimo", "conexoes"}
+
+    # ── quem pode usar ──
+    @staticmethod
+    def cliente_permitido(ip: str) -> bool:
+        """Só aparelhos de redes locais (roteador do celular, USB, Wi-Fi); ninguém vindo da internet."""
+        try:
+            return not ipaddress.ip_address(ip.split("%")[0]).is_global
+        except ValueError:
+            return False
+
+    @staticmethod
+    def destino_permitido(ip: str) -> bool:
+        """Para onde o proxy pode ir: nunca para este próprio celular (127.0.0.1), onde ficam serviços que só
+        escutam localmente (ADB, a API...)."""
+        try:
+            alvo = ipaddress.ip_address(ip.split("%")[0])
+        except ValueError:
+            return False
+        return not (alvo.is_loopback or alvo.is_unspecified or alvo.is_multicast)
+
+    def _senha_confere(self, usuario: str, senha: str) -> bool:
+        certo_u = hmac.compare_digest(usuario.encode(), self.usuario.encode())
+        certo_s = hmac.compare_digest(senha.encode(), self.senha.encode())
+        return certo_u and certo_s
+
+    # ── conexão com o destino e cópia dos dados ──
+    async def _conectar(self, host: str, porta: int):
+        """(leitor, escritor) do destino, ou levanta PermissionError (destino proibido) / OSError (não abriu)."""
+        if self.saida:
+            return await self._conectar_pela_saida(host, porta)
+        laco = asyncio.get_running_loop()
+        infos = await asyncio.wait_for(laco.getaddrinfo(host, porta, type=socket.SOCK_STREAM), 20)
+        permitidos = [info[4] for info in infos if self.destino_permitido(str(info[4][0]))]
+        if not permitidos:
+            raise PermissionError(f"destino bloqueado: {host}")
+        ultimo_erro: Exception = OSError(f"não conectou em {host}")
+        for endereco in permitidos:
+            try:
+                return await asyncio.wait_for(asyncio.open_connection(endereco[0], endereco[1]), 20)
+            except (OSError, asyncio.TimeoutError) as e:
+                ultimo_erro = e
+        raise OSError(str(ultimo_erro))
+
+    async def _conectar_pela_saida(self, host: str, porta: int):
+        """Abre o destino pelo SOCKS5 da saída (túnel SSH ou Tor). O nome do site vai para o outro lado resolver:
+        resolver aqui contaria ao DNS da operadora quais sites você abre."""
+        nome = host.strip("[]").lower()
+        try:
+            ip = ipaddress.ip_address(nome)
+        except ValueError:
+            ip = None
+        if (ip is not None and not self.destino_permitido(nome)) or nome == "localhost" or nome.endswith(".localhost"):
+            raise PermissionError(f"destino bloqueado: {host}")
+        try:
+            bruto = nome.encode("idna") if ip is None else b""
+            endereco = (b"\x03" + bytes([len(bruto)]) + bruto if ip is None
+                        else (b"\x01" if ip.version == 4 else b"\x04") + ip.packed)
+        except (UnicodeError, ValueError):
+            raise OSError(f"nome inválido: {host}") from None
+        leitor, escritor = await asyncio.wait_for(asyncio.open_connection(*self.saida), 20)
+        try:
+            escritor.write(b"\x05\x01\x00")
+            await escritor.drain()
+            if await asyncio.wait_for(leitor.readexactly(2), 20) != b"\x05\x00":
+                raise OSError("a saída (túnel SSH ou Tor) recusou a conexão")
+            escritor.write(b"\x05\x01\x00" + endereco + porta.to_bytes(2, "big"))
+            await escritor.drain()
+            resposta = await asyncio.wait_for(leitor.readexactly(4), 60)  # pelo Tor pode demorar
+            if resposta[1] != 0:
+                raise OSError(f"a saída não conseguiu abrir {host} (código {resposta[1]})")
+            tipo = resposta[3]
+            await leitor.readexactly(6 if tipo == 1 else 18 if tipo == 4 else (await leitor.readexactly(1))[0] + 2)
+        except BaseException:
+            escritor.close()
+            raise
+        return leitor, escritor
+
+    async def _copiar(self, leitor, escritor, ip: str, subindo: bool) -> None:
+        try:
+            while True:
+                dados = await asyncio.wait_for(leitor.read(65536), 900)  # 15 min parado: a conexão morreu
+                if not dados:
+                    break
+                escritor.write(dados)
+                await escritor.drain()
+                if subindo:
+                    self.enviados += len(dados)
+                else:
+                    self.recebidos += len(dados)
+                cliente = self.clientes[ip]
+                cliente["bytes"] += len(dados)
+                cliente["ultimo"] = time.time()
+        except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            with contextlib.suppress(OSError, RuntimeError):
+                if escritor.can_write_eof():
+                    escritor.write_eof()
+                else:
+                    escritor.close()
+
+    async def _ligar_pontas(self, cliente_l, cliente_e, destino_l, destino_e, ip: str) -> None:
+        await asyncio.gather(self._copiar(cliente_l, destino_e, ip, True), self._copiar(destino_l, cliente_e, ip, False))
+        for escritor in (destino_e, cliente_e):
+            with contextlib.suppress(OSError, RuntimeError):
+                escritor.close()
+
+    # ── atendimento ──
+    async def atender(self, leitor, escritor) -> None:
+        ip = str((escritor.get_extra_info("peername") or ("?",))[0])
+        if not self.cliente_permitido(ip) or self.ativas >= MAX_CONEXOES_PROXY:
+            if not self.cliente_permitido(ip):
+                log(f"Recusado: {ip} não é de uma rede local.")
+            escritor.close()
+            return
+        if ip not in self.clientes:
+            log(f"Novo aparelho usando o proxy: {ip}")
+            self.clientes[ip] = {"bytes": 0, "ultimo": time.time(), "conexoes": 0}
+        self.clientes[ip]["conexoes"] += 1
+        self.ativas += 1
+        self.total += 1
+        try:
+            primeiro = await asyncio.wait_for(leitor.readexactly(1), 30)
+            if primeiro == b"\x05":
+                await self._socks5(leitor, escritor, ip)
+            elif primeiro == b"\x04":
+                await self._socks4(leitor, escritor, ip)
+            else:
+                await self._http(primeiro, leitor, escritor, ip)
+        except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, ValueError):
+            pass
+        finally:
+            self.ativas -= 1
+            with contextlib.suppress(OSError, RuntimeError):
+                escritor.close()
+
+    async def _http(self, primeiro: bytes, leitor, escritor, ip: str) -> None:
+        cabeca = primeiro + await asyncio.wait_for(leitor.readuntil(b"\r\n\r\n"), 30)
+        linhas = cabeca.decode("latin-1").split("\r\n")
+        metodo, alvo, versao = (linhas[0].split(" ") + ["", "", ""])[:3]
+        cabecalhos = [l.split(":", 1) for l in linhas[1:] if ":" in l]
+        cab = {k.strip().lower(): v.strip() for k, v in cabecalhos}
+
+        async def responder(codigo: str, texto: str = "", extra: str = "", tipo: str = "text/plain; charset=utf-8"):
+            corpo = texto.encode()
+            escritor.write(f"HTTP/1.1 {codigo}\r\n{extra}Content-Type: {tipo}\r\nContent-Length: {len(corpo)}\r\n"
+                           f"Connection: close\r\n\r\n".encode() + corpo)
+            await escritor.drain()
+
+        if alvo.startswith("/"):  # pedido para o próprio proxy: página de teste e o script automático (PAC)
+            host = cab.get("host", "").split(":")[0] or ip_local()
+            if alvo.split("?")[0] == "/proxy.pac":
+                return await responder("200 OK", _script_pac(host, self.porta), tipo="application/x-ns-proxy-autoconfig")
+            return await responder("200 OK", _pagina_proxy(host, self.porta, bool(self.senha)),
+                                   tipo="text/html; charset=utf-8")
+        if self.senha:
+            tipo, _, credencial = cab.get("proxy-authorization", "").partition(" ")
+            usuario = senha = ""
+            if tipo.lower() == "basic":
+                with contextlib.suppress(ValueError):
+                    usuario, _, senha = base64.b64decode(credencial).decode("utf-8").partition(":")
+            if not self._senha_confere(usuario, senha):
+                return await responder("407 Proxy Authentication Required", "Este proxy precisa de usuário e senha.\n",
+                                       'Proxy-Authenticate: Basic realm="Proxy do celular (Termux-Toons)", charset="UTF-8"\r\n')
+        if metodo.upper() == "CONNECT":  # HTTPS: só abre o túnel até o site
+            host, _, porta = alvo.rpartition(":")
+            host = host.strip("[]")
+            if not host or not porta.isdigit():
+                return await responder("400 Bad Request", "Endereço inválido.\n")
+            try:
+                destino_l, destino_e = await self._conectar(host, int(porta))
+            except PermissionError:
+                return await responder("403 Forbidden", "O proxy não deixa abrir endereços deste próprio celular.\n")
+            except (OSError, asyncio.TimeoutError):
+                return await responder("502 Bad Gateway", f"Não consegui chegar em {host}.\n")
+            escritor.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await escritor.drain()
+            return await self._ligar_pontas(leitor, escritor, destino_l, destino_e, ip)
+        partes = urllib.parse.urlsplit(alvo)  # HTTP comum: GET http://site/caminho
+        if partes.scheme.lower() != "http" or not partes.hostname:
+            return await responder("400 Bad Request", "Use este proxy como proxy HTTP (ou SOCKS5).\n")
+        try:
+            destino_l, destino_e = await self._conectar(partes.hostname, partes.port or 80)
+        except PermissionError:
+            return await responder("403 Forbidden", "O proxy não deixa abrir endereços deste próprio celular.\n")
+        except (OSError, asyncio.TimeoutError):
+            return await responder("502 Bad Gateway", f"Não consegui chegar em {partes.hostname}.\n")
+        caminho = (partes.path or "/") + (f"?{partes.query}" if partes.query else "")
+        upgrade = "upgrade" in cab.get("connection", "").lower() and "upgrade" in cab
+        fora = {"proxy-authorization", "proxy-connection", "connection", "keep-alive"}
+        novos = [f"{k.strip()}: {v.strip()}" for k, v in cabecalhos if k.strip().lower() not in fora]
+        novos.append("Connection: upgrade" if upgrade else "Connection: close")  # um pedido por conexão: simples
+        pedido = f"{metodo} {caminho} {versao}\r\n" + "".join(f"{linha}\r\n" for linha in novos) + "\r\n"
+        destino_e.write(pedido.encode("latin-1"))
+        await destino_e.drain()
+        self.enviados += len(cabeca)
+        await self._ligar_pontas(leitor, escritor, destino_l, destino_e, ip)
+
+    async def _socks5(self, leitor, escritor, ip: str) -> None:
+        metodos = await leitor.readexactly((await leitor.readexactly(1))[0])
+        if self.senha:
+            if 2 not in metodos:  # o app não oferece usuário e senha
+                escritor.write(b"\x05\xff")
+                return
+            escritor.write(b"\x05\x02")
+            await escritor.drain()
+            await leitor.readexactly(1)  # versão da sub-negociação (1)
+            usuario = (await leitor.readexactly((await leitor.readexactly(1))[0])).decode("utf-8", "replace")
+            senha = (await leitor.readexactly((await leitor.readexactly(1))[0])).decode("utf-8", "replace")
+            certo = self._senha_confere(usuario, senha)
+            escritor.write(b"\x01\x00" if certo else b"\x01\x01")
+            await escritor.drain()
+            if not certo:
+                return
+        else:
+            escritor.write(b"\x05\x00" if 0 in metodos else b"\x05\xff")
+            await escritor.drain()
+            if 0 not in metodos:
+                return
+        _, comando, _, tipo = await leitor.readexactly(4)
+        if tipo == 1:
+            host = socket.inet_ntoa(await leitor.readexactly(4))
+        elif tipo == 3:
+            host = (await leitor.readexactly((await leitor.readexactly(1))[0])).decode("utf-8", "replace")  # já vem em ASCII
+        elif tipo == 4:
+            host = socket.inet_ntop(socket.AF_INET6, await leitor.readexactly(16))
+        else:
+            escritor.write(b"\x05\x08\x00\x01" + b"\x00" * 6)  # tipo de endereço não suportado
+            return
+        porta = int.from_bytes(await leitor.readexactly(2), "big")
+        if comando != 1:  # só CONNECT (sem BIND nem UDP)
+            escritor.write(b"\x05\x07\x00\x01" + b"\x00" * 6)
+            return
+        try:
+            destino_l, destino_e = await self._conectar(host, porta)
+        except PermissionError:
+            escritor.write(b"\x05\x02\x00\x01" + b"\x00" * 6)  # não permitido
+            return
+        except (OSError, asyncio.TimeoutError):
+            escritor.write(b"\x05\x04\x00\x01" + b"\x00" * 6)  # não alcançou
+            return
+        escritor.write(b"\x05\x00\x00\x01" + b"\x00" * 6)
+        await escritor.drain()
+        await self._ligar_pontas(leitor, escritor, destino_l, destino_e, ip)
+
+    async def _socks4(self, leitor, escritor, ip: str) -> None:
+        comando, porta_b, ip_b = (await leitor.readexactly(1))[0], await leitor.readexactly(2), await leitor.readexactly(4)
+        await asyncio.wait_for(leitor.readuntil(b"\x00"), 10)  # identificação (ignorada)
+        host = socket.inet_ntoa(ip_b)
+        if ip_b[:3] == b"\x00\x00\x00" and ip_b[3]:  # SOCKS4a: o nome do site vem depois
+            host = (await asyncio.wait_for(leitor.readuntil(b"\x00"), 10))[:-1].decode("utf-8", "replace")
+        if self.senha or comando != 1:  # o SOCKS4 não tem senha: com senha ligada, só HTTP ou SOCKS5
+            escritor.write(b"\x00\x5b" + b"\x00" * 6)
+            return
+        try:
+            destino_l, destino_e = await self._conectar(host, int.from_bytes(porta_b, "big"))
+        except (OSError, asyncio.TimeoutError):  # PermissionError também é OSError
+            escritor.write(b"\x00\x5b" + b"\x00" * 6)
+            return
+        escritor.write(b"\x00\x5a" + b"\x00" * 6)
+        await escritor.drain()
+        await self._ligar_pontas(leitor, escritor, destino_l, destino_e, ip)
+
+    # ── uso (para o menu) ──
+    def _gravar_estado(self) -> None:
+        if not self.estado:
+            return
+        dados = {"pid": os.getpid(), "porta": self.porta, "inicio": self.inicio, "atualizado": time.time(),
+                 "ativas": self.ativas, "total": self.total, "enviados": self.enviados, "recebidos": self.recebidos,
+                 "senha": bool(self.senha), "clientes": self.clientes}
+        with contextlib.suppress(OSError):
+            gravar_json(self.estado, dados)
+
+    async def rodar(self) -> None:
+        servidor = await asyncio.start_server(self.atender, "0.0.0.0", self.porta, reuse_address=True)
+        log(f"Proxy (HTTP e SOCKS) na porta {self.porta}" + (" com senha" if self.senha else " sem senha")
+            + (f" · saindo pelo SOCKS {self.saida[0]}:{self.saida[1]}" if self.saida else "")
+            + " · endereços: " + (", ".join(f"{ip} ({tipo})" for ip, _, tipo in enderecos_do_celular()) or "nenhum"))
+        async with servidor:
+            while True:
+                self._gravar_estado()
+                await asyncio.sleep(5)
+
+
+def servir_proxy(porta: int) -> None:
+    """Sobe o proxy em primeiro plano (é o que roda dentro do tmux). Usuário e senha vêm do config (não ficam na
+    linha de comando)."""
+    with contextlib.suppress(ImportError, ValueError, OSError):  # o navegador abre muitas conexões ao mesmo tempo
+        import resource
+        _, maximo = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(maximo, 8192) if maximo > 0 else 8192, maximo))
+    c = cfg()
+    senha = c.get("proxy_senha") or ""
+    servidor = ServidorProxy(porta, c.get("proxy_usuario") or "toons" if senha else "", senha, ESTADO_PROXY,
+                             saida_do_proxy())
+    try:
+        asyncio.run(servidor.rodar())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ESTADO_PROXY.unlink(missing_ok=True)
+
+
+def _script_pac(host: str, porta: int) -> str:
+    """Script automático (PAC): sites da internet pelo proxy; endereços da rede local direto."""
+    return ("function FindProxyForURL(url, host) {\n"
+            "  if (isPlainHostName(host) || dnsDomainIs(host, '.local') ||\n"
+            "      /^(10|127)\\./.test(host) || /^192\\.168\\./.test(host) || /^172\\.(1[6-9]|2[0-9]|3[01])\\./.test(host))\n"
+            "    return 'DIRECT';\n"
+            f"  return 'PROXY {host}:{porta}';\n"
+            "}\n")
+
+
+def _pagina_proxy(host: str, porta: int, com_senha: bool) -> str:
+    """O que aparece ao abrir http://IP:PORTA no PC: confirma que ele alcança o celular e diz como configurar."""
+    senha = "<p>O navegador vai pedir <b>usuário e senha</b> (os que aparecem no Termux-Toons).</p>" if com_senha else ""
+    return f"""<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proxy do celular</title>
+<style>body{{font:16px/1.5 system-ui,sans-serif;max-width:640px;margin:2em auto;padding:0 16px;color:#222}}
+code{{background:#eee;padding:2px 6px;border-radius:4px}}h1{{font-size:1.4em}}</style>
+<h1>✅ O PC alcança o proxy do celular</h1>
+<p>Endereço <code>{html.escape(host)}</code>, porta <code>{porta}</code> (proxy HTTP; também aceita SOCKS5).</p>{senha}
+<h2>Windows 10/11</h2><p>Configurações → Rede e Internet → Proxy → Configuração manual de proxy → <i>Usar um servidor
+proxy</i>: endereço <code>{html.escape(host)}</code>, porta <code>{porta}</code> → Salvar.</p>
+<h2>Chromebook</h2><p>Configurações → Rede → clique na rede em que está conectado → Proxy → <i>Configuração manual de
+proxy</i> → Proxy HTTP <code>{html.escape(host)}</code> porta <code>{porta}</code>, e marque usar o mesmo proxy para
+todos os protocolos.</p>
+<h2>Script automático</h2><p>Nos dois, dá para usar o endereço de configuração automática:
+<code>http://{html.escape(host)}:{porta}/proxy.pac</code></p>"""
+
+
+def uso_do_proxy() -> dict | None:
+    """O que o servidor anotou do uso (None se não estiver rodando)."""
+    if not servico_ativo(SERVICO_PROXY):
+        return None
+    dados = ler_json(ESTADO_PROXY, {}) if ESTADO_PROXY.exists() else {}
+    return dados or None
+
+
+def instrucoes_proxy() -> None:
+    c = cfg()
+    porta = c["proxy_porta"]
+    enderecos = enderecos_do_celular()
+    if not enderecos:
+        aviso("Não achei nenhuma rede para o PC alcançar o celular. Ligue o roteador Wi-Fi (hotspot) do celular, "
+              "a ancoragem USB, ou conecte os dois no mesmo Wi-Fi.")
+        return
+    info("No PC, use o endereço da rede em que ele está ligado ao celular:")
+    for ip, _, tipo in enderecos:
+        print(f"  {NEG}{ip}{RST}  porta {NEG}{porta}{RST}  {DIM}← {tipo}{RST}")
+    ip = enderecos[0][0]
+    if c.get("proxy_senha"):
+        print(f"  Usuário {NEG}{c.get('proxy_usuario') or 'toons'}{RST} · senha {NEG}{c['proxy_senha']}{RST} "
+              f"{DIM}(o navegador pergunta na primeira vez){RST}")
+    passos = [
+        ("Windows 10/11", f"Configurações → Rede e Internet → Proxy → Configuração manual de proxy → Usar um servidor "
+                          f"proxy: endereço {ip}, porta {porta} → Salvar. Marque 'Não usar para endereços locais'."),
+        ("Chromebook", f"Configurações → Rede → a rede do celular → Proxy → Configuração manual de proxy → Proxy HTTP "
+                       f"{ip}, porta {porta}; marque usar o mesmo proxy para todos os protocolos. Se a opção estiver "
+                       "bloqueada, ligue 'Permitir proxies para redes compartilhadas' nas configurações de rede."),
+        ("Script automático", f"no Windows ('Usar script de configuração') ou no Chromebook ('Configuração automática'): "
+                              f"http://{ip}:{porta}/proxy.pac"),
+        ("Outros apps", f"Telegram, Firefox, qBittorrent...: SOCKS5 em {ip}, porta {porta}."),
+        ("Para testar", f"abra http://{ip}:{porta} no navegador do PC: aparece 'O PC alcança o proxy do celular'."),
+    ]
+    for titulo_p, texto in passos:  # o título conta na largura da 1ª linha
+        linhas = textwrap.wrap(f"{titulo_p}: {texto}", max(30, min(largura_tela(), 90) - 2), subsequent_indent="  ")
+        linhas[0] = f"{CIANO}{titulo_p}:{RST}" + linhas[0][len(titulo_p) + 1:]
+        print("\n" + "\n".join("  " + l for l in linhas))
+    if saida_do_proxy():
+        print(f"\n  {CIANO}Saída:{RST} tudo sai {_nome_saida(c.get('proxy_saida'))}.")
+    print(f"\n  {DIM}Vale para o que usa o proxy do sistema (navegadores e a maioria dos apps); alguns jogos e "
+          f"programas ignoram. Depois, para voltar ao normal, desligue o proxy no PC. O tráfego sai pela conexão do "
+          f"celular: confira as regras do seu plano de dados.{RST}")
+
+
+def ligar_proxy() -> None:
+    c = cfg()
+    if servico_ativo(SERVICO_PROXY):
+        info("O proxy já está ligado.")
+        instrucoes_proxy()
+        return
+    if c.get("proxy_senha") is None:  # primeira vez: quem pode usar?
+        wifi = any(tipo == "Wi-Fi" for _, _, tipo in enderecos_do_celular())
+        info("Quem estiver na mesma rede que o celular consegue usar o proxy. No roteador (hotspot) do próprio "
+             "celular, só entra quem tem a senha do Wi-Fi dele; num Wi-Fi de casa, de escola ou público, outras "
+             "pessoas também estão na rede.")
+        opcoes = ["Com usuário e senha (recomendado em Wi-Fi de casa, escola ou público)",
+                  "Sem senha: qualquer aparelho conectado no roteador ou no Wi-Fi do celular"]
+        i = escolher("Como proteger o proxy?", opcoes, "1" if wifi else "2")
+        if i is None:
+            return
+        c["proxy_senha"] = secrets.token_urlsafe(6) if i == 0 else ""
+        salvar_cfg()
+    porta = c["proxy_porta"]
+    if not porta_livre(porta, espera=2):
+        raise ToonsError(f"A porta {porta} já está em uso por outro programa. Troque a porta neste menu.")
+    servico_saida = {"ssh": SERVICO_PONTE_SSH, "tor": SERVICO_TOR}.get(c.get("proxy_saida") or "")
+    if servico_saida and not servico_ativo(servico_saida):
+        aviso(f"A saída escolhida ({_nome_saida(c.get('proxy_saida'))}) está desligada: os sites só vão abrir "
+              "depois de ligá-la (ou mude a saída para 'direto').")
+    if iniciar_servico(SERVICO_PROXY, cmd_self(SERVICO_PROXY, "--porta", str(porta)), reiniciar=True):
+        print()
+        instrucoes_proxy()
+
+
+def ver_uso_proxy() -> None:
+    uso = uso_do_proxy()
+    if not uso:
+        info("O proxy está desligado.")
+        return
+    total = uso.get("enviados", 0) + uso.get("recebidos", 0)
+    info(f"Ligado há {_hms(time.time() - uso.get('inicio', time.time()))} · "
+         f"{_qtd(uso.get('ativas', 0), 'conexão aberta', 'conexões abertas')} agora · {bytes_humanos(total)} no total ({bytes_humanos(uso.get('recebidos', 0))} baixados, "
+         f"{bytes_humanos(uso.get('enviados', 0))} enviados)")
+    clientes = sorted((uso.get("clientes") or {}).items(), key=lambda kv: -kv[1].get("bytes", 0))
+    if not clientes:
+        print(f"  {DIM}Nenhum aparelho usou ainda.{RST}")
+    for ip, d in clientes:
+        quando = datetime.fromtimestamp(d.get("ultimo", 0)).strftime("%H:%M")
+        print(f"  {NEG}{ip}{RST}  {bytes_humanos(d.get('bytes', 0))} · {_qtd(d.get('conexoes', 0), 'conexão', 'conexões')} · "
+              f"último uso {quando}")
+
+
+@submenu
+def menu_proxy():
+    c = cfg()
+
+    def mudar_senha():
+        opcoes = ["Com usuário e senha (gera uma senha nova)", "Sem senha (só aparelhos da rede local)"]
+        if c.get("proxy_senha"):
+            opcoes.insert(1, "Mostrar o usuário e a senha atuais")
+        i = escolher("Senha do proxy", opcoes)
+        if i is None:
+            return
+        if opcoes[i].startswith("Mostrar"):
+            print(f"  Usuário {NEG}{c.get('proxy_usuario') or 'toons'}{RST} · senha {NEG}{c['proxy_senha']}{RST}")
+            return
+        c["proxy_senha"] = secrets.token_urlsafe(6) if i == 0 else ""
+        salvar_cfg()
+        ok(f"Senha nova: {c['proxy_senha']}" if c["proxy_senha"] else "Proxy sem senha.")
+        if servico_ativo(SERVICO_PROXY):
+            parar_servico(SERVICO_PROXY)
+            ligar_proxy()
+
+    def mudar_porta():
+        c["proxy_porta"] = perguntar_int("Porta do proxy", c["proxy_porta"], 1024, 65535)
+        salvar_cfg()
+        ok(f"Porta {c['proxy_porta']}.")
+        if servico_ativo(SERVICO_PROXY):
+            parar_servico(SERVICO_PROXY)
+            ligar_proxy()
+
+    def mudar_saida():
+        opcoes = [(None, "Direto pela conexão do celular"), ("ssh", "Pelo túnel SSH (o seu servidor)"),
+                  ("tor", "Pelo Tor (anônimo, mais lento)")]
+        i = escolher("Por onde o proxy sai para a internet?", [t for _, t in opcoes])
+        if i is not None:
+            usar_saida_no_proxy(opcoes[i][0])
+
+    def cabecalho():
+        uso = uso_do_proxy()
+        if uso:
+            enderecos = ", ".join(f"{ip}:{c['proxy_porta']}" for ip, _, _ in enderecos_do_celular()[:2])
+            print(f"{DIM}Ligado · {enderecos} · {len(uso.get('clientes') or {})} aparelho(s) · "
+                  f"{bytes_humanos(uso.get('enviados', 0) + uso.get('recebidos', 0))} desde que ligou · saída "
+                  f"{_nome_saida(c.get('proxy_saida'))}{RST}")
+        else:
+            print(f"{DIM}Desligado. Conecte o PC no roteador (hotspot) do celular, no cabo USB ou no mesmo Wi-Fi.{RST}")
+
+    menu("🧭 Proxy: a internet do celular no PC ou Chromebook", [
+        (lambda: "Ligar o proxy" + (" (ligado)" if servico_ativo(SERVICO_PROXY) else ""), ligar_proxy),
+        ("Desligar o proxy", lambda: parar_servico(SERVICO_PROXY)),
+        ("Como configurar no Windows, Chromebook e outros", instrucoes_proxy),
+        ("Quem está usando e quanto já passou", ver_uso_proxy),
+        (lambda: f"Senha ({'ligada' if c.get('proxy_senha') else 'desligada'})", mudar_senha),
+        (lambda: f"Porta ({c['proxy_porta']})", mudar_porta),
+        (lambda: f"Saída: {_nome_saida(c.get('proxy_saida'))} (ou pelo túnel SSH / Tor)", mudar_saida),
+        ("Status e log", lambda: status_servico(SERVICO_PROXY)),
+    ], cabecalho=cabecalho)
+
+
+# ════════════════════════════════════════════════════════════════════
+#  Pontes de conexão: túnel SSH, Tor, Smart DNS, proxy, links públicos e redes privadas
+# ════════════════════════════════════════════════════════════════════
+# Cada ponte tem a sua janela. As que publicam algo do celular na internet (Cloudflare, ngrok, localtunnel,
+# serveo, pinggy) seguem o mesmo molde: escolher a porta, ligar em segundo plano e mostrar o link.
+
+PORTA_TOR, PORTA_TOR_CONTROLE = 9050, 9051
+TOR_DIR = DATA_DIR / "tor"
+NGROK_BIN = DATA_DIR / "bin" / "ngrok"
+
+# chave → (nome, serviço em segundo plano, onde está o link público no log)
+PONTES_PUBLICAS = {
+    "cloudflare": ("Cloudflare Tunnel", "ponte-cloudflare", r"(https://[a-z0-9-]+\.trycloudflare\.com)"),
+    "ngrok": ("ngrok", "ponte-ngrok", r"url=(https://[^\s\"]+)"),
+    "localtunnel": ("localtunnel", "ponte-localtunnel", r"(https://[a-z0-9-]+\.loca\.lt)"),
+    "serveo": ("serveo", "ponte-serveo", r"(https://[a-z0-9.-]+\.(?:serveo\.net|serveousercontent\.com))"),
+    "pinggy": ("pinggy", "ponte-pinggy", r"(https://[a-z0-9.-]+\.pinggy\.(?:link|online|io|net))"),
+}
+
+
+def _explicar(paragrafos: list) -> None:
+    largura = max(30, min(largura_tela(), 90) - 4)
+    for p in paragrafos:
+        print("\n".join("  " + l for l in textwrap.wrap(p, largura)) + "\n")
+
+
+def _abrir_link_android(url: str) -> None:
+    if tem("termux-open-url"):
+        rodar(["termux-open-url", url], capturar=True, mostrar=False, timeout=15)
+        ok(f"Abrindo {url}")
+    else:
+        info(f"Abra no navegador: {url}")
+
+
+def _copiar_ou_qr(url: str, nome: str) -> None:
+    """Oferece copiar o link e mostrar o QR code (para abrir no outro aparelho apontando a câmera)."""
+    if tem("termux-clipboard-set") and confirmar("Copiar o link?", True):
+        _tapi(["termux-clipboard-set"], 10, entrada=url, json_saida=False)
+        ok("Link copiado.")
+    if tem("qrencode") and confirmar("Mostrar o QR code do link?", False):
+        mostrar_qr(url, nome, salvar=False)
+
+
+def _escolher_porta_local(msg: str = "O que você quer deixar acessível?") -> int | None:
+    """Uma porta deste celular: um site publicado, o servidor de filmes, a API, o SSH... ou outra."""
+    opcoes = list(_portas_uteis())
+    if tem("sshd") or servico_ativo("ssh"):
+        opcoes.append((8022, "SSH do Termux"))
+    rotulos = [f"{nome} · porta {porta}" + ("" if not porta_livre(porta) else f" {DIM}(nada rodando agora){RST}")
+               for porta, nome in opcoes]
+    i = escolher(msg, rotulos + ["Outra porta..."])
+    if i is None:
+        return None
+    return opcoes[i][0] if i < len(opcoes) else perguntar_int("Porta", 8000, 1, 65535)
+
+
+def url_da_ponte(chave: str) -> str | None:
+    """O link público mais recente que a ponte escreveu no log (ele muda quando a ponte religa)."""
+    _, servico, padrao = PONTES_PUBLICAS[chave]
+    try:
+        texto = log_de(servico).read_text("utf-8", errors="replace")
+    except OSError:
+        return None
+    achados = re.findall(padrao, texto)
+    return achados[-1].rstrip(".,;)") if achados else None
+
+
+def _mostrar_link_da_ponte(chave: str) -> None:
+    nome, servico, _ = PONTES_PUBLICAS[chave]
+    url = url_da_ponte(chave)
+    if not servico_ativo(servico):
+        info(f"{nome}: desligado.")
+        return
+    if not url:
+        aviso(f"{nome} está ligado, mas o link ainda não apareceu. Veja 'Status e log' ou abra a sessão.")
+        return
+    porta = (cfg().get("pontes_portas") or {}).get(chave)
+    print(f"  {NEG}{url}{RST}" + (f"  {DIM}→ porta {porta}: {_o_que_roda_na_porta(porta)}{RST}" if porta else ""))
+    _copiar_ou_qr(url, f"link {nome}")
+
+
+def ligar_ponte_publica(chave: str, comando: str, porta: int, espera: int = 40) -> None:
+    """Liga a ponte em segundo plano e espera o link público aparecer no log."""
+    nome, servico, _ = PONTES_PUBLICAS[chave]
+    if servico_ativo(servico):
+        parar_servico(servico)
+    log_de(servico).unlink(missing_ok=True)  # o link certo é o desta vez
+    cfg().setdefault("pontes_portas", {})[chave] = porta
+    salvar_cfg()
+    if porta_livre(porta):
+        aviso(f"Nada está rodando na porta {porta} agora: o link vai abrir, mas mostrar erro até você ligar o serviço.")
+    if not iniciar_servico(servico, comando, reiniciar=True):
+        return
+    info(f"Esperando o {nome} criar o link público...")
+    for _ in range(espera):
+        if url_da_ponte(chave):
+            ok(f"Link público ({nome}):")
+            _mostrar_link_da_ponte(chave)
+            return
+        if not servico_ativo(servico):
+            break
+        time.sleep(1)
+    aviso("O link ainda não apareceu. Veja 'Status e log'; se a ponte pediu alguma coisa (senha, confirmação), "
+          "use 'Abrir a sessão' e responda lá.")
+
+
+def _menu_ponte_publica(chave: str, titulo_menu: str, explicacao: list, preparar, comando_para,
+                        extras: list | None = None, depois=None) -> None:
+    """Janela padrão das pontes que publicam uma porta do celular na internet."""
+    nome, servico, _ = PONTES_PUBLICAS[chave]
+
+    def ligar():
+        if not preparar():
+            return
+        porta = _escolher_porta_local()
+        if porta is None:
+            return
+        ligar_ponte_publica(chave, comando_para(porta), porta)
+        if depois and servico_ativo(servico):
+            depois()
+
+    def cabecalho():
+        if servico_ativo(servico):
+            print(f"{DIM}Ligado · {url_da_ponte(chave) or 'esperando o link...'}{RST}")
+        else:
+            print(f"{DIM}Desligado.{RST}")
+
+    menu(titulo_menu, [
+        ("Como funciona", lambda: _explicar(explicacao)),
+        (lambda: "Ligar: criar um link público para algo do celular" + (" (ligado)" if servico_ativo(servico) else ""),
+         ligar),
+        ("Ver o link (copiar / QR code)", lambda: _mostrar_link_da_ponte(chave)),
+        ("Desligar", lambda: parar_servico(servico)),
+        ("Status e log", lambda: status_servico(servico)),
+        ("Abrir a sessão (para responder se a ponte perguntar algo)", lambda: abrir_sessao(servico)),
+        *(extras or []),
+    ], cabecalho=cabecalho)
+
+
+# ── Cloudflare Tunnel ────────────────────────────────────────────────
+
+@submenu
+def menu_ponte_cloudflare():
+    _menu_ponte_publica(
+        "cloudflare", "☁️ Cloudflare Tunnel (cloudflared)",
+        ["Cria um link https://….trycloudflare.com que leva a uma porta deste celular, de graça, sem conta e sem "
+         "abrir portas no roteador. O cloudflared faz uma conexão de saída até a Cloudflare e as visitas voltam por ela.",
+         "O link rápido muda toda vez que liga. Para um endereço que não muda, use 'Endereço fixo com o seu domínio'.",
+         "Os sites publicados e o servidor de filmes já têm o próprio botão de túnel; aqui serve para qualquer porta."],
+        lambda: garantir_cmd("cloudflared"),
+        lambda porta: f"cloudflared tunnel --no-autoupdate --url http://localhost:{porta}",
+        extras=[("🔗 Endereço fixo com o seu domínio", menu_tunel_fixo)])
+
+
+# ── ngrok ────────────────────────────────────────────────────────────
+
+def _programa_ngrok() -> str | None:
+    return shutil.which("ngrok") or (str(NGROK_BIN) if NGROK_BIN.exists() else None)
+
+
+def _prefixo_dns() -> list:
+    """Programas em Go feitos para Linux procuram o DNS em /etc/resolv.conf, que não existe no Android. O proot
+    mostra para eles o do Termux nesse lugar."""
+    if Path("/etc/resolv.conf").exists() or not PREFIX:
+        return []
+    if not garantir_cmd("proot"):
+        return []
+    return ["proot", "-b", f"{PREFIX}/etc/resolv.conf:/etc/resolv.conf"]
+
+
+def instalar_ngrok() -> bool:
+    """Baixa o ngrok oficial (equinox.io) para o processador do celular."""
+    maquina = platform.machine().lower()
+    arq = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "amd64", "amd64": "amd64", "i686": "386",
+           "i386": "386"}.get(maquina, "arm" if maquina.startswith("arm") else None)
+    if not arq:
+        raise ToonsError(f"Não sei qual ngrok serve para o processador '{maquina}'.")
+    url = f"https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-{arq}.tgz"
+    info(f"Baixando o ngrok ({arq})...")
+    dados = pedir_bytes(url, timeout=180)
+    with tarfile.open(fileobj=io.BytesIO(dados), mode="r:gz") as tar:
+        membro = next((m for m in tar.getmembers() if m.isfile() and Path(m.name).name == "ngrok"), None)
+        if membro is None:
+            raise ToonsError("O pacote baixado não tem o programa ngrok.")
+        conteudo = tar.extractfile(membro).read()
+    NGROK_BIN.parent.mkdir(parents=True, exist_ok=True)
+    tmp = NGROK_BIN.with_suffix(".tmp")
+    tmp.write_bytes(conteudo)
+    tmp.chmod(0o755)
+    tmp.replace(NGROK_BIN)
+    ok(f"ngrok instalado em {NGROK_BIN}")
+    return True
+
+
+def _ngrok_tem_token() -> bool:
+    for pasta in (Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "ngrok", HOME / ".ngrok2"):
+        for nome in ("ngrok.yml", "ngrok.yaml"):
+            with contextlib.suppress(OSError):
+                if "authtoken" in (pasta / nome).read_text("utf-8", errors="replace"):
+                    return True
+    return False
+
+
+def configurar_token_ngrok() -> bool:
+    programa = _programa_ngrok()
+    if not programa:
+        return False
+    info("Crie uma conta grátis em ngrok.com e copie o 'Authtoken' em dashboard.ngrok.com → Your Authtoken.")
+    token = re.sub(r"^.*add-authtoken\s+", "", perguntar("Authtoken do ngrok (ou o comando inteiro)").strip())
+    if not re.fullmatch(r"[A-Za-z0-9_-]{20,}", token):
+        raise ToonsError("Isso não parece um authtoken do ngrok (é um texto comprido, só letras, números e _).")
+    if rodar([programa, "config", "add-authtoken", token], capturar=True, mostrar=False).returncode != 0:
+        raise ToonsError("O ngrok não aceitou guardar o token.")
+    ok("Authtoken guardado.")
+    return True
+
+
+def _preparar_ngrok() -> bool:
+    if not _programa_ngrok() and not (confirmar("O ngrok não está instalado. Baixar agora (uns 10 MB)?", True)
+                                      and instalar_ngrok()):
+        return False
+    return _ngrok_tem_token() or configurar_token_ngrok()
+
+
+@submenu
+def menu_ponte_ngrok():
+    _menu_ponte_publica(
+        "ngrok", "🔗 ngrok",
+        ["Cria um link https público (…ngrok-free.app) que leva a uma porta deste celular. Precisa de uma conta grátis "
+         "no ngrok.com: o app pede o 'authtoken' na primeira vez.",
+         "Na conta grátis, quem abre o link vê antes um aviso do ngrok (é só clicar em 'Visit Site'). O link muda "
+         "toda vez que liga, a menos que você use o domínio grátis fixo que o ngrok dá no painel."],
+        _preparar_ngrok,
+        lambda porta: shlex.join([*_prefixo_dns(), _programa_ngrok() or "ngrok", "http", str(porta),
+                                  "--log", "stdout", "--log-format", "logfmt"]),
+        extras=[("Instalar ou atualizar o ngrok", instalar_ngrok), ("Colar o authtoken", configurar_token_ngrok)])
+
+
+# ── localtunnel ──────────────────────────────────────────────────────
+
+def _preparar_localtunnel() -> bool:
+    if tem("lt"):
+        return True
+    if not garantir_cmd("node", "nodejs"):
+        return False
+    info("Instalando o localtunnel (npm)...")
+    return rodar(["npm", "install", "-g", "localtunnel"]).returncode == 0 and tem("lt")
+
+
+def _senha_localtunnel() -> None:
+    ip = ip_publico()
+    info(f"Quem abrir o link do localtunnel vê uma página pedindo a 'Tunnel Password': é o IP público deste "
+         f"celular, {NEG}{ip}{RST}. Mande junto com o link.")
+
+
+@submenu
+def menu_ponte_localtunnel():
+    _menu_ponte_publica(
+        "localtunnel", "🚇 localtunnel",
+        ["Cria um link https://….loca.lt para uma porta deste celular, sem conta. Usa o Node.js (o app instala).",
+         "Quem abre o link vê antes uma página pedindo uma senha: é o IP público deste celular (veja a opção 'Senha "
+         "para quem abrir o link'). É um serviço gratuito mantido por voluntários: às vezes fica lento ou fora do ar."],
+        _preparar_localtunnel,
+        lambda porta: shlex.join(["lt", "--port", str(porta), "--local-host", "127.0.0.1"]),
+        extras=[("Senha para quem abrir o link (o IP público do celular)", _senha_localtunnel)],
+        depois=_senha_localtunnel)
+
+
+# ── serveo e pinggy (pelo SSH, sem instalar nada além do ssh) ─────────
+
+_SSH_SEM_PERGUNTAS = ["-o", "StrictHostKeyChecking=accept-new", "-o", "ServerAliveInterval=30",
+                      "-o", "ServerAliveCountMax=3", "-o", "ExitOnForwardFailure=yes"]
+
+
+@submenu
+def menu_ponte_serveo():
+    _menu_ponte_publica(
+        "serveo", "🛰️ serveo",
+        ["Cria um link https público usando só o ssh, que o Termux já tem (pkg install openssh): nada de conta nem "
+         "programa novo. O link muda a cada vez que liga.",
+         "É um serviço gratuito que já ficou fora do ar algumas vezes; se não funcionar, tente o pinggy ou o "
+         "Cloudflare Tunnel."],
+        lambda: garantir_cmd("ssh", "openssh"),
+        lambda porta: shlex.join(["ssh", *_SSH_SEM_PERGUNTAS, "-R", f"80:localhost:{porta}", "serveo.net"]))
+
+
+@submenu
+def menu_ponte_pinggy():
+    _menu_ponte_publica(
+        "pinggy", "📌 pinggy",
+        ["Cria um link https público usando só o ssh (pkg install openssh), sem conta.",
+         "No plano grátis, cada link dura 60 minutos; depois a ponte religa sozinha com um link novo (veja de novo em "
+         "'Ver o link'). Se o pinggy pedir uma senha, abra a sessão e só aperte Enter."],
+        lambda: garantir_cmd("ssh", "openssh"),
+        lambda porta: shlex.join(["ssh", "-p", "443", *_SSH_SEM_PERGUNTAS, f"-R0:localhost:{porta}", "a.pinggy.io"]))
+
+
+# ── Túnel SSH (proxy SOCKS pelo seu servidor) ────────────────────────
+
+SERVICO_PONTE_SSH = "ponte-ssh"
+
+
+def _chave_ssh() -> Path:
+    return HOME / ".ssh" / "id_ed25519"
+
+
+def _testar_ip_por(socks: tuple | None) -> str:
+    """O IP que a internet vê: direto ou passando pelo SOCKS (host, porta)."""
+    if socks is None:
+        return ip_publico()
+    if not tem("curl"):
+        return "instale o curl para testar"
+    proc = rodar(["curl", "-s", "--max-time", "25", "--socks5-hostname", f"{socks[0]}:{socks[1]}",
+                  "https://api.ipify.org"], capturar=True, mostrar=False, timeout=40)
+    texto = (proc.stdout or "").strip()
+    return texto if proc.returncode == 0 and _ip_valido(texto) else "não respondeu"
+
+
+def ligar_ponte_ssh() -> bool:
+    c = cfg()
+    destino = c.get("ssh_ponte_destino")
+    if not destino:
+        raise ToonsError("Configure primeiro o servidor (usuário@endereço).")
+    if not garantir_cmd("ssh", "openssh"):
+        return False
+    porta_socks = c.get("ssh_ponte_socks", 1080)
+    endereco = "0.0.0.0" if c.get("ssh_ponte_lan") else "127.0.0.1"
+    if servico_ativo(SERVICO_PONTE_SSH):
+        parar_servico(SERVICO_PONTE_SSH)
+    log_de(SERVICO_PONTE_SSH).unlink(missing_ok=True)
+    comando = shlex.join(["ssh", "-N", "-D", f"{endereco}:{porta_socks}", "-p", str(c.get("ssh_ponte_porta", 22)),
+                          "-o", "BatchMode=yes", *_SSH_SEM_PERGUNTAS, destino])
+    if not iniciar_servico(SERVICO_PONTE_SSH, comando, reiniciar=True):
+        return False
+    info("Conectando ao servidor...")
+    for _ in range(25):
+        texto = ""
+        with contextlib.suppress(OSError):
+            texto = log_de(SERVICO_PONTE_SSH).read_text("utf-8", errors="replace")
+        if "Permission denied" in texto:
+            parar_servico(SERVICO_PONTE_SSH)
+            raise ToonsError("O servidor recusou a entrada: falta a chave deste celular nele. Use 'Criar a chave "
+                             "deste celular e colocar no servidor'.")
+        if re.search(r"Could not resolve|Connection refused|timed out|No route", texto):
+            parar_servico(SERVICO_PONTE_SSH)
+            raise ToonsError("Não consegui chegar no servidor: " + texto.strip().splitlines()[-1][-200:])
+        if not porta_livre(porta_socks):
+            ok(f"Túnel ligado: proxy SOCKS5 em {endereco if endereco != '0.0.0.0' else ip_local()}:{porta_socks}, "
+               "saindo pelo seu servidor.")
+            return True
+        time.sleep(1)
+    aviso("O túnel ainda não abriu. Veja 'Status e log'.")
+    return False
+
+
+@submenu
+def menu_ponte_ssh():
+    c = cfg()
+
+    def configurar():
+        destino = perguntar("Servidor (usuário@endereço)", c.get("ssh_ponte_destino") or "").strip()
+        if not re.fullmatch(r"[\w.-]+@[\w.:-]+", destino):
+            raise ToonsError("Escreva no formato usuário@endereço (ex.: joao@meuservidor.com).")
+        c["ssh_ponte_destino"] = destino
+        c["ssh_ponte_porta"] = perguntar_int("Porta do SSH no servidor", c.get("ssh_ponte_porta", 22), 1, 65535)
+        c["ssh_ponte_socks"] = perguntar_int("Porta do proxy SOCKS aqui no celular", c.get("ssh_ponte_socks", 1080),
+                                             1024, 65535)
+        salvar_cfg()
+        ok(f"Servidor: {destino} (porta {c['ssh_ponte_porta']}).")
+
+    def chave():
+        if not garantir_cmd("ssh-keygen", "openssh"):
+            return
+        arq = _chave_ssh()
+        if not arq.exists():
+            arq.parent.mkdir(mode=0o700, exist_ok=True)
+            rodar(["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "termux-toons", "-f", str(arq)], capturar=True,
+                  check=True)
+            ok("Chave criada.")
+        publica = arq.with_suffix(".pub").read_text().strip()
+        destino = c.get("ssh_ponte_destino")
+        if destino and tem("ssh-copy-id") and confirmar(f"Colocar a chave em {destino} agora (pede a senha do "
+                                                        "servidor uma vez)?", True):
+            rodar(["ssh-copy-id", "-i", str(arq.with_suffix(".pub")), "-p", str(c.get("ssh_ponte_porta", 22)),
+                   *_SSH_SEM_PERGUNTAS[:2], destino])
+        else:
+            info("Coloque esta linha no arquivo ~/.ssh/authorized_keys do servidor:")
+            print(f"  {publica}")
+
+    def testar():
+        socks = ("127.0.0.1", c.get("ssh_ponte_socks", 1080))
+        if not servico_ativo(SERVICO_PONTE_SSH):
+            info("O túnel está desligado.")
+            return
+        info(f"IP sem o túnel: {_testar_ip_por(None)}")
+        info(f"IP pelo túnel:  {_testar_ip_por(socks)} (deve ser o do seu servidor)")
+
+    def compartilhar():
+        c["ssh_ponte_lan"] = not c.get("ssh_ponte_lan")
+        if c["ssh_ponte_lan"]:
+            aviso("O SOCKS do túnel fica aberto na rede local, SEM senha: qualquer aparelho no mesmo Wi-Fi pode usar. "
+                  "Para ter senha, prefira 'Usar no navegador do celular e no PC' (proxy com senha).")
+        salvar_cfg()
+        ok("Liberado para a rede local." if c["ssh_ponte_lan"] else "Só este celular usa o túnel.")
+        if servico_ativo(SERVICO_PONTE_SSH):
+            ligar_ponte_ssh()
+
+    def cabecalho():
+        alvo = c.get("ssh_ponte_destino") or "servidor não configurado"
+        estado = f"ligado · SOCKS5 na porta {c.get('ssh_ponte_socks', 1080)}" if servico_ativo(SERVICO_PONTE_SSH) \
+            else "desligado"
+        print(f"{DIM}{alvo} · {estado}{RST}")
+
+    menu("🔐 Túnel SSH (proxy SOCKS pelo seu servidor)", [
+        ("Como funciona", lambda: _explicar([
+            "Com 'ssh -D' a conexão sai criptografada até um servidor seu (um VPS, o PC de casa, um Raspberry...) e de "
+            "lá vai para a internet. Para os sites, você está no lugar do servidor; quem está no seu Wi-Fi só vê "
+            "uma conexão SSH.",
+            "Precisa de um servidor com SSH que aceite a chave deste celular (a opção abaixo cria e copia a chave). "
+            "Depois, o túnel vira um proxy SOCKS5 aqui no celular. Para usar no navegador do celular ou no PC, use "
+            "'Usar no navegador do celular e no PC'."])),
+        ("Configurar o servidor (usuário@endereço e porta)", configurar),
+        ("Criar a chave deste celular e colocar no servidor", chave),
+        (lambda: "Ligar o túnel" + (" (ligado)" if servico_ativo(SERVICO_PONTE_SSH) else ""), ligar_ponte_ssh),
+        ("Testar: qual IP a internet vê pelo túnel", testar),
+        ("Usar no navegador do celular e no PC (proxy com saída pelo túnel)", lambda: usar_saida_no_proxy("ssh")),
+        (lambda: "Liberar o SOCKS para a rede local, sem senha (" + ("liberado" if c.get("ssh_ponte_lan") else
+                                                                     "só este celular") + ")", compartilhar),
+        ("Desligar o túnel", lambda: parar_servico(SERVICO_PONTE_SSH)),
+        ("Status e log", lambda: status_servico(SERVICO_PONTE_SSH)),
+    ], cabecalho=cabecalho)
+
+
+# ── Tor ──────────────────────────────────────────────────────────────
+
+SERVICO_TOR = "ponte-tor"
+
+
+def _comando_tor() -> str:
+    TOR_DIR.mkdir(parents=True, exist_ok=True)
+    TOR_DIR.chmod(0o700)  # o Tor recusa uma pasta que outros possam ler
+    args = ["tor", "--SocksPort", f"127.0.0.1:{PORTA_TOR}", "--ControlPort", f"127.0.0.1:{PORTA_TOR_CONTROLE}",
+            "--CookieAuthentication", "1", "--DataDirectory", str(TOR_DIR / "dados"), "--Log", "notice stdout"]
+    porta_onion = cfg().get("tor_onion_porta")
+    if porta_onion:
+        onion = TOR_DIR / "onion"
+        onion.mkdir(mode=0o700, exist_ok=True)
+        onion.chmod(0o700)
+        args += ["--HiddenServiceDir", str(onion), "--HiddenServicePort", f"80 127.0.0.1:{porta_onion}"]
+    return shlex.join(args)
+
+
+def ligar_tor() -> bool:
+    if not garantir_cmd("tor"):
+        return False
+    if servico_ativo(SERVICO_TOR):
+        parar_servico(SERVICO_TOR)
+    log_de(SERVICO_TOR).unlink(missing_ok=True)
+    if not iniciar_servico(SERVICO_TOR, _comando_tor(), reiniciar=True):
+        return False
+    info("Conectando à rede Tor (costuma levar de 10 segundos a 1 minuto)...")
+    ultimo = -1
+    for _ in range(120):
+        texto = ""
+        with contextlib.suppress(OSError):
+            texto = log_de(SERVICO_TOR).read_text("utf-8", errors="replace")
+        achados = re.findall(r"Bootstrapped (\d+)%", texto)
+        pct = int(achados[-1]) if achados else 0
+        if pct != ultimo:
+            print(f"\r  {pct}%\033[K", end="", flush=True)
+            ultimo = pct
+        if pct >= 100:
+            print()
+            ok(f"Tor conectado: proxy SOCKS5 em 127.0.0.1:{PORTA_TOR}.")
+            if cfg().get("tor_onion_porta"):
+                mostrar_onion()
+            return True
+        if not servico_ativo(SERVICO_TOR):
+            break
+        time.sleep(1)
+    print()
+    aviso("O Tor ainda não terminou de conectar. Veja 'Status e log' (a sua rede pode estar bloqueando o Tor).")
+    return False
+
+
+def tor_nova_identidade() -> None:
+    """Pede ao Tor caminhos novos (outro IP de saída) pela porta de controle."""
+    try:
+        cookie = (TOR_DIR / "dados" / "control_auth_cookie").read_bytes()
+        with socket.create_connection(("127.0.0.1", PORTA_TOR_CONTROLE), timeout=10) as s:
+            s.sendall(f"AUTHENTICATE {cookie.hex()}\r\nSIGNAL NEWNYM\r\nQUIT\r\n".encode())
+            resposta = b""
+            while chunk := s.recv(1024):
+                resposta += chunk
+    except OSError as e:
+        raise ToonsError(f"Não consegui falar com o Tor (ele está ligado?): {e}") from None
+    if resposta.count(b"250") >= 2:
+        ok("Pronto: as próximas conexões usam caminhos novos (o Tor só deixa trocar a cada 10 segundos).")
+    else:
+        raise ToonsError(f"O Tor recusou: {resposta.decode(errors='replace').strip()[:200]}")
+
+
+def mostrar_onion() -> None:
+    arq = TOR_DIR / "onion" / "hostname"
+    porta = cfg().get("tor_onion_porta")
+    if not porta:
+        info("Nada publicado como .onion. Use 'Publicar algo deste celular como endereço .onion'.")
+        return
+    for _ in range(30 if servico_ativo(SERVICO_TOR) else 0):
+        if arq.exists():
+            break
+        time.sleep(1)
+    if not arq.exists():
+        info("O endereço .onion aparece quando o Tor terminar de conectar.")
+        return
+    endereco = f"http://{arq.read_text().strip()}"
+    ok(f"Endereço .onion (abre só no Tor Browser): {NEG}{endereco}{RST}")
+    print(f"  {DIM}→ porta {porta}: {_o_que_roda_na_porta(porta)}{RST}")
+    _copiar_ou_qr(endereco, "endereco onion")
+
+
+@submenu
+def menu_ponte_tor():
+    c = cfg()
+
+    def testar():
+        if not servico_ativo(SERVICO_TOR):
+            info("O Tor está desligado.")
+            return
+        if not tem("curl"):
+            raise ToonsError("Instale o curl para testar (pkg install curl).")
+        proc = rodar(["curl", "-s", "--max-time", "40", "--socks5-hostname", f"127.0.0.1:{PORTA_TOR}",
+                      "https://check.torproject.org/api/ip"], capturar=True, mostrar=False, timeout=60)
+        try:
+            dados = json.loads(proc.stdout or "{}")
+        except ValueError:
+            dados = {}
+        if dados.get("IsTor"):
+            ok(f"Funcionando: os sites veem o IP {dados.get('IP')}, de um nó de saída do Tor.")
+        else:
+            aviso("Não consegui confirmar pelo check.torproject.org (o Tor ainda está conectando?).")
+
+    def publicar_onion():
+        porta = _escolher_porta_local("O que publicar como endereço .onion?")
+        if porta is None:
+            return
+        c["tor_onion_porta"] = porta
+        salvar_cfg()
+        ligar_tor()
+
+    def parar_onion():
+        c["tor_onion_porta"] = None
+        salvar_cfg()
+        ok("Endereço .onion desligado (a chave fica guardada: se publicar de novo, o endereço é o mesmo).")
+        if servico_ativo(SERVICO_TOR):
+            ligar_tor()
+
+    def cabecalho():
+        estado = f"ligado · SOCKS5 em 127.0.0.1:{PORTA_TOR}" if servico_ativo(SERVICO_TOR) else "desligado"
+        onion = f" · publicando a porta {c['tor_onion_porta']} como .onion" if c.get("tor_onion_porta") else ""
+        print(f"{DIM}Tor {estado}{onion}{RST}")
+
+    menu("🧅 Tor", [
+        ("Como funciona", lambda: _explicar([
+            "O Tor passa a conexão por três computadores voluntários pelo mundo, cada um sabendo só um pedaço do "
+            "caminho: o site não vê o seu IP e a sua operadora não vê o site. Em troca, fica bem mais lento, e "
+            "alguns sites bloqueiam ou pedem captcha.",
+            "Para anonimato de verdade, navegue pelo Tor Browser (app oficial): ele também esconde o que identifica o "
+            "seu navegador. Passar o Chrome pelo Tor esconde o IP, mas não o resto.",
+            "Também dá para publicar um site deste celular como endereço .onion, que só abre no Tor Browser e não "
+            "revela onde o celular está."])),
+        (lambda: "Ligar o Tor" + (" (ligado)" if servico_ativo(SERVICO_TOR) else ""), ligar_tor),
+        ("Testar (check.torproject.org)", testar),
+        ("Trocar de identidade (outro IP de saída)", tor_nova_identidade),
+        ("Usar no navegador do celular e no PC (proxy com saída pelo Tor)", lambda: usar_saida_no_proxy("tor")),
+        ("Publicar algo deste celular como endereço .onion", publicar_onion),
+        ("Ver o endereço .onion", mostrar_onion),
+        ("Parar de publicar o .onion", parar_onion),
+        ("Instalar o Tor Browser no celular (Play Store)",
+         lambda: _abrir_link_android("https://play.google.com/store/apps/details?id=org.torproject.torbrowser")),
+        ("Desligar o Tor", lambda: parar_servico(SERVICO_TOR)),
+        ("Status e log", lambda: status_servico(SERVICO_TOR)),
+    ], cabecalho=cabecalho)
+
+
+# ── Saída do proxy pelo túnel SSH ou pelo Tor ────────────────────────
+
+def saida_do_proxy() -> tuple | None:
+    """(host, porta) do SOCKS por onde o proxy manda tudo, ou None (direto pela conexão do celular)."""
+    c = cfg()
+    if c.get("proxy_saida") == "ssh":
+        return "127.0.0.1", int(c.get("ssh_ponte_socks", 1080))
+    if c.get("proxy_saida") == "tor":
+        return "127.0.0.1", PORTA_TOR
+    return None
+
+
+def _nome_saida(chave: str | None) -> str:
+    return {"ssh": "pelo túnel SSH", "tor": "pelo Tor"}.get(chave or "", "direto pela conexão do celular")
+
+
+def usar_saida_no_proxy(chave: str | None) -> None:
+    """Faz o proxy (HTTP e SOCKS, para o navegador do celular e para o PC) sair pelo túnel SSH ou pelo Tor."""
+    c = cfg()
+    servico = {"ssh": SERVICO_PONTE_SSH, "tor": SERVICO_TOR}.get(chave or "")
+    if servico and not servico_ativo(servico):
+        if not confirmar(f"O {'túnel SSH' if chave == 'ssh' else 'Tor'} está desligado. Ligar agora?", True):
+            return
+        if not (ligar_ponte_ssh() if chave == "ssh" else ligar_tor()):
+            return
+    c["proxy_saida"] = chave or ""
+    salvar_cfg()
+    ok(f"Proxy saindo {_nome_saida(chave)}.")
+    if servico_ativo(SERVICO_PROXY):
+        parar_servico(SERVICO_PROXY)
+    ligar_proxy()
+    if chave:
+        print(f"\n  {CIANO}No navegador deste celular:{RST} Configurações do Android → Wi-Fi → toque na rede → Proxy: "
+              f"Manual → servidor 127.0.0.1, porta {c['proxy_porta']}. {DIM}(O Android só deixa pôr proxy no Wi-Fi; "
+              f"nos dados móveis, use o Firefox ou o app Orbot.){RST}")
+
+
+# ── Smart DNS ────────────────────────────────────────────────────────
+
+DNS_PUBLICOS = [("Google", "8.8.8.8"), ("Cloudflare", "1.1.1.1"), ("Quad9", "9.9.9.9"),
+                ("AdGuard (bloqueia anúncios)", "94.140.14.14"), ("OpenDNS", "208.67.222.222")]
+DNS_PRIVADOS_ANDROID = [("Google", "dns.google"), ("Cloudflare", "one.one.one.one"), ("Quad9", "dns.quad9.net"),
+                        ("AdGuard (bloqueia anúncios)", "dns.adguard-dns.com")]
+
+
+def consulta_dns(servidor: str, nome: str, porta: int = 53, timeout: float = 2.5) -> tuple:
+    """Pergunta o IP de `nome` direto a um servidor DNS (UDP), sem passar pelo DNS do celular.
+    Devolve (milissegundos, [IPs]) ou (None, []) se não respondeu."""
+    ident = random.randrange(65536)
+    try:
+        partes = [p.encode("idna") for p in nome.strip(".").split(".")]
+    except UnicodeError:
+        return None, []
+    pergunta = b"".join(bytes([len(p)]) + p for p in partes) + b"\x00" + struct.pack(">HH", 1, 1)
+    pacote = struct.pack(">HHHHHH", ident, 0x0100, 1, 0, 0, 0) + pergunta
+    familia = socket.AF_INET6 if ":" in servidor else socket.AF_INET
+    try:
+        with socket.socket(familia, socket.SOCK_DGRAM) as s:
+            s.settimeout(timeout)
+            inicio = time.perf_counter()
+            s.sendto(pacote, (servidor, porta))
+            while True:
+                dados, _ = s.recvfrom(4096)
+                if len(dados) >= 12 and struct.unpack(">H", dados[:2])[0] == ident:
+                    break
+            ms = (time.perf_counter() - inicio) * 1000
+    except OSError:
+        return None, []
+    return ms, _ips_da_resposta(dados)
+
+
+def _ips_da_resposta(dados: bytes) -> list:
+    """Os IPv4 (registros A) de uma resposta DNS."""
+    def pular_nome(pos: int) -> int:
+        while pos < len(dados):
+            tamanho = dados[pos]
+            if tamanho == 0:
+                return pos + 1
+            if tamanho & 0xC0 == 0xC0:  # ponteiro de compressão: 2 bytes
+                return pos + 2
+            pos += 1 + tamanho
+        return pos
+
+    try:
+        _, _, perguntas, respostas, _, _ = struct.unpack(">HHHHHH", dados[:12])
+        pos = 12
+        for _ in range(perguntas):
+            pos = pular_nome(pos) + 4
+        ips = []
+        for _ in range(respostas):
+            pos = pular_nome(pos)
+            tipo, _, _, tamanho = struct.unpack(">HHIH", dados[pos:pos + 10])
+            pos += 10
+            if tipo == 1 and tamanho == 4:
+                ips.append(socket.inet_ntoa(dados[pos:pos + 4]))
+            pos += tamanho
+        return ips
+    except (struct.error, IndexError, OSError):
+        return []
+
+
+@submenu
+def menu_ponte_dns():
+    c = cfg()
+
+    def todos() -> list:
+        meus = [(f"Seu Smart DNS {i}", ip) for i, ip in enumerate(c.get("smartdns_ips") or [], 1)]
+        return meus + DNS_PUBLICOS
+
+    def velocidade():
+        info("Perguntando o endereço de google.com a cada DNS (3 vezes; vale o melhor tempo)...")
+        resultados = []
+        for nome, ip in todos():
+            tempos = [t for t, _ in (consulta_dns(ip, "google.com") for _ in range(3)) if t is not None]
+            resultados.append((min(tempos) if tempos else None, nome, ip))
+        for ms, nome, ip in sorted(resultados, key=lambda r: (r[0] is None, r[0] or 0)):
+            texto = f"{ms:5.0f} ms" if ms is not None else f"{VERM}não respondeu{RST}"
+            print(f"  {texto}  {NEG}{ip:<16}{RST} {nome}")
+
+    def comparar():
+        site = perguntar("Site para comparar", "netflix.com").strip().lower()
+        if not site:
+            return
+        info(f"O que cada DNS responde para {site} (um Smart DNS que funciona responde com IPs diferentes):")
+        with contextlib.suppress(OSError):
+            locais = sorted({i[4][0] for i in socket.getaddrinfo(site, 443, socket.AF_INET)})
+            print(f"  {'DNS deste celular':<30} {', '.join(locais[:3])}")
+        for nome, ip in todos():
+            _, ips = consulta_dns(ip, site)
+            print(f"  {(nome + ' (' + ip + ')')[:30]:<30} {', '.join(ips[:3]) or DIM + 'sem resposta' + RST}")
+
+    def guardar():
+        texto = perguntar("IPs do seu Smart DNS (separados por espaço)", " ".join(c.get("smartdns_ips") or []))
+        ips = [ip for ip in texto.replace(",", " ").split() if _ip_valido(ip)]
+        if texto.strip() and not ips:
+            raise ToonsError("Não achei nenhum IP válido aí (ex.: 54.229.171.243).")
+        c["smartdns_ips"] = ips
+        salvar_cfg()
+        ok(f"Guardado: {', '.join(ips) or 'nenhum'}.")
+
+    def como_configurar():
+        meus = c.get("smartdns_ips") or ["IP1", "IP2"]
+        _explicar([
+            f"Windows 10/11: Configurações → Rede e Internet → Wi-Fi (ou Ethernet) → Propriedades de hardware → "
+            f"Atribuição de servidor DNS → Editar → Manual → IPv4 → DNS preferencial {meus[0]}"
+            + (f" e alternativo {meus[1]}" if len(meus) > 1 else "") + ".",
+            "Chromebook: Configurações → Rede → clique na rede → Rede → Servidores de nomes → Servidores de nomes "
+            "personalizados → coloque os IPs.",
+            "Android: o 'DNS privado' (Configurações → Rede e internet → DNS privado) só aceita um nome, como "
+            + ", ".join(h for _, h in DNS_PRIVADOS_ANDROID) + ". Para usar os IPs do Smart DNS no celular: no Wi-Fi, "
+            "toque e segure a rede → Modificar → Opções avançadas → IP estático → DNS 1 e DNS 2; nos dados móveis, "
+            "só com um app de DNS (que usa a vaga de VPN).",
+            "Depois de trocar, reinicie o app de streaming. Se ele perceber, mostra aviso de 'proxy' ou o catálogo "
+            "da sua região mesmo."])
+
+    menu("🌎 Smart DNS", [
+        ("Como funciona", lambda: _explicar([
+            "O DNS é a 'lista telefônica' que transforma netflix.com num IP. Um serviço de Smart DNS (pago, em geral) "
+            "responde de um jeito que faz alguns sites de streaming acharem que você está em outro país.",
+            "Ele troca SÓ o DNS: não criptografa nada, não esconde o seu IP e a velocidade continua a da sua "
+            "internet. Muitos serviços de streaming já detectam e bloqueiam. Respeite os termos do serviço.",
+            "Aqui dá para testar qual DNS responde mais rápido, comparar respostas e ver como configurar."])),
+        ("Testar a velocidade dos DNS (públicos e o seu)", velocidade),
+        ("Comparar o que cada DNS responde para um site", comparar),
+        (lambda: "Guardar os IPs do seu Smart DNS" + (f" ({', '.join(c['smartdns_ips'])})" if c.get("smartdns_ips")
+                                                      else ""), guardar),
+        ("Como configurar no celular, no Windows e no Chromebook", como_configurar),
+        ("Abrir as configurações de rede do Android",
+         lambda: rodar(["am", "start", "-a", "android.settings.WIRELESS_SETTINGS"], capturar=True, mostrar=False)
+         if tem("am") else info("Só dentro do Termux.")),
+    ])
+
+
+# ── Tailscale e ZeroTier (rede privada entre os seus aparelhos) ──────
+
+def ips_de_vpn() -> list:
+    """[(ip, placa, rede)] dos endereços das redes privadas (Tailscale usa 100.64.0.0/10)."""
+    lista = []
+    for ip, nome in _placas_ipv4():
+        if not nome.lower().startswith(("tun", "zt", "tailscale", "utun")):
+            continue
+        tailscale = ipaddress.ip_address(ip) in ipaddress.ip_network("100.64.0.0/10")
+        lista.append((ip, nome, "Tailscale" if tailscale else "ZeroTier ou outra VPN"))
+    return lista
+
+
+def _usar_rede_privada(rede: str) -> None:
+    meus = [(ip, nome) for ip, nome, tipo in ips_de_vpn() if (tipo == "Tailscale") == (rede == "Tailscale")]
+    if not meus:
+        aviso(f"Não achei o celular numa rede {rede}. Abra o app {rede}, entre na sua conta/rede e ligue a conexão.")
+        return
+    ip = meus[0][0]
+    ok(f"Este celular na rede {rede}: {NEG}{ip}{RST}")
+    usuario = saida(["whoami"]) or getpass.getuser()
+    exemplos = [("SSH do Termux", f"ssh -p 8022 {usuario}@{ip}", "precisa do servidor SSH ligado (Rede e segurança)"),
+                ("Proxy do celular", f"{ip} porta {cfg()['proxy_porta']}", "a internet do celular no PC, de qualquer lugar"),
+                ("Servidor de filmes", f"http://{ip}:{cfg()['midia_porta']}", "os links de filme com este IP")]
+    exemplos += [(f"Site {n}", f"http://{ip}:{_dados_site(n)['porta']}", _dados_site(n)["nome"]) for n in sites_no_ar()]
+    info("De outro aparelho na mesma rede (PC, notebook, outro celular), de qualquer lugar:")
+    for nome, endereco, obs in exemplos:
+        print(f"  {CIANO}{nome}:{RST} {NEG}{endereco}{RST}  {DIM}{obs}{RST}")
+
+
+def _testar_aparelho() -> None:
+    alvo = perguntar("IP do outro aparelho na rede (ex.: 100.101.102.103)").strip()
+    if not _ip_valido(alvo):
+        raise ToonsError("Escreva um IP, como 100.101.102.103.")
+    porta = perguntar_int("Porta para testar (22 = SSH, 3389 = área de trabalho remota do Windows)", 22, 1, 65535)
+    inicio = time.perf_counter()
+    try:
+        with socket.create_connection((alvo, porta), timeout=8):
+            ok(f"{alvo}:{porta} respondeu em {(time.perf_counter() - inicio) * 1000:.0f} ms.")
+    except OSError as e:
+        aviso(f"{alvo}:{porta} não respondeu ({e}). O aparelho está ligado e na rede? A porta está aberta nele?")
+
+
+@submenu
+def menu_ponte_tailscale():
+    menu("🕸️ Tailscale", [
+        ("Como funciona", lambda: _explicar([
+            "O Tailscale junta os seus aparelhos (celular, PC, Chromebook, servidor) numa rede privada criptografada, "
+            "como se estivessem no mesmo Wi-Fi, mesmo cada um num lugar. Cada aparelho ganha um IP 100.x.y.z.",
+            "Com isso, de qualquer lugar, o PC acessa o SSH, os sites e o proxy deste celular (e o celular acessa o "
+            "PC), sem abrir portas e sem link público. É grátis para uso pessoal (até 100 aparelhos).",
+            "No Android ele usa a vaga de VPN: não dá para ligar junto com outra VPN."])),
+        ("Instalar o app Tailscale neste celular (Play Store)",
+         lambda: _abrir_link_android("https://play.google.com/store/apps/details?id=com.tailscale.ipn")),
+        ("Instalar o app pelo F-Droid", lambda: _abrir_link_android("https://f-droid.org/packages/com.tailscale.ipn/")),
+        ("Instalar no PC ou no Chromebook", lambda: _explicar([
+            "Windows: baixe em tailscale.com/download/windows e entre com a mesma conta.",
+            "Chromebook: instale o app Tailscale da Play Store (como no celular) e entre com a mesma conta."])),
+        ("Ver o IP deste celular e como acessá-lo de outro aparelho", lambda: _usar_rede_privada("Tailscale")),
+        ("Testar a conexão com outro aparelho da rede", _testar_aparelho),
+        ("Abrir o painel (lista de aparelhos)", lambda: _abrir_link_android("https://login.tailscale.com/admin/machines")),
+    ])
+
+
+@submenu
+def menu_ponte_zerotier():
+    menu("🌐 ZeroTier", [
+        ("Como funciona", lambda: _explicar([
+            "O ZeroTier cria uma rede virtual entre os seus aparelhos, como um cabo de rede pela internet. Você cria "
+            "uma rede no site my.zerotier.com, ganha um 'Network ID' de 16 caracteres e coloca esse ID em cada "
+            "aparelho; depois autoriza cada um no site.",
+            "Cada aparelho ganha um IP da sua rede (ex.: 10.147.20.x) e se enxergam de qualquer lugar. Grátis para uso "
+            "pessoal. No Android ele usa a vaga de VPN: não dá para ligar junto com outra VPN."])),
+        ("Criar a sua rede (my.zerotier.com)", lambda: _abrir_link_android("https://my.zerotier.com/")),
+        ("Instalar o app ZeroTier neste celular (Play Store)",
+         lambda: _abrir_link_android("https://play.google.com/store/apps/details?id=com.zerotier.one")),
+        ("Instalar no PC ou no Chromebook", lambda: _explicar([
+            "Windows: baixe em zerotier.com/download, abra o ícone perto do relógio → Join New Network → cole o "
+            "Network ID. Depois autorize o PC em my.zerotier.com.",
+            "Chromebook: instale o app ZeroTier da Play Store e entre na rede com o Network ID."])),
+        ("Ver o IP deste celular e como acessá-lo de outro aparelho", lambda: _usar_rede_privada("ZeroTier")),
+        ("Testar a conexão com outro aparelho da rede", _testar_aparelho),
+    ])
+
+
+# ── A janela principal das pontes ────────────────────────────────────
+
+def _estado(servico: str) -> str:
+    return " — ligado" if servico_ativo(servico) else ""
+
+
+@submenu
+def menu_pontes():
+    itens = [
+        (lambda: "🔐 Túnel SSH: proxy SOCKS criptografado pelo seu servidor" + _estado(SERVICO_PONTE_SSH), menu_ponte_ssh),
+        (lambda: "🧅 Tor: anonimato passando por vários nós (mais lento)" + _estado(SERVICO_TOR), menu_ponte_tor),
+        ("🌎 Smart DNS: trocar só o DNS para parecer outra região", menu_ponte_dns),
+        (lambda: "🧭 Proxy: a internet do celular no PC ou Chromebook" + _estado(SERVICO_PROXY), menu_proxy),
+        (lambda: "☁️ Cloudflare Tunnel: link público grátis para algo do celular" + _estado("ponte-cloudflare"),
+         menu_ponte_cloudflare),
+        (lambda: "🔗 ngrok: link público para algo do celular (conta grátis)" + _estado("ponte-ngrok"), menu_ponte_ngrok),
+        (lambda: "🚇 localtunnel: link público rápido, sem conta" + _estado("ponte-localtunnel"), menu_ponte_localtunnel),
+        (lambda: "🛰️ serveo: link público só com o ssh" + _estado("ponte-serveo"), menu_ponte_serveo),
+        (lambda: "📌 pinggy: link público só com o ssh (60 min grátis)" + _estado("ponte-pinggy"), menu_ponte_pinggy),
+        ("🕸️ Tailscale: rede privada entre os seus aparelhos", menu_ponte_tailscale),
+        ("🌐 ZeroTier: rede privada entre os seus aparelhos", menu_ponte_zerotier),
+    ]
+    descricoes = [
+        "Sai criptografado até um servidor seu e de lá para a internet. Precisa de um servidor com SSH.",
+        "Esconde o seu IP passando por 3 voluntários. Lento. Também publica sites como .onion.",
+        "Só troca o DNS para alguns streamings acharem que você está em outro país. Não criptografa.",
+        "O PC ou Chromebook navega pela internet do celular (roteador, cabo USB ou mesmo Wi-Fi).",
+        "Expõe uma porta do celular num link https, sem abrir portas. Endereço fixo com o seu domínio.",
+        "Expõe uma porta do celular num link https. Precisa de conta grátis no ngrok.com.",
+        "Expõe uma porta do celular num link https://….loca.lt. Usa o Node.js.",
+        "Expõe uma porta do celular num link https, usando só o ssh. Às vezes fica fora do ar.",
+        "Expõe uma porta do celular num link https, usando só o ssh. Cada link dura 60 min no grátis.",
+        "Seus aparelhos numa rede privada (IPs 100.x): acesse o celular do PC de qualquer lugar.",
+        "Seus aparelhos numa rede virtual criada por você: acesse o celular do PC de qualquer lugar.",
+    ]
+
+    def cabecalho():
+        ligadas = [nome for nome, servico in (("túnel SSH", SERVICO_PONTE_SSH), ("Tor", SERVICO_TOR),
+                                              ("proxy", SERVICO_PROXY), *((n, s) for n, s, _ in PONTES_PUBLICAS.values()))
+                   if servico_ativo(servico)]
+        print(f"{DIM}Ligadas agora: {', '.join(ligadas) if ligadas else 'nenhuma'}{RST}")
+
+    menu("🌉 Pontes de conexão", itens, cabecalho=cabecalho, descricoes=descricoes)
+
+
 @submenu
 def menu_rede():
     if not _aceitar_aviso_rede():
@@ -4279,6 +5736,7 @@ def menu_rede():
         ("SSH: parar servidor", lambda: rodar(["pkill", "sshd"])),
         ("SSH: autorizar chave pública", ssh_chave),
         ("WireGuard: gerar chaves + config + QR code", wireguard),
+        ("🌉 Pontes de conexão (proxy, túnel SSH, Tor, ngrok, Cloudflare, Tailscale...)", menu_pontes),
         ("📡 Modem: comandos AT (chamadas, SMS, sinal, APN; precisa de root)", menu_modem),
     ])
 
@@ -20576,6 +22034,7 @@ def menu_internet():
         ("📰 Notícias (RSS, modo leitura, ouvir)", menu_noticias),
         ("⬇️ Gerenciador de downloads (links, magnet, torrent)", menu_downloads),
         ("💬 Chat na rede local (sem internet)", menu_chat),
+        ("🌉 Pontes de conexão (proxy, túnel SSH, Tor, ngrok, Cloudflare, Tailscale...)", menu_pontes),
         ("🦊 Navegador no terminal (Browsh e w3m)", menu_navegador),
         ("🔗 Encurtador de links e pastebin", menu_links),
     ])
@@ -25552,7 +27011,7 @@ def menu_config():
         for chave, valor in c.items():
             if chave in ("monitores", "compartilhamentos", "sites"):
                 valor = f"{len(valor)} item(ns)"
-            elif chave.endswith(("token", "_chave", "_catalogo")):
+            elif chave.endswith(("token", "_chave", "_catalogo", "_senha")):
                 valor = mascarar(valor)
             print(f"  {CIANO}{chave:<24}{RST} {valor}")
         print(f"\nArquivo: {CONFIG_FILE}")
@@ -25898,6 +27357,8 @@ def main(argv=None) -> int:
     p.add_argument("alvos", nargs="+")
     p.add_argument("--formato", choices=list(FORMATOS_VIDEO), help="padrão: o último escolhido no menu")
     p.add_argument("--qualidade", choices=list(QUALIDADES_VIDEO), help="padrão: a última escolhida no menu")
+    p = sub.add_parser(SERVICO_PROXY, help="proxy HTTP e SOCKS5 para usar a internet do celular no PC (primeiro plano)")
+    p.add_argument("--porta", type=int)
     sub.add_parser(SERVICO_TUNEL_FIXO, help="túnel da Cloudflare com endereço fixo (token do painel) em primeiro plano")
     p = sub.add_parser(SERVICO_REDUZIR, help="cópia de um vídeo (arquivo ou link) numa resolução menor")
     p.add_argument("fonte")
@@ -25985,6 +27446,8 @@ def main(argv=None) -> int:
             falhas = sum(not baixar_video(alvo, args.formato, args.qualidade) for alvo in args.alvos)
             if falhas:
                 raise ToonsError(f"{falhas} download(s) falharam.")
+        elif args.comando == SERVICO_PROXY:
+            servir_proxy(args.porta or cfg()["proxy_porta"])
         elif args.comando == SERVICO_TUNEL_FIXO:
             rodar_tunel_fixo()
         elif args.comando == SERVICO_REDUZIR:
