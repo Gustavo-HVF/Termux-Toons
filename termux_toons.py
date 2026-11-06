@@ -7,7 +7,7 @@ Reúne em um único menu:
    1. Servidor web/API pessoal (Flask, FastAPI ou só biblioteca padrão) + Cloudflare Tunnel
    2. Bots de Telegram e Discord rodando 24h (tmux + termux-wake-lock)
    3. Scraping e monitoramento (preço, notícias/RSS, status de site, chuva)
-   4. Rede e segurança em equipamentos seus (nmap, SSH, WireGuard, velocidade, modem AT)
+   4. Rede e segurança em equipamentos seus (nmap, SSH, WireGuard, velocidade, modem AT, proxy para o PC)
    5. Linux de verdade com proot-distro (Debian, Ubuntu, Arch...), com desktop no Termux:X11
    6. Arquivos e backup: gerenciador de arquivos (ADB ou root para Android/data), rclone, Syncthing,
       Samba, HTTP, backup e página HTML num link
@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import asyncio
 import atexit
 import base64
 import calendar
@@ -57,6 +58,7 @@ import fnmatch
 import getpass
 import hashlib
 import hmac
+import html
 import importlib
 import importlib.util
 import io
@@ -1134,6 +1136,9 @@ PADRAO_CFG = {
     "site_porta": 8097,
     "sites": {},
     "site_avisar_visitas": False,
+    "proxy_porta": 3128,
+    "proxy_usuario": "toons",
+    "proxy_senha": None,  # None: ainda não escolheu; "": sem senha
     "tunel_fixo_token": "",  # token do túnel criado no painel da Cloudflare (endereço fixo com o seu domínio)
     "tunel_fixo_painel": [],  # endereços que o painel mandou (o cloudflared escreve no log): [{host, porta}]
     "tunel_fixo_manuais": [],  # endereços anotados à mão
@@ -4112,6 +4117,500 @@ def _rede_local_24() -> str:
     return ".".join(partes[:3]) + ".0/24" if len(partes) == 4 else "192.168.0.0/24"
 
 
+# ── Proxy: a internet do celular no PC ou no Chromebook ──────────────
+# Um servidor de proxy no próprio celular. O PC (ligado no roteador/hotspot do celular, no cabo USB ou no mesmo
+# Wi-Fi) manda a navegação por ele, e ela sai pela conexão do celular: dados móveis, a VPN dele, etc.
+# Uma porta só atende HTTP (o que Windows e ChromeOS pedem nas configurações, com CONNECT para HTTPS), SOCKS5
+# (Telegram, Firefox, qBittorrent...) e SOCKS4. Só aceita aparelhos de redes locais, nunca da internet, e não deixa
+# ninguém chegar aos serviços deste celular que só escutam em 127.0.0.1.
+
+SERVICO_PROXY = "proxy"
+ESTADO_PROXY = DATA_DIR / "proxy_estado.json"  # o servidor escreve aqui o uso (o menu lê)
+MAX_CONEXOES_PROXY = 400
+# (começo do nome da placa de rede, o que é). Dados móveis (rmnet, ccmni), VPN (tun) e afins ficam de fora:
+# o PC não alcança o celular por elas.
+_PLACAS = ((("ap", "swlan", "softap"), "roteador (hotspot) do celular"),
+           (("rndis", "usb", "ncm"), "cabo USB (ancoragem USB)"),
+           (("bt-pan", "bnep"), "Bluetooth"),
+           (("wlan", "wifi"), "Wi-Fi"),
+           (("eth",), "cabo de rede"))
+_PLACAS_FORA = ("lo", "rmnet", "ccmni", "tun", "ppp", "dummy", "v4-", "clat", "ip6", "sit", "p2p", "rev_rmnet", "seth")
+
+
+def _tipo_da_placa(nome: str, ip: str) -> str | None:
+    nome = nome.lower()
+    if nome.startswith(_PLACAS_FORA):
+        return None
+    for prefixos, tipo in _PLACAS:
+        if nome.startswith(prefixos):
+            if tipo == "Wi-Fi" and nome != "wlan0" and ip.endswith(".1"):
+                return "roteador (hotspot) do celular"  # wlan1/wlan2 com IP .1: é o roteador ligado
+            return tipo
+    return "outra rede"
+
+
+def enderecos_do_celular() -> list:
+    """[(ip, nome da placa, o que é)] por onde o PC alcança este celular: roteador (hotspot), USB, Wi-Fi..."""
+    achados = []
+    texto = saida(["ip", "-o", "-4", "addr", "show"], timeout=10) if tem("ip") else ""
+    for nome, ip in re.findall(r"^\d+:\s+(\S+)\s+inet\s+([\d.]+)/\d+", texto, re.M):
+        achados.append((ip, nome.split("@")[0]))
+    if not achados:  # sem o comando ip: pergunta a cada placa (ioctl SIOCGIFADDR)
+        with contextlib.suppress(ImportError, OSError):
+            import fcntl
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                for _, nome in socket.if_nameindex():
+                    with contextlib.suppress(OSError):
+                        resposta = fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", nome[:15].encode()))
+                        achados.append((socket.inet_ntoa(resposta[20:24]), nome))
+    lista = []
+    for ip, nome in achados:
+        tipo = _tipo_da_placa(nome, ip)
+        if tipo and not ip.startswith("127.") and (ip, nome) not in [(a, b) for a, b, _ in lista]:
+            lista.append((ip, nome, tipo))
+    if not lista and ip_local() != "127.0.0.1":
+        lista.append((ip_local(), "?", "rede local"))
+    ordem = ["roteador (hotspot) do celular", "cabo USB (ancoragem USB)", "Wi-Fi"]
+    return sorted(lista, key=lambda e: ordem.index(e[2]) if e[2] in ordem else len(ordem))
+
+
+class ServidorProxy:
+    """Proxy HTTP + SOCKS5 + SOCKS4 numa porta só (asyncio, só a biblioteca padrão)."""
+
+    def __init__(self, porta: int, usuario: str = "", senha: str = "", estado: Path | None = None):
+        self.porta, self.usuario, self.senha, self.estado = porta, usuario, senha, estado
+        self.inicio = time.time()
+        self.ativas = self.total = self.enviados = self.recebidos = 0
+        self.clientes: dict = {}  # ip -> {"bytes", "ultimo", "conexoes"}
+
+    # ── quem pode usar ──
+    @staticmethod
+    def cliente_permitido(ip: str) -> bool:
+        """Só aparelhos de redes locais (roteador do celular, USB, Wi-Fi); ninguém vindo da internet."""
+        try:
+            return not ipaddress.ip_address(ip.split("%")[0]).is_global
+        except ValueError:
+            return False
+
+    @staticmethod
+    def destino_permitido(ip: str) -> bool:
+        """Para onde o proxy pode ir: nunca para este próprio celular (127.0.0.1), onde ficam serviços que só
+        escutam localmente (ADB, a API...)."""
+        try:
+            alvo = ipaddress.ip_address(ip.split("%")[0])
+        except ValueError:
+            return False
+        return not (alvo.is_loopback or alvo.is_unspecified or alvo.is_multicast)
+
+    def _senha_confere(self, usuario: str, senha: str) -> bool:
+        certo_u = hmac.compare_digest(usuario.encode(), self.usuario.encode())
+        certo_s = hmac.compare_digest(senha.encode(), self.senha.encode())
+        return certo_u and certo_s
+
+    # ── conexão com o destino e cópia dos dados ──
+    async def _conectar(self, host: str, porta: int):
+        """(leitor, escritor) do destino, ou levanta PermissionError (destino proibido) / OSError (não abriu)."""
+        laco = asyncio.get_running_loop()
+        infos = await asyncio.wait_for(laco.getaddrinfo(host, porta, type=socket.SOCK_STREAM), 20)
+        permitidos = [info[4] for info in infos if self.destino_permitido(str(info[4][0]))]
+        if not permitidos:
+            raise PermissionError(f"destino bloqueado: {host}")
+        ultimo_erro: Exception = OSError(f"não conectou em {host}")
+        for endereco in permitidos:
+            try:
+                return await asyncio.wait_for(asyncio.open_connection(endereco[0], endereco[1]), 20)
+            except (OSError, asyncio.TimeoutError) as e:
+                ultimo_erro = e
+        raise OSError(str(ultimo_erro))
+
+    async def _copiar(self, leitor, escritor, ip: str, subindo: bool) -> None:
+        try:
+            while True:
+                dados = await asyncio.wait_for(leitor.read(65536), 900)  # 15 min parado: a conexão morreu
+                if not dados:
+                    break
+                escritor.write(dados)
+                await escritor.drain()
+                if subindo:
+                    self.enviados += len(dados)
+                else:
+                    self.recebidos += len(dados)
+                cliente = self.clientes[ip]
+                cliente["bytes"] += len(dados)
+                cliente["ultimo"] = time.time()
+        except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            with contextlib.suppress(OSError, RuntimeError):
+                if escritor.can_write_eof():
+                    escritor.write_eof()
+                else:
+                    escritor.close()
+
+    async def _ligar_pontas(self, cliente_l, cliente_e, destino_l, destino_e, ip: str) -> None:
+        await asyncio.gather(self._copiar(cliente_l, destino_e, ip, True), self._copiar(destino_l, cliente_e, ip, False))
+        for escritor in (destino_e, cliente_e):
+            with contextlib.suppress(OSError, RuntimeError):
+                escritor.close()
+
+    # ── atendimento ──
+    async def atender(self, leitor, escritor) -> None:
+        ip = str((escritor.get_extra_info("peername") or ("?",))[0])
+        if not self.cliente_permitido(ip) or self.ativas >= MAX_CONEXOES_PROXY:
+            if not self.cliente_permitido(ip):
+                log(f"Recusado: {ip} não é de uma rede local.")
+            escritor.close()
+            return
+        if ip not in self.clientes:
+            log(f"Novo aparelho usando o proxy: {ip}")
+            self.clientes[ip] = {"bytes": 0, "ultimo": time.time(), "conexoes": 0}
+        self.clientes[ip]["conexoes"] += 1
+        self.ativas += 1
+        self.total += 1
+        try:
+            primeiro = await asyncio.wait_for(leitor.readexactly(1), 30)
+            if primeiro == b"\x05":
+                await self._socks5(leitor, escritor, ip)
+            elif primeiro == b"\x04":
+                await self._socks4(leitor, escritor, ip)
+            else:
+                await self._http(primeiro, leitor, escritor, ip)
+        except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, asyncio.LimitOverrunError, ValueError):
+            pass
+        finally:
+            self.ativas -= 1
+            with contextlib.suppress(OSError, RuntimeError):
+                escritor.close()
+
+    async def _http(self, primeiro: bytes, leitor, escritor, ip: str) -> None:
+        cabeca = primeiro + await asyncio.wait_for(leitor.readuntil(b"\r\n\r\n"), 30)
+        linhas = cabeca.decode("latin-1").split("\r\n")
+        metodo, alvo, versao = (linhas[0].split(" ") + ["", "", ""])[:3]
+        cabecalhos = [l.split(":", 1) for l in linhas[1:] if ":" in l]
+        cab = {k.strip().lower(): v.strip() for k, v in cabecalhos}
+
+        async def responder(codigo: str, texto: str = "", extra: str = "", tipo: str = "text/plain; charset=utf-8"):
+            corpo = texto.encode()
+            escritor.write(f"HTTP/1.1 {codigo}\r\n{extra}Content-Type: {tipo}\r\nContent-Length: {len(corpo)}\r\n"
+                           f"Connection: close\r\n\r\n".encode() + corpo)
+            await escritor.drain()
+
+        if alvo.startswith("/"):  # pedido para o próprio proxy: página de teste e o script automático (PAC)
+            host = cab.get("host", "").split(":")[0] or ip_local()
+            if alvo.split("?")[0] == "/proxy.pac":
+                return await responder("200 OK", _script_pac(host, self.porta), tipo="application/x-ns-proxy-autoconfig")
+            return await responder("200 OK", _pagina_proxy(host, self.porta, bool(self.senha)),
+                                   tipo="text/html; charset=utf-8")
+        if self.senha:
+            tipo, _, credencial = cab.get("proxy-authorization", "").partition(" ")
+            usuario = senha = ""
+            if tipo.lower() == "basic":
+                with contextlib.suppress(ValueError):
+                    usuario, _, senha = base64.b64decode(credencial).decode("utf-8").partition(":")
+            if not self._senha_confere(usuario, senha):
+                return await responder("407 Proxy Authentication Required", "Este proxy precisa de usuário e senha.\n",
+                                       'Proxy-Authenticate: Basic realm="Proxy do celular (Termux-Toons)", charset="UTF-8"\r\n')
+        if metodo.upper() == "CONNECT":  # HTTPS: só abre o túnel até o site
+            host, _, porta = alvo.rpartition(":")
+            host = host.strip("[]")
+            if not host or not porta.isdigit():
+                return await responder("400 Bad Request", "Endereço inválido.\n")
+            try:
+                destino_l, destino_e = await self._conectar(host, int(porta))
+            except PermissionError:
+                return await responder("403 Forbidden", "O proxy não deixa abrir endereços deste próprio celular.\n")
+            except (OSError, asyncio.TimeoutError):
+                return await responder("502 Bad Gateway", f"Não consegui chegar em {host}.\n")
+            escritor.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await escritor.drain()
+            return await self._ligar_pontas(leitor, escritor, destino_l, destino_e, ip)
+        partes = urllib.parse.urlsplit(alvo)  # HTTP comum: GET http://site/caminho
+        if partes.scheme.lower() != "http" or not partes.hostname:
+            return await responder("400 Bad Request", "Use este proxy como proxy HTTP (ou SOCKS5).\n")
+        try:
+            destino_l, destino_e = await self._conectar(partes.hostname, partes.port or 80)
+        except PermissionError:
+            return await responder("403 Forbidden", "O proxy não deixa abrir endereços deste próprio celular.\n")
+        except (OSError, asyncio.TimeoutError):
+            return await responder("502 Bad Gateway", f"Não consegui chegar em {partes.hostname}.\n")
+        caminho = (partes.path or "/") + (f"?{partes.query}" if partes.query else "")
+        upgrade = "upgrade" in cab.get("connection", "").lower() and "upgrade" in cab
+        fora = {"proxy-authorization", "proxy-connection", "connection", "keep-alive"}
+        novos = [f"{k.strip()}: {v.strip()}" for k, v in cabecalhos if k.strip().lower() not in fora]
+        novos.append("Connection: upgrade" if upgrade else "Connection: close")  # um pedido por conexão: simples
+        pedido = f"{metodo} {caminho} {versao}\r\n" + "".join(f"{linha}\r\n" for linha in novos) + "\r\n"
+        destino_e.write(pedido.encode("latin-1"))
+        await destino_e.drain()
+        self.enviados += len(cabeca)
+        await self._ligar_pontas(leitor, escritor, destino_l, destino_e, ip)
+
+    async def _socks5(self, leitor, escritor, ip: str) -> None:
+        metodos = await leitor.readexactly((await leitor.readexactly(1))[0])
+        if self.senha:
+            if 2 not in metodos:  # o app não oferece usuário e senha
+                escritor.write(b"\x05\xff")
+                return
+            escritor.write(b"\x05\x02")
+            await escritor.drain()
+            await leitor.readexactly(1)  # versão da sub-negociação (1)
+            usuario = (await leitor.readexactly((await leitor.readexactly(1))[0])).decode("utf-8", "replace")
+            senha = (await leitor.readexactly((await leitor.readexactly(1))[0])).decode("utf-8", "replace")
+            certo = self._senha_confere(usuario, senha)
+            escritor.write(b"\x01\x00" if certo else b"\x01\x01")
+            await escritor.drain()
+            if not certo:
+                return
+        else:
+            escritor.write(b"\x05\x00" if 0 in metodos else b"\x05\xff")
+            await escritor.drain()
+            if 0 not in metodos:
+                return
+        _, comando, _, tipo = await leitor.readexactly(4)
+        if tipo == 1:
+            host = socket.inet_ntoa(await leitor.readexactly(4))
+        elif tipo == 3:
+            host = (await leitor.readexactly((await leitor.readexactly(1))[0])).decode("utf-8", "replace")  # já vem em ASCII
+        elif tipo == 4:
+            host = socket.inet_ntop(socket.AF_INET6, await leitor.readexactly(16))
+        else:
+            escritor.write(b"\x05\x08\x00\x01" + b"\x00" * 6)  # tipo de endereço não suportado
+            return
+        porta = int.from_bytes(await leitor.readexactly(2), "big")
+        if comando != 1:  # só CONNECT (sem BIND nem UDP)
+            escritor.write(b"\x05\x07\x00\x01" + b"\x00" * 6)
+            return
+        try:
+            destino_l, destino_e = await self._conectar(host, porta)
+        except PermissionError:
+            escritor.write(b"\x05\x02\x00\x01" + b"\x00" * 6)  # não permitido
+            return
+        except (OSError, asyncio.TimeoutError):
+            escritor.write(b"\x05\x04\x00\x01" + b"\x00" * 6)  # não alcançou
+            return
+        escritor.write(b"\x05\x00\x00\x01" + b"\x00" * 6)
+        await escritor.drain()
+        await self._ligar_pontas(leitor, escritor, destino_l, destino_e, ip)
+
+    async def _socks4(self, leitor, escritor, ip: str) -> None:
+        comando, porta_b, ip_b = (await leitor.readexactly(1))[0], await leitor.readexactly(2), await leitor.readexactly(4)
+        await asyncio.wait_for(leitor.readuntil(b"\x00"), 10)  # identificação (ignorada)
+        host = socket.inet_ntoa(ip_b)
+        if ip_b[:3] == b"\x00\x00\x00" and ip_b[3]:  # SOCKS4a: o nome do site vem depois
+            host = (await asyncio.wait_for(leitor.readuntil(b"\x00"), 10))[:-1].decode("utf-8", "replace")
+        if self.senha or comando != 1:  # o SOCKS4 não tem senha: com senha ligada, só HTTP ou SOCKS5
+            escritor.write(b"\x00\x5b" + b"\x00" * 6)
+            return
+        try:
+            destino_l, destino_e = await self._conectar(host, int.from_bytes(porta_b, "big"))
+        except (OSError, asyncio.TimeoutError):  # PermissionError também é OSError
+            escritor.write(b"\x00\x5b" + b"\x00" * 6)
+            return
+        escritor.write(b"\x00\x5a" + b"\x00" * 6)
+        await escritor.drain()
+        await self._ligar_pontas(leitor, escritor, destino_l, destino_e, ip)
+
+    # ── uso (para o menu) ──
+    def _gravar_estado(self) -> None:
+        if not self.estado:
+            return
+        dados = {"pid": os.getpid(), "porta": self.porta, "inicio": self.inicio, "atualizado": time.time(),
+                 "ativas": self.ativas, "total": self.total, "enviados": self.enviados, "recebidos": self.recebidos,
+                 "senha": bool(self.senha), "clientes": self.clientes}
+        with contextlib.suppress(OSError):
+            gravar_json(self.estado, dados)
+
+    async def rodar(self) -> None:
+        servidor = await asyncio.start_server(self.atender, "0.0.0.0", self.porta, reuse_address=True)
+        log(f"Proxy (HTTP e SOCKS) na porta {self.porta}" + (" com senha" if self.senha else " sem senha")
+            + " · endereços: " + (", ".join(f"{ip} ({tipo})" for ip, _, tipo in enderecos_do_celular()) or "nenhum"))
+        async with servidor:
+            while True:
+                self._gravar_estado()
+                await asyncio.sleep(5)
+
+
+def servir_proxy(porta: int) -> None:
+    """Sobe o proxy em primeiro plano (é o que roda dentro do tmux). Usuário e senha vêm do config (não ficam na
+    linha de comando)."""
+    with contextlib.suppress(ImportError, ValueError, OSError):  # o navegador abre muitas conexões ao mesmo tempo
+        import resource
+        _, maximo = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (min(maximo, 8192) if maximo > 0 else 8192, maximo))
+    c = cfg()
+    senha = c.get("proxy_senha") or ""
+    servidor = ServidorProxy(porta, c.get("proxy_usuario") or "toons" if senha else "", senha, ESTADO_PROXY)
+    try:
+        asyncio.run(servidor.rodar())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ESTADO_PROXY.unlink(missing_ok=True)
+
+
+def _script_pac(host: str, porta: int) -> str:
+    """Script automático (PAC): sites da internet pelo proxy; endereços da rede local direto."""
+    return ("function FindProxyForURL(url, host) {\n"
+            "  if (isPlainHostName(host) || dnsDomainIs(host, '.local') ||\n"
+            "      /^(10|127)\\./.test(host) || /^192\\.168\\./.test(host) || /^172\\.(1[6-9]|2[0-9]|3[01])\\./.test(host))\n"
+            "    return 'DIRECT';\n"
+            f"  return 'PROXY {host}:{porta}';\n"
+            "}\n")
+
+
+def _pagina_proxy(host: str, porta: int, com_senha: bool) -> str:
+    """O que aparece ao abrir http://IP:PORTA no PC: confirma que ele alcança o celular e diz como configurar."""
+    senha = "<p>O navegador vai pedir <b>usuário e senha</b> (os que aparecem no Termux-Toons).</p>" if com_senha else ""
+    return f"""<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Proxy do celular</title>
+<style>body{{font:16px/1.5 system-ui,sans-serif;max-width:640px;margin:2em auto;padding:0 16px;color:#222}}
+code{{background:#eee;padding:2px 6px;border-radius:4px}}h1{{font-size:1.4em}}</style>
+<h1>✅ O PC alcança o proxy do celular</h1>
+<p>Endereço <code>{html.escape(host)}</code>, porta <code>{porta}</code> (proxy HTTP; também aceita SOCKS5).</p>{senha}
+<h2>Windows 10/11</h2><p>Configurações → Rede e Internet → Proxy → Configuração manual de proxy → <i>Usar um servidor
+proxy</i>: endereço <code>{html.escape(host)}</code>, porta <code>{porta}</code> → Salvar.</p>
+<h2>Chromebook</h2><p>Configurações → Rede → clique na rede em que está conectado → Proxy → <i>Configuração manual de
+proxy</i> → Proxy HTTP <code>{html.escape(host)}</code> porta <code>{porta}</code>, e marque usar o mesmo proxy para
+todos os protocolos.</p>
+<h2>Script automático</h2><p>Nos dois, dá para usar o endereço de configuração automática:
+<code>http://{html.escape(host)}:{porta}/proxy.pac</code></p>"""
+
+
+def uso_do_proxy() -> dict | None:
+    """O que o servidor anotou do uso (None se não estiver rodando)."""
+    if not servico_ativo(SERVICO_PROXY):
+        return None
+    dados = ler_json(ESTADO_PROXY, {}) if ESTADO_PROXY.exists() else {}
+    return dados or None
+
+
+def instrucoes_proxy() -> None:
+    c = cfg()
+    porta = c["proxy_porta"]
+    enderecos = enderecos_do_celular()
+    if not enderecos:
+        aviso("Não achei nenhuma rede para o PC alcançar o celular. Ligue o roteador Wi-Fi (hotspot) do celular, "
+              "a ancoragem USB, ou conecte os dois no mesmo Wi-Fi.")
+        return
+    info("No PC, use o endereço da rede em que ele está ligado ao celular:")
+    for ip, _, tipo in enderecos:
+        print(f"  {NEG}{ip}{RST}  porta {NEG}{porta}{RST}  {DIM}← {tipo}{RST}")
+    ip = enderecos[0][0]
+    if c.get("proxy_senha"):
+        print(f"  Usuário {NEG}{c.get('proxy_usuario') or 'toons'}{RST} · senha {NEG}{c['proxy_senha']}{RST} "
+              f"{DIM}(o navegador pergunta na primeira vez){RST}")
+    passos = [
+        ("Windows 10/11", f"Configurações → Rede e Internet → Proxy → Configuração manual de proxy → Usar um servidor "
+                          f"proxy: endereço {ip}, porta {porta} → Salvar. Marque 'Não usar para endereços locais'."),
+        ("Chromebook", f"Configurações → Rede → a rede do celular → Proxy → Configuração manual de proxy → Proxy HTTP "
+                       f"{ip}, porta {porta}; marque usar o mesmo proxy para todos os protocolos. Se a opção estiver "
+                       "bloqueada, ligue 'Permitir proxies para redes compartilhadas' nas configurações de rede."),
+        ("Script automático", f"no Windows ('Usar script de configuração') ou no Chromebook ('Configuração automática'): "
+                              f"http://{ip}:{porta}/proxy.pac"),
+        ("Outros apps", f"Telegram, Firefox, qBittorrent...: SOCKS5 em {ip}, porta {porta}."),
+        ("Para testar", f"abra http://{ip}:{porta} no navegador do PC: aparece 'O PC alcança o proxy do celular'."),
+    ]
+    for titulo_p, texto in passos:  # o título conta na largura da 1ª linha
+        linhas = textwrap.wrap(f"{titulo_p}: {texto}", max(30, min(largura_tela(), 90) - 2), subsequent_indent="  ")
+        linhas[0] = f"{CIANO}{titulo_p}:{RST}" + linhas[0][len(titulo_p) + 1:]
+        print("\n" + "\n".join("  " + l for l in linhas))
+    print(f"\n  {DIM}Vale para o que usa o proxy do sistema (navegadores e a maioria dos apps); alguns jogos e "
+          f"programas ignoram. Depois, para voltar ao normal, desligue o proxy no PC. O tráfego sai pela conexão do "
+          f"celular: confira as regras do seu plano de dados.{RST}")
+
+
+def ligar_proxy() -> None:
+    c = cfg()
+    if servico_ativo(SERVICO_PROXY):
+        info("O proxy já está ligado.")
+        instrucoes_proxy()
+        return
+    if c.get("proxy_senha") is None:  # primeira vez: quem pode usar?
+        wifi = any(tipo == "Wi-Fi" for _, _, tipo in enderecos_do_celular())
+        info("Quem estiver na mesma rede que o celular consegue usar o proxy. No roteador (hotspot) do próprio "
+             "celular, só entra quem tem a senha do Wi-Fi dele; num Wi-Fi de casa, de escola ou público, outras "
+             "pessoas também estão na rede.")
+        opcoes = ["Com usuário e senha (recomendado em Wi-Fi de casa, escola ou público)",
+                  "Sem senha: qualquer aparelho conectado no roteador ou no Wi-Fi do celular"]
+        i = escolher("Como proteger o proxy?", opcoes, "1" if wifi else "2")
+        if i is None:
+            return
+        c["proxy_senha"] = secrets.token_urlsafe(6) if i == 0 else ""
+        salvar_cfg()
+    porta = c["proxy_porta"]
+    if not porta_livre(porta, espera=2):
+        raise ToonsError(f"A porta {porta} já está em uso por outro programa. Troque a porta neste menu.")
+    if iniciar_servico(SERVICO_PROXY, cmd_self(SERVICO_PROXY, "--porta", str(porta)), reiniciar=True):
+        print()
+        instrucoes_proxy()
+
+
+def ver_uso_proxy() -> None:
+    uso = uso_do_proxy()
+    if not uso:
+        info("O proxy está desligado.")
+        return
+    total = uso.get("enviados", 0) + uso.get("recebidos", 0)
+    info(f"Ligado há {_hms(time.time() - uso.get('inicio', time.time()))} · "
+         f"{_qtd(uso.get('ativas', 0), 'conexão aberta', 'conexões abertas')} agora · {bytes_humanos(total)} no total ({bytes_humanos(uso.get('recebidos', 0))} baixados, "
+         f"{bytes_humanos(uso.get('enviados', 0))} enviados)")
+    clientes = sorted((uso.get("clientes") or {}).items(), key=lambda kv: -kv[1].get("bytes", 0))
+    if not clientes:
+        print(f"  {DIM}Nenhum aparelho usou ainda.{RST}")
+    for ip, d in clientes:
+        quando = datetime.fromtimestamp(d.get("ultimo", 0)).strftime("%H:%M")
+        print(f"  {NEG}{ip}{RST}  {bytes_humanos(d.get('bytes', 0))} · {_qtd(d.get('conexoes', 0), 'conexão', 'conexões')} · "
+              f"último uso {quando}")
+
+
+@submenu
+def menu_proxy():
+    c = cfg()
+
+    def mudar_senha():
+        opcoes = ["Com usuário e senha (gera uma senha nova)", "Sem senha (só aparelhos da rede local)"]
+        if c.get("proxy_senha"):
+            opcoes.insert(1, "Mostrar o usuário e a senha atuais")
+        i = escolher("Senha do proxy", opcoes)
+        if i is None:
+            return
+        if opcoes[i].startswith("Mostrar"):
+            print(f"  Usuário {NEG}{c.get('proxy_usuario') or 'toons'}{RST} · senha {NEG}{c['proxy_senha']}{RST}")
+            return
+        c["proxy_senha"] = secrets.token_urlsafe(6) if i == 0 else ""
+        salvar_cfg()
+        ok(f"Senha nova: {c['proxy_senha']}" if c["proxy_senha"] else "Proxy sem senha.")
+        if servico_ativo(SERVICO_PROXY):
+            parar_servico(SERVICO_PROXY)
+            ligar_proxy()
+
+    def mudar_porta():
+        c["proxy_porta"] = perguntar_int("Porta do proxy", c["proxy_porta"], 1024, 65535)
+        salvar_cfg()
+        ok(f"Porta {c['proxy_porta']}.")
+        if servico_ativo(SERVICO_PROXY):
+            parar_servico(SERVICO_PROXY)
+            ligar_proxy()
+
+    def cabecalho():
+        uso = uso_do_proxy()
+        if uso:
+            enderecos = ", ".join(f"{ip}:{c['proxy_porta']}" for ip, _, _ in enderecos_do_celular()[:2])
+            print(f"{DIM}Ligado · {enderecos} · {len(uso.get('clientes') or {})} aparelho(s) · "
+                  f"{bytes_humanos(uso.get('enviados', 0) + uso.get('recebidos', 0))} desde que ligou{RST}")
+        else:
+            print(f"{DIM}Desligado. Conecte o PC no roteador (hotspot) do celular, no cabo USB ou no mesmo Wi-Fi.{RST}")
+
+    menu("🧭 Proxy: a internet do celular no PC ou Chromebook", [
+        (lambda: "Ligar o proxy" + (" (ligado)" if servico_ativo(SERVICO_PROXY) else ""), ligar_proxy),
+        ("Desligar o proxy", lambda: parar_servico(SERVICO_PROXY)),
+        ("Como configurar no Windows, Chromebook e outros", instrucoes_proxy),
+        ("Quem está usando e quanto já passou", ver_uso_proxy),
+        (lambda: f"Senha ({'ligada' if c.get('proxy_senha') else 'desligada'})", mudar_senha),
+        (lambda: f"Porta ({c['proxy_porta']})", mudar_porta),
+        ("Status e log", lambda: status_servico(SERVICO_PROXY)),
+    ], cabecalho=cabecalho)
+
+
 @submenu
 def menu_rede():
     if not _aceitar_aviso_rede():
@@ -4279,6 +4778,7 @@ def menu_rede():
         ("SSH: parar servidor", lambda: rodar(["pkill", "sshd"])),
         ("SSH: autorizar chave pública", ssh_chave),
         ("WireGuard: gerar chaves + config + QR code", wireguard),
+        ("🧭 Proxy: usar a internet do celular no PC ou Chromebook", menu_proxy),
         ("📡 Modem: comandos AT (chamadas, SMS, sinal, APN; precisa de root)", menu_modem),
     ])
 
@@ -20576,6 +21076,7 @@ def menu_internet():
         ("📰 Notícias (RSS, modo leitura, ouvir)", menu_noticias),
         ("⬇️ Gerenciador de downloads (links, magnet, torrent)", menu_downloads),
         ("💬 Chat na rede local (sem internet)", menu_chat),
+        ("🧭 Proxy: usar a internet do celular no PC ou Chromebook", menu_proxy),
         ("🦊 Navegador no terminal (Browsh e w3m)", menu_navegador),
         ("🔗 Encurtador de links e pastebin", menu_links),
     ])
@@ -25552,7 +26053,7 @@ def menu_config():
         for chave, valor in c.items():
             if chave in ("monitores", "compartilhamentos", "sites"):
                 valor = f"{len(valor)} item(ns)"
-            elif chave.endswith(("token", "_chave", "_catalogo")):
+            elif chave.endswith(("token", "_chave", "_catalogo", "_senha")):
                 valor = mascarar(valor)
             print(f"  {CIANO}{chave:<24}{RST} {valor}")
         print(f"\nArquivo: {CONFIG_FILE}")
@@ -25898,6 +26399,8 @@ def main(argv=None) -> int:
     p.add_argument("alvos", nargs="+")
     p.add_argument("--formato", choices=list(FORMATOS_VIDEO), help="padrão: o último escolhido no menu")
     p.add_argument("--qualidade", choices=list(QUALIDADES_VIDEO), help="padrão: a última escolhida no menu")
+    p = sub.add_parser(SERVICO_PROXY, help="proxy HTTP e SOCKS5 para usar a internet do celular no PC (primeiro plano)")
+    p.add_argument("--porta", type=int)
     sub.add_parser(SERVICO_TUNEL_FIXO, help="túnel da Cloudflare com endereço fixo (token do painel) em primeiro plano")
     p = sub.add_parser(SERVICO_REDUZIR, help="cópia de um vídeo (arquivo ou link) numa resolução menor")
     p.add_argument("fonte")
@@ -25985,6 +26488,8 @@ def main(argv=None) -> int:
             falhas = sum(not baixar_video(alvo, args.formato, args.qualidade) for alvo in args.alvos)
             if falhas:
                 raise ToonsError(f"{falhas} download(s) falharam.")
+        elif args.comando == SERVICO_PROXY:
+            servir_proxy(args.porta or cfg()["proxy_porta"])
         elif args.comando == SERVICO_TUNEL_FIXO:
             rodar_tunel_fixo()
         elif args.comando == SERVICO_REDUZIR:
