@@ -8,8 +8,8 @@ Reúne em um único menu:
    2. Bots de Telegram e Discord rodando 24h (tmux + termux-wake-lock)
    3. Scraping e monitoramento (preço, notícias/RSS, status de site, chuva)
    4. Rede e segurança em equipamentos seus (nmap, SSH, WireGuard, velocidade, modem AT) e pontes de
-      conexão: proxy para o PC, túnel SSH, Tor, Smart DNS, links públicos (Cloudflare, ngrok...) e
-      redes privadas (Tailscale, ZeroTier)
+      conexão: proxy para o PC, navegador pelo celular (abre sites num link, pela conexão dele), túnel
+      SSH, Tor, Smart DNS, links públicos (Cloudflare, ngrok...) e redes privadas (Tailscale, ZeroTier)
    5. Linux de verdade com proot-distro (Debian, Ubuntu, Arch...), com desktop no Termux:X11
    6. Arquivos e backup: gerenciador de arquivos (ADB ou root para Android/data), rclone, Syncthing,
       Samba, HTTP, backup e página HTML num link
@@ -24,7 +24,8 @@ Reúne em um único menu:
   12. Celular e sistema: depuração sem fio (ADB), Termux:API, painel do sistema, bateria, uso de dados e
       apps, resolução da tela (inteira ou por app), fotos, conversor de arquivos, automação por eventos,
       espelhamento e transmissão da tela por link
-  13. Internet: e-mail, notícias, downloads (aria2), chat na rede local, Browsh/w3m e encurtador/pastebin
+  13. Internet: e-mail, notícias, downloads (aria2), chat na rede local, navegador pelo celular (abre
+      sites num link, pela conexão dele), Browsh/w3m e encurtador/pastebin
   14. Meus dados na internet: o que está público sobre você na Receita Federal, Portal da Transparência,
       Tribunais de Justiça e TRFs, Google, LinkedIn/Instagram/Facebook, Diário Oficial e Lattes
   15. Inteligência artificial: Claude/ChatGPT/Gemini, LLMs locais (llama.cpp), voz (whisper.cpp) e OCR
@@ -58,9 +59,13 @@ import csv
 import difflib
 import fnmatch
 import getpass
+import gzip
 import hashlib
 import hmac
 import html
+import http.client
+import http.cookiejar
+import http.cookies
 import importlib
 import importlib.util
 import io
@@ -78,6 +83,7 @@ import select
 import shlex
 import shutil
 import socket
+import ssl
 import stat
 import statistics
 import string
@@ -96,6 +102,7 @@ import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from datetime import date, datetime, timedelta
 from fractions import Fraction
 from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -1142,6 +1149,10 @@ PADRAO_CFG = {
     "proxy_usuario": "toons",
     "proxy_senha": None,  # None: ainda não escolheu; "": sem senha
     "proxy_saida": "",  # "" direto; "ssh" pelo túnel SSH; "tor" pelo Tor
+    "navegador_porta": 8101,
+    "navegador_token": "",  # link secreto do navegador pelo celular
+    "navegador_saida": "",  # "" direto; "ssh" pelo túnel SSH; "tor" pelo Tor
+    "navegador_barra": True,  # barra com o endereço no topo das páginas abertas pelo navegador
     "pontes_portas": {},  # qual porta cada ponte pública está expondo
     "ssh_ponte_destino": "",  # usuario@servidor do túnel SSH (ssh -D)
     "ssh_ponte_porta": 22,
@@ -4682,6 +4693,731 @@ def menu_proxy():
 
 
 # ════════════════════════════════════════════════════════════════════
+#  Navegador pelo celular: abrir sites usando a conexão dele
+# ════════════════════════════════════════════════════════════════════
+# Um "navegador" que mora no celular. A pessoa abre a página por um link (na mesma rede Wi-Fi ou pela internet,
+# com o túnel), digita um endereço ou uma busca, e QUEM BAIXA O SITE É O CELULAR: ele pega a página pela conexão
+# dele (dados móveis, Wi-Fi, a VPN...), reescreve os links para a navegação continuar passando por ele, e devolve
+# o conteúdo já pronto. Para o site, quem acessou foi o celular. É só a biblioteca padrão.
+#
+# Diferença para o proxy: o proxy precisa ser configurado no sistema do PC; este é só uma página da web, abre em
+# qualquer aparelho (celular, PC, TV, tablet) sem configurar nada. Em troca, sites muito dependentes de
+# JavaScript (apps, redes sociais modernas) abrem mal: ele é bom para pesquisar, ler notícias, Wikipédia, etc.
+
+SERVICO_NAVEGADOR = "navegador"
+NAV_TIMEOUT = 30                        # segundos para cada pedido a um site
+NAV_MAX_REESCREVER = 8 * 1024 * 1024    # até aqui a página é baixada para reescrever os links; acima, passa direto
+NAV_MAX_CORPO = 25 * 1024 * 1024        # tamanho máximo de um envio (POST) do visitante
+NAV_BLOCO = 1 << 16
+NAV_TIPOS_TEXTO = ("text/html", "application/xhtml", "text/css")
+NAV_BUSCA = "https://html.duckduckgo.com/html/"   # busca que funciona sem JavaScript
+# cabeçalhos da resposta do site que NÃO podem ir para o visitante (atrapalham a reescrita, travam a página num
+# iframe ou vazam detalhes da conexão). O corpo é reescrito/recalculado, então tamanho e codificação também saem.
+NAV_CORTAR_RESP = {
+    "content-security-policy", "content-security-policy-report-only", "x-frame-options", "x-xss-protection",
+    "strict-transport-security", "public-key-pins", "public-key-pins-report-only", "expect-ct",
+    "cross-origin-opener-policy", "cross-origin-embedder-policy", "cross-origin-resource-policy",
+    "content-length", "transfer-encoding", "content-encoding", "connection", "keep-alive", "upgrade",
+    "set-cookie", "report-to", "nel", "alt-svc", "accept-ch", "permissions-policy", "feature-policy",
+}
+
+
+# ── Conexão só para a internet pública (nunca para a rede local nem para o próprio celular) ──
+# Isto é essencial: como o link pode ser público, sem o bloqueio qualquer visitante pediria ao celular para abrir
+# http://127.0.0.1:... (a API, o ADB) ou um aparelho do seu Wi-Fi. Resolvemos o nome aqui e só conectamos se o
+# endereço for público, conectando no IP já verificado (sem deixar o nome ser resolvido de novo para outro IP).
+
+def _destino_navegador_ok(ip: str) -> bool:
+    try:
+        alvo = ipaddress.ip_address(ip.split("%")[0])
+    except ValueError:
+        return False
+    return not (alvo.is_loopback or alvo.is_private or alvo.is_link_local or alvo.is_multicast
+                or alvo.is_reserved or alvo.is_unspecified)
+
+
+def _enderecos_publicos(host: str, porta: int) -> list:
+    try:
+        infos = socket.getaddrinfo(host, porta, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise OSError(f"não achei o endereço de {host}") from e
+    publicos = [inf for inf in infos if _destino_navegador_ok(str(inf[4][0]))]
+    if not publicos:
+        raise PermissionError(f"destino na rede local bloqueado: {host}")
+    return publicos
+
+
+def _conectar_publico(host: str, porta: int, timeout: float):
+    ultimo: Exception = OSError(f"não conectou em {host}")
+    for inf in _enderecos_publicos(host, porta):
+        try:
+            return socket.create_connection(inf[4][:2], timeout)
+        except OSError as e:
+            ultimo = e
+    raise ultimo
+
+
+def _recv_exato(sock: socket.socket, n: int) -> bytes:
+    dados = b""
+    while len(dados) < n:
+        pedaco = sock.recv(n - len(dados))
+        if not pedaco:
+            raise OSError("conexão fechada antes do esperado")
+        dados += pedaco
+    return dados
+
+
+def _socket_via_saida(saida: tuple, host: str, porta: int, timeout: float) -> socket.socket:
+    """Abre (host, porta) por um SOCKS5 (o túnel SSH ou o Tor). O nome vai para o outro lado resolver: resolver
+    aqui contaria ao DNS da operadora quais sites estão sendo abertos."""
+    nome = host.strip("[]").lower()
+    try:
+        ip = ipaddress.ip_address(nome)
+    except ValueError:
+        ip = None
+    if (ip is not None and not _destino_navegador_ok(nome)) or nome == "localhost" or nome.endswith(".localhost"):
+        raise PermissionError(f"destino na rede local bloqueado: {host}")
+    try:
+        if ip is None:
+            bruto = nome.encode("idna")
+            endereco = b"\x03" + bytes([len(bruto)]) + bruto
+        else:
+            endereco = (b"\x01" if ip.version == 4 else b"\x04") + ip.packed
+    except (UnicodeError, ValueError):
+        raise OSError(f"nome inválido: {host}") from None
+    sock = socket.create_connection(saida, timeout)
+    try:
+        sock.sendall(b"\x05\x01\x00")
+        if _recv_exato(sock, 2) != b"\x05\x00":
+            raise OSError("a saída (túnel SSH ou Tor) recusou a conexão")
+        sock.sendall(b"\x05\x01\x00" + endereco + porta.to_bytes(2, "big"))
+        resposta = _recv_exato(sock, 4)
+        if resposta[1] != 0:
+            raise OSError(f"a saída não conseguiu abrir {host} (código {resposta[1]})")
+        tipo = resposta[3]
+        _recv_exato(sock, 6 if tipo == 1 else 18 if tipo == 4 else _recv_exato(sock, 1)[0] + 2)
+    except BaseException:
+        sock.close()
+        raise
+    return sock
+
+
+class _ConexaoNav(http.client.HTTPConnection):
+    saida: tuple | None = None   # (host, porta) do SOCKS da saída, ou None (direto)
+
+    def connect(self):
+        if self.saida:
+            self.sock = _socket_via_saida(self.saida, self.host, self.port or 80, self.timeout)
+        else:
+            self.sock = _conectar_publico(self.host, self.port or 80, self.timeout)
+
+
+class _ConexaoNavTLS(http.client.HTTPSConnection):
+    saida: tuple | None = None
+
+    def connect(self):
+        if self.saida:
+            crua = _socket_via_saida(self.saida, self.host, self.port or 443, self.timeout)
+        else:
+            crua = _conectar_publico(self.host, self.port or 443, self.timeout)
+        self.sock = self._context.wrap_socket(crua, server_hostname=self.host)
+
+
+class _AbreNav(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(_ConexaoNav, req)
+
+
+class _AbreNavTLS(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(_ConexaoNavTLS, req, context=self._context)
+
+
+def _abridor_navegador(jar) -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(
+        _AbreNav(), _AbreNavTLS(context=ssl.create_default_context()),
+        urllib.request.HTTPCookieProcessor(jar))
+
+
+# ── Buscar a página e preparar o conteúdo ────────────────────────────
+
+def _buscar_site(opener, url: str, metodo: str, corpo: bytes | None, tipo_corpo: str | None, idioma: str):
+    cabecalhos = {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": idioma.strip() or "pt-BR,pt;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate",
+    }
+    if tipo_corpo:
+        cabecalhos["Content-Type"] = tipo_corpo
+    req = urllib.request.Request(url, data=corpo, headers=cabecalhos, method=metodo)
+    return opener.open(req, timeout=NAV_TIMEOUT)
+
+
+def _descomprimir(dados: bytes, codificacao: str | None) -> bytes:
+    codificacao = (codificacao or "").lower().strip()
+    try:
+        if codificacao == "gzip":
+            return gzip.decompress(dados)
+        if codificacao == "deflate":
+            try:
+                return zlib.decompress(dados)
+            except zlib.error:
+                return zlib.decompress(dados, -zlib.MAX_WBITS)
+    except (OSError, zlib.error):
+        return dados
+    return dados
+
+
+def _charset_da_pagina(ctype: str, dados: bytes) -> str:
+    achado = re.search(r"charset=([\w-]+)", ctype or "", re.I)
+    candidatos = [achado.group(1)] if achado else []
+    meta = re.search(rb"""<meta[^>]+charset=["']?\s*([\w-]+)""", dados[:4096], re.I)
+    if meta:
+        candidatos.append(meta.group(1).decode("ascii", "ignore"))
+    for cs in candidatos:
+        try:
+            "teste".encode(cs)
+            return cs
+        except (LookupError, TypeError):
+            continue
+    return "utf-8"
+
+
+def _b64_url(url: str) -> str:
+    return base64.urlsafe_b64encode(url.encode("utf-8", "replace")).decode("ascii").rstrip("=")
+
+
+def _de_b64_url(cod: str) -> str:
+    cod = cod + "=" * (-len(cod) % 4)
+    return base64.urlsafe_b64decode(cod.encode("ascii")).decode("utf-8", "replace")
+
+
+def _proxiar(base_url: str, alvo: str | None) -> str | None:
+    """Transforma um link da página num link que passa pelo celular (/r/<endereço em base64>).
+    Devolve None para o que deve ficar como está (âncoras, data:, javascript:, mailto:...)."""
+    alvo = (alvo or "").strip()
+    if not alvo or alvo[:1] in ("#",) or alvo.lower().startswith(
+            ("data:", "javascript:", "mailto:", "tel:", "blob:", "about:", "sms:", "intent:", "#")):
+        return None
+    try:
+        absoluto = urllib.parse.urljoin(base_url, alvo)
+    except ValueError:
+        return None
+    esquema = urllib.parse.urlsplit(absoluto).scheme.lower()
+    if esquema not in ("http", "https"):
+        return None
+    return "/r/" + _b64_url(absoluto)
+
+
+# ── Reescrever o HTML e o CSS para a navegação continuar pelo celular ──
+
+_NAV_ATTR = re.compile(
+    r"""(\s(?:href|src|action|poster|formaction|data-src|data-href|data-url|data-original|background)\s*=\s*)"""
+    r"""(?:"([^"]*)"|'([^']*)'|([^\s"'<>`]+))""", re.I)
+_NAV_SRCSET = re.compile(r"""(\ssrcset\s*=\s*)(?:"([^"]*)"|'([^']*)')""", re.I)
+_NAV_STYLE_ATTR = re.compile(r"""(\sstyle\s*=\s*)(?:"([^"]*)"|'([^']*)')""", re.I)
+_NAV_STYLE_BLOCO = re.compile(r"(<style\b[^>]*>)(.*?)(</style>)", re.I | re.S)
+_NAV_CSS_URL = re.compile(r"""url\(\s*(?:"([^"]*)"|'([^']*)'|([^)\s'"]*))\s*\)""", re.I)
+_NAV_CSS_IMPORT = re.compile(r"""@import\s+(?:url\()?\s*(?:"([^"]*)"|'([^']*)')""", re.I)
+_NAV_BASE = re.compile(r"""<base\b[^>]*\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`]+))""", re.I)
+_NAV_META_REFRESH = re.compile(
+    r"""(<meta\b[^>]*?http-equiv\s*=\s*["']?refresh["']?[^>]*?content\s*=\s*["'][^"';]*;\s*url\s*=\s*)([^"'>]+)""", re.I)
+
+
+def _reescrever_css(css: str, base: str) -> str:
+    def u(m):
+        novo = _proxiar(base, m.group(1) or m.group(2) or m.group(3) or "")
+        return f'url("{novo}")' if novo else m.group(0)
+
+    def imp(m):
+        novo = _proxiar(base, m.group(1) or m.group(2) or "")
+        return f'@import "{novo}"' if novo else m.group(0)
+
+    return _NAV_CSS_URL.sub(u, _NAV_CSS_IMPORT.sub(imp, css))
+
+
+def _reescrever_html(pagina: str, base_url: str, com_barra: bool) -> str:
+    base = base_url
+    achado = _NAV_BASE.search(pagina)
+    if achado:
+        href = achado.group(1) or achado.group(2) or achado.group(3) or ""
+        with contextlib.suppress(ValueError):
+            base = urllib.parse.urljoin(base_url, href)
+    pagina = _NAV_BASE.sub("", pagina)   # a navegação passa a ser toda absoluta; a <base> original atrapalharia
+
+    def attr(m):
+        valor = m.group(2) if m.group(2) is not None else m.group(3) if m.group(3) is not None else m.group(4)
+        novo = _proxiar(base, valor or "")
+        return f'{m.group(1)}"{html.escape(novo, quote=True)}"' if novo else m.group(0)
+
+    def srcset(m):
+        lista = m.group(2) if m.group(2) is not None else (m.group(3) or "")
+        saida = []
+        for item in lista.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            pedacos = item.split(None, 1)
+            novo = _proxiar(base, pedacos[0])
+            saida.append((novo + (" " + pedacos[1] if len(pedacos) > 1 else "")) if novo else item)
+        return f'{m.group(1)}"{html.escape(", ".join(saida), quote=True)}"'
+
+    def style_attr(m):
+        css = m.group(2) if m.group(2) is not None else (m.group(3) or "")
+        return f'{m.group(1)}"{html.escape(_reescrever_css(css, base), quote=True)}"'
+
+    def style_bloco(m):
+        return m.group(1) + _reescrever_css(m.group(2), base) + m.group(3)
+
+    def meta_refresh(m):
+        novo = _proxiar(base, m.group(2).strip().strip("'\""))
+        return m.group(1) + html.escape(novo, quote=True) if novo else m.group(0)
+
+    pagina = _NAV_STYLE_BLOCO.sub(style_bloco, pagina)
+    pagina = _NAV_STYLE_ATTR.sub(style_attr, pagina)
+    pagina = _NAV_SRCSET.sub(srcset, pagina)
+    pagina = _NAV_ATTR.sub(attr, pagina)
+    pagina = _NAV_META_REFRESH.sub(meta_refresh, pagina)
+    if com_barra:
+        barra = _BARRA_NAVEGADOR.replace("__URL__", html.escape(base, quote=True)).replace(
+            "__RECARREGAR__", html.escape("/r/" + _b64_url(base), quote=True))
+        if re.search(r"<body\b[^>]*>", pagina, re.I):
+            pagina = re.sub(r"(<body\b[^>]*>)", lambda m: m.group(1) + barra, pagina, count=1, flags=re.I)
+        else:
+            pagina = barra + pagina
+    return pagina
+
+
+_BARRA_NAVEGADOR = (
+    '<div style="position:fixed;top:0;left:0;right:0;z-index:2147483647;display:flex;gap:6px;align-items:center;'
+    'background:#0d0d0d;border-bottom:1px solid #333;padding:6px 8px;font:14px system-ui,-apple-system,sans-serif;'
+    'box-shadow:0 1px 6px #0008;box-sizing:border-box">'
+    '<a href="/" title="Início" style="color:#6cf;text-decoration:none;font-size:20px;line-height:1">&#8962;</a>'
+    '<form action="/ir" method="get" style="flex:1;display:flex;margin:0">'
+    '<input name="q" value="__URL__" spellcheck="false" autocapitalize="off" autocomplete="off" '
+    'style="flex:1;min-width:0;padding:7px 10px;border-radius:9px;border:1px solid #444;background:#1c1c1c;'
+    'color:#eee;font-size:14px"></form>'
+    '<a href="__RECARREGAR__" title="Recarregar" style="color:#6cf;text-decoration:none;font-size:18px;'
+    'line-height:1">&#8635;</a></div><div style="height:48px"></div>')
+
+
+# ── Páginas próprias do navegador (início e erro) ─────────────────────
+
+def _pagina_inicio_navegador() -> bytes:
+    return ("""<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">
+<title>Navegador pelo celular</title><style>
+*{box-sizing:border-box}html,body{margin:0;height:100%}
+body{background:#0e0f13;color:#e8e8e8;font-family:system-ui,-apple-system,sans-serif;display:flex;
+ flex-direction:column;align-items:center;justify-content:center;padding:24px;text-align:center}
+h1{font-size:1.5em;margin:.2em 0}p{opacity:.75;margin:.3em 0 1.4em;max-width:460px;line-height:1.5}
+form{display:flex;width:100%;max-width:520px;gap:8px}
+input{flex:1;min-width:0;padding:14px 16px;border-radius:12px;border:1px solid #333;background:#181a20;
+ color:#fff;font-size:16px}
+button{padding:0 20px;border:0;border-radius:12px;background:#2a6df0;color:#fff;font-size:16px;cursor:pointer}
+.atalhos{margin-top:18px;display:flex;flex-wrap:wrap;gap:8px;justify-content:center}
+.atalhos a{color:#8bf;text-decoration:none;border:1px solid #333;border-radius:20px;padding:6px 14px;font-size:14px}
+.rodape{margin-top:26px;font-size:12px;opacity:.5;max-width:460px;line-height:1.5}
+</style></head><body>
+<h1>&#127760; Navegador pelo celular</h1>
+<p>Digite um endereço ou uma busca. Quem carrega a página &#233; o celular, pela conex&#227;o dele.</p>
+<form action="/ir" method="get" autocomplete="off">
+ <input name="q" placeholder="site.com ou o que voc&#234; quer pesquisar" autofocus spellcheck="false"
+  autocapitalize="off">
+ <button type="submit">Ir</button></form>
+<div class="atalhos">
+ <a href="/ir?q=https://pt.wikipedia.org">Wikip&#233;dia</a>
+ <a href="/ir?q=https://lite.cnn.com">Not&#237;cias</a>
+ <a href="/ir?q=https://html.duckduckgo.com/html/">Buscar</a>
+ <a href="/ir?q=https://www.google.com">Google</a></div>
+<p class="rodape">Bom para pesquisar, ler not&#237;cias e textos. Sites que dependem muito de JavaScript
+ (apps, redes sociais, v&#237;deos) podem abrir mal. Os sites veem o IP do celular.</p>
+</body></html>""").encode("utf-8")
+
+
+def _pagina_erro_navegador(mensagem: str, alvo: str = "") -> bytes:
+    onde = f'<p class="alvo">{html.escape(alvo)}</p>' if alvo else ""
+    return (f"""<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Não deu</title><style>
+html,body{{margin:0;height:100%}}body{{background:#0e0f13;color:#e8e8e8;font-family:system-ui,sans-serif;
+ display:flex;flex-direction:column;align-items:center;justify-content:center;padding:24px;text-align:center}}
+h1{{font-size:1.3em}}p{{opacity:.8;max-width:460px;line-height:1.5}}.alvo{{opacity:.5;font-size:13px;word-break:break-all}}
+a{{color:#8bf;text-decoration:none;border:1px solid #333;border-radius:20px;padding:8px 18px;margin-top:14px}}
+</style></head><body><h1>&#128533; {html.escape(mensagem)}</h1>{onde}
+<a href="/">&#8962; Voltar ao in&#237;cio</a></body></html>""").encode("utf-8")
+
+
+class _HandlerNavegador(BaseHTTPRequestHandler):
+    server_version = "TermuxToons"
+    token = ""
+    com_barra = True
+    opener: urllib.request.OpenerDirector | None = None
+
+    def log_message(self, formato, *args):
+        pass
+
+    def _consulta(self) -> dict:
+        return urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+
+    def _tem_token_valido(self, valor: str) -> bool:
+        return bool(self.token) and bool(valor) and hmac.compare_digest(valor.encode(), self.token.encode())
+
+    def _autorizar(self) -> tuple:
+        """(autorizado, veio_pelo_link). O link secreto traz ?t=...; depois disso um cookie mantém o acesso."""
+        if self._tem_token_valido((self._consulta().get("t") or [""])[0]):
+            return True, True
+        bisc = http.cookies.SimpleCookie(self.headers.get("Cookie", "")).get("navtk")
+        return (bool(bisc) and self._tem_token_valido(bisc.value)), False
+
+    def _responder(self, codigo: int, corpo: bytes = b"", tipo: str = "text/html; charset=utf-8",
+                   extra: dict | None = None, cookie: bool = False) -> None:
+        self.send_response(codigo)
+        self.send_header("Content-Type", tipo)
+        self.send_header("Content-Length", str(len(corpo)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if cookie and self.token:
+            self.send_header("Set-Cookie", f"navtk={self.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800")
+        for chave, valor in (extra or {}).items():
+            self.send_header(chave, valor)
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(corpo)
+
+    def do_GET(self):
+        self._tratar()
+
+    do_POST = do_HEAD = do_GET
+
+    def _tratar(self):
+        caminho = urllib.parse.urlsplit(self.path).path
+        if caminho == "/favicon.ico":
+            self._responder(204, b"", "image/x-icon")
+            return
+        autorizado, pelo_link = self._autorizar()
+        if not autorizado:
+            self._responder(403, _pagina_erro_navegador("Link inválido. Peça o link do navegador para quem o criou."))
+            return
+        try:
+            if caminho == "/":
+                self._responder(200, _pagina_inicio_navegador(), cookie=pelo_link)
+            elif caminho == "/ir":
+                self._ir(pelo_link)
+            elif caminho == "/sair":
+                self._responder(200, _pagina_erro_navegador("Pronto."),
+                                extra={"Set-Cookie": "navtk=; Path=/; Max-Age=0"})
+            elif caminho.startswith("/r/"):
+                self._navegar(caminho[3:], pelo_link)
+            else:
+                self._responder(404, _pagina_erro_navegador("Página não encontrada."))
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:  # noqa: BLE001 — um erro numa página nunca pode derrubar o navegador
+            log(f"Navegador: erro inesperado ({e!r})")
+            with contextlib.suppress(OSError):
+                self._responder(500, _pagina_erro_navegador("Algo deu errado ao abrir a página."))
+
+    def _ir(self, cookie: bool) -> None:
+        termo = (self._consulta().get("q") or [""])[0].strip()
+        if not termo:
+            self._responder(303, b"", extra={"Location": "/"}, cookie=cookie)
+            return
+        if re.match(r"[a-z][a-z0-9+.\-]*://", termo, re.I):
+            url = termo
+        elif " " not in termo and re.search(r"\.[a-z]{2,}$", termo.split("/")[0], re.I):
+            url = "https://" + termo
+        else:
+            url = url_com(NAV_BUSCA, q=termo)
+        self._responder(303, b"", extra={"Location": "/r/" + _b64_url(url)}, cookie=cookie)
+
+    def _navegar(self, cod: str, cookie: bool) -> None:
+        try:
+            alvo = _de_b64_url(cod)
+        except (ValueError, UnicodeDecodeError):
+            self._responder(400, _pagina_erro_navegador("Endereço inválido."))
+            return
+        extra = [(k, v) for k, v in urllib.parse.parse_qsl(urllib.parse.urlsplit(self.path).query) if k != "t"]
+        if extra:  # veio de um formulário GET: o navegador troca a query do endereço pelos campos preenchidos
+            partes = urllib.parse.urlsplit(alvo)
+            alvo = urllib.parse.urlunsplit((partes.scheme, partes.netloc, partes.path,
+                                            urllib.parse.urlencode(extra), ""))
+        corpo = tipo_corpo = None
+        if self.command == "POST":
+            tamanho = int(self.headers.get("Content-Length") or 0)
+            corpo = self.rfile.read(min(tamanho, NAV_MAX_CORPO)) if tamanho else b""
+            tipo_corpo = self.headers.get("Content-Type")
+        try:
+            resposta = _buscar_site(self.opener, alvo, self.command if self.command != "HEAD" else "GET",
+                                    corpo, tipo_corpo, self.headers.get("Accept-Language") or "")
+        except urllib.error.HTTPError as e:
+            resposta = e   # a própria página de erro do site; reescrevemos e mostramos
+        except urllib.error.URLError as e:
+            motivo = e.reason
+            if isinstance(motivo, PermissionError):
+                self._responder(403, _pagina_erro_navegador(
+                    "Esse endereço aponta para a rede local ou para o próprio celular; o navegador não abre esses.", alvo))
+            else:
+                self._responder(502, _pagina_erro_navegador(f"Não consegui abrir o site: {motivo}", alvo))
+            return
+        except (OSError, http.client.HTTPException, ValueError) as e:
+            self._responder(502, _pagina_erro_navegador(f"Não consegui abrir o site: {e}", alvo))
+            return
+        with contextlib.closing(resposta):
+            self._entregar(resposta, cookie)
+
+    def _entregar(self, resposta, cookie: bool) -> None:
+        final = resposta.geturl() or ""
+        status = getattr(resposta, "status", None) or 200
+        cabecalhos = resposta.headers
+        ctype = cabecalhos.get("Content-Type", "")
+        base_tipo = ctype.split(";")[0].strip().lower()
+        if base_tipo.startswith(NAV_TIPOS_TEXTO):
+            bruto = resposta.read(NAV_MAX_REESCREVER + 1)
+            if len(bruto) <= NAV_MAX_REESCREVER:
+                dados = _descomprimir(bruto, cabecalhos.get("Content-Encoding"))
+                texto = dados.decode(_charset_da_pagina(ctype, dados), "replace")
+                if base_tipo == "text/css":
+                    saida = _reescrever_css(texto, final)
+                    tipo = "text/css; charset=utf-8"
+                else:
+                    saida = _reescrever_html(texto, final, self.com_barra)
+                    tipo = "text/html; charset=utf-8"
+                self._responder(status if 200 <= status < 600 else 200, saida.encode("utf-8", "replace"),
+                                tipo, cookie=cookie)
+                return
+            # grande demais para reescrever: entrega como veio (começando pelo que já foi lido)
+            self._fluxo(status, cabecalhos, resposta, cookie, prefixo=bruto)
+            return
+        self._fluxo(status, cabecalhos, resposta, cookie)
+
+    def _fluxo(self, status: int, cabecalhos, resposta, cookie: bool, prefixo: bytes = b"") -> None:
+        """Repassa um conteúdo que não é página (imagem, vídeo, fonte, script...) sem mexer, em blocos."""
+        self.send_response(status if 200 <= status < 600 else 200)
+        passar = ("Content-Type", "Content-Encoding", "Content-Length", "Content-Disposition", "Content-Range",
+                  "Accept-Ranges", "Last-Modified", "ETag", "Expires", "Age")
+        enviou_tamanho = False
+        for chave in passar:
+            valor = cabecalhos.get(chave)
+            if valor and chave.lower() not in NAV_CORTAR_RESP:
+                self.send_header(chave, valor)
+                enviou_tamanho = enviou_tamanho or chave == "Content-Length"
+        if not enviou_tamanho and prefixo:
+            pass  # sem Content-Length: a conexão fecha no fim (HTTP/1.0), o navegador entende
+        self.send_header("Cache-Control", cabecalhos.get("Cache-Control", "no-store"))
+        if cookie and self.token:
+            self.send_header("Set-Cookie", f"navtk={self.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800")
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        with contextlib.suppress(OSError):
+            if prefixo:
+                self.wfile.write(prefixo)
+            while True:
+                bloco = resposta.read(NAV_BLOCO)
+                if not bloco:
+                    break
+                self.wfile.write(bloco)
+
+
+def _saida_navegador() -> tuple | None:
+    """(host, porta) do SOCKS por onde o navegador sai (túnel SSH ou Tor), ou None (direto)."""
+    c = cfg()
+    if c.get("navegador_saida") == "ssh":
+        return "127.0.0.1", int(c.get("ssh_ponte_socks", 1080))
+    if c.get("navegador_saida") == "tor":
+        return "127.0.0.1", PORTA_TOR
+    return None
+
+
+def servir_navegador(porta: int) -> None:
+    """Servidor do navegador pelo celular (roda dentro do tmux)."""
+    c = cfg()
+    if not c.get("navegador_token"):
+        raise ToonsError("Crie o navegador pelo menu primeiro (ele gera o link secreto).")
+    saida = _saida_navegador()
+    _ConexaoNav.saida = _ConexaoNavTLS.saida = saida
+    _HandlerNavegador.opener = _abridor_navegador(http.cookiejar.CookieJar())
+    _HandlerNavegador.token = c["navegador_token"]
+    _HandlerNavegador.com_barra = bool(c.get("navegador_barra", True))
+    with ThreadingHTTPServer(("0.0.0.0", porta), _HandlerNavegador) as servidor:
+        log(f"Navegador pelo celular em http://{ip_local()}:{porta}"
+            + (f" · saindo {_nome_saida(c.get('navegador_saida'))}" if saida else "")
+            + "  (Ctrl+C para parar)")
+        servidor.serve_forever()
+
+
+# ── Menu do navegador pelo celular ───────────────────────────────────
+
+def links_do_navegador() -> list:
+    c = cfg()
+    links = [("Mesma rede Wi-Fi", f"http://{ip_local()}:{c['navegador_porta']}/?t={c['navegador_token']}")]
+    fixo = endereco_fixo(c["navegador_porta"]) or host_fixo(c["navegador_porta"])
+    if fixo:
+        links.append(("Endereço fixo", f"{fixo}/?t={c['navegador_token']}"))
+    if servico_ativo("tunel-navegador") and url_tunel("tunel-navegador"):
+        links.append(("Internet (de qualquer lugar)", f"{url_tunel('tunel-navegador')}/?t={c['navegador_token']}"))
+    return links
+
+
+def mostrar_links_navegador(oferecer_acoes: bool = True) -> None:
+    if not servico_ativo(SERVICO_NAVEGADOR):
+        info("O navegador está parado.")
+        return
+    links = links_do_navegador()
+    print(f"\n{NEG}🌐 Navegador pelo celular{RST} {DIM}(abra o link e navegue; os sites são carregados pelo celular){RST}")
+    for onde, link in links:
+        print(f"  {CIANO}{onde}:{RST}\n  {NEG}{link}{RST}")
+    if len(links) == 1:
+        print(f"  {DIM}Para abrir fora do seu Wi-Fi, ligue o navegador escolhendo 'qualquer lugar'.{RST}")
+    if not oferecer_acoes:
+        return
+    link = links[-1][1]
+    i = escolher("E agora?", ["Copiar o link", "Mostrar QR code", "Enviar (WhatsApp, Telegram...)",
+                              "Abrir aqui para testar", "Nada"])
+    if i == 0:
+        copiar_texto(link)
+    elif i == 1:
+        mostrar_qr(link, "navegador")
+    elif i == 2 and tem("termux-share"):
+        _tapi(["termux-share", "-a", "send"], 30, entrada=f"🌐 Navegue pela internet do meu celular:\n{link}",
+              json_saida=False)
+    elif i == 3:
+        abrir_link(links[0][1])
+
+
+def _reiniciar_navegador() -> None:
+    c = cfg()
+    if servico_ativo(SERVICO_NAVEGADOR):
+        parar_servico(SERVICO_NAVEGADOR)
+        time.sleep(1)
+        iniciar_servico(SERVICO_NAVEGADOR, cmd_self(SERVICO_NAVEGADOR, "--porta", str(c["navegador_porta"])),
+                        reiniciar=True)
+
+
+def ligar_navegador() -> None:
+    c = cfg()
+    if servico_ativo(SERVICO_NAVEGADOR):
+        info("O navegador já está ligado.")
+        mostrar_links_navegador()
+        return
+    j = escolher("Quem vai usar o navegador?",
+                 ["Só eu ou alguém na mesma rede Wi-Fi", "Qualquer lugar (internet, pelo túnel)"])
+    if j is None:
+        return
+    aviso("Quem tiver o link navega pela conexão do seu celular (dados móveis, Wi-Fi...). Os sites veem o IP do "
+          "celular, e o gasto de dados é seu. Guarde o link; ele é a senha.")
+    if not c.get("navegador_token"):
+        c["navegador_token"] = secrets.token_urlsafe(18)
+    salvar_cfg()
+    if not porta_livre(c["navegador_porta"], espera=2):
+        raise ToonsError(f"A porta {c['navegador_porta']} está em uso por outro programa. Troque no menu.")
+    saida = c.get("navegador_saida")
+    servico_saida = {"ssh": SERVICO_PONTE_SSH, "tor": SERVICO_TOR}.get(saida or "")
+    if servico_saida and not servico_ativo(servico_saida):
+        aviso(f"A saída escolhida ({_nome_saida(saida)}) está desligada: os sites só abrem depois de ligá-la "
+              "(ou mude a saída para 'direto').")
+    if not iniciar_servico(SERVICO_NAVEGADOR, cmd_self(SERVICO_NAVEGADOR, "--porta", str(c["navegador_porta"])),
+                           reiniciar=True):
+        return
+    if j == 1:
+        abrir_tunel("tunel-navegador", c["navegador_porta"])
+    elif servico_ativo("tunel-navegador"):
+        parar_servico("tunel-navegador")
+    mostrar_links_navegador()
+
+
+def parar_navegador() -> None:
+    parar_servico("tunel-navegador")
+    parar_servico(SERVICO_NAVEGADOR)
+
+
+def novo_link_navegador() -> None:
+    c = cfg()
+    c["navegador_token"] = secrets.token_urlsafe(18)
+    salvar_cfg()
+    ok("Link novo criado: o antigo parou de funcionar.")
+    _reiniciar_navegador()
+    if servico_ativo(SERVICO_NAVEGADOR):
+        mostrar_links_navegador()
+
+
+def usar_saida_no_navegador(chave: str | None) -> None:
+    c = cfg()
+    servico = {"ssh": SERVICO_PONTE_SSH, "tor": SERVICO_TOR}.get(chave or "")
+    if servico and not servico_ativo(servico):
+        if not confirmar(f"O {'túnel SSH' if chave == 'ssh' else 'Tor'} está desligado. Ligar agora?", True):
+            return
+        if not (ligar_ponte_ssh() if chave == "ssh" else ligar_tor()):
+            return
+    c["navegador_saida"] = chave or ""
+    salvar_cfg()
+    ok(f"Navegador saindo {_nome_saida(chave)}.")
+    _reiniciar_navegador()
+
+
+@submenu
+def menu_navegador_web():
+    c = cfg()
+
+    def mudar_porta():
+        c["navegador_porta"] = perguntar_int("Porta do navegador", c["navegador_porta"], 1024, 65535)
+        salvar_cfg()
+        ok(f"Porta {c['navegador_porta']}.")
+        _reiniciar_navegador()
+
+    def mudar_saida():
+        opcoes = [(None, "Direto pela conexão do celular"), ("ssh", "Pelo túnel SSH (o seu servidor)"),
+                  ("tor", "Pelo Tor (anônimo, mais lento)")]
+        i = escolher("Por onde o navegador abre os sites?", [t for _, t in opcoes])
+        if i is not None:
+            usar_saida_no_navegador(opcoes[i][0])
+
+    def alternar_barra():
+        c["navegador_barra"] = not c.get("navegador_barra", True)
+        salvar_cfg()
+        ok(f"Barra de endereço no topo das páginas {'ligada' if c['navegador_barra'] else 'desligada'}.")
+        _reiniciar_navegador()
+
+    def como_funciona():
+        _explicar([
+            "O navegador é uma página web que mora no celular. Quem abre o link digita um endereço ou uma busca; "
+            "o celular baixa o site pela conexão dele e devolve a página pronta. Para o site, quem acessou foi o "
+            "celular (é o IP dele que aparece).",
+            "Abre em qualquer aparelho (celular, PC, TV, tablet) sem instalar nem configurar nada: é só abrir o "
+            "link. Serve para pesquisar, ler notícias, Wikipédia, abrir um site bloqueado na outra rede...",
+            "Como ele reescreve as páginas, sites muito dependentes de JavaScript (apps, redes sociais, players de "
+            "vídeo, login em muitos serviços) podem abrir mal ou não abrir. Para navegar 'de verdade' no PC, use o "
+            "Proxy; para ver a sua própria tela, a Transmissão da tela.",
+            "A saída pode ser direto, pelo túnel SSH (sai pelo seu servidor) ou pelo Tor (esconde o IP). Com senha "
+            "no link (o ?t=...), só quem tem o link abre; o endereço fixo e o túnel da Cloudflare dão um link que "
+            "funciona pela internet.",
+        ])
+
+    def cabecalho():
+        if servico_ativo(SERVICO_NAVEGADOR):
+            onde = ", ".join(link for _, link in links_do_navegador()[:1])
+            print(f"{DIM}Ligado · {onde} · saída {_nome_saida(c.get('navegador_saida'))}{RST}")
+        else:
+            print(f"{DIM}Desligado.{RST}")
+
+    menu("🌐 Navegador pelo celular (abrir sites pela conexão dele)", [
+        ("Como funciona", como_funciona),
+        (lambda: "Ligar o navegador" + (" (ligado)" if servico_ativo(SERVICO_NAVEGADOR) else ""), ligar_navegador),
+        (lambda: f"Mostrar o link ({'no ar' if servico_ativo(SERVICO_NAVEGADOR) else 'parado'})",
+         mostrar_links_navegador),
+        ("Gerar link novo (o antigo para de funcionar)", novo_link_navegador),
+        ("Desligar (e fechar o túnel)", parar_navegador),
+        (lambda: f"Saída: {_nome_saida(c.get('navegador_saida'))} (ou pelo túnel SSH / Tor)", mudar_saida),
+        (lambda: f"Barra de endereço no topo ({'ligada' if c.get('navegador_barra', True) else 'desligada'})",
+         alternar_barra),
+        (lambda: f"Porta ({c['navegador_porta']})", mudar_porta),
+        ("Status e log", lambda: status_servico(SERVICO_NAVEGADOR)),
+    ], cabecalho=cabecalho)
+
+
+
+# ════════════════════════════════════════════════════════════════════
 #  Pontes de conexão: túnel SSH, Tor, Smart DNS, proxy, links públicos e redes privadas
 # ════════════════════════════════════════════════════════════════════
 # Cada ponte tem a sua janela. As que publicam algo do celular na internet (Cloudflare, ngrok, localtunnel,
@@ -5537,6 +6273,8 @@ def menu_pontes():
         (lambda: "🧅 Tor: anonimato passando por vários nós (mais lento)" + _estado(SERVICO_TOR), menu_ponte_tor),
         ("🌎 Smart DNS: trocar só o DNS para parecer outra região", menu_ponte_dns),
         (lambda: "🧭 Proxy: a internet do celular no PC ou Chromebook" + _estado(SERVICO_PROXY), menu_proxy),
+        (lambda: "🌐 Navegador pelo celular: abrir sites num link, pela conexão dele" + _estado(SERVICO_NAVEGADOR),
+         menu_navegador_web),
         (lambda: "☁️ Cloudflare Tunnel: link público grátis para algo do celular" + _estado("ponte-cloudflare"),
          menu_ponte_cloudflare),
         (lambda: "🔗 ngrok: link público para algo do celular (conta grátis)" + _estado("ponte-ngrok"), menu_ponte_ngrok),
@@ -5551,6 +6289,7 @@ def menu_pontes():
         "Esconde o seu IP passando por 3 voluntários. Lento. Também publica sites como .onion.",
         "Só troca o DNS para alguns streamings acharem que você está em outro país. Não criptografa.",
         "O PC ou Chromebook navega pela internet do celular (roteador, cabo USB ou mesmo Wi-Fi).",
+        "Uma página web no celular: digite um endereço e o celular carrega o site e devolve pronto. Sem configurar.",
         "Expõe uma porta do celular num link https, sem abrir portas. Endereço fixo com o seu domínio.",
         "Expõe uma porta do celular num link https. Precisa de conta grátis no ngrok.com.",
         "Expõe uma porta do celular num link https://….loca.lt. Usa o Node.js.",
@@ -5562,7 +6301,8 @@ def menu_pontes():
 
     def cabecalho():
         ligadas = [nome for nome, servico in (("túnel SSH", SERVICO_PONTE_SSH), ("Tor", SERVICO_TOR),
-                                              ("proxy", SERVICO_PROXY), *((n, s) for n, s, _ in PONTES_PUBLICAS.values()))
+                                              ("proxy", SERVICO_PROXY), ("navegador", SERVICO_NAVEGADOR),
+                                              *((n, s) for n, s, _ in PONTES_PUBLICAS.values()))
                    if servico_ativo(servico)]
         print(f"{DIM}Ligadas agora: {', '.join(ligadas) if ligadas else 'nenhuma'}{RST}")
 
@@ -22035,6 +22775,8 @@ def menu_internet():
         ("⬇️ Gerenciador de downloads (links, magnet, torrent)", menu_downloads),
         ("💬 Chat na rede local (sem internet)", menu_chat),
         ("🌉 Pontes de conexão (proxy, túnel SSH, Tor, ngrok, Cloudflare, Tailscale...)", menu_pontes),
+        (lambda: "🌐 Navegador pelo celular (abrir sites num link, pela conexão dele)" + _estado(SERVICO_NAVEGADOR),
+         menu_navegador_web),
         ("🦊 Navegador no terminal (Browsh e w3m)", menu_navegador),
         ("🔗 Encurtador de links e pastebin", menu_links),
     ])
@@ -27359,6 +28101,8 @@ def main(argv=None) -> int:
     p.add_argument("--qualidade", choices=list(QUALIDADES_VIDEO), help="padrão: a última escolhida no menu")
     p = sub.add_parser(SERVICO_PROXY, help="proxy HTTP e SOCKS5 para usar a internet do celular no PC (primeiro plano)")
     p.add_argument("--porta", type=int)
+    p = sub.add_parser(SERVICO_NAVEGADOR, help="navegador pelo celular: abre sites pela conexão dele (primeiro plano)")
+    p.add_argument("--porta", type=int)
     sub.add_parser(SERVICO_TUNEL_FIXO, help="túnel da Cloudflare com endereço fixo (token do painel) em primeiro plano")
     p = sub.add_parser(SERVICO_REDUZIR, help="cópia de um vídeo (arquivo ou link) numa resolução menor")
     p.add_argument("fonte")
@@ -27448,6 +28192,8 @@ def main(argv=None) -> int:
                 raise ToonsError(f"{falhas} download(s) falharam.")
         elif args.comando == SERVICO_PROXY:
             servir_proxy(args.porta or cfg()["proxy_porta"])
+        elif args.comando == SERVICO_NAVEGADOR:
+            servir_navegador(args.porta or cfg()["navegador_porta"])
         elif args.comando == SERVICO_TUNEL_FIXO:
             rodar_tunel_fixo()
         elif args.comando == SERVICO_REDUZIR:
