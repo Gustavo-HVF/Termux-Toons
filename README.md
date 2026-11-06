@@ -247,6 +247,23 @@ endereço ou uma busca, e o celular baixa o site pela conexão dele e devolve a 
   e formulários também passam pelo celular. Caminhos como `/api/...` são levados para o site certo.
 - **Endereços legíveis**: `/p/https/pt.wikipedia.org/wiki/Brasil`. Links relativos, redirecionamentos e listas de
   vídeo HLS (`.m3u8`) e DASH (`.mpd`) funcionam sozinhos. Os links antigos (`/r/...`) continuam valendo.
+- **Cookies para o JavaScript dos sites**: os cookies ficam no celular, mas o navegador do visitante recebe uma
+  cópia dos que o JavaScript pode ler (como o `csrftoken` do Instagram), presa ao caminho do site e com o nome
+  marcado (`tt~site~nome`). A página só vê os do próprio site, os cookies `HttpOnly` nunca saem do celular, e o que
+  o JavaScript grava (`document.cookie = ...`) volta para o celular e segue nos pedidos seguintes.
+- **Vídeos de TikTok, Instagram, Facebook, YouTube, X e outros**: essas páginas costumam quebrar quando abertas
+  pelo navegador (veja abaixo), mas o vídeo delas o celular acha com o **yt-dlp**. Abrir um link de vídeo desses
+  sites (pela busca, por um link na página ou colando no cartão do VLC Web) mostra "Procurando o vídeo…" e abre
+  o VLC Web tocando, ainda pela conexão do celular, com os cabeçalhos e cookies que o site exige para entregar o
+  vídeo. *Abrir a página mesmo assim* mostra a página. Se o site pedir login, entre na conta pelo navegador: os
+  cookies do visitante vão junto para o yt-dlp. Precisa do yt-dlp instalado (menu **▶ VLC Web → Instalar o yt-dlp**).
+
+#### Por que TikTok, Instagram e Facebook abrem mal
+
+Esses sites são aplicativos inteiros em JavaScript: conferem se estão no próprio endereço, usam WebSocket e
+detectam robôs pela "impressão digital" da conexão segura (a do Python não é a de um navegador). Por isso o
+navegador leva direto ao vídeo, pelo yt-dlp. Para usar essas redes por completo pela internet do celular, use o
+**Proxy** (*Pontes de conexão → Proxy*): o navegador de verdade do PC faz tudo e só a conexão passa pelo celular.
 
 ### ▶ VLC Web
 
@@ -256,7 +273,9 @@ AVI, AC-3...). O navegador pelo celular **baixa o VLC Web do GitHub** (cerca de 
 serve no mesmo link, em `/vlc/`.
 
 - O botão laranja **▶ VLC** da barra conta os vídeos e músicas achados na página (`<video>`, `<audio>`, links para
-  arquivos de mídia e listas `.m3u8`/`.mpd` pedidas pelos players em JavaScript). Um toque e eles abrem no VLC Web.
+  arquivos de mídia, listas `.m3u8`/`.mpd` pedidas pelos players em JavaScript e links para páginas de vídeo do
+  TikTok, YouTube, Instagram...). Um toque e eles abrem no VLC Web. *Procurar o vídeo desta página (yt-dlp)* tenta
+  qualquer outra página. Colar no cartão do VLC Web o link de uma página (e não do arquivo) também usa o yt-dlp.
 - Abrir um link de vídeo direto mostra uma página com **Assistir no VLC Web**, **Tocar aqui**, **Baixar** e
   **Copiar o link**.
 - O vídeo **continua vindo pela conexão do celular**, com avanço por Range, por links `/m/...` assinados (valem

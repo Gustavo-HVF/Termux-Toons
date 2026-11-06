@@ -4908,15 +4908,17 @@ _NAV_SESSOES: dict = {}
 _NAV_SESSOES_LOCK = threading.Lock()
 
 
-def _sessao_navegador(sid: str) -> urllib.request.OpenerDirector:
+def _sessao_navegador(sid: str) -> tuple:
+    """(abridor, cookies) do visitante."""
     with _NAV_SESSOES_LOCK:
         sessao = _NAV_SESSOES.get(sid)
         if sessao is None:
             if len(_NAV_SESSOES) >= NAV_MAX_SESSOES:
                 del _NAV_SESSOES[min(_NAV_SESSOES, key=lambda k: _NAV_SESSOES[k][1])]
-            sessao = _NAV_SESSOES[sid] = [_abridor_navegador(http.cookiejar.CookieJar()), 0.0]
+            jar = http.cookiejar.CookieJar()
+            sessao = _NAV_SESSOES[sid] = [_abridor_navegador(jar), 0.0, jar]
         sessao[1] = time.time()
-        return sessao[0]
+        return sessao[0], sessao[2]
 
 
 def _esquecer_sessao_navegador(sid: str) -> None:
@@ -4931,9 +4933,9 @@ def _assinatura_midia(token: str, esquema: str, netloc: str) -> str:
     return hmac.new(token.encode(), f"{esquema}://{netloc.lower()}".encode(), hashlib.sha256).hexdigest()[:20]
 
 
-def _nav_link(url: str, assinar_com: str | None = None) -> str | None:
-    """https://site/caminho?x → /p/https/site/caminho?x (ou /m/<assinatura>/https/site/... com assinar_com).
-    Devolve None para o que não é http(s)."""
+def _nav_link(url: str, assinar_com: str | None = None, prefixo: str | None = None) -> str | None:
+    """https://site/caminho?x → /p/https/site/caminho?x (ou /m/<assinatura>/https/site/... com assinar_com, ou
+    <prefixo>https/site/... para os vídeos achados pelo yt-dlp). Devolve None para o que não é http(s)."""
     try:
         partes = urllib.parse.urlsplit(url.strip())
     except (ValueError, AttributeError):
@@ -4945,14 +4947,15 @@ def _nav_link(url: str, assinar_com: str | None = None) -> str | None:
     caminho = partes.path or "/"
     if not caminho.startswith("/"):
         caminho = "/" + caminho
-    prefixo = f"/m/{_assinatura_midia(assinar_com, esquema, netloc)}/" if assinar_com else "/p/"
+    if not prefixo:
+        prefixo = f"/m/{_assinatura_midia(assinar_com, esquema, netloc)}/" if assinar_com else "/p/"
     return (f"{prefixo}{esquema}/{netloc}{caminho}" + (f"?{partes.query}" if partes.query else "")
             + (f"#{partes.fragment}" if partes.fragment else ""))
 
 
 def _nav_real(caminho: str, consulta: str = "") -> str | None:
-    """O contrário de _nav_link: /p/https/site/x (ou /m/<assinatura>/https/site/x) → https://site/x."""
-    achado = re.match(r"/(?:p|m/[0-9a-f]{8,64})/(https?)/([^/?#]+)(/[^?#]*)?$", caminho)
+    """O contrário de _nav_link: /p/https/site/x (ou /m/<assinatura>/..., /y/<id>/...) → https://site/x."""
+    achado = re.match(r"/(?:p|m/[0-9a-f]{8,64}|y/[\w-]{16,40})/(https?)/([^/?#]+)(/[^?#]*)?$", caminho)
     if not achado:
         return None
     return (f"{achado.group(1)}://{urllib.parse.unquote(achado.group(2))}{achado.group(3) or '/'}"
@@ -4962,7 +4965,7 @@ def _nav_real(caminho: str, consulta: str = "") -> str | None:
 def _url_real(texto: str) -> str | None:
     """Aceita um endereço real (https://...) ou um caminho do navegador (/p/..., /m/...) e devolve o real."""
     texto = (texto or "").strip()
-    if texto.startswith(("/p/", "/m/")):
+    if texto.startswith(("/p/", "/m/", "/y/")):
         partes = urllib.parse.urlsplit(texto)
         return _nav_real(partes.path, partes.query)
     if re.match(r"(?i)https?://[^/\s]", texto):
@@ -4993,7 +4996,7 @@ _NAV_ESQUEMAS_FORA = re.compile(
     r"(?i)(?:data|javascript|vbscript|mailto|tel|sms|blob|about|intent|magnet|geo|market|whatsapp|tg|file|chrome):")
 
 
-def _proxiar(base_url: str, alvo: str | None, assinar_com: str | None = None) -> str | None:
+def _proxiar(base_url: str, alvo: str | None, assinar_com: str | None = None, prefixo: str | None = None) -> str | None:
     """Transforma um link da página num link que passa pelo celular. Devolve None para o que deve ficar como
     está (âncoras, data:, javascript:, mailto:...)."""
     alvo = (alvo or "").strip()
@@ -5003,7 +5006,7 @@ def _proxiar(base_url: str, alvo: str | None, assinar_com: str | None = None) ->
         absoluto = urllib.parse.urljoin(base_url, alvo)
     except ValueError:
         return None
-    return _nav_link(absoluto, assinar_com)
+    return _nav_link(absoluto, assinar_com, prefixo)
 
 
 def _endereco_digitado(termo: str, motor: str = "ddg") -> str:
@@ -5290,6 +5293,261 @@ def _motivo_amigavel(erro_rede) -> str:
     return str(motivo) or "erro de rede."
 
 
+# ── Cookies dos sites para o JavaScript das páginas ──────────────────
+# Os cookies de verdade ficam no celular (um pote por visitante, com as regras de domínio). Muitos sites, porém,
+# leem cookies pelo JavaScript (o csrftoken do Instagram, o msToken do TikTok...) ou gravam cookies por ele. Por
+# isso o servidor manda uma CÓPIA dos cookies que o JavaScript pode ler (os que não são HttpOnly) para o
+# navegador do visitante, cada uma presa ao caminho do site (/p/https/site/) e com o nome marcado com o site
+# (tt~site~nome). O nav.js mostra ao JavaScript da página só as do site dela, sem a marca, e o que a página grava
+# volta para o pote do celular. Assim um site nunca vê os cookies de outro.
+
+NAV_COOKIES_NOSSOS = {"navtk", "navsid", "navsite"}
+NAV_COOKIE_MAX = 3800   # valores maiores não são copiados (o navegador recusaria a linha)
+
+
+def _chave_cookie(site: str) -> str:
+    """Marca dos cookies de um site no navegador do visitante: tt~www.site.com~ (igual à do nav.js)."""
+    return "tt~" + re.sub(r"[^a-z0-9.-]", "_", urllib.parse.unquote(site).lower()) + "~"
+
+
+def _cookie_http_only(cookie) -> bool:
+    return any(str(k).lower() == "httponly" for k in getattr(cookie, "_rest", {}) or {})
+
+
+def _cookies_aplicaveis(jar, url: str) -> list:
+    """Os cookies do pote que valem para o endereço (domínio, caminho, https, validade)."""
+    pedido = urllib.request.Request(url)
+    try:
+        with jar._cookies_lock:
+            jar._policy._now = jar._now = int(time.time())
+            return list(jar._cookies_for_request(pedido))
+    except (AttributeError, TypeError, ValueError):
+        return []
+
+
+def _nomes_set_cookie(cabecalhos) -> dict:
+    """{nome: caminho} dos cookies que a resposta do site gravou ou apagou."""
+    nomes = {}
+    for linha in (cabecalhos.get_all("Set-Cookie") or []) if hasattr(cabecalhos, "get_all") else []:
+        partes = linha.split(";")
+        nome = partes[0].split("=", 1)[0].strip()
+        caminho = next((p.split("=", 1)[1].strip() for p in partes[1:]
+                        if p.strip().lower().startswith("path=") and "=" in p), "/")
+        if nome:
+            nomes[nome] = caminho if caminho.startswith("/") else "/"
+    return nomes
+
+
+def _espelho_de_cookies(jar, url: str, esquema: str, site: str, mudados: dict, tudo: bool) -> list:
+    """Linhas Set-Cookie com a cópia dos cookies que o JavaScript do site pode ler. `tudo` (páginas) manda
+    todos os que valem para o endereço; senão, só os que esta resposta mudou."""
+    chave, base = _chave_cookie(site), f"/p/{esquema}/{site}"
+    legiveis = {c.name: c for c in _cookies_aplicaveis(jar, url) if not _cookie_http_only(c)}
+    nomes = set(legiveis) if tudo else set(mudados)
+    linhas = []
+    for nome in sorted(nomes)[:60]:
+        if not re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", nome):
+            continue
+        cookie = legiveis.get(nome)
+        if cookie is None:   # apagado, ou ficou HttpOnly: a cópia sai do navegador do visitante
+            linhas.append(f"{chave}{nome}=; Path={base}{mudados.get(nome, '/')}; Max-Age=0")
+            continue
+        valor = cookie.value or ""
+        if len(valor) > NAV_COOKIE_MAX or re.search(r"[;\r\n]", valor):
+            continue
+        caminho = cookie.path if (cookie.path or "").startswith("/") else "/"
+        validade = f"; Max-Age={max(0, min(int(cookie.expires - time.time()), 2592000))}" if cookie.expires else ""
+        linhas.append(f"{chave}{nome}={valor}; Path={base}{caminho}; SameSite=Lax{validade}")
+    return linhas
+
+
+def _cookies_do_visitante(cabecalho_cookie: str, site: str) -> list:
+    """[(nome, valor)] das cópias deste site que o navegador do visitante mandou (gravadas pelo JavaScript da
+    página ou copiadas pelo servidor), já sem a marca."""
+    chave, achados = _chave_cookie(site), []
+    for parte in (cabecalho_cookie or "").split(";"):
+        nome, igual, valor = parte.strip().partition("=")
+        if igual and nome.startswith(chave) and len(nome) > len(chave):
+            achados.append((nome[len(chave):], valor))
+    return achados
+
+
+def _mesclar_cookies(do_pote: str, do_visitante: list) -> str:
+    """Junta o cabeçalho Cookie do pote com as cópias do visitante (a do visitante vale: o JavaScript pode ter
+    acabado de mudar o valor)."""
+    juntos = {}
+    for parte in (do_pote or "").split(";"):
+        nome, igual, valor = parte.strip().partition("=")
+        if nome:
+            juntos[nome] = valor if igual else ""
+    for nome, valor in do_visitante:
+        juntos[nome] = valor
+    return "; ".join(f"{n}={v}" for n, v in juntos.items())
+
+
+class _RespostaCookie:
+    """Resposta de mentira com um Set-Cookie, para o http.cookiejar ler um cookie gravado pelo JavaScript."""
+
+    def __init__(self, texto: str):
+        self._cabecalhos = http.client.HTTPMessage()
+        self._cabecalhos["Set-Cookie"] = texto
+
+    def info(self):
+        return self._cabecalhos
+
+
+def _guardar_cookie_js(jar, url: str, texto: str) -> None:
+    """Guarda no pote do celular um cookie gravado pelo JavaScript da página (document.cookie = ...). Como no
+    navegador, o JavaScript não troca um cookie HttpOnly."""
+    texto = re.sub(r"[\r\n]+", " ", texto).strip()
+    if not texto or "=" not in texto.split(";", 1)[0]:
+        return
+    pedido = urllib.request.Request(_url_para_rede(url))
+    protegidos = {c.name for c in _cookies_aplicaveis(jar, url) if _cookie_http_only(c)}
+    for cookie in jar.make_cookies(_RespostaCookie(texto), pedido):
+        if cookie.name not in protegidos:
+            jar.set_cookie_if_ok(cookie, pedido)
+
+
+# ── Vídeos de páginas (TikTok, Instagram, Facebook, YouTube...) pelo yt-dlp ──
+# Esses sites quebram quando abertos pelo navegador (ver "Como funciona"), mas o vídeo de cada página o yt-dlp
+# acha. O celular roda o yt-dlp, guarda os cabeçalhos e cookies que o site exige para entregar aquele vídeo e
+# devolve um link /y/<id>/... que o VLC Web toca, ainda pela conexão do celular.
+
+NAV_PAGINAS_VIDEO = re.compile(r"""(?ix) ^https?://(?:[\w-]+\.)*(?:
+    youtube\.com/(?:watch|shorts/|live/|embed/) | youtu\.be/ |
+    tiktok\.com/(?:@[^/?#]+/(?:video|photo)/|t/|v/|embed/) | (?:vm|vt)\.tiktok\.com/ |
+    instagram\.com/(?:[^/?#]+/)?(?:p|reel|reels|tv)/ |
+    facebook\.com/(?:watch|reel/|share/[vr]/|[^/?#]+/videos/|video\.php) | fb\.watch/ |
+    (?:x|twitter)\.com/[^/?#]+/status/ | threads\.(?:net|com)/@[^/?#]+/post/ |
+    vimeo\.com/\d | dailymotion\.com/video/ | dai\.ly/ | twitch\.tv/(?:videos/|[^/?#]+/clip/) | clips\.twitch\.tv/ |
+    reddit\.com/r/[^/?#]+/comments/ | kwai\.com/ | kw\.ai/ | bilibili\.com/video/ | rumble\.com/v |
+    streamable\.com/\w | pinterest\.[a-z.]+/pin/ | soundcloud\.com/[^/?#]+/[^/?#]+
+)""")
+# um arquivo só, com imagem e som (o VLC Web não junta vídeo e áudio separados), de preferência H.264 até 1080p
+NAV_YTDLP_FORMATO = "b[protocol!*=dash]/b"
+NAV_YTDLP_ORDEM = "vcodec:h264,res:1080,acodec:aac"
+NAV_YTDLP_VALIDADE = 4 * 3600   # os sites expiram os endereços de vídeo em poucas horas
+_NAV_YTDLP: dict = {}           # id do link /y/ → {"abridor", "cabecalhos", "quando"}
+_NAV_YTDLP_CACHE: dict = {}     # (página, visitante) → (quando, resposta pronta)
+_NAV_YTDLP_LOCK = threading.Lock()
+
+
+def _pagina_de_video(url: str) -> bool:
+    return bool(url) and NAV_PAGINAS_VIDEO.match(url) is not None
+
+
+def _cookies_ytdlp(texto: str) -> list:
+    """O campo "cookies" do yt-dlp ("a=1; Domain=.site.com; Path=/; Secure; Expires=...; b=2; ...") em Cookies."""
+    atributos = {"domain", "path", "secure", "expires", "version", "httponly", "max-age", "samesite"}
+    lidos, atual = [], None
+    for pedaco in (texto or "").split("; "):
+        chave, igual, valor = pedaco.partition("=")
+        if chave.strip().lower() in atributos:
+            if atual is not None:
+                atual[chave.strip().lower()] = valor.strip() if igual else True
+        elif igual and chave.strip():
+            atual = {"nome": chave.strip(), "valor": valor}
+            lidos.append(atual)
+    cookies = []
+    for c in lidos:
+        dominio = str(c.get("domain") or "")
+        if not dominio:
+            continue
+        try:
+            expira = int(float(c["expires"])) if c.get("expires") not in (None, True) else None
+        except ValueError:
+            expira = None
+        cookies.append(http.cookiejar.Cookie(
+            0, c["nome"], c["valor"], None, False, dominio, True, dominio.startswith("."), str(c.get("path") or "/"),
+            True, bool(c.get("secure")), expira, expira is None, None, None, {}))
+    return cookies
+
+
+def _arquivo_cookies_visitante(jar, pagina: str) -> Path | None:
+    """Os cookies que o visitante já tem no site (ex.: entrou na conta pelo navegador), num arquivo para o
+    yt-dlp usar. Fica só durante a busca, com permissão 600."""
+    host = (urllib.parse.urlsplit(pagina).hostname or "").lower()
+    partes = host.split(".")
+    dominio = ".".join(partes[-2:]) if len(partes) >= 2 else host
+    escolhidos = [c for c in jar if c.domain.lstrip(".").lower().endswith(dominio)] if jar is not None else []
+    if not escolhidos:
+        return None
+    pasta = DATA_DIR / "cache"
+    pasta.mkdir(parents=True, exist_ok=True)
+    arquivo = pasta / f"ytdlp-cookies-{secrets.token_hex(6)}.txt"
+    mz = http.cookiejar.MozillaCookieJar()
+    for cookie in escolhidos:
+        mz.set_cookie(cookie)
+    arquivo.touch(mode=0o600)
+    mz.save(str(arquivo), ignore_discard=True, ignore_expires=True)
+    return arquivo
+
+
+def _resolver_com_ytdlp(pagina: str, jar=None, saida: tuple | None = None) -> dict:
+    """Roda o yt-dlp na página e devolve {'url', 'titulo', 'protocolo', 'cabecalhos', 'cookies'}."""
+    if not tem("yt-dlp"):
+        raise ToonsError("O yt-dlp não está instalado no celular. No Termux-Toons: menu do navegador → ▶ VLC Web "
+                         "→ Instalar o yt-dlp (ou 'pkg install python-yt-dlp').")
+    comando = ["yt-dlp", "-j", "--no-playlist", "--no-warnings", "-f", NAV_YTDLP_FORMATO, "-S", NAV_YTDLP_ORDEM]
+    if saida:
+        comando += ["--proxy", f"socks5://{saida[0]}:{saida[1]}"]
+    arquivo = _arquivo_cookies_visitante(jar, pagina)
+    if arquivo:
+        comando += ["--cookies", str(arquivo)]
+    try:
+        proc = rodar([*comando, pagina], capturar=True, timeout=150, mostrar=False)
+    finally:
+        if arquivo:
+            arquivo.unlink(missing_ok=True)
+    dados = None
+    with contextlib.suppress(json.JSONDecodeError, IndexError):
+        dados = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 else None
+    if not dados or not dados.get("url"):
+        motivo = (proc.stderr or "").strip().splitlines()
+        motivo = re.sub(r"^ERROR:\s*(\[[^\]]+\]\s*)?", "", motivo[-1]) if motivo else ""
+        if re.search(r"(?i)log ?in|cookies|private|rate.?limit|sign in", motivo):
+            motivo += " (esse site pede login para este vídeo; entre na conta pelo navegador e tente de novo)"
+        raise ToonsError("O yt-dlp não achou um vídeo nessa página" + (f": {motivo[:300]}" if motivo else "."))
+    return {"url": dados["url"], "titulo": str(dados.get("title") or "Vídeo")[:200],
+            "protocolo": str(dados.get("protocol") or ""),
+            "cabecalhos": {k: v for k, v in (dados.get("http_headers") or {}).items()
+                           if isinstance(v, str) and k.lower() not in ("accept-encoding", "cookie")},
+            "cookies": _cookies_ytdlp(dados.get("cookies") or "")}
+
+
+def _registrar_video_ytdlp(info: dict) -> str:
+    """Guarda os cabeçalhos e cookies do vídeo e devolve o caminho /y/<id>/... que o VLC Web vai pedir."""
+    jar = http.cookiejar.CookieJar()
+    for cookie in info["cookies"]:
+        jar.set_cookie(cookie)
+    ident = secrets.token_urlsafe(18)
+    agora = time.time()
+    with _NAV_YTDLP_LOCK:
+        for velho in [k for k, v in _NAV_YTDLP.items() if agora - v["quando"] > NAV_YTDLP_VALIDADE]:
+            del _NAV_YTDLP[velho]
+        while len(_NAV_YTDLP) >= 300:
+            del _NAV_YTDLP[min(_NAV_YTDLP, key=lambda k: _NAV_YTDLP[k]["quando"])]
+        _NAV_YTDLP[ident] = {"abridor": _abridor_navegador(jar), "cabecalhos": info["cabecalhos"], "quando": agora}
+    caminho = _nav_link(info["url"], prefixo=f"/y/{ident}/") or ""
+    # o VLC Web reconhece HLS/DASH pela extensão: alguns sites não a põem no endereço
+    sem_ext = urllib.parse.urlsplit(info["url"]).path.lower()
+    if "m3u8" in info["protocolo"] and not sem_ext.endswith(".m3u8"):
+        caminho += "#.m3u8"
+    elif "dash" in info["protocolo"] and not sem_ext.endswith(".mpd"):
+        caminho += "#.mpd"
+    return caminho
+
+
+def _video_ytdlp_ativo(ident: str) -> dict | None:
+    with _NAV_YTDLP_LOCK:
+        entrada = _NAV_YTDLP.get(ident)
+        if entrada and time.time() - entrada["quando"] > NAV_YTDLP_VALIDADE:
+            del _NAV_YTDLP[ident]
+            return None
+        return entrada
+
+
 # ── Páginas próprias do navegador (início, erro, mídia e VLC Web) ─────
 # Todas funcionam sem internet no aparelho de quem abre (nada de fontes ou scripts de fora) e seguem o tema
 # claro/escuro do sistema.
@@ -5298,7 +5556,7 @@ NAV_CSS = """:root{color-scheme:light dark;--bg:#f3f4f8;--bg2:#fff;--tx:#14161b;
 --campo:#fff;--real:#2f6df6;--real2:#6a4cff;--sombra:0 12px 32px -16px rgba(20,30,60,.32)}
 @media (prefers-color-scheme:dark){:root{--bg:#0b0d12;--bg2:#151820;--tx:#eef0f5;--sub:#99a0b0;--borda:rgba(255,255,255,.09);
 --campo:#1a1e27;--real:#6f9bff;--real2:#9a7bff;--sombra:0 16px 40px -18px rgba(0,0,0,.8)}}
-*{box-sizing:border-box}html,body{margin:0}
+*{box-sizing:border-box}html,body{margin:0}[hidden]{display:none!important}
 body{min-height:100vh;background:radial-gradient(1100px 560px at 8% -12%,rgba(47,109,246,.18),transparent 62%),
 radial-gradient(900px 520px at 108% 6%,rgba(255,107,0,.13),transparent 60%),var(--bg);background-attachment:fixed;color:var(--tx);
 font:15px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;-webkit-font-smoothing:antialiased;
@@ -5344,6 +5602,17 @@ NAV_JS = r"""/* Termux-Toons · navegador pelo celular: faz o JavaScript da pág
   var NOSSO = /^\/(?:p|m|_tt|vlc)\//;
   var IGNORAR = /^(?:#|(?:data|blob|javascript|vbscript|about|mailto|tel|sms|intent|magnet|geo|market|whatsapp|tg|file|chrome):)/i;
   var RE_LISTA = /\.(?:m3u8|mpd)$/i;
+  /* páginas de vídeo que o yt-dlp abre (igual a NAV_PAGINAS_VIDEO do Termux-Toons) */
+  var RE_PAGINA_VIDEO = new RegExp('^https?://(?:[\\w-]+\\.)*(?:' + [
+    'youtube\\.com/(?:watch|shorts/|live/|embed/)', 'youtu\\.be/',
+    'tiktok\\.com/(?:@[^/?#]+/(?:video|photo)/|t/|v/|embed/)', '(?:vm|vt)\\.tiktok\\.com/',
+    'instagram\\.com/(?:[^/?#]+/)?(?:p|reel|reels|tv)/',
+    'facebook\\.com/(?:watch|reel/|share/[vr]/|[^/?#]+/videos/|video\\.php)', 'fb\\.watch/',
+    '(?:x|twitter)\\.com/[^/?#]+/status/', 'threads\\.(?:net|com)/@[^/?#]+/post/',
+    'vimeo\\.com/\\d', 'dailymotion\\.com/video/', 'dai\\.ly/', 'twitch\\.tv/(?:videos/|[^/?#]+/clip/)', 'clips\\.twitch\\.tv/',
+    'reddit\\.com/r/[^/?#]+/comments/', 'kwai\\.com/', 'kw\\.ai/', 'bilibili\\.com/video/', 'rumble\\.com/v',
+    'streamable\\.com/\\w', 'pinterest\\.[a-z.]+/pin/', 'soundcloud\\.com/[^/?#]+/[^/?#]+'
+  ].join('|') + ')', 'i');
   var agendarContagem = function () { /* trocada quando a barra existir */ };
   var RE_MIDIA = /\.(?:mp4|m4v|webm|mkv|mov|ogv|avi|wmv|flv|mpg|mpeg|ts|m2ts|3gp|vob|mp3|m4a|m4b|aac|wav|flac|ogg|oga|opus|wma|mka|weba|m3u8|m3u|mpd)$/i;
 
@@ -5457,6 +5726,49 @@ NAV_JS = r"""/* Termux-Toons · navegador pelo celular: faz o JavaScript da pág
       }).catch(function () {});
     }
   } catch (e) { /* ignora */ }
+
+  /* ---------- cookies do site para o JavaScript da página ----------
+     O celular guarda os cookies e manda uma cópia dos que o JavaScript pode ler, presa ao caminho do site e com
+     o nome marcado (tt~site~nome). Aqui o document.cookie mostra só as do site desta página, sem a marca, e o que
+     a página grava vira uma cópia marcada e é guardado também no celular. */
+  function chaveCookie() {
+    var m = /^\/p\/(https?)\/([^\/?#]+)/.exec(location.pathname);
+    if (!m) return null;
+    var site = m[2];
+    try { site = decodeURIComponent(site); } catch (e) { /* fica */ }
+    return { base: '/p/' + m[1] + '/' + m[2], chave: 'tt~' + site.toLowerCase().replace(/[^a-z0-9.-]/g, '_') + '~' };
+  }
+  try {
+    var descCookie = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie') ||
+      (window.HTMLDocument && Object.getOwnPropertyDescriptor(HTMLDocument.prototype, 'cookie'));
+    if (descCookie && descCookie.get && descCookie.set) {
+      Object.defineProperty(document, 'cookie', {
+        configurable: true,
+        get: function () {
+          var c = chaveCookie(), bruto = descCookie.get.call(document);
+          if (!c) return bruto;
+          return bruto.split(/;\s*/).filter(function (x) { return x.indexOf(c.chave) === 0 && x.length > c.chave.length; })
+            .map(function (x) { return x.slice(c.chave.length); }).join('; ');
+        },
+        set: function (valor) {
+          var c = chaveCookie();
+          if (!c) return descCookie.set.call(document, valor);
+          var texto = String(valor), partes = texto.split(';'), par = partes.shift().trim();
+          if (!par || par.indexOf('=') < 1) return;
+          var caminho = '/', resto = [], seguro = location.protocol === 'https:';
+          partes.forEach(function (p) {
+            var t = p.trim(), k = t.split('=')[0].trim().toLowerCase();
+            if (k === 'path') caminho = t.slice(t.indexOf('=') + 1).trim() || '/';
+            else if (k === 'domain' || k === 'partitioned' || ((k === 'secure' || (k === 'samesite' && /none/i.test(t))) && !seguro)) { /* não vale aqui */ }
+            else if (t) resto.push(t);
+          });
+          if (caminho.charAt(0) !== '/') caminho = '/';
+          descCookie.set.call(document, [c.chave + par, 'path=' + c.base + caminho].concat(resto).join('; '));
+          try { navigator.sendBeacon('/_tt/cookie?u=' + encodeURIComponent(real() || ''), new Blob([texto], { type: 'text/plain' })); } catch (e) { /* sem beacon */ }
+        }
+      });
+    }
+  } catch (e) { /* navegador antigo: fica o cookie de sempre */ }
 
   /* ---------- atributos com endereço (src, href...) mudados pelo JavaScript ---------- */
   function prenderSetter(Classe, prop, conv) {
@@ -5604,6 +5916,19 @@ NAV_JS = r"""/* Termux-Toons · navegador pelo celular: faz o JavaScript da pág
       m.querySelectorAll('source[src]').forEach(function (s) { add(s.getAttribute('src'), '', m.tagName); });
     });
     listasPedidas.forEach(function (r) { add(r, '', ''); });
+    /* páginas de vídeo (TikTok, Instagram, YouTube...): o celular acha o vídeo com o yt-dlp */
+    var paginas = 0;
+    function addPagina(r, rotulo, primeiro) {
+      if (!r || vistos[r] || paginas >= 30 || !RE_PAGINA_VIDEO.test(r)) return;
+      vistos[r] = 1; paginas++;
+      var host = ''; try { host = new URL(r).host.replace(/^www\./, ''); } catch (e) { /* ignora */ }
+      var item = { real: r, nome: (rotulo || '').trim() || nomeDe(r), tipo: 'Página', host: host, pagina: true };
+      if (primeiro) achadas.unshift(item); else achadas.push(item);
+    }
+    addPagina(real(), document.title, true);
+    document.querySelectorAll('a[href]').forEach(function (a) {
+      addPagina(realDe(a.getAttribute('href')), (a.getAttribute('aria-label') || a.textContent || '').replace(/\s+/g, ' ').slice(0, 90));
+    });
     document.querySelectorAll('a[href]').forEach(function (a) {
       var r = realDe(a.getAttribute('href'));
       var p = '';
@@ -5663,7 +5988,7 @@ NAV_JS = r"""/* Termux-Toons · navegador pelo celular: faz o JavaScript da pág
     '.sep{height:1px;background:var(--borda);margin:5px 8px}' +
     '.cab{display:flex;align-items:center;gap:10px;padding:8px 6px 8px 12px}.cab b{flex:1;font-size:15px}.cab small{display:block;font-weight:400;color:var(--sub);font-size:12px;margin-top:1px}' +
     '.mid{display:flex;align-items:center;gap:11px;padding:9px 8px 9px 10px;border-radius:14px}.mid:hover{background:var(--hover)}' +
-    '.mid .ic{flex:none;width:42px;height:42px;border-radius:12px;display:flex;align-items:center;justify-content:center;color:#fff;background:linear-gradient(135deg,#ffa53a,#ff6b00)}.mid .ic.au{background:linear-gradient(135deg,#7c5cff,#3d7bff)}' +
+    '.mid .ic{flex:none;width:42px;height:42px;border-radius:12px;display:flex;align-items:center;justify-content:center;color:#fff;background:linear-gradient(135deg,#ffa53a,#ff6b00)}.mid .ic.au{background:linear-gradient(135deg,#7c5cff,#3d7bff)}.mid .ic.pg{background:linear-gradient(135deg,#ff4f7b,#a43cff)}' +
     '.mid .tx{flex:1;min-width:0}.mid .nm{font-weight:650;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mid .ds{font-size:12px;color:var(--sub);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}' +
     '.acao{all:unset;box-sizing:border-box;flex:none;height:34px;padding:0 12px;border-radius:17px;display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-size:13px;font-weight:650;background:var(--campo);color:var(--tx)}.acao.forte{background:#ff6b00;color:#fff}.acao.so{width:34px;padding:0;justify-content:center}' +
     '.vazio{padding:6px 14px 8px;color:var(--sub);font-size:13.5px;line-height:1.5}' +
@@ -5767,13 +6092,14 @@ NAV_JS = r"""/* Termux-Toons · navegador pelo celular: faz o JavaScript da pág
       }
       lista.forEach(function (m, i) {
         var au = m.tipo === 'Áudio';
-        h += '<div class="mid"><span class="ic' + (au ? ' au' : '') + '">' + svg(au ? 'nota' : m.tipo === 'Vídeo' ? 'filme' : 'lista', 22) + '</span>' +
-          '<span class="tx"><div class="nm" title="' + esc(m.nome) + '">' + esc(m.nome) + '</div><div class="ds">' + esc(m.tipo) + ' · ' + esc(m.host) + '</div></span>' +
+        h += '<div class="mid"><span class="ic' + (au ? ' au' : m.pagina ? ' pg' : '') + '">' + svg(au ? 'nota' : m.tipo === 'Vídeo' || m.pagina ? 'filme' : 'lista', 22) + '</span>' +
+          '<span class="tx"><div class="nm" title="' + esc(m.nome) + '">' + esc(m.nome) + '</div><div class="ds">' + (m.pagina ? 'Vídeo da página · ' + esc(m.host) + ' · yt-dlp' : esc(m.tipo) + ' · ' + esc(m.host)) + '</div></span>' +
           '<button class="acao so" data-a="copiar-midia" data-i="' + i + '" title="Copiar o link" aria-label="Copiar o link">' + svg('copiar', 17) + '</button>' +
           '<a class="acao forte" href="' + esc(linkVlc(m.real, m.nome)) + '">' + svg('play', 14) + 'VLC</a></div>';
       });
       h += '<form class="colar" data-f="colar"><input name="u" placeholder="Colar o link de um vídeo ou música" inputmode="url" autocomplete="off" spellcheck="false">' +
         '<button class="acao forte" type="submit">' + svg('play', 14) + 'Tocar</button></form>' +
+        (real() ? '<a class="item" href="' + esc('/_tt/ytdlp?u=' + encodeURIComponent(real()) + '&titulo=' + encodeURIComponent(document.title || '')) + '">' + svg('filme') + 'Procurar o vídeo desta página (yt-dlp)</a>' : '') +
         '<div class="pe"><span>Legendas, equalizador, faixas de áudio e mais.</span><a class="acao" href="/vlc/">Abrir o VLC Web</a></div>';
       painelMidias.innerHTML = h;
       painelMidias.__lista = lista;
@@ -6189,6 +6515,60 @@ def _pagina_preparar_vlc() -> bytes:
     return _pagina_simples("Preparando o VLC Web", corpo, script=script)
 
 
+def _nome_do_site(url: str) -> str:
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    for chave, nome in (("tiktok", "TikTok"), ("instagram", "Instagram"), ("facebook", "Facebook"), ("fb.watch", "Facebook"),
+                        ("youtu", "YouTube"), ("twitter", "X (Twitter)"), ("x.com", "X (Twitter)"), ("threads", "Threads"),
+                        ("vimeo", "Vimeo"), ("dailymotion", "Dailymotion"), ("dai.ly", "Dailymotion"), ("twitch", "Twitch"),
+                        ("reddit", "Reddit"), ("kwai", "Kwai"), ("kw.ai", "Kwai"), ("soundcloud", "SoundCloud"),
+                        ("pinterest", "Pinterest")):
+        if chave in host:
+            return nome
+    return host.removeprefix("www.") or "site"
+
+
+def _pagina_ytdlp(pagina: str, titulo: str = "") -> bytes:
+    """Tela de espera enquanto o yt-dlp acha o vídeo da página; depois abre o VLC Web sozinha."""
+    site = _nome_do_site(pagina)
+    abrir_pagina = (_nav_link(pagina) or "/")
+    abrir_pagina += ("&" if "?" in abrir_pagina else "?") + "__tt=pagina"
+    info_url = "/_tt/ytdlp-info?" + urllib.parse.urlencode({"u": pagina, "titulo": titulo})
+    corpo = f"""<div class="selo vlc"><span class="giro" aria-hidden="true"></span></div>
+<h1 id="tit">Procurando o vídeo no {html.escape(site)}…</h1>
+<p id="txt">O celular está usando o yt-dlp para achar o vídeo desta página. Ele abre no VLC Web, carregado pela
+conexão do celular. Leva alguns segundos.</p>
+<code class="alvo">{html.escape(pagina)}</code>
+<div class="acoes"><button class="btn prim" type="button" id="denovo" hidden>Tentar de novo</button>
+<a class="btn" href="{html.escape(abrir_pagina, quote=True)}">Abrir a página mesmo assim</a>
+<a class="btn" href="/">Início</a></div>"""
+    css = """.giro{width:30px;height:30px;border-radius:50%;border:3.5px solid rgba(255,255,255,.35);border-top-color:#fff;
+animation:gira .8s linear infinite}@keyframes gira{to{transform:rotate(360deg)}}
+.selo.erro{background:var(--campo);color:var(--tx);box-shadow:none;border:1px solid var(--borda)}"""
+    script = f"""<script>
+(function () {{
+  var tit = document.getElementById('tit'), txt = document.getElementById('txt'), denovo = document.getElementById('denovo');
+  var selo = document.querySelector('.selo');
+  function buscar() {{
+    denovo.hidden = true;
+    fetch({_json_no_html(info_url)}, {{ credentials: 'same-origin', cache: 'no-store' }})
+      .then(function (r) {{ return r.json(); }})
+      .then(function (j) {{
+        if (j.ok) {{ tit.textContent = 'Abrindo no VLC Web…'; location.replace(j.vlc); return; }}
+        falhou(j.erro || 'O yt-dlp não achou o vídeo.');
+      }}).catch(function () {{ falhou('Não consegui falar com o celular.'); }});
+  }}
+  function falhou(msg) {{
+    selo.className = 'selo erro'; selo.innerHTML = '&#128533;';
+    tit.textContent = 'Não deu para abrir o vídeo';
+    txt.textContent = msg; denovo.hidden = false;
+  }}
+  denovo.onclick = function () {{ selo.className = 'selo vlc'; selo.innerHTML = '<span class="giro"></span>'; tit.textContent = 'Procurando o vídeo…'; buscar(); }};
+  buscar();
+}})();
+</script>"""
+    return _pagina_simples(f"Vídeo do {site}", corpo, css, script)
+
+
 # ── VLC Web: baixar do GitHub e guardar no celular ───────────────────
 
 _VLC_ESTADO = {"baixando": False, "progresso": 0.0, "erro": "", "remoto": None, "remoto_quando": 0.0,
@@ -6395,7 +6775,10 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
             self._novos_cookies.append(f"navsid={sid}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
         return sid
 
-    def _abridor(self, midia: bool = False) -> urllib.request.OpenerDirector:
+    def _abridor(self, midia: bool = False) -> tuple:
+        """(abridor, pote de cookies do visitante) para buscar o site."""
+        if self._ytdlp is not None:
+            return self._ytdlp["abridor"], None   # vídeo achado pelo yt-dlp: os cookies que o site deu a ele
         if midia and not self._cookie("navsid"):
             return _sessao_navegador("_midia")   # o VLC Web pede sem cookies: usa uma sessão só para as mídias
         return _sessao_navegador(self._sessao())
@@ -6460,6 +6843,7 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
     # ── rotas ──
     def _tratar(self):
         self._novos_cookies, self._respondeu, self._corpo_lido = [], False, False
+        self._ytdlp = self._ytdlp_id = self._site = self._jar = None
         partes = urllib.parse.urlsplit(self.path)
         caminho, consulta = partes.path, partes.query
         try:
@@ -6469,6 +6853,8 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
                 self._icone(caminho)
             elif caminho.startswith("/m/"):
                 self._midia(caminho, consulta)   # link assinado do VLC Web: vale sem o cookie
+            elif caminho.startswith("/y/"):
+                self._midia_ytdlp(caminho, consulta)   # vídeo achado pelo yt-dlp: o id secreto vale sem o cookie
             else:
                 autorizado, pelo_link = self._autorizar()
                 if not autorizado:
@@ -6477,6 +6863,10 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
                 if pelo_link:
                     self._novos_cookies.append(
                         f"navtk={self.token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
+                # o cookie de sessão já sai na primeira resposta (a página inicial): se só saísse quando um site
+                # é aberto, os pedidos que a página faz em paralelo criariam sessões diferentes e o último a
+                # chegar trocaria a sessão do visitante no meio da navegação
+                self._sessao()
                 self._rotear(caminho, consulta)
         except _CorpoInvalido:
             pass
@@ -6509,6 +6899,24 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
                             {"Cache-Control": "public, max-age=604800, immutable" if versao_certa else "no-cache"})
         elif caminho == "/_tt/vlc":
             self._abrir_no_vlc()
+        elif caminho == "/_tt/ytdlp":
+            real = _url_real(self._param("u"))
+            if real:
+                self._responder(200, _pagina_ytdlp(real, self._param("titulo")))
+            else:
+                self._responder(400, _pagina_erro_navegador("Endereço inválido."))
+        elif caminho == "/_tt/ytdlp-info":
+            self._ytdlp_info()
+        elif caminho == "/_tt/cookie":
+            if self.command != "POST":
+                self._json({"erro": "use POST"}, 405)
+                return
+            texto = self._ler_corpo()[:8192].decode("utf-8", "replace")
+            real = _url_real(self._param("u"))
+            if real:
+                with contextlib.suppress(ValueError):
+                    _guardar_cookie_js(_sessao_navegador(self._sessao())[1], real, texto)
+            self._responder(204, b"", "text/plain")
         elif caminho == "/_tt/assinar":
             real = _url_real(self._param("u"))
             link = _nav_link(real, self.token) if real else None
@@ -6572,6 +6980,9 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
             self._ir_para("/")
             return
         url = _endereco_digitado(termo, self._param("motor") or "ddg")
+        if _pagina_de_video(url):   # link de vídeo do TikTok, Instagram...: vai direto para o vídeo
+            self._ir_para("/_tt/ytdlp?" + urllib.parse.urlencode({"u": url}))
+            return
         destino = _nav_link(url)
         if not destino:
             self._responder(400, _pagina_erro_navegador("O navegador só abre endereços http:// e https://.", url))
@@ -6600,6 +7011,10 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
         if not real:
             self._ir_para("/vlc/")
             return
+        if _pagina_de_video(real) or self._eh_pagina_html(real):
+            # TikTok, Instagram, YouTube... ou outra página com vídeo: o vídeo dela, achado pelo yt-dlp
+            self._ir_para("/_tt/ytdlp?" + urllib.parse.urlencode({"u": real, "titulo": self._param("titulo")}))
+            return
         link = _nav_link(real, self.token)
         if not link:
             self._responder(400, _pagina_erro_navegador("Esse link não é http:// nem https://.", real))
@@ -6609,6 +7024,25 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
         if titulo:
             params["title"] = titulo[:200]
         self._ir_para("/vlc/?" + urllib.parse.urlencode(params))
+
+    def _eh_pagina_html(self, url: str) -> bool:
+        """O link colado é uma página (HTML) e não o arquivo de mídia? Sem extensão de mídia, pergunta ao site só
+        o primeiro byte."""
+        ext = posixpath.splitext(urllib.parse.urlsplit(url).path)[1].lower().lstrip(".")
+        if ext in NAV_EXT_VIDEO | NAV_EXT_AUDIO | {"m3u8", "m3u", "mpd", "pls", "xspf", "asx"}:
+            return False
+        try:
+            pedido = urllib.request.Request(_url_para_rede(url), headers={
+                "User-Agent": self.headers.get("User-Agent") or USER_AGENT, "Accept": "*/*", "Range": "bytes=0-0"})
+            with self._abridor()[0].open(pedido, timeout=12) as resposta:
+                tipo = resposta.headers.get("Content-Type", "")
+        except urllib.error.HTTPError as e:
+            if 300 <= e.code < 400:
+                return False   # redirecionamento (link de download, CDN...): o VLC Web segue sozinho
+            tipo = (e.headers or {}).get("Content-Type", "") if e.headers else ""
+        except (OSError, ValueError, http.client.HTTPException):
+            return False
+        return tipo.split(";")[0].strip().lower() in ("text/html", "application/xhtml+xml")
 
     def _vlc_arquivo(self, relativo: str) -> None:
         if not vlc_web_instalado():
@@ -6649,6 +7083,50 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
             return
         self._proxy(caminho[achado.start(2):], consulta, midia=True)
 
+    def _midia_ytdlp(self, caminho: str, consulta: str) -> None:
+        achado = re.match(r"/y/([\w-]{16,40})/(https?)/", caminho)
+        entrada = _video_ytdlp_ativo(achado.group(1)) if achado else None
+        if not entrada:
+            self._responder(410, b"link de video expirado: abra o video de novo pelo navegador", "text/plain",
+                            {"Access-Control-Allow-Origin": "*"})
+            return
+        if self.command == "OPTIONS" and self.headers.get("Access-Control-Request-Method"):
+            self._responder(204, b"", "text/plain", {
+                "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+                "Access-Control-Allow-Headers": self.headers.get("Access-Control-Request-Headers") or "*",
+                "Access-Control-Max-Age": "600", "Cache-Control": "max-age=600"})
+            return
+        self._ytdlp, self._ytdlp_id = entrada, achado.group(1)
+        self._proxy(caminho[achado.start(2):], consulta, midia=True)
+
+    def _ytdlp_info(self) -> None:
+        """/_tt/ytdlp-info?u=<página>: roda o yt-dlp e responde com o endereço do VLC Web que toca o vídeo."""
+        real = _url_real(self._param("u"))
+        if not real:
+            self._json({"ok": False, "erro": "Endereço inválido (só http:// e https://)."})
+            return
+        sid = self._sessao()
+        chave = (real, sid)
+        with _NAV_YTDLP_LOCK:
+            pronto = _NAV_YTDLP_CACHE.get(chave)
+        if not pronto or time.time() - pronto[0] > 20 * 60 or not _video_ytdlp_ativo(pronto[1]["id"]):
+            try:
+                info = _resolver_com_ytdlp(real, _sessao_navegador(sid)[1], _ConexaoNav.saida)
+            except ToonsError as e:
+                self._json({"ok": False, "erro": str(e)})
+                return
+            caminho = _registrar_video_ytdlp(info)
+            pronto = (time.time(), {"id": caminho.split("/")[2], "caminho": caminho, "titulo": info["titulo"]})
+            with _NAV_YTDLP_LOCK:
+                for velho in [k for k, v in _NAV_YTDLP_CACHE.items() if time.time() - v[0] > 20 * 60]:
+                    del _NAV_YTDLP_CACHE[velho]
+                _NAV_YTDLP_CACHE[chave] = pronto
+        dados = pronto[1]
+        titulo = self._param("titulo").strip() or dados["titulo"]
+        link = self._origem_publica() + dados["caminho"]
+        self._json({"ok": True, "titulo": titulo, "link": link,
+                    "vlc": "/vlc/?" + urllib.parse.urlencode({"url": link, "play": "1", "title": titulo})})
+
     def _proxy(self, resto: str, consulta: str, midia: bool = False) -> None:
         esquema, _, resto = resto.partition("/")
         site_cod, barra, caminho = resto.partition("/")
@@ -6670,6 +7148,12 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
             elif not (chave == "t" and self._token_ok(urllib.parse.unquote_plus(valor))):
                 fica.append(pedaco)
         url = f"{esquema}://{site}/{caminho}" + ("?" + "&".join(fica) if fica else "")
+        if (not midia and acao != "pagina" and self.command == "GET" and self._eh_navegacao()
+                and _pagina_de_video(url)):
+            # TikTok, Instagram, YouTube...: a página quebra por aqui; o vídeo dela abre no VLC Web
+            self._responder(200, _pagina_ytdlp(url))
+            return
+        self._site = (esquema, site_cod)
         corpo = None
         cabecalhos = self._cabecalhos_para_site(url)
         if self.command not in ("GET", "HEAD", "OPTIONS"):
@@ -6681,8 +7165,17 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
         except ValueError as e:
             self._responder(400, _pagina_erro_navegador(f"Endereço inválido: {e}", url))
             return
+        abridor, jar = self._abridor(midia)
+        if jar is not None and not midia:
+            # cookies do pote + as cópias que o JavaScript da página pode ter acabado de mudar
+            jar.add_cookie_header(pedido)
+            mesclado = _mesclar_cookies(pedido.get_header("Cookie") or "",
+                                        _cookies_do_visitante(self.headers.get("Cookie", ""), site_cod))
+            if mesclado:
+                pedido.add_unredirected_header("Cookie", mesclado)
+        self._jar = jar
         try:
-            resposta = self._abridor(midia).open(pedido, timeout=NAV_TIMEOUT)
+            resposta = abridor.open(pedido, timeout=NAV_TIMEOUT)
         except urllib.error.HTTPError as e:
             resposta = e   # a própria resposta do site (erro ou redirecionamento): entregamos como veio
         except urllib.error.URLError as e:
@@ -6738,12 +7231,27 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
                 cab["Referer"] = origem + "/"
             if self.command not in ("GET", "HEAD") and self.headers.get("Origin"):
                 cab["Origin"] = origem
+        if self._ytdlp is not None:   # o que o site exige para entregar o vídeo achado pelo yt-dlp
+            for chave in [k for k in cab if k.lower() in {c.lower() for c in self._ytdlp["cabecalhos"]}]:
+                del cab[chave]
+            cab.update(self._ytdlp["cabecalhos"])
         return cab
 
     def _entregar(self, resposta, url: str, acao: str, midia: bool) -> None:
         status = getattr(resposta, "status", None) or getattr(resposta, "code", None) or 200
         cab = resposta.headers
-        ligar_lista = (lambda base, alvo: _proxiar(base, alvo, self.token)) if midia else _proxiar
+        if self._ytdlp_id:
+            ligar_lista = (lambda base, alvo: _proxiar(base, alvo, prefixo=f"/y/{self._ytdlp_id}/"))
+        elif midia:
+            ligar_lista = (lambda base, alvo: _proxiar(base, alvo, self.token))
+        else:
+            ligar_lista = _proxiar
+        if not midia and self._jar is not None and self._site:
+            # cópia dos cookies que o JavaScript do site pode ler (todos numa página; os mudados no resto)
+            tipo_resp = (cab.get("Content-Type") or "").split(";")[0].strip().lower()
+            self._novos_cookies += _espelho_de_cookies(
+                self._jar, url, self._site[0], self._site[1], _nomes_set_cookie(cab),
+                tudo=tipo_resp in ("text/html", "application/xhtml+xml"))
         extra_cors = {"Access-Control-Allow-Origin": "*", "Access-Control-Expose-Headers":
                       "Content-Length, Content-Range, Content-Type, Content-Disposition, Accept-Ranges"} if midia else {}
         if status in (301, 302, 303, 307, 308):
@@ -7098,13 +7606,27 @@ def menu_vlc_web_navegador():
             "faixas de áudio e legendas, aplicar efeitos e gravar (o que costuma falhar com vídeos de outros sites).",
             "Os links de rede abertos dentro do VLC Web (Mídia → Abrir rede, rádios, podcasts e busca de legendas) "
             "também passam pelo celular. Os links de vídeo valem enquanto o link do navegador for o mesmo.",
+            "TikTok, Instagram, Facebook, YouTube, X e outros quebram quando abertos pelo navegador, mas o vídeo de "
+            "cada página o celular acha com o yt-dlp: abrir um link de vídeo desses sites (ou tocar em ▶ VLC numa "
+            "página dele) leva direto ao vídeo no VLC Web. Se o site pedir login, entre na conta pelo navegador: "
+            "os cookies vão junto para o yt-dlp. O link do vídeo dura algumas horas.",
         ])
 
     def cabecalho():
         print(f"{DIM}VLC Web: {_descricao_vlc_web()} · {VLC_WEB_SITE}{RST}")
+        print(f"{DIM}yt-dlp (vídeos do TikTok, Instagram, YouTube...): "
+              f"{'instalado' if tem('yt-dlp') else 'não instalado'}{RST}")
+
+    def instalar_ytdlp():
+        if tem("yt-dlp"):
+            ok("O yt-dlp já está instalado. Para atualizar: Atualização do Termux (ou 'pip install -U yt-dlp').")
+        elif garantir_deps_musica(com_player=False):
+            ok("yt-dlp instalado: os vídeos do TikTok, Instagram, YouTube... já abrem no VLC Web.")
 
     menu("▶ VLC Web no navegador pelo celular", [
         ("Como funciona", como_funciona),
+        (lambda: "Instalar o yt-dlp (vídeos do TikTok, Instagram, Facebook, YouTube...)"
+         + (" (instalado)" if tem("yt-dlp") else ""), instalar_ytdlp),
         (lambda: "Baixar o VLC Web do GitHub" if vlc_web_versao() is None else "Atualizar o VLC Web (do GitHub)",
          lambda: atualizar_vlc_web(perguntar_antes=True)),
         ("Mostrar o link do VLC Web", abrir),
@@ -7151,6 +7673,10 @@ def menu_navegador_web():
             "Como ele reescreve as páginas, sites muito dependentes de JavaScript (apps, redes sociais, login em "
             "muitos serviços) podem abrir mal ou não abrir. Para navegar 'de verdade' no PC, use o Proxy; para ver "
             "a sua própria tela, a Transmissão da tela.",
+            "Links de vídeo do TikTok, Instagram, Facebook, YouTube, X e outros vão direto para o vídeo: o celular o "
+            "acha com o yt-dlp e ele toca no VLC Web ('Abrir a página mesmo assim' mostra a página). Os cookies que o "
+            "JavaScript dos sites usa (como o token de segurança do Instagram) ficam disponíveis para a página, sem "
+            "misturar um site com outro.",
             "A saída pode ser direto, pelo túnel SSH (sai pelo seu servidor) ou pelo Tor (esconde o IP). Só quem "
             "tem o link (o ?t=...) abre; cada aparelho tem os próprios cookies dos sites. O endereço fixo e o túnel "
             "da Cloudflare dão um link que funciona pela internet. Nunca abre a rede local nem o próprio celular.",
