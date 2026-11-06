@@ -1153,6 +1153,8 @@ PADRAO_CFG = {
     "navegador_token": "",  # link secreto do navegador pelo celular
     "navegador_saida": "",  # "" direto; "ssh" pelo túnel SSH; "tor" pelo Tor
     "navegador_barra": True,  # barra com o endereço no topo das páginas abertas pelo navegador
+    "navegador_completo": False,  # ligar o modo completo (motor Rammerhead, experimental) junto com o navegador
+    "navegador_completo_porta": 8102,  # porta do motor do modo completo (só em 127.0.0.1)
     "pontes_portas": {},  # qual porta cada ponte pública está expondo
     "ssh_ponte_destino": "",  # usuario@servidor do túnel SSH (ssh -D)
     "ssh_ponte_porta": 22,
@@ -5184,12 +5186,13 @@ def _reescrever_tag(tag: str, nome: str, base: str, ligar) -> str:
     return f"<{nome_original}{novo_corpo}{'/' if fechada else ''}>"
 
 
-def _script_do_navegador(com_barra: bool) -> str:
-    return f'<script src="/_tt/nav.js?v={NAV_JS_VERSAO}" data-barra="{1 if com_barra else 0}"></script>'
+def _script_do_navegador(com_barra: bool, completo: bool = False) -> str:
+    return (f'<script src="/_tt/nav.js?v={NAV_JS_VERSAO}" data-barra="{1 if com_barra else 0}"'
+            f'{' data-completo="1"' if completo else ""}></script>')
 
 
 def _reescrever_html(pagina: str, base_url: str, ligar=_proxiar, com_barra: bool = True,
-                     com_script: bool = True) -> str:
+                     com_script: bool = True, completo: bool = False) -> str:
     base = base_url
     achado = _NAV_BASE.search(pagina)
     if achado:
@@ -5223,7 +5226,7 @@ def _reescrever_html(pagina: str, base_url: str, ligar=_proxiar, com_barra: bool
             saida.append(_reescrever_css(conteudo, base, ligar) if nome == "style" else conteudo)
             pos = final
     if com_script:
-        script = _script_do_navegador(com_barra)
+        script = _script_do_navegador(com_barra, completo)
         if ponto_head is not None:
             saida.insert(ponto_head, script)
         elif ponto_html is not None:
@@ -5301,7 +5304,7 @@ def _motivo_amigavel(erro_rede) -> str:
 # (tt~site~nome). O nav.js mostra ao JavaScript da página só as do site dela, sem a marca, e o que a página grava
 # volta para o pote do celular. Assim um site nunca vê os cookies de outro.
 
-NAV_COOKIES_NOSSOS = {"navtk", "navsid", "navsite"}
+NAV_COOKIES_NOSSOS = {"navtk", "navsid", "navsite", "navrh"}
 NAV_COOKIE_MAX = 3800   # valores maiores não são copiados (o navegador recusaria a linha)
 
 
@@ -5598,6 +5601,7 @@ NAV_JS = r"""/* Termux-Toons · navegador pelo celular: faz o JavaScript da pág
   window.__ttNav = true;
   var euMesmo = document.currentScript;
   var COM_BARRA = !euMesmo || euMesmo.getAttribute('data-barra') !== '0';
+  var COMPLETO = !!euMesmo && euMesmo.getAttribute('data-completo') === '1';
   var ORIGEM = location.origin;
   var NOSSO = /^\/(?:p|m|_tt|vlc)\//;
   var IGNORAR = /^(?:#|(?:data|blob|javascript|vbscript|about|mailto|tel|sms|intent|magnet|geo|market|whatsapp|tg|file|chrome):)/i;
@@ -6077,6 +6081,7 @@ NAV_JS = r"""/* Termux-Toons · navegador pelo celular: faz o JavaScript da pág
         '<div class="sep"></div>' +
         '<button class="item" data-a="copiar">' + svg('copiar') + 'Copiar o endereço do site</button>' +
         '<button class="item" data-a="direto">' + svg('externo') + 'Abrir direto, sem passar pelo celular</button>' +
+        (COMPLETO ? '<a class="item" href="' + esc('/_tt/completo?u=' + encodeURIComponent(real() || '')) + '">' + svg('globo') + 'Abrir no modo completo (experimental)</a>' : '') +
         '<div class="sep"></div>' +
         '<button class="item" data-a="posicao">' + svg('posicao') + (embaixo ? 'Barra no topo da tela' : 'Barra embaixo da tela') + '</button>' +
         '<button class="item" data-a="esconder">' + svg('ocultar') + 'Esconder a barra</button>' +
@@ -6203,6 +6208,11 @@ main{max-width:980px;margin:0 auto;padding:10px 18px 40px}
 .motores{display:flex;flex-wrap:wrap;justify-content:center;gap:6px;margin:14px 0 0}
 .motor{height:32px;padding:0 13px;border-radius:16px;border:1px solid var(--borda);background:transparent;color:var(--sub);font:inherit;font-size:13px;cursor:pointer}
 .motor[aria-pressed="true"]{background:var(--tx);color:var(--bg);border-color:transparent;font-weight:650}
+.modos{margin:14px auto 0;max-width:640px;text-align:center}
+.seg-modo{display:inline-flex;padding:3px;border-radius:14px;background:var(--campo);border:1px solid var(--borda)}
+.modo{height:32px;padding:0 14px;border:0;border-radius:11px;background:transparent;color:var(--sub);font:inherit;font-size:13px;font-weight:650;cursor:pointer}
+.modo[aria-pressed="true"]{background:var(--bg2);color:var(--tx);box-shadow:0 2px 8px -2px rgba(0,0,0,.3)}
+.dica-modo{margin:8px auto 0;max-width:520px;font-size:12.5px;color:var(--sub);line-height:1.45}
 h2{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:15px;margin:34px 2px 12px;color:var(--sub);font-weight:650;text-transform:uppercase;letter-spacing:.7px}
 h2 button{font:inherit;font-size:12.5px;text-transform:none;letter-spacing:0;color:var(--real);background:none;border:0;cursor:pointer;padding:4px 6px}
 .grade{display:grid;grid-template-columns:repeat(auto-fill,minmax(112px,1fr));gap:10px}
@@ -6253,8 +6263,13 @@ h2 button{font:inherit;font-size:12.5px;text-transform:none;letter-spacing:0;col
 <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-4.2-4.2"/></svg>
 <input name="q" id="q" placeholder="site.com ou o que você quer pesquisar" autofocus spellcheck="false" autocapitalize="off" enterkeyhint="go" aria-label="Endereço ou busca">
 <input type="hidden" name="motor" id="motor" value="ddg">
+<input type="hidden" name="modo" id="modo" value="leve">
 <button class="btn prim" type="submit">Ir</button></form>
 <div class="motores" id="motores" role="group" aria-label="Buscar com"></div>
+<div class="modos" id="modos" hidden><div class="seg-modo" role="group" aria-label="Modo do navegador">
+<button type="button" class="modo" data-modo="leve" aria-pressed="true">&#9889; Leve</button>
+<button type="button" class="modo" data-modo="completo" aria-pressed="false">&#129514; Completo</button></div>
+<p class="dica-modo" id="dica-modo"></p></div>
 </section>
 
 <h2><span>Atalhos</span><button type="button" id="editar">Editar</button></h2>
@@ -6292,7 +6307,8 @@ h2 button{font:inherit;font-size:12.5px;text-transform:none;letter-spacing:0;col
   function host(u) { try { return new URL(u).host.replace(/^www\./, ''); } catch (e) { return u; } }
   function cor(t) { var h = 0; for (var i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) >>> 0; return 'hsl(' + (h % 360) + ',62%,48%)'; }
   function proxied(u) { try { var x = new URL(u); return '/p/' + x.protocol.slice(0, -1) + '/' + x.host + x.pathname + x.search; } catch (e) { return '/'; } }
-  function ir(u) { return '/ir?q=' + encodeURIComponent(u); }
+  var modo = 'leve';
+  function ir(u) { return '/ir?q=' + encodeURIComponent(u) + (modo === 'completo' ? '&modo=completo' : ''); }
 
   /* saída */
   $('saida').querySelector('.longo').textContent = 'Saindo ' + CFG.saida;
@@ -6312,6 +6328,26 @@ h2 button{font:inherit;font-size:12.5px;text-transform:none;letter-spacing:0;col
     motor = b.getAttribute('data-m'); LS.set('motor', motor); desenharMotores(); $('q').focus();
   });
   desenharMotores();
+
+  /* modo leve / completo (o completo só aparece com o motor ligado no Termux-Toons) */
+  modo = CFG.completo && LS.get('modo', 'leve') === 'completo' ? 'completo' : 'leve';
+  function desenharModo() {
+    $('modo').value = modo;
+    if (!CFG.completo) return;
+    $('modos').hidden = false;
+    Array.prototype.forEach.call(document.querySelectorAll('.modo'), function (b) {
+      b.setAttribute('aria-pressed', String(b.getAttribute('data-modo') === modo));
+    });
+    $('dica-modo').textContent = modo === 'completo'
+      ? 'Completo (experimental): o motor Rammerhead roda o JavaScript dos sites, como o blockaway. Abre mais sites (TikTok, Instagram, Facebook...), mas é mais pesado para o celular.'
+      : 'Leve: mais rápido e gasta menos. Vídeos do TikTok, Instagram e YouTube abrem direto no VLC Web.';
+  }
+  $('modos').addEventListener('click', function (e) {
+    var b = e.target.closest('[data-modo]'); if (!b) return;
+    modo = b.getAttribute('data-modo'); LS.set('modo', modo);
+    desenharModo(); desenharAtalhos(); desenharHist();
+  });
+  desenharModo();
 
   /* atalhos */
   function favoritos() { var f = LS.get('fav', null); return Array.isArray(f) ? f : CFG.atalhos.map(function (a) { return { n: a[0], u: a[1] }; }); }
@@ -6360,7 +6396,7 @@ h2 button{font:inherit;font-size:12.5px;text-transform:none;letter-spacing:0;col
     $('limpar').hidden = !h.length;
     if (!h.length) { $('hist').innerHTML = '<div class="nada">' + (sem ? 'O histórico está desligado neste aparelho.' : 'Os sites que você abrir aparecem aqui (só neste aparelho).') + '</div>'; return; }
     $('hist').innerHTML = h.slice(0, 10).map(function (x) {
-      return '<a href="' + esc(proxied(x.u)) + '"><span class="av" style="background:' + cor(host(x.u)) + '">' + esc(host(x.u).charAt(0).toUpperCase()) + '</span>' +
+      return '<a href="' + esc(modo === 'completo' ? '/_tt/completo?u=' + encodeURIComponent(x.u) : proxied(x.u)) + '"><span class="av" style="background:' + cor(host(x.u)) + '">' + esc(host(x.u).charAt(0).toUpperCase()) + '</span>' +
         '<span class="tx"><div class="t">' + esc(x.t || host(x.u)) + '</div><div class="u">' + esc(x.u.replace(/^https?:\/\//, '')) + '</div></span><span class="q">' + esc(quando(x.d)) + '</span></a>';
     }).join('');
   }
@@ -6422,8 +6458,8 @@ def _json_no_html(dados) -> str:
     return json.dumps(dados, ensure_ascii=False).replace("</", "<\\/")
 
 
-def _pagina_inicio_navegador(saida: str = "") -> bytes:
-    cfg_pagina = {"saida": _nome_saida(saida), "saida_curta": {"ssh": "Túnel SSH", "tor": "Tor"}.get(saida, "Direto"),
+def _pagina_inicio_navegador(saida: str = "", completo: bool = False) -> bytes:
+    cfg_pagina = {"completo": completo, "saida": _nome_saida(saida), "saida_curta": {"ssh": "Túnel SSH", "tor": "Tor"}.get(saida, "Direto"),
                   "atalhos": [list(a) for a in NAV_ATALHOS],
                   "buscas": [[k, v[0]] for k, v in NAV_BUSCAS.items()]}
     return (NAV_PAGINA_INICIO.replace("__CSS__", NAV_CSS).replace("__LOGO_GRANDE__", _logo(76))
@@ -6726,6 +6762,315 @@ def _vlc_estado_json() -> dict:
             "atualizacao": bool(sha and estado["remoto"] and estado["remoto"] != sha), "repo": VLC_WEB_SITE}
 
 
+# ── Modo completo (EXPERIMENTAL): o motor Rammerhead ─────────────────
+# Sites como TikTok, Instagram e Facebook quebram no modo leve porque o JavaScript deles confere o próprio
+# endereço, usa WebSocket e guarda dados por site. Serviços como o blockaway e o CroxyProxy resolvem isso com um
+# motor que REESCREVE O JAVASCRIPT dos sites. O Rammerhead (github.com/binary-person/rammerhead, MIT) é um motor
+# assim, aberto, em Node.js. O Termux-Toons o instala pelo npm em ~/.termux_toons/motor-completo e o roda em
+# 127.0.0.1; o navegador pelo celular confere o link secreto e repassa a ele os endereços /<sessão>/<site>.
+# Cada visitante tem a sua sessão (cookie navrh). O motor também nunca abre a rede local (servidor.js).
+
+SERVICO_MOTOR = "navegador-completo"
+MOTOR_DIR = DATA_DIR / "motor-completo"
+MOTOR_PACOTE = {"rammerhead": "1.2.64"}
+# endereços do motor: a sessão (32 hex) com marcas opcionais (*janela, !tipo...) e o site; e as rotas de serviço
+_NAV_MOTOR_SESSAO = re.compile(r"/([0-9a-f]{32})(?:[*!][^/]*)?/(.*)$", re.S)
+NAV_MOTOR_ROTAS = {"/hammerhead.js", "/task.js", "/iframe-task.js", "/messaging", "/transport-worker.js",
+                   "/worker-hammerhead.js", "/rammerhead.js", "/api/shuffleDict", "/syncLocalStorage"}
+NAV_SALTO = {"connection", "keep-alive", "proxy-connection", "proxy-authorization", "te", "trailer",
+             "transfer-encoding", "upgrade", "content-length"}
+_NAV_MOTOR_ESTADO = {"quando": 0.0, "no_ar": False, "porta": 0}
+
+NAV_MOTOR_JS = r"""'use strict';
+/* Termux-Toons · modo completo do navegador pelo celular (EXPERIMENTAL).
+   Usa o Rammerhead (github.com/binary-person/rammerhead, licença MIT), que roda sobre o testcafe-hammerhead: ele
+   reescreve o JavaScript dos sites para eles "acharem" que estão no próprio endereço, guarda os cookies e o
+   localStorage de cada site e passa WebSocket. É o mesmo tipo de motor de sites como o blockaway e o CroxyProxy.
+   Só escuta em 127.0.0.1: quem fala com ele é o navegador pelo celular (Termux-Toons, em Python), que confere o
+   link secreto e repassa os pedidos. Este arquivo é reescrito pelo Termux-Toons a cada vez que o motor liga. */
+const fs = require('fs');
+const path = require('path');
+const net = require('net');
+const dns = require('dns');
+
+/* ---------- nunca abrir a rede local nem o próprio celular ----------
+   Toda conexão de saída passa por net.Socket.prototype.connect: endereços IP são conferidos na hora e nomes,
+   depois de resolvidos (o lookup recusa IPs privados). Assim nenhum site pode fazer o motor abrir o roteador,
+   a API do Termux ou o ADB, nem por redirecionamento nem por WebSocket. */
+function ipv4Privado(ip) {
+  const p = ip.split('.').map(Number);
+  if (p.length !== 4 || p.some(function (n) { return !(n >= 0 && n <= 255); })) return true;
+  const a = p[0], b = p[1];
+  return a === 0 || a === 10 || a === 127 || (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 192 && b === 0 && p[2] === 0) ||
+    (a === 198 && (b === 18 || b === 19)) || a >= 224;
+}
+function privado(endereco) {
+  const ip = String(endereco || '').replace(/^\[|\]$/g, '').split('%')[0].toLowerCase();
+  if (net.isIPv4(ip)) return ipv4Privado(ip);
+  if (!net.isIPv6(ip)) return true;
+  if (ip === '::' || ip === '::1') return true;
+  const v4 = /^(?:0*:)*:?(?:ffff:)?(\d+\.\d+\.\d+\.\d+)$/.exec(ip);
+  if (v4) return ipv4Privado(v4[1]);
+  const hx = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(ip);
+  if (hx) {
+    const x = parseInt(hx[1], 16), y = parseInt(hx[2], 16);
+    return ipv4Privado([x >> 8, x & 255, y >> 8, y & 255].join('.'));
+  }
+  const primeiro = parseInt(ip.split(':')[0] || '0', 16);
+  return (primeiro & 0xfe00) === 0xfc00 || (primeiro & 0xffc0) === 0xfe80 || (primeiro & 0xff00) === 0xff00;
+}
+function bloqueado(host) {
+  const erro = new Error('destino na rede local bloqueado: ' + host);
+  erro.code = 'EACCES';
+  return erro;
+}
+const lookupPadrao = dns.lookup;
+function lookupSeguro(lookup) {
+  return function (host, opcoes, cb) {
+    if (typeof opcoes === 'function') { cb = opcoes; opcoes = {}; }
+    else if (typeof opcoes === 'number') opcoes = { family: opcoes };
+    else opcoes = opcoes || {};
+    (lookup || lookupPadrao).call(dns, host, opcoes, function (erro, endereco, familia) {
+      if (erro) return cb(erro);
+      if (Array.isArray(endereco)) {
+        const bons = endereco.filter(function (a) { return !privado(a.address); });
+        return bons.length ? cb(null, bons) : cb(bloqueado(host));
+      }
+      return privado(endereco) ? cb(bloqueado(host)) : cb(null, endereco, familia);
+    });
+  };
+}
+const conectarOriginal = net.Socket.prototype.connect;
+net.Socket.prototype.connect = function () {
+  let args = Array.prototype.slice.call(arguments);
+  if (typeof args[0] === 'number' || (typeof args[0] === 'string' && /^\d+$/.test(args[0]))) {
+    // connect(porta[, host][, callback]) → forma com opções, para conferir o destino
+    const cb = args.filter(function (a) { return typeof a === 'function'; })[0];
+    args = [{ port: Number(args[0]), host: typeof args[1] === 'string' ? args[1] : 'localhost' }];
+    if (cb) args.push(cb);
+  }
+  const opcoes = Array.isArray(args[0]) ? args[0][0] : args[0];
+  if (opcoes && typeof opcoes === 'object' && !opcoes.path) {
+    const host = String(opcoes.host || 'localhost');
+    if (net.isIP(host.replace(/^\[|\]$/g, ''))) {
+      if (privado(host)) {
+        const socket = this;
+        process.nextTick(function () { socket.destroy(bloqueado(host)); });
+        return this;
+      }
+    } else {
+      opcoes.lookup = lookupSeguro(opcoes.lookup);
+    }
+  }
+  return conectarOriginal.apply(this, args);
+};
+
+/* ---------- o motor ---------- */
+const porta = parseInt(process.argv[2] || '8102', 10);
+let segredo = '';
+try { segredo = fs.readFileSync(path.join(__dirname, 'segredo'), 'utf8').trim(); } catch (e) { /* sem arquivo */ }
+if (!segredo) {
+  console.error('Falta o arquivo "segredo": instale o modo completo pelo Termux-Toons.');
+  process.exit(1);
+}
+const pastaSessoes = path.join(__dirname, 'sessoes');
+fs.mkdirSync(pastaSessoes, { recursive: true });
+
+const rh = require('rammerhead');
+const logger = new rh.RammerheadLogging({
+  logLevel: process.env.TT_LOG || 'info',
+  generatePrefix: function (nivel) { return '[' + new Date().toISOString() + '] [' + nivel.toUpperCase() + '] '; }
+});
+const proxy = new rh.RammerheadProxy({
+  logger: logger,
+  loggerGetIP: function (req) { return req.socket.remoteAddress; },
+  bindingAddress: '127.0.0.1',
+  port: porta,
+  crossDomainPort: null,   // uma porta só: é o navegador pelo celular que leva os pedidos até aqui
+  getServerInfo: function (req) {
+    // o endereço que o visitante usa (IP do Wi-Fi ou o túnel https), que o navegador pelo celular repassa
+    const protocolo = req.headers['x-forwarded-proto'] === 'https' ? 'https:' : 'http:';
+    let u;
+    try { u = new URL(protocolo + '//' + (req.headers.host || ('127.0.0.1:' + porta))); }
+    catch (e) { u = new URL('http://127.0.0.1:' + porta); }
+    return { hostname: u.hostname, port: Number(u.port) || (protocolo === 'https:' ? 443 : 80), protocol: protocolo };
+  },
+  disableLocalStorageSync: false,
+  jsCache: new rh.RammerheadJSMemCache(32 * 1024 * 1024),
+  disableHttp2: false
+});
+const sessoes = new rh.RammerheadSessionFileCache({
+  logger: logger,
+  saveDirectory: pastaSessoes,
+  cacheTimeout: 20 * 60 * 1000,
+  cacheCheckInterval: 10 * 60 * 1000,
+  deleteUnused: true,
+  deleteCorruptedSessions: true,
+  staleCleanupOptions: { staleTimeout: 7 * 24 * 3600 * 1000, maxToLive: null, staleCheckInterval: 6 * 3600 * 1000 }
+});
+sessoes.attachToProxy(proxy);
+
+// cabeçalhos que contariam ao site o IP de quem navega (o túnel da Cloudflare põe vários) não seguem adiante
+proxy.addToOnRequestPipeline(function (req, res, info, ehRota) {
+  if (ehRota) return;
+  Object.keys(req.headers).forEach(function (h) {
+    if (/^(cf-|x-forwarded|x-real-ip$|true-client-ip$|forwarded$|via$|cdn-loop$|x-tt-)/i.test(h)) delete req.headers[h];
+  });
+});
+
+function parametro(req, nome) {
+  try { return new URL(req.url, 'http://x').searchParams.get(nome) || ''; } catch (e) { return ''; }
+}
+// sessões: só o navegador pelo celular cria (ele sabe o segredo); cada visitante tem a sua
+proxy.GET('/newsession', function (req, res) {
+  if (parametro(req, 'pwd') !== segredo) { res.writeHead(403); res.end('proibido'); return; }
+  const id = rh.generateId();
+  sessoes.addSerializedSession(id, new rh.RammerheadSession().serializeSession());
+  res.end(id);
+});
+proxy.GET('/sessionexists', function (req, res) {
+  const id = parametro(req, 'id');
+  res.end(id && sessoes.has(id) ? 'exists' : 'not found');
+});
+
+['SIGTERM', 'SIGINT'].forEach(function (sinal) {
+  process.on(sinal, function () {
+    try { proxy.close(); } catch (e) { /* já fechado */ }
+    process.exit(0);
+  });
+});
+process.on('uncaughtException', function (e) { logger.error('(motor) erro: ' + ((e && e.stack) || e)); });
+logger.info('(motor) Modo completo ouvindo em http://127.0.0.1:' + porta);
+"""
+
+NAV_BARRA_COMPLETO_JS = r"""(function () {
+  /* Termux-Toons · minibarra das páginas abertas no modo completo (motor Rammerhead). Só botões e
+     location.assign: o motor reescreve links e atributos criados por script, então nada aqui usa href. */
+  try {
+    if (window.top !== window.self || window.__ttCompleto) return;
+    window.__ttCompleto = true;
+    var m = /^\/[0-9a-f]{32}[^\/]*\/(https?:\/\/.*)$/.exec(location.pathname);
+    var real = m ? m[1] + location.search + location.hash : '';
+    var IC = {
+      inicio: '<path d="M4 11.5 12 5l8 6.5"/><path d="M6.5 10v9h4v-5h3v5h4v-9"/>',
+      play: '<path d="M8 5.5v13l10.5-6.5z" fill="currentColor" stroke="none"/>',
+      leve: '<path d="M13 3 5 13.5h6L10 21l8-10.5h-6z"/>',
+      menos: '<path d="M6 12h12"/>',
+      globo: '<circle cx="12" cy="12" r="8"/><path d="M4 12h16"/><path d="M12 4c2.5 2.7 2.5 13.3 0 16M12 4c-2.5 2.7-2.5 13.3 0 16"/>'
+    };
+    function svg(n) { return '<svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + IC[n] + '</svg>'; }
+    var hospede = document.createElement('tt-completo');
+    hospede.setAttribute('style', 'all:initial!important;position:fixed!important;z-index:2147483647!important;left:max(10px,env(safe-area-inset-left))!important;bottom:max(12px,env(safe-area-inset-bottom))!important');
+    var raiz = hospede.attachShadow ? hospede.attachShadow({ mode: 'closed' }) : hospede;
+    raiz.innerHTML = '<style>' +
+      '*{box-sizing:border-box}.p{display:flex;align-items:center;gap:2px;padding:4px;border-radius:22px;background:rgba(18,20,26,.86);' +
+      '-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);border:1px solid rgba(255,255,255,.14);box-shadow:0 10px 28px -10px rgba(0,0,0,.6);' +
+      'font:600 12.5px/1 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:#eef0f5}' +
+      'button{all:unset;box-sizing:border-box;display:inline-flex;align-items:center;gap:5px;height:34px;padding:0 10px;border-radius:17px;cursor:pointer;color:inherit}' +
+      'button:hover{background:rgba(255,255,255,.1)}button.vlc{background:linear-gradient(135deg,#ffa53a,#ff6b00);color:#fff}' +
+      '.so{width:34px;padding:0;justify-content:center}.min .t{display:none}.min .x{display:none}' +
+      '</style><div class="p" role="toolbar" aria-label="Navegador pelo celular · modo completo">' +
+      '<button data-a="inicio" title="Página inicial" aria-label="Página inicial">' + svg('inicio') + '<span class="t">Início</span></button>' +
+      '<button class="vlc x" data-a="vlc" title="Tocar o vídeo desta página no VLC Web" aria-label="VLC">' + svg('play') + '<span class="t">VLC</span></button>' +
+      '<button class="x" data-a="leve" title="Abrir no modo leve" aria-label="Modo leve">' + svg('leve') + '<span class="t">Leve</span></button>' +
+      '<button class="so" data-a="min" title="Encolher" aria-label="Encolher">' + svg('menos') + '</button></div>';
+    var painel = raiz.querySelector('.p');
+    raiz.addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('[data-a]') : null;
+      if (!b) return;
+      var a = b.getAttribute('data-a');
+      if (a === 'inicio') location.assign('/');
+      else if (a === 'vlc' && real) location.assign('/_tt/vlc?u=' + encodeURIComponent(real) + '&titulo=' + encodeURIComponent(document.title || ''));
+      else if (a === 'leve' && real) location.assign('/ir?modo=leve&q=' + encodeURIComponent(real));
+      else if (a === 'min') {
+        var min = painel.classList.toggle('min');
+        b.innerHTML = svg(min ? 'globo' : 'menos');
+      }
+    });
+    (document.body || document.documentElement).appendChild(hospede);
+  } catch (e) { /* a página continua sem a minibarra */ }
+})();
+"""
+
+
+def motor_completo_instalado() -> bool:
+    return (MOTOR_DIR / "node_modules" / "rammerhead" / "src" / "index.js").is_file()
+
+
+def _segredo_motor() -> str:
+    try:
+        return (MOTOR_DIR / "segredo").read_text("utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _escrever_arquivos_motor() -> None:
+    """servidor.js (sempre a versão deste Termux-Toons), package.json e o segredo (permissão 600)."""
+    MOTOR_DIR.mkdir(parents=True, exist_ok=True)
+    (MOTOR_DIR / "servidor.js").write_text(NAV_MOTOR_JS, "utf-8")
+    (MOTOR_DIR / "package.json").write_text(json.dumps(
+        {"name": "termux-toons-motor-completo", "private": True, "description": "Modo completo do navegador "
+         "pelo celular (Rammerhead)", "dependencies": MOTOR_PACOTE}, indent=2), "utf-8")
+    segredo = MOTOR_DIR / "segredo"
+    if not _segredo_motor():
+        segredo.touch(mode=0o600)
+        segredo.write_text(secrets.token_urlsafe(24), "utf-8")
+    with contextlib.suppress(OSError):
+        segredo.chmod(0o600)
+
+
+def _motor_no_ar(porta: int) -> bool:
+    """O motor responde em 127.0.0.1? (guardado por 5 segundos)"""
+    if not porta:
+        return False
+    agora = time.time()
+    if _NAV_MOTOR_ESTADO["porta"] == porta and agora - _NAV_MOTOR_ESTADO["quando"] < 5:
+        return _NAV_MOTOR_ESTADO["no_ar"]
+    try:
+        socket.create_connection(("127.0.0.1", porta), 0.5).close()
+        no_ar = True
+    except OSError:
+        no_ar = False
+    _NAV_MOTOR_ESTADO.update(quando=agora, no_ar=no_ar, porta=porta)
+    return no_ar
+
+
+def _pedir_ao_motor(porta: int, caminho: str) -> str:
+    conexao = http.client.HTTPConnection("127.0.0.1", porta, timeout=15)
+    try:
+        conexao.request("GET", caminho, headers={"Host": f"127.0.0.1:{porta}"})
+        resposta = conexao.getresponse()
+        return resposta.read(4096).decode("utf-8", "replace").strip() if resposta.status == 200 else ""
+    except (OSError, http.client.HTTPException):
+        return ""
+    finally:
+        conexao.close()
+
+
+def _destino_motor_ok(destino: str) -> bool:
+    """Bloqueio rápido (o motor confere de novo depois de resolver o nome): nada de localhost nem IP local."""
+    try:
+        host = (urllib.parse.urlsplit(destino).hostname or "").lower()
+    except ValueError:
+        return False
+    if not host:
+        return True   # caminhos internos do motor
+    if host == "localhost" or host.endswith(".localhost"):
+        return False
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    return _destino_navegador_ok(host)
+
+
+def _injetar_barra_completo(pagina: bytes) -> bytes:
+    script = ("<script>" + NAV_BARRA_COMPLETO_JS + "</script>").encode("utf-8")
+    fim = pagina.lower().rfind(b"</body>")
+    return pagina[:fim] + script + pagina[fim:] if fim >= 0 else pagina + script
+
+
 # ── O servidor ───────────────────────────────────────────────────────
 
 class _CorpoInvalido(Exception):
@@ -6739,6 +7084,8 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
     token = ""
     com_barra = True
     saida = ""
+    porta_completo = 0      # porta do motor do modo completo (Rammerhead) em 127.0.0.1
+    segredo_completo = ""   # senha que só o navegador pelo celular usa para criar sessões no motor
 
     def log_message(self, formato, *args):
         pass
@@ -6855,6 +7202,8 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
                 self._midia(caminho, consulta)   # link assinado do VLC Web: vale sem o cookie
             elif caminho.startswith("/y/"):
                 self._midia_ytdlp(caminho, consulta)   # vídeo achado pelo yt-dlp: o id secreto vale sem o cookie
+            elif self.porta_completo and (caminho in NAV_MOTOR_ROTAS or _NAV_MOTOR_SESSAO.match(caminho)):
+                self._motor(caminho)   # modo completo: a sessão de 32 caracteres no endereço vale como senha
             else:
                 autorizado, pelo_link = self._autorizar()
                 if not autorizado:
@@ -6886,7 +7235,7 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
 
     def _rotear(self, caminho: str, consulta: str) -> None:
         if caminho == "/":
-            self._responder(200, _pagina_inicio_navegador(self.saida))
+            self._responder(200, _pagina_inicio_navegador(self.saida, _motor_no_ar(self.porta_completo)))
         elif caminho == "/ir":
             self._ir()
         elif caminho.startswith("/p/"):
@@ -6899,6 +7248,8 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
                             {"Cache-Control": "public, max-age=604800, immutable" if versao_certa else "no-cache"})
         elif caminho == "/_tt/vlc":
             self._abrir_no_vlc()
+        elif caminho == "/_tt/completo":
+            self._abrir_completo()
         elif caminho == "/_tt/ytdlp":
             real = _url_real(self._param("u"))
             if real:
@@ -6942,7 +7293,7 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
             if sid:
                 _esquecer_sessao_navegador(sid)
             self._novos_cookies += ["navtk=; Path=/; Max-Age=0", "navsid=; Path=/; Max-Age=0",
-                                    "navsite=; Path=/; Max-Age=0"]
+                                    "navsite=; Path=/; Max-Age=0", "navrh=; Path=/; Max-Age=0"]
             self._responder(200, _pagina_simples("Pronto", f"""{_logo(64)}<h1>Este aparelho saiu</h1>
 <p>Os cookies dos sites abertos por aqui foram apagados do celular. Para voltar, abra o link do navegador de novo.</p>"""))
         else:
@@ -6980,6 +7331,9 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
             self._ir_para("/")
             return
         url = _endereco_digitado(termo, self._param("motor") or "ddg")
+        if self._param("modo") == "completo" and _motor_no_ar(self.porta_completo) and _nav_link(url):
+            self._ir_para("/_tt/completo?" + urllib.parse.urlencode({"u": url}))
+            return
         if _pagina_de_video(url):   # link de vídeo do TikTok, Instagram...: vai direto para o vídeo
             self._ir_para("/_tt/ytdlp?" + urllib.parse.urlencode({"u": url}))
             return
@@ -7024,6 +7378,186 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
         if titulo:
             params["title"] = titulo[:200]
         self._ir_para("/vlc/?" + urllib.parse.urlencode(params))
+
+    # ── modo completo (motor Rammerhead) ──
+    def _abrir_completo(self) -> None:
+        """/_tt/completo?u=<site>: abre o site no motor, na sessão deste visitante (criada na primeira vez)."""
+        real = _url_real(self._param("u"))
+        if not real:
+            self._ir_para("/")
+            return
+        if not _motor_no_ar(self.porta_completo):
+            self._responder(503, _pagina_erro_navegador(
+                "O modo completo está desligado. No Termux-Toons: navegador pelo celular → Modo completo.", real))
+            return
+        if not _destino_motor_ok(real):
+            self._responder(403, _pagina_erro_navegador(
+                "Esse endereço aponta para a rede local ou para o próprio celular; o navegador não abre esses.",
+                real, "&#128274;"))
+            return
+        sessao = self._cookie("navrh")
+        if not re.fullmatch(r"[0-9a-f]{32}", sessao) or \
+                _pedir_ao_motor(self.porta_completo, f"/sessionexists?id={sessao}") != "exists":
+            sessao = _pedir_ao_motor(self.porta_completo,
+                                     "/newsession?pwd=" + urllib.parse.quote(self.segredo_completo, safe=""))
+            if not re.fullmatch(r"[0-9a-f]{32}", sessao):
+                self._responder(502, _pagina_erro_navegador(
+                    "O modo completo não criou a sessão. Veja o log em Modo completo → Status e log.", real))
+                return
+            self._novos_cookies.append(f"navrh={sessao}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
+        self._ir_para(f"/{sessao}/{real}")
+
+    def _cabecalhos_para_motor(self) -> list:
+        """Os cabeçalhos do visitante para o motor: sem os de conexão, sem os do túnel (o IP de quem navega) e sem
+        os nossos cookies. O Host fica (o motor monta os endereços com ele) e vai o protocolo que o visitante usa."""
+        cab = []
+        for chave, valor in self.headers.items():
+            baixa = chave.lower()
+            if baixa in NAV_SALTO or baixa.startswith(("cf-", "x-forwarded", "x-tt-")) or baixa in (
+                    "x-real-ip", "true-client-ip", "forwarded", "via", "cdn-loop"):
+                continue
+            if baixa == "cookie":
+                valor = "; ".join(p.strip() for p in valor.split(";")
+                                  if p.strip() and p.strip().split("=", 1)[0] not in NAV_COOKIES_NOSSOS
+                                  and not p.strip().startswith("tt~"))
+                if not valor:
+                    continue
+            cab.append((chave, valor))
+        cab.append(("X-Forwarded-Proto", self._origem_publica().split(":", 1)[0]))
+        return cab
+
+    def _motor(self, caminho: str) -> None:
+        """Repassa ao motor do modo completo (127.0.0.1) e devolve a resposta. As páginas ganham a minibarra."""
+        achado = _NAV_MOTOR_SESSAO.match(caminho)
+        destino = achado.group(2) if achado else ""
+        if destino and not _destino_motor_ok(destino):
+            self._responder(403, _pagina_erro_navegador(
+                "Esse endereço aponta para a rede local ou para o próprio celular; o navegador não abre esses.",
+                destino, "&#128274;"))
+            return
+        if not _motor_no_ar(self.porta_completo):
+            leve = _nav_link(destino) if destino.startswith(("http://", "https://")) else None
+            self._responder(503, _pagina_erro_navegador(
+                "O modo completo está desligado. Ligue no Termux-Toons ou use o modo leve.", destino)
+                if not leve else _pagina_erro_navegador("O modo completo está desligado.", destino))
+            return
+        if "websocket" in (self.headers.get("Upgrade") or "").lower():
+            self._motor_websocket()
+            return
+        corpo = None
+        if self.command not in ("GET", "HEAD", "OPTIONS") or int(self.headers.get("Content-Length") or 0) > 0:
+            corpo = self._ler_corpo()
+        cabecalhos = self._cabecalhos_para_motor()
+        documento = self.command == "GET" and self._eh_navegacao()
+        if documento:   # a página volta sem brotli, para a minibarra entrar
+            cabecalhos = [(k, v) for k, v in cabecalhos if k.lower() != "accept-encoding"]
+            cabecalhos.append(("Accept-Encoding", "gzip, deflate"))
+        conexao = http.client.HTTPConnection("127.0.0.1", self.porta_completo, timeout=120)
+        try:
+            conexao.putrequest(self.command, self.path, skip_host=True, skip_accept_encoding=True)
+            for chave, valor in cabecalhos:
+                conexao.putheader(chave, valor)
+            if corpo is not None:
+                conexao.putheader("Content-Length", str(len(corpo)))
+            conexao.endheaders(corpo)
+            resposta = conexao.getresponse()
+        except (OSError, http.client.HTTPException) as e:
+            conexao.close()
+            self._responder(502, _pagina_erro_navegador(f"O modo completo não respondeu: {e}", destino))
+            return
+        try:
+            self._entregar_do_motor(resposta, documento)
+        finally:
+            conexao.close()
+
+    def _entregar_do_motor(self, resposta, documento: bool) -> None:
+        status = resposta.status
+        cabecalhos = [(k, v) for k, v in resposta.getheaders() if k.lower() not in NAV_SALTO
+                      and k.lower() not in ("date", "server")]
+        tipo = (resposta.getheader("Content-Type") or "").split(";")[0].strip().lower()
+        codificacao = (resposta.getheader("Content-Encoding") or "").lower().strip()
+        sem_corpo = self.command == "HEAD" or status in (204, 304) or 100 <= status < 200
+        prefixo = b""
+        if (documento and status == 200 and tipo == "text/html" and not sem_corpo
+                and codificacao in ("", "identity", "gzip", "x-gzip", "deflate")):
+            prefixo = resposta.read(NAV_MAX_REESCREVER + 1)
+            if len(prefixo) <= NAV_MAX_REESCREVER:
+                pagina = _injetar_barra_completo(_descomprimir(prefixo, codificacao) if codificacao else prefixo)
+                self._comecar_motor(status, [(k, v) for k, v in cabecalhos if k.lower() != "content-encoding"])
+                self.send_header("Content-Length", str(len(pagina)))
+                self.end_headers()
+                self.wfile.write(pagina)
+                return
+        tamanho = resposta.getheader("Content-Length")
+        self._comecar_motor(status, cabecalhos)
+        if sem_corpo:
+            if tamanho:
+                self.send_header("Content-Length", tamanho)
+            self.end_headers()
+            return
+        em_pedacos = not tamanho   # sem o tamanho, vai em pedaços (chunked) e a conexão continua aberta
+        if em_pedacos:
+            self.send_header("Transfer-Encoding", "chunked")
+        else:
+            self.send_header("Content-Length", tamanho)
+        self.end_headers()
+        try:
+            bloco = prefixo or resposta.read(NAV_BLOCO)
+            while bloco:
+                self.wfile.write(f"{len(bloco):x}\r\n".encode() + bloco + b"\r\n" if em_pedacos else bloco)
+                bloco = resposta.read(NAV_BLOCO)
+            if em_pedacos:
+                self.wfile.write(b"0\r\n\r\n")
+        except (OSError, http.client.HTTPException):
+            self.close_connection = True
+
+    def _comecar_motor(self, status: int, cabecalhos: list) -> None:
+        self._respondeu = True
+        self.send_response(status)
+        for cookie in self._novos_cookies:
+            self.send_header("Set-Cookie", cookie)
+        for chave, valor in cabecalhos:
+            self.send_header(chave, valor)
+
+    def _motor_websocket(self) -> None:
+        """WebSocket (chats, notificações ao vivo): liga o visitante ao motor e repassa os bytes nos dois sentidos."""
+        try:
+            motor = socket.create_connection(("127.0.0.1", self.porta_completo), 10)
+        except OSError:
+            self._responder(502, b"modo completo fora do ar", "text/plain")
+            return
+        linhas = [f"{self.command} {self.path} HTTP/1.1"]
+        for chave, valor in self.headers.items():
+            baixa = chave.lower()
+            if baixa.startswith(("cf-", "x-forwarded", "x-tt-")) or baixa in ("x-real-ip", "true-client-ip",
+                                                                            "forwarded", "via", "cdn-loop"):
+                continue
+            if baixa == "cookie":
+                valor = "; ".join(p.strip() for p in valor.split(";")
+                                  if p.strip() and p.strip().split("=", 1)[0] not in NAV_COOKIES_NOSSOS
+                                  and not p.strip().startswith("tt~"))
+            linhas.append(f"{chave}: {valor}")
+        linhas.append(f"X-Forwarded-Proto: {self._origem_publica().split(':', 1)[0]}")
+        self._respondeu = self._corpo_lido = True
+        self.close_connection = True
+        cliente = self.connection
+        try:
+            motor.sendall(("\r\n".join(linhas) + "\r\n\r\n").encode("latin-1", "replace"))
+            motor.settimeout(None)
+            cliente.settimeout(None)
+            while True:
+                prontos, _, _ = select.select([cliente, motor], [], [], 3600)
+                if not prontos:
+                    break
+                for origem in prontos:
+                    dados = origem.recv(1 << 16)
+                    if not dados:
+                        return
+                    (motor if origem is cliente else cliente).sendall(dados)
+        except OSError:
+            pass
+        finally:
+            motor.close()
 
     def _eh_pagina_html(self, url: str) -> bool:
         """O link colado é uma página (HTML) e não o arquivo de mídia? Sem extensão de mídia, pergunta ao site só
@@ -7295,7 +7829,8 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
         texto = dados.decode(_charset_da_pagina(tipo, dados), "replace")
         extra = dict(extra_cors)
         if modo == "html":
-            saida = _reescrever_html(texto, url, _proxiar, self.com_barra)
+            saida = _reescrever_html(texto, url, _proxiar, self.com_barra,
+                                     completo=_motor_no_ar(self.porta_completo))
             tipo_saida = "text/html; charset=utf-8"
             partes = urllib.parse.urlsplit(url)
             self._novos_cookies.append(f"navsite={partes.scheme}/{partes.netloc}; Path=/; SameSite=Lax")
@@ -7382,6 +7917,9 @@ def servir_navegador(porta: int) -> None:
     _HandlerNavegador.token = c["navegador_token"]
     _HandlerNavegador.com_barra = bool(c.get("navegador_barra", True))
     _HandlerNavegador.saida = c.get("navegador_saida") or ""
+    if motor_completo_instalado():
+        _HandlerNavegador.porta_completo = int(c.get("navegador_completo_porta") or 8102)
+        _HandlerNavegador.segredo_completo = _segredo_motor()
     with ThreadingHTTPServer(("0.0.0.0", porta), _HandlerNavegador) as servidor:
         log(f"Navegador pelo celular em http://{ip_local()}:{porta}"
             + (f" · saindo {_nome_saida(c.get('navegador_saida'))}" if saida else "")
@@ -7475,6 +8013,8 @@ def ligar_navegador() -> None:
     if not iniciar_servico(SERVICO_NAVEGADOR, cmd_self(SERVICO_NAVEGADOR, "--porta", str(c["navegador_porta"])),
                            reiniciar=True):
         return
+    if c.get("navegador_completo") and motor_completo_instalado() and not servico_ativo(SERVICO_MOTOR):
+        ligar_motor_completo(religar_navegador=False)   # o navegador acabou de ligar e já sabe do motor
     if j == 1:
         abrir_tunel("tunel-navegador", c["navegador_porta"])
     elif servico_ativo("tunel-navegador"):
@@ -7485,6 +8025,7 @@ def ligar_navegador() -> None:
 def parar_navegador() -> None:
     parar_servico("tunel-navegador")
     parar_servico(SERVICO_NAVEGADOR)
+    desligar_motor_completo()
 
 
 def novo_link_navegador() -> None:
@@ -7635,6 +8176,122 @@ def menu_vlc_web_navegador():
     ], cabecalho=cabecalho)
 
 
+# ── Modo completo (motor Rammerhead, experimental) ────────────────────
+
+def _descricao_motor() -> str:
+    if not motor_completo_instalado():
+        return "não instalado"
+    return "ligado" if servico_ativo(SERVICO_MOTOR) else "instalado, desligado"
+
+
+def instalar_motor_completo() -> bool:
+    """Instala o Node.js (se faltar) e o Rammerhead pelo npm em ~/.termux_toons/motor-completo."""
+    aviso("Modo completo é EXPERIMENTAL: usa o Rammerhead (github.com/binary-person/rammerhead, MIT), que reescreve "
+          "o JavaScript dos sites, como o blockaway. Baixa algumas dezenas de MB e pesa mais no celular.")
+    if not garantir_cmd("node", "nodejs-lts") or not garantir_cmd("npm", "nodejs-lts"):
+        return False
+    _escrever_arquivos_motor()
+    info("Baixando o Rammerhead e o testcafe-hammerhead pelo npm (pode levar alguns minutos)...")
+    # --ignore-scripts: as dependências são só JavaScript; o script de pré-instalação do Rammerhead não é necessário
+    proc = rodar(["npm", "install", "--omit=dev", "--no-audit", "--no-fund", "--ignore-scripts", "--loglevel=error"],
+                 cwd=str(MOTOR_DIR), timeout=1800)
+    if proc.returncode != 0 or not motor_completo_instalado():
+        erro("O npm não terminou a instalação. Tente de novo (a internet pode ter caído) ou veja a mensagem acima.")
+        return False
+    ok("Modo completo instalado.")
+    if servico_ativo(SERVICO_MOTOR):
+        parar_servico(SERVICO_MOTOR)
+        ligar_motor_completo()
+    return True
+
+
+def ligar_motor_completo(religar_navegador: bool = True) -> bool:
+    if not motor_completo_instalado():
+        aviso("Instale o modo completo primeiro.")
+        return False
+    if servico_ativo(SERVICO_MOTOR):
+        return True
+    _escrever_arquivos_motor()
+    porta = int(cfg().get("navegador_completo_porta") or 8102)
+    if not porta_livre(porta, espera=2):
+        raise ToonsError(f"A porta {porta} (do modo completo) está em uso por outro programa. Troque no menu.")
+    ligou = iniciar_servico(SERVICO_MOTOR, f"cd {shlex.quote(str(MOTOR_DIR))} && node servidor.js {porta}",
+                            reiniciar=True)
+    if ligou and religar_navegador and servico_ativo(SERVICO_NAVEGADOR):
+        info("Religando o navegador para ele usar o modo completo...")
+        _reiniciar_navegador()
+    return ligou
+
+
+def desligar_motor_completo() -> None:
+    if servico_ativo(SERVICO_MOTOR):
+        parar_servico(SERVICO_MOTOR)
+
+
+@submenu
+def menu_modo_completo():
+    c = cfg()
+
+    def como_funciona():
+        _explicar([
+            "O modo leve (o normal) reescreve só o HTML das páginas e faz o JavaScript passar pelo celular. É rápido, "
+            "mas aplicativos web como TikTok, Instagram e Facebook quebram: o JavaScript deles confere o próprio "
+            "endereço, usa WebSocket e guarda dados por site.",
+            "Sites como o blockaway e o CroxyProxy usam um motor que REESCREVE O JAVASCRIPT dos sites, para eles "
+            "acharem que estão no próprio endereço, com cookies, localStorage e WebSocket de cada site. O modo "
+            "completo traz um motor assim, aberto: o Rammerhead (github.com/binary-person/rammerhead, MIT), em "
+            "Node.js, rodando no próprio celular e só em 127.0.0.1.",
+            "Com ele ligado, a página inicial do navegador mostra a escolha Leve / Completo, a barra das páginas ganha "
+            "'Abrir no modo completo' e as páginas do modo completo ganham uma minibarra (Início, ▶ VLC, Leve). O "
+            "link secreto do navegador continua valendo para tudo, e o motor nunca abre a rede local nem o celular.",
+            "É EXPERIMENTAL: pesa mais (memória e bateria), alguns sites ainda podem detectar o acesso e recusar, e "
+            "a 'saída' (túnel SSH ou Tor) não vale para ele, que sai direto pela conexão do celular. Não "
+            "compartilhe os endereços das páginas do modo completo: eles carregam a sua sessão.",
+        ])
+
+    def alternar_junto():
+        c["navegador_completo"] = not c.get("navegador_completo", False)
+        salvar_cfg()
+        ok("O modo completo " + ("liga" if c["navegador_completo"] else "não liga mais") + " junto com o navegador.")
+        if c["navegador_completo"] and motor_completo_instalado() and servico_ativo(SERVICO_NAVEGADOR):
+            ligar_motor_completo()
+
+    def mudar_porta():
+        c["navegador_completo_porta"] = perguntar_int("Porta do motor (só em 127.0.0.1)",
+                                                       c.get("navegador_completo_porta", 8102), 1024, 65535)
+        salvar_cfg()
+        ok(f"Porta {c['navegador_completo_porta']}.")
+        if servico_ativo(SERVICO_MOTOR):
+            desligar_motor_completo()
+            ligar_motor_completo()
+
+    def apagar():
+        if not MOTOR_DIR.exists():
+            info("O modo completo não está instalado.")
+        elif confirmar("Apagar o modo completo (Rammerhead e as sessões guardadas)?", False):
+            desligar_motor_completo()
+            shutil.rmtree(MOTOR_DIR, ignore_errors=True)
+            ok("Modo completo apagado.")
+            if servico_ativo(SERVICO_NAVEGADOR):
+                _reiniciar_navegador()
+
+    def cabecalho():
+        print(f"{DIM}Modo completo: {_descricao_motor()} · liga junto com o navegador: "
+              f"{'sim' if c.get('navegador_completo') else 'não'}{RST}")
+
+    menu("🧪 Modo completo do navegador (motor Rammerhead, experimental)", [
+        ("Como funciona", como_funciona),
+        (lambda: "Instalar o modo completo" if not motor_completo_instalado() else "Reinstalar / atualizar",
+         instalar_motor_completo),
+        (lambda: "Ligar agora" + (" (ligado)" if servico_ativo(SERVICO_MOTOR) else ""), ligar_motor_completo),
+        ("Desligar", desligar_motor_completo),
+        (lambda: f"Ligar junto com o navegador ({'sim' if c.get('navegador_completo') else 'não'})", alternar_junto),
+        (lambda: f"Porta do motor ({c.get('navegador_completo_porta', 8102)})", mudar_porta),
+        ("Status e log", lambda: status_servico(SERVICO_MOTOR)),
+        ("Apagar o modo completo", apagar),
+    ], cabecalho=cabecalho)
+
+
 @submenu
 def menu_navegador_web():
     c = cfg()
@@ -7696,6 +8353,7 @@ def menu_navegador_web():
         (lambda: f"Mostrar o link ({'no ar' if servico_ativo(SERVICO_NAVEGADOR) else 'parado'})",
          mostrar_links_navegador),
         (lambda: f"▶ VLC Web: tocar os vídeos dos sites ({_descricao_vlc_web()})", menu_vlc_web_navegador),
+        (lambda: f"🧪 Modo completo, como o blockaway (experimental · {_descricao_motor()})", menu_modo_completo),
         ("Gerar link novo (o antigo para de funcionar)", novo_link_navegador),
         ("Desligar (e fechar o túnel)", parar_navegador),
         (lambda: f"Saída: {_nome_saida(c.get('navegador_saida'))} (ou pelo túnel SSH / Tor)", mudar_saida),

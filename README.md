@@ -263,7 +263,30 @@ endereço ou uma busca, e o celular baixa o site pela conexão dele e devolve a 
 Esses sites são aplicativos inteiros em JavaScript: conferem se estão no próprio endereço, usam WebSocket e
 detectam robôs pela "impressão digital" da conexão segura (a do Python não é a de um navegador). Por isso o
 navegador leva direto ao vídeo, pelo yt-dlp. Para usar essas redes por completo pela internet do celular, use o
-**Proxy** (*Pontes de conexão → Proxy*): o navegador de verdade do PC faz tudo e só a conexão passa pelo celular.
+**Proxy** (*Pontes de conexão → Proxy*): o navegador de verdade do PC faz tudo e só a conexão passa pelo celular,
+ou experimente o modo completo (abaixo).
+
+### 🧪 Modo completo (experimental)
+
+Sites como o blockaway e o CroxyProxy abrem TikTok, Instagram e Facebook porque usam um motor que **reescreve o
+JavaScript dos sites** (para eles acharem que estão no próprio endereço), guarda cookies e `localStorage` de cada
+site e passa WebSocket. O modo completo traz um motor assim, aberto: o
+**[Rammerhead](https://github.com/binary-person/rammerhead)** (MIT, sobre o `testcafe-hammerhead`), em Node.js,
+rodando no próprio celular.
+
+- Instale em *navegador pelo celular → 🧪 Modo completo → Instalar*: o Termux-Toons instala o `nodejs-lts` e o
+  Rammerhead pelo npm (algumas dezenas de MB) em `~/.termux_toons/motor-completo`. Ligue ali mesmo ou marque
+  *Ligar junto com o navegador*.
+- Com o motor ligado, a página inicial mostra a escolha **⚡ Leve / 🧪 Completo**. Ela vale para a busca, os
+  atalhos e os visitados. A barra das páginas leves ganha *Abrir no modo completo*, e as páginas do modo completo
+  ganham uma minibarra (**Início**, **▶ VLC** e **Leve**).
+- O motor só escuta em `127.0.0.1`. O navegador pelo celular confere o link secreto, cria uma sessão do motor para
+  cada aparelho (cookie `navrh`) e repassa os pedidos, inclusive WebSocket, sem os cabeçalhos do túnel que
+  revelariam o IP de quem navega. O próprio motor recusa conexões para a rede local e para o celular, mesmo por
+  nome de site ou redirecionamento.
+- **Experimental**: pesa mais (memória e bateria), não foi testado no TikTok, Instagram e Facebook de verdade, e
+  esses sites ainda podem detectar o acesso. A saída pelo túnel SSH ou Tor não vale para ele. Não compartilhe os
+  endereços das páginas do modo completo: eles levam a sua sessão.
 
 ### ▶ VLC Web
 
@@ -555,6 +578,7 @@ Android.
 ├── monitores_estado.json  # último resultado de cada monitor
 ├── cache/legendas/        # legendas embutidas já extraídas
 ├── vlc-web/               # VLC Web baixado do GitHub para o navegador pelo celular
+├── motor-completo/        # modo completo do navegador (Rammerhead pelo npm, sessões e o segredo)
 ├── playlists/             # playlists .m3u
 ├── basic/                 # programas BASIC salvos
 └── recordes.json
