@@ -3,39 +3,41 @@
 """
 Termux-Toons — um canivete suíço em Python para o Termux.
 
-Reúne em um único menu:
-   1. Servidor web/API pessoal (Flask, FastAPI ou só biblioteca padrão) + Cloudflare Tunnel
+Reúne em um único menu (cada categoria tem subcategorias; 🔍 Buscar acha qualquer opção pelo nome):
+   1. Servidor web/API pessoal (Flask, FastAPI ou só biblioteca padrão) + túnel Cloudflare
    2. Bots de Telegram e Discord rodando 24h (tmux + termux-wake-lock)
-   3. Scraping e monitoramento (preço, notícias/RSS, status de site, chuva)
-   4. Rede e segurança em equipamentos seus (nmap, SSH, WireGuard, velocidade, modem AT) e pontes de
-      conexão: proxy para o PC, navegador pelo celular (abre sites num link, pela conexão dele), túnel
-      SSH, Tor, Smart DNS, links públicos (Cloudflare, ngrok...) e redes privadas (Tailscale, ZeroTier)
+   3. Scraping e monitoramento (preço, notícias/RSS, status de site, texto e mudança de página)
+   4. Rede e segurança em equipamentos seus: diagnóstico (nmap, DNS, velocidade, Wi-Fi, tráfego), servidor
+      SSH, WireGuard e pontes de conexão (proxy para o PC, túnel SSH, Tor, Smart DNS, links públicos com
+      Cloudflare/ngrok/localtunnel/serveo/pinggy, endereço fixo e redes privadas Tailscale/ZeroTier)
    5. Linux de verdade com proot-distro (Debian, Ubuntu, Arch...), com desktop no Termux:X11
-   6. Arquivos e backup: gerenciador de arquivos (ADB ou root para Android/data), rclone, Syncthing,
-      Samba, HTTP, backup e página HTML num link
-   7. Música, rádio e podcasts: yt-dlp para baixar; player com tela 'Tocando agora' e notificação com botões;
-      equalizador de 10 bandas; rádios do mundo todo com legenda automática (whisper.cpp); podcasts
-   8. Vídeos do TikTok, YouTube e outros sites com yt-dlp; reduzir a resolução (4K → 1080p/720p)
+   6. Arquivos e backup: gerenciador de arquivos (ADB ou root para Android/data), publicar site num link,
+      nuvem e sincronização (rclone, Syncthing), compartilhar na rede (HTTP, Samba) e backup
+   7. Música, rádio e podcasts: ouvir, baixar, biblioteca e playlists; player com tela 'Tocando agora' e
+      notificação com botões; equalizador de 10 bandas; rádios do mundo todo com legenda automática
+   8. Vídeos do TikTok, YouTube e outros sites com yt-dlp; reduzir a resolução ou comprimir (4K → 1080p/720p)
    9. Compartilhar filmes por link: arquivo do celular ou qualquer link de vídeo, com player próprio,
       troca de trilha de áudio e conversão na hora (servidor de vídeo + túnel)
-  10. Calculadora científica com botões (setas + Enter)
-  11. Utilitários: notas, tarefas, lembretes/alarmes, cronômetro/Pomodoro, agenda, conversor, gastos,
-      senhas, previsão do tempo, QR code (Wi-Fi, PIX) e tradutor
-  12. Celular e sistema: depuração sem fio (ADB), Termux:API, painel do sistema, bateria, uso de dados e
-      apps, resolução da tela (inteira ou por app), fotos, conversor de arquivos, automação por eventos,
-      espelhamento e transmissão da tela por link
-  13. Internet: e-mail, notícias, downloads (aria2), chat na rede local, navegador pelo celular (abre
+  10. Utilitários: calculadora científica, notas, lista de afazeres, lembretes/alarmes, cronômetro/Pomodoro,
+      agenda, conversor, gastos, senhas, previsão do tempo, QR code (Wi-Fi, PIX) e tradutor
+  11. Celular e sistema: depuração sem fio (ADB), Termux:API, painel do sistema, bateria, uso de dados e
+      apps, resolução da tela, fotos, conversor de arquivos, automação por eventos, espelhamento e
+      transmissão da tela, controle da TV e de outros aparelhos por infravermelho, modem (comandos AT)
+  12. Internet: e-mail, notícias, downloads (aria2), chat na rede local, navegador pelo celular (abre
       sites num link, pela conexão dele), Browsh/w3m e encurtador/pastebin
-  14. Meus dados na internet: o que está público sobre você na Receita Federal, Portal da Transparência,
+  13. Meus dados na internet: o que está público sobre você na Receita Federal, Portal da Transparência,
       Tribunais de Justiça e TRFs, Google, LinkedIn/Instagram/Facebook, Diário Oficial e Lattes
-  15. Inteligência artificial: Claude/ChatGPT/Gemini, LLMs locais (llama.cpp), voz (whisper.cpp) e OCR
-  16. Diversão e aprendizado: jogos (incluindo os retrô), cursos de Python/Bash/Git, BASIC, leitor de
-      livros e arte ASCII
-  17. Programação e servidores: ambiente de desenvolvimento, SQLite/MariaDB/PostgreSQL, GitHub, cron,
-      Minecraft, Jellyfin e Navidrome
-  18. Atualização do Termux e dos repositórios
-  19. Otimização e limpeza (caches, arquivos grandes/duplicados, processos)
-  20. Configurações e diagnóstico
+  14. Inteligência artificial: Claude/ChatGPT/Gemini, LLMs locais (llama.cpp), voz (whisper.cpp), OCR,
+      traduzir a tela e remover o fundo de fotos e vídeos
+  15. Diversão e aprendizado: jogos (incluindo os retrô), cursos de Python/Bash/Git, BASIC, leitor de
+      livros, arte ASCII e trote
+  16. Programação e servidores: ambiente de desenvolvimento, SQLite/MariaDB/PostgreSQL, GitHub, agendar
+      comandos (cron), Minecraft, Jellyfin e Navidrome
+  17. Sistema e manutenção: atualização, otimização e limpeza, instalar dependências, aparência do
+      terminal (tema, fonte, banner) e configurações/diagnóstico
+
+O verificador tests/verificar_menus.py confere se não há opções duplicadas, menus soltos ou entradas da
+busca apontando para o lugar errado (rode antes de cada commit).
 
 Uso:
     python termux_toons.py            # menu interativo
@@ -831,6 +833,21 @@ def menu(titulo_menu: str, itens: list, sair: str = "Voltar", cabecalho=None, de
             continue
         rotulo, func = itens[int(esc) - 1]
         executar(func, rotulo() if callable(rotulo) else rotulo)
+
+
+def grupo(titulo_menu: str, itens: list, descricoes=None, cabecalho=None):
+    """Junta opções relacionadas numa subcategoria.
+
+    Devolve uma função de submenu que abre `menu(titulo_menu, itens)`. Serve para
+    organizar listas longas (ex.: as opções de "Site publicado" dentro de Arquivos)
+    sem precisar escrever uma função nova para cada grupo. O verificador de menus
+    (tests/verificar_menus.py) entende `grupo(...)` como um submenu.
+    """
+    @submenu
+    def abrir():
+        menu(titulo_menu, itens, cabecalho=cabecalho, descricoes=descricoes)
+    abrir.__qualname__ = f"grupo<{titulo_menu}>"
+    return abrir
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -2186,9 +2203,10 @@ def menu_web():
         ("Endereços, token e exemplos de uso", enderecos),
         (lambda: f"Escolher framework/porta (atual: {c['web_framework']}:{c['web_porta']})", escolher_framework),
         ("Gerar novo token da API", regenerar),
-        ("Cloudflare Tunnel: expor na internet", iniciar_tunel),
-        ("Cloudflare Tunnel: parar", lambda: parar_servico("tunel")),
-        ("Cloudflare Tunnel: mostrar URL", lambda: info(url_tunel() or "Nenhuma URL encontrada.")),
+        # túnel do próprio servidor web (cada serviço publica a sua porta; mesmo nome em todos os menus)
+        ("🌍 Liberar na internet (túnel Cloudflare)", iniciar_tunel),
+        ("🌍 Túnel: desligar", lambda: parar_servico("tunel")),
+        ("🌍 Túnel: mostrar o endereço", lambda: info(url_tunel() or "Nenhuma URL encontrada.")),
     ])
 
 
@@ -2647,7 +2665,7 @@ def menu_termux_api():
         ("Vibrar", lambda: vibrar(perguntar_int("Duração (ms)", 500, 50, 5000))),
         ("Lanterna liga/desliga", lambda: lanterna(confirmar("Ligar a lanterna?", True))),
         ("Área de transferência", clipboard),
-        ("Infravermelho: controle da TV", menu_tv),
+        # o controle da TV pelo infravermelho fica só em 📲 Celular e sistema → 📺 Controle da TV
         ("Volume do sistema", lambda: mostrar_dados(_tapi(["termux-volume"], 15))),
         ("Instalar o pacote termux-api", lambda: instalar_pkg("termux-api")),
     ])
@@ -3407,6 +3425,8 @@ TIPOS_MONITOR = {
     "bateria": "Bateria abaixo de um limite",
     "chuva": "Chuva prevista nas próximas horas",
 }
+# tipos que se criam em outro menu (versão mais completa): 🔋 Saúde da bateria e 🌦️ Previsão do tempo
+TIPOS_MONITOR_EM_OUTRO_MENU = ("bateria", "chuva")
 
 REGEX_PRECO = {
     "Preço em reais (R$ 1.234,56)": r"R\$\s*([\d.]+,\d{2})",
@@ -3649,22 +3669,19 @@ def menu_monitor():
     c = cfg()
 
     def adicionar():
-        chaves = list(TIPOS_MONITOR)
+        # Os alertas de bateria e de chuva são criados no lugar de cada um (🔋 Saúde da bateria e
+        # 🌦️ Previsão do tempo), que têm a versão mais completa. Os monitores desses tipos que já
+        # existiam continuam sendo checados normalmente pelo serviço.
+        chaves = [k for k in TIPOS_MONITOR if k not in TIPOS_MONITOR_EM_OUTRO_MENU]
         i = escolher("Tipo de monitor", [TIPOS_MONITOR[k] for k in chaves])
         if i is None:
             return
         tipo = chaves[i]
         dados = {"tipo": tipo}
-        if tipo == "bateria":
-            dados["limite"] = perguntar_int("Limite (%)", 20, 1, 99)
-            dados["nome"] = f"Bateria < {dados['limite']}%"
-        elif tipo == "chuva":
-            dados.update(configurar_alerta_chuva())
-        else:
-            dados["url"] = perguntar("URL" + (" do feed" if tipo == "rss" else ""))
-            if not dados["url"].startswith(("http://", "https://")):
-                raise ToonsError("A URL precisa começar com http:// ou https://")
-            dados["nome"] = perguntar("Nome do monitor", urllib.parse.urlsplit(dados["url"]).netloc)
+        dados["url"] = perguntar("URL" + (" do feed" if tipo == "rss" else ""))
+        if not dados["url"].startswith(("http://", "https://")):
+            raise ToonsError("A URL precisa começar com http:// ou https://")
+        dados["nome"] = perguntar("Nome do monitor", urllib.parse.urlsplit(dados["url"]).netloc)
         if tipo == "texto":
             dados["texto"] = perguntar("Texto a procurar")
             dados["modo"] = "sumir" if escolher("Avisar quando", ["o texto APARECER", "o texto SUMIR"], 1) == 1 \
@@ -9221,8 +9238,7 @@ def menu_pontes():
         (lambda: "🧅 Tor: anonimato passando por vários nós (mais lento)" + _estado(SERVICO_TOR), menu_ponte_tor),
         ("🌎 Smart DNS: trocar só o DNS para parecer outra região", menu_ponte_dns),
         (lambda: "🧭 Proxy: a internet do celular no PC ou Chromebook" + _estado(SERVICO_PROXY), menu_proxy),
-        (lambda: "🌐 Navegador pelo celular: abrir sites num link, pela conexão dele" + _estado(SERVICO_NAVEGADOR),
-         menu_navegador_web),
+        # o 🌐 Navegador pelo celular fica só em 🌐 Internet (antes aparecia aqui também)
         (lambda: "☁️ Cloudflare Tunnel: link público grátis para algo do celular" + _estado("ponte-cloudflare"),
          menu_ponte_cloudflare),
         (lambda: "🔗 ngrok: link público para algo do celular (conta grátis)" + _estado("ponte-ngrok"), menu_ponte_ngrok),
@@ -9237,7 +9253,6 @@ def menu_pontes():
         "Esconde o seu IP passando por 3 voluntários. Lento. Também publica sites como .onion.",
         "Só troca o DNS para alguns streamings acharem que você está em outro país. Não criptografa.",
         "O PC ou Chromebook navega pela internet do celular (roteador, cabo USB ou mesmo Wi-Fi).",
-        "Uma página web no celular: digite um endereço e o celular carrega o site e devolve pronto. Sem configurar.",
         "Expõe uma porta do celular num link https, sem abrir portas. Endereço fixo com o seu domínio.",
         "Expõe uma porta do celular num link https. Precisa de conta grátis no ngrok.com.",
         "Expõe uma porta do celular num link https://….loca.lt. Usa o Node.js.",
@@ -9249,7 +9264,7 @@ def menu_pontes():
 
     def cabecalho():
         ligadas = [nome for nome, servico in (("túnel SSH", SERVICO_PONTE_SSH), ("Tor", SERVICO_TOR),
-                                              ("proxy", SERVICO_PROXY), ("navegador", SERVICO_NAVEGADOR),
+                                              ("proxy", SERVICO_PROXY),
                                               *((n, s) for n, s, _ in PONTES_PUBLICAS.values()))
                    if servico_ativo(servico)]
         print(f"{DIM}Ligadas agora: {', '.join(ligadas) if ligadas else 'nenhuma'}{RST}")
@@ -9412,20 +9427,25 @@ def menu_rede():
         info("Subir o túnel direto no Termux exige root (wg-quick). Sem root, use o app WireGuard.")
 
     menu("🛡️ Rede e segurança (só em equipamentos seus!)", [
-        ("Informações de rede (IP local/público, Wi-Fi)", info_rede),
-        ("Descobrir dispositivos na rede (nmap -sn)", descobrir),
-        ("Escanear portas de um host seu (nmap)", portas),
-        ("DNS, ping e traceroute", basicas),
-        ("Teste de velocidade (Cloudflare)", velocidade),
-        ("Redes Wi-Fi próximas", wifi_proximas),
-        ("Análise de tráfego (tcpdump / .pcap)", trafego),
-        ("SSH: instalar e definir senha", ssh_configurar),
-        ("SSH: iniciar servidor (porta 8022)", ssh_iniciar),
-        ("SSH: parar servidor", lambda: rodar(["pkill", "sshd"])),
-        ("SSH: autorizar chave pública", ssh_chave),
-        ("WireGuard: gerar chaves + config + QR code", wireguard),
+        ("🔍 Diagnóstico de rede (IP, dispositivos, portas, DNS, velocidade, Wi-Fi, tráfego)", grupo(
+            "🔍 Diagnóstico de rede", [
+                ("Informações de rede (IP local/público, Wi-Fi)", info_rede),
+                ("Descobrir dispositivos na rede (nmap -sn)", descobrir),
+                ("Escanear portas de um host seu (nmap)", portas),
+                ("DNS, ping e traceroute", basicas),
+                ("Teste de velocidade (Cloudflare)", velocidade),
+                ("Redes Wi-Fi próximas", wifi_proximas),
+                ("Análise de tráfego (tcpdump / .pcap)", trafego),
+            ])),
+        ("🔐 Servidor SSH (porta 8022)", grupo("🔐 Servidor SSH", [
+            ("Instalar e definir senha", ssh_configurar),
+            ("Iniciar o servidor (porta 8022)", ssh_iniciar),
+            ("Parar o servidor", lambda: rodar(["pkill", "sshd"])),
+            ("Autorizar uma chave pública", ssh_chave),
+        ])),
+        ("🔒 WireGuard: gerar chaves + config + QR code", wireguard),
         ("🌉 Pontes de conexão (proxy, túnel SSH, Tor, ngrok, Cloudflare, Tailscale...)", menu_pontes),
-        ("📡 Modem: comandos AT (chamadas, SMS, sinal, APN; precisa de root)", menu_modem),
+        # 📡 Modem (comandos AT) mudou para 📲 Celular e sistema: é um recurso do aparelho
     ])
 
 
@@ -10775,7 +10795,7 @@ def _mostrar_links(n: int) -> None:
     for onde, link in links_do_site(n):
         print(f"  {CIANO}{onde}:{RST}\n  {NEG}{link}{RST}")
     if not servico_ativo(_tunel_site(n)) and not endereco_fixo(_dados_site(n)["porta"]):
-        print(f"  {DIM}Para quem está fora da sua rede Wi-Fi, use 'Site publicado: liberar para a internet'.{RST}")
+        print(f"  {DIM}Para quem está fora da sua rede Wi-Fi, use '🌍 Publicar site → 🌍 Liberar na internet'.{RST}")
 
 
 def mostrar_links_do_site() -> None:
@@ -11441,7 +11461,7 @@ def _resumo_visitas(reg: dict, visitas: list, grupos: list, limite: int | None =
               f"{'não entra' if n == 1 else 'não entram'} na conta.{RST}")
     if not any(g["via"] == "internet" for g in pessoas) and reg["situacao"] == "no ar":
         print(f"  {DIM}Ninguém veio pela internet ainda. O IP real e o país de quem está longe aparecem com o "
-              f"túnel ligado ('Site publicado: liberar para a internet').{RST}")
+              f"túnel ligado ('🌍 Publicar site → 🌍 Liberar na internet').{RST}")
     mostrar = pessoas if limite is None else pessoas[:limite]
     for pos, g in enumerate(mostrar, 1):
         _imprimir_visitante(pos, g, ips)
@@ -11830,31 +11850,44 @@ def menu_arquivos():
             rodar(["tar", "-zxf", arq, "-C", _caminho_termux(), "--recursive-unlink", "--preserve-permissions"])
             ok("Restaurado. Reinicie o Termux.")
 
+    def dica_endereco_fixo():
+        # o endereço fixo fica num lugar só (Pontes → Cloudflare); aqui só lembramos onde ele está
+        regras = regras_tunel_fixo() if cfg().get("tunel_fixo_token") else []
+        if regras:
+            print(f"{DIM}Endereço fixo: {', '.join(r['host'] for r in regras)}{RST}")
+        print(f"{DIM}Link que não muda (seu domínio): 🛡️ Rede e segurança → 🌉 Pontes → ☁️ Cloudflare → "
+              f"🔗 Endereço fixo.{RST}")
+
     menu("🗄️ Servidor de arquivos e backup", [
         ("📂 Gerenciador de arquivos (copiar, mover, renomear, Android/data...)", gerenciador_arquivos),
-        (f"🌍 Publicar página/site HTML num link (até {MAX_SITES} ao mesmo tempo)", publicar_site),
-        ("Sites publicados: ver os links", mostrar_links_do_site),
-        ("Site publicado: QR code do link (gerar e baixar)", qr_do_site),
-        ("Site publicado: liberar para a internet (túnel)", liberar_site),
-        ("Site publicado: 👀 ver quem acessou (IP, país, aparelho e páginas)", ver_visitas_do_site),
-        (lambda: "Site publicado: avisar quando alguém novo abrir o link "
-                 f"({'ligado' if cfg().get('site_avisar_visitas') else 'desligado'})", alternar_aviso_visitas),
-        ("Site publicado: limpar o registro de visitas", limpar_visitas_do_site),
-        ("Site publicado: tirar do ar", parar_site),
-        (lambda: "🔗 Endereço fixo com o seu domínio (Cloudflare)" + (f" ({', '.join(r['host'] for r in regras_tunel_fixo())})"
-                                                                     if cfg().get("tunel_fixo_token") and regras_tunel_fixo() else ""),
-         menu_tunel_fixo),
-        *itens_servico("http-arquivos", "Compartilhar pasta via HTTP", http_iniciar),
-        ("rclone: instalar e configurar nuvem (Drive, Dropbox, OneDrive...)", rclone_config),
-        ("rclone: copiar/sincronizar pasta com a nuvem", rclone_copiar),
-        ("rclone: servir pasta na rede via WebDAV (com senha)", rclone_servir),
-        ("rclone: parar WebDAV", lambda: parar_servico("webdav")),
-        ("Syncthing: iniciar", syncthing_iniciar),
-        ("Syncthing: parar", lambda: parar_servico("syncthing")),
-        ("Samba (SMB): configurar e iniciar", samba),
-        ("Samba (SMB): parar", lambda: parar_servico("samba")),
-        ("Backup do Termux (.tar.gz em Downloads)", backup),
-        ("Restaurar backup do Termux", restaurar),
+        (f"🌍 Publicar site (página HTML num link, até {MAX_SITES} ao mesmo tempo)", grupo("🌍 Publicar site", [
+            (f"Publicar página/site HTML num link (até {MAX_SITES} ao mesmo tempo)", publicar_site),
+            ("Ver os links dos sites publicados", mostrar_links_do_site),
+            ("QR code do link (gerar e baixar)", qr_do_site),
+            ("🌍 Liberar na internet (túnel)", liberar_site),
+            ("👀 Ver quem acessou (IP, país, aparelho e páginas)", ver_visitas_do_site),
+            (lambda: "Avisar quando alguém novo abrir o link "
+                     f"({'ligado' if cfg().get('site_avisar_visitas') else 'desligado'})", alternar_aviso_visitas),
+            ("Limpar o registro de visitas", limpar_visitas_do_site),
+            ("Tirar do ar", parar_site),
+        ], cabecalho=dica_endereco_fixo)),
+        ("☁️ Nuvem e sincronização (rclone, Syncthing)", grupo("☁️ Nuvem e sincronização", [
+            ("rclone: instalar e configurar nuvem (Drive, Dropbox, OneDrive...)", rclone_config),
+            ("rclone: copiar/sincronizar pasta com a nuvem", rclone_copiar),
+            ("rclone: servir pasta na rede via WebDAV (com senha)", rclone_servir),
+            ("rclone: parar WebDAV", lambda: parar_servico("webdav")),
+            ("Syncthing: iniciar", syncthing_iniciar),
+            ("Syncthing: parar", lambda: parar_servico("syncthing")),
+        ])),
+        ("📡 Compartilhar na rede (HTTP, Samba)", grupo("📡 Compartilhar na rede", [
+            *itens_servico("http-arquivos", "Compartilhar pasta via HTTP", http_iniciar),
+            ("Samba (SMB): configurar e iniciar", samba),
+            ("Samba (SMB): parar", lambda: parar_servico("samba")),
+        ])),
+        ("💾 Backup do Termux (fazer e restaurar)", grupo("💾 Backup do Termux", [
+            ("Backup do Termux (.tar.gz em Downloads)", backup),
+            ("Restaurar backup do Termux", restaurar),
+        ])),
     ])
 
 
@@ -13679,24 +13712,31 @@ def menu_musica():
         (lambda: f"🎚️ Equalizador ({nome_eq(equalizador()) if equalizador()['ligado'] else 'desligado'})",
          tela_equalizador),
         ("🔎 Descobrir a música de um arquivo (pelo som)", descobrir_musica),
-        ("Buscar e tocar (streaming)", buscar_tocar),
-        ("💿 Ouvir um álbum (buscar pelo nome)", ouvir_album),
-        ("🎤 Tocar todas as músicas de um cantor ou banda", tocar_artista),
-        ("Buscar e baixar (escolhe o formato: MP3, Opus, M4A, FLAC...)", buscar_baixar),
-        ("💿 Baixar um álbum inteiro (pasta do álbum, faixas numeradas)", baixar_album),
-        ("🎤 Baixar as músicas de um cantor ou banda (mais ouvidas ou discografia)", baixar_artista),
-        ("Baixar por link (YouTube, SoundCloud, playlist...)", baixar_link),
-        ("Baixar do Spotify (link → busca no YouTube)", baixar_spotify),
-        ("Tocar mix/rádio por busca", mix),
+        ("▶  Ouvir (buscar, álbum, cantor ou banda, mix)", grupo("▶  Ouvir", [
+            ("Buscar e tocar (streaming)", buscar_tocar),
+            ("💿 Ouvir um álbum (buscar pelo nome)", ouvir_album),
+            ("🎤 Tocar todas as músicas de um cantor ou banda", tocar_artista),
+            ("Tocar mix/rádio por busca", mix),
+        ])),
+        ("⬇️ Baixar (busca, álbum, cantor, link, Spotify)", grupo("⬇️ Baixar músicas", [
+            ("Buscar e baixar (escolhe o formato: MP3, Opus, M4A, FLAC...)", buscar_baixar),
+            ("💿 Baixar um álbum inteiro (pasta do álbum, faixas numeradas)", baixar_album),
+            ("🎤 Baixar as músicas de um cantor ou banda (mais ouvidas ou discografia)", baixar_artista),
+            ("Baixar por link (YouTube, SoundCloud, playlist...)", baixar_link),
+            ("Baixar do Spotify (link → busca no YouTube)", baixar_spotify),
+        ])),
         ("📻 Rádio online (estações do Brasil e do mundo)", menu_radio),
         ("🎙️ Podcasts (buscar, seguir, ouvir, baixar)", menu_podcasts),
-        ("Biblioteca: escolher e tocar", biblioteca),
-        ("Biblioteca: tocar tudo no aleatório", tudo_aleatorio),
-        ("Playlists: criar", criar_playlist),
-        ("Playlists: tocar", tocar_playlist),
+        ("📚 Biblioteca e playlists", grupo("📚 Biblioteca e playlists", [
+            ("Biblioteca: escolher e tocar", biblioteca),
+            ("Biblioteca: tocar tudo no aleatório", tudo_aleatorio),
+            ("Playlists: criar", criar_playlist),
+            ("Playlists: tocar", tocar_playlist),
+        ])),
         ("⏹ Parar a música", parar),
         (lambda: f"Pasta das músicas ({onde_fica(pasta_musicas())})", mudar_pasta),
-        ("Instalar dependências (yt-dlp, ffmpeg, mpv, mutagen)", garantir_deps_musica),
+        # "Instalar dependências" foi para ⚙️ Sistema e manutenção → 📦 Instalar dependências
+        # (e cada opção já instala sozinha o que falta, perguntando antes)
     ])
 
 
@@ -13845,9 +13885,10 @@ def menu_videos():
         ("Buscar no YouTube e baixar", buscar_baixar),
         ("Abrir vídeo baixado no player do Android", abrir),
         ("Assistir um link sem baixar (VLC, MX Player...)", assistir_link_no_celular),
-        ("📉 Reduzir a resolução de um vídeo (4K → 1080p, 720p...: para de travar)", reduzir_resolucao),
+        # única opção de reduzir/comprimir vídeo (antes repetida no 📺 servidor de filmes e no 🔁 Conversor)
+        ("📉 Reduzir a resolução / comprimir um vídeo (4K → 1080p, 720p, 480p...)", reduzir_resolucao),
         (lambda: f"Pasta dos vídeos ({onde_fica(pasta_videos())})", mudar_pasta),
-        ("Instalar dependências (yt-dlp, ffmpeg)", lambda: garantir_deps_musica(com_player=False)),
+        # "Instalar dependências" foi para ⚙️ Sistema e manutenção → 📦 Instalar dependências
     ])
 
 
@@ -16102,8 +16143,8 @@ def mostrar_links(item: dict) -> None:
         print(f"  {CIANO}{onde}:{RST}\n  {NEG}{link}{RST}")
     print(f"\n  {DIM}No VLC (todas as trilhas de áudio e legendas): use o mesmo link terminado em /video.{RST}")
     if not (servico_ativo("tunel-midia") and url_tunel("tunel-midia")) and not endereco_fixo(cfg()["midia_porta"]):
-        print(f"  {DIM}Para quem está fora da sua rede Wi-Fi, ligue o 'Túnel para a internet' neste menu "
-              f"(ou use um endereço fixo).{RST}")
+        print(f"  {DIM}Para quem está fora da sua rede Wi-Fi, use '⚙️ Servidor, túnel e ajustes → 🌍 Liberar na internet' "
+              f"(ou um endereço fixo, em 🌉 Pontes → ☁️ Cloudflare).{RST}")
 
 
 def abrir_no_android(alvo: str, pacote: str | None = None) -> None:
@@ -16175,8 +16216,8 @@ def assistir_link_no_celular(url: str | None = None) -> None:
     if i is not None:
         abrir_no_android(alvo, VLC_ANDROID if i == 0 else None)
         if not pagina:
-            print(f"  {DIM}É um arquivo só, na resolução em que foi feito. Se travar (4K), '📉 Reduzir a resolução de "
-                  f"um vídeo' baixa este link já em 1080p ou 720p.{RST}")
+            print(f"  {DIM}É um arquivo só, na resolução em que foi feito. Se travar (4K), '🎬 Vídeos → 📉 Reduzir a resolução' "
+                  f"baixa este link já em 1080p ou 720p.{RST}")
 
 
 # ── Conversão para MP4 (ffmpeg) ──────────────────────────────────────
@@ -16357,12 +16398,17 @@ def filtro_reduzir(faixa: dict, nivel: int, rapido: bool = False, fps30: bool = 
     return ",".join(filtros)
 
 
-def comando_reduzir(fonte: str, sonda: dict, nivel: int, fps30: bool, destino: Path) -> list:
+def comando_reduzir(fonte: str, sonda: dict, nivel: int, fps30: bool, destino: Path, menor: bool = False) -> list:
     """ffmpeg que grava `destino` na resolução `nivel`: imagem em H.264 (o mais leve de tocar), todas as trilhas
-    de áudio e legendas. MKV continua MKV (guarda tudo como está); o resto vira MP4."""
+    de áudio e legendas. MKV continua MKV (guarda tudo como está); o resto vira MP4.
+
+    `menor=True` é o modo "arquivo bem menor" (para mandar no WhatsApp ou guardar): comprime mais a imagem
+    (CRF +6) e, no MP4, o áudio (128 kbps; no MKV o áudio é copiado como está). Antes isso era o "Comprimir vídeo" do Conversor de arquivos, que era uma
+    cópia mais simples desta função (sem trilhas, legendas, HDR nem 60→30 quadros)."""
     video = sonda["video"][0]
     mkv = destino.suffix.lower() == ".mkv"
-    crf = {1440: 21, 1080: 21, 720: 22, 480: 23, 360: 24}.get(nivel, 22)
+    crf = {1440: 21, 1080: 21, 720: 22, 480: 23, 360: 24}.get(nivel, 22) + (6 if menor else 0)
+    bitrate_audio = "128k" if menor else "192k"
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-progress", "pipe:1", "-nostats",
            *_opcoes_entrada(fonte), "-map", f"0:{video.get('index', 0)}", "-map_metadata", "0", "-map_chapters", "0",
            "-vf", filtro_reduzir(video, nivel, fps30=fps30), "-c:v", "libx264", "-preset", "veryfast",
@@ -16372,8 +16418,8 @@ def comando_reduzir(fonte: str, sonda: dict, nivel: int, fps30: bool, destino: P
     else:
         for n, faixa in enumerate(sonda["audio"]):
             cmd += ["-map", f"0:a:{n}"]
-            cmd += [f"-c:a:{n}", "copy"] if faixa.get("codec_name") in AUDIO_NO_MP4 else \
-                [f"-c:a:{n}", "aac", f"-b:a:{n}", "192k"]
+            cmd += [f"-c:a:{n}", "copy"] if faixa.get("codec_name") in AUDIO_NO_MP4 and not menor else \
+                [f"-c:a:{n}", "aac", f"-b:a:{n}", bitrate_audio]
         textos = [n for n, f in enumerate(sonda["legendas"]) if f.get("codec_name") in CODECS_LEGENDA_TEXTO]
         for k, n in enumerate(textos):  # legenda em imagem (PGS, VobSub) não cabe no MP4
             cmd += ["-map", f"0:s:{n}", f"-c:s:{k}", "mov_text"]
@@ -16451,7 +16497,7 @@ def _destino_reduzido(fonte: str, nivel: int) -> Path:
 
 
 def executar_reducao(fonte: str, nivel: int, destino: Path, fps30: bool = False, sonda=None,
-                     segundo_plano: bool = False) -> Path:
+                     segundo_plano: bool = False, menor: bool = False) -> Path:
     """Faz a cópia mais leve. Na tela mostra o andamento; em segundo plano escreve no log e na notificação."""
     sonda = sonda or sondar_video(fonte)
     if not sonda or not sonda["video"]:
@@ -16476,7 +16522,7 @@ def executar_reducao(fonte: str, nivel: int, destino: Path, fps30: bool = False,
                        "--title", f"📉 Reduzindo para {nome_nivel(nivel)}", "--content", f"{destino.name}\n{texto}"],
                       15, json_saida=False)
 
-    cmd = comando_reduzir(fonte, sonda, nivel, fps30, destino)
+    cmd = comando_reduzir(fonte, sonda, nivel, fps30, destino, menor=menor)
     try:
         with manter_acordado():
             codigo, erros = _ffmpeg_com_andamento(cmd, duracao, avisar)
@@ -16499,12 +16545,12 @@ def executar_reducao(fonte: str, nivel: int, destino: Path, fps30: bool = False,
     return destino
 
 
-def reduzir_video_cli(fonte: str, nivel: int, destino: str | None, fps30: bool) -> None:
+def reduzir_video_cli(fonte: str, nivel: int, destino: str | None, fps30: bool, menor: bool = False) -> None:
     """O que roda em segundo plano (tmux): converte e avisa por notificação quando terminar."""
     destino_p = Path(destino) if destino else _destino_reduzido(fonte, nivel)
-    log(f"Reduzindo {fonte} para {nome_nivel(nivel)} → {destino_p}")
+    log(f"Reduzindo {fonte} para {nome_nivel(nivel)}{' (arquivo menor)' if menor else ''} → {destino_p}")
     try:
-        pronto = executar_reducao(fonte, nivel, destino_p, fps30, segundo_plano=True)
+        pronto = executar_reducao(fonte, nivel, destino_p, fps30, segundo_plano=True, menor=menor)
     except ToonsError as e:
         log(f"Falhou: {e}")
         notificar_seguro("❌ Não deu para reduzir o vídeo", str(e).splitlines()[0])
@@ -16602,11 +16648,20 @@ def reduzir_resolucao(fonte: str | Path | None = None, perguntar_modo: bool = Tr
         resumo.append(bytes_humanos(Path(fonte).stat().st_size))
     print(f"  🎬 {NEG}{Path(urllib.parse.urlsplit(fonte).path).name if eh_link(fonte) else Path(fonte).name}{RST}")
     print(f"     {' · '.join(resumo)}")
+    objetivo = escolher("Para quê?", [
+        "Tocar sem travar (imagem ótima, só diminui a resolução)",
+        "Arquivo bem menor (para mandar no WhatsApp ou guardar; comprime mais)"])
+    if objetivo is None:
+        return None
+    menor = objetivo == 1
     opcoes = niveis_menores(nivel)
+    if menor:  # para comprimir, também vale manter a mesma resolução
+        opcoes = [n for n in sorted(NIVEIS_VIDEO, reverse=True) if n <= min(nivel, 2160)] or opcoes
     if not opcoes:
         info(f"Este vídeo já está em {nome_nivel(nivel)}: não dá para ficar mais leve sem estragar a imagem.")
         return None
-    padrao = opcoes.index(1080) + 1 if 1080 in opcoes else 1
+    padrao = (opcoes.index(720) + 1 if 720 in opcoes else 1) if menor else \
+        (opcoes.index(1080) + 1 if 1080 in opcoes else 1)
     i = escolher("Para qual resolução?", [f"{nome_nivel(n)} — {DICAS_NIVEL[n]}" for n in opcoes], str(padrao))
     if i is None:
         return None
@@ -16631,14 +16686,14 @@ def reduzir_resolucao(fonte: str | Path | None = None, perguntar_modo: bool = Tr
         segundo_plano = modo == 0
     if segundo_plano:
         comando = cmd_self(SERVICO_REDUZIR, fonte, "--nivel", str(alvo), "--saida", str(destino),
-                           *(["--fps30"] if fps30 else []))
+                           *(["--fps30"] if fps30 else []), *(["--menor"] if menor else []))
         if iniciar_servico(SERVICO_REDUZIR, comando):
             ok(f"Convertendo em segundo plano para {destino.name}.")
-            info("O andamento aparece na notificação e aqui mesmo, em 'Reduzir a resolução de um vídeo'.")
+            info("O andamento aparece na notificação e aqui mesmo, em '🎬 Vídeos → 📉 Reduzir a resolução'.")
         return None
     info(f"Convertendo para {nome_nivel(alvo)}: {destino}")
     try:
-        pronto = executar_reducao(fonte, alvo, destino, fps30, sonda)
+        pronto = executar_reducao(fonte, alvo, destino, fps30, sonda, menor=menor)
     except KeyboardInterrupt:
         aviso("Conversão cancelada.")
         return None
@@ -16876,7 +16931,7 @@ def menu_torbox():
         (lambda: f"Configurar a chave da API ({'configurada' if c.get('torbox_chave') else 'não configurada'})", configurar),
         ("Abrir o catálogo neste celular (navegador)", abrir),
         ("Mostrar / enviar o link do catálogo", mostrar_enviar),
-        ("Túnel para a internet: ligar (assistir fora do Wi-Fi)", tunel),
+        ("🌍 Liberar na internet (túnel, para assistir fora do Wi-Fi)", tunel),
         ("Assistir um vídeo da biblioteca no VLC deste celular", assistir_aqui),
         ("Gerar um link novo (o antigo para de funcionar)", novo_link),
         ("Remover a chave do TorBox", remover),
@@ -16900,7 +16955,7 @@ def menu_midia():
             if sonda["video"] and nivel_video(sonda["video"][0]) > 1080:
                 print(f"  {DIM}Vídeo {nome_nivel(nivel_video(sonda['video'][0]))}: se travar para quem assiste, no player "
                       f"use Ajustes → Qualidade (este celular converte na hora) ou faça antes uma cópia mais leve em "
-                      f"'📉 Reduzir a resolução de um filme'.{RST}")
+                      f"'🎬 Vídeos → 📉 Reduzir a resolução'.{RST}")
         problemas = problemas_de_reproducao(arq, sonda)
         if problemas:
             print()
@@ -17089,16 +17144,19 @@ def menu_midia():
         ("🍿 Catálogo do TorBox (todos os seus filmes e séries num link só)", menu_torbox),
         ("Meus links (copiar, enviar, assistir, apagar)", ver_links),
         ("Converter filme para MP4 compatível", converter),
-        ("🔗 Endereço fixo com o seu domínio (Cloudflare)", menu_tunel_fixo),
-        ("📉 Reduzir a resolução de um filme (4K → 1080p, 720p...)", reduzir_resolucao),
-        *itens_servico("midia", "Servidor de vídeo", iniciar_servidor),
-        ("Túnel para a internet: ligar", iniciar_tunel),
-        ("Túnel para a internet: desligar", lambda: parar_servico("tunel-midia")),
-        ("Túnel para a internet: mostrar endereço", lambda: info(url_tunel("tunel-midia") or "Túnel desligado.")),
-        ("Apagar links expirados", apagar_expirados),
-        ("Apagar TODOS os links", apagar_todos),
-        (lambda: f"Porta do servidor ({c['midia_porta']})", mudar_porta),
-        (lambda: f"Conversões ao mesmo tempo ({c['midia_transmissoes']})", mudar_transmissoes),
+        # 🔗 Endereço fixo: só em 🛡️ Rede e segurança → 🌉 Pontes → ☁️ Cloudflare (vale para os filmes também)
+        # 📉 Reduzir a resolução: só em 🎬 Vídeos
+        ("⚙️ Servidor, túnel e ajustes", grupo("⚙️ Servidor de vídeo, túnel e ajustes", [
+            *itens_servico("midia", "Servidor de vídeo", iniciar_servidor),
+            ("🌍 Liberar na internet (túnel)", iniciar_tunel),
+            ("🌍 Túnel: desligar", lambda: parar_servico("tunel-midia")),
+            ("🌍 Túnel: mostrar o endereço", lambda: info(url_tunel("tunel-midia") or "Túnel desligado.")),
+            ("Apagar links expirados", apagar_expirados),
+            ("Apagar TODOS os links", apagar_todos),
+            (lambda: f"Porta do servidor ({c['midia_porta']})", mudar_porta),
+            (lambda: f"Conversões ao mesmo tempo ({c['midia_transmissoes']})", mudar_transmissoes),
+        ], cabecalho=lambda: print(f"{DIM}Link que não muda (seu domínio): 🛡️ Rede e segurança → 🌉 Pontes → "
+                                   f"☁️ Cloudflare → 🔗 Endereço fixo.{RST}"))),
     ])
 
 
@@ -17157,13 +17215,6 @@ def ativar_repos() -> None:
         rodar(["pkg", "update", "-y"])
 
 
-def limpar_cache() -> None:
-    if IS_TERMUX:
-        rodar(["pkg", "clean"])
-        rodar(["apt", "autoremove", "-y"])
-    rodar([sys.executable, "-m", "pip", "cache", "purge"])
-
-
 def atualizar_tudo() -> None:
     atualizar_termux()
     atualizar_pip()
@@ -17181,7 +17232,8 @@ def menu_atualizar():
         ("Atualizar pacotes Python opcionais (pip)", atualizar_pip),
         ("Atualizar repositórios git de uma pasta (git pull)", atualizar_gits),
         ("Atualizar o Termux-Toons", atualizar_toons),
-        ("Limpar cache de pacotes", limpar_cache),
+        # "Limpar cache de pacotes" saiu daqui: a ⚡ Otimização rápida (🧹 Otimização e limpeza) já limpa o
+        # cache do apt e o ~/.cache (onde fica o cache do pip) e agora também faz o "apt autoremove"
         ("Atualizar TUDO (Termux, pip, distros, Termux-Toons)", atualizar_tudo),
     ])
 
@@ -17296,6 +17348,9 @@ def _limpador_apt() -> dict:
     def limpar():
         antes = tamanho(cache)
         rodar(["apt", "clean"], capturar=True)
+        # remove pacotes instalados só como dependência e que nada mais usa (era do antigo
+        # "Limpar cache de pacotes" da Atualização, que foi juntado a esta limpeza)
+        rodar(["apt", "autoremove", "-y"], capturar=True, timeout=300)
         return max(0, antes - tamanho(cache))
 
     return {"estimar": lambda: tamanho(cache) if IS_TERMUX else None, "limpar": limpar}
@@ -21434,7 +21489,7 @@ def menu_tradutor():
         ("Trocar o idioma de destino", trocar_idioma),
         ("Traduzir o que está copiado", traduzir_area),
         ("Dicionário (português ou inglês)", dicionario),
-        ("🌐 Traduzir a tela (print → texto → tradução)", menu_traduzir_tela),
+        # 🌐 Traduzir a tela fica só em ✨ Inteligência artificial (antes aparecia aqui e no OCR também)
         (lambda: f"Falar as traduções em voz alta: {'sim' if c.get('tradutor_falar') else 'não'}",
          lambda: (c.update(tradutor_falar=not c.get("tradutor_falar")), salvar_cfg())),
     ])
@@ -21443,8 +21498,10 @@ def menu_tradutor():
 @submenu
 def menu_utilitarios():
     menu("🧰 Utilitários", [
+        ("🧮 Calculadora científica", menu_calculadora),
         ("📝 Bloco de notas", menu_notas),
-        ("✅ Lista de tarefas", tarefas_tui),
+        # "afazeres" para não confundir com ⏲️ Agendar comandos (cron), em Programação e servidores
+        ("✅ Lista de afazeres", tarefas_tui),
         ("⏰ Lembretes e alarmes", menu_lembretes),
         ("⏱️ Cronômetro, timer e Pomodoro", menu_relogio),
         ("📅 Calendário e agenda (feriados)", menu_agenda),
@@ -22387,20 +22444,6 @@ def menu_conversor_arquivos():
         _ffmpeg("-i", arq, "-vn", *formatos[i][2], destino)
         ok(f"Salvo: {destino}")
 
-    def comprimir_video():
-        arq = escolher_arquivo("Qual vídeo?", EXT_VIDEO)
-        if not arq:
-            return
-        alturas = [("720p (bom para WhatsApp)", 720), ("480p (bem menor)", 480), ("1080p", 1080)]
-        i = escolher("Resolução", [a for a, _ in alturas])
-        if i is None:
-            return
-        destino = _saida_convertida(arq, ".mp4", f"_{alturas[i][1]}p")
-        info("Comprimindo (vídeos longos demoram; deixe a tela ligada)...")
-        _ffmpeg("-i", arq, "-vf", f"scale=-2:'min({alturas[i][1]},ih)'", "-c:v", "libx264", "-preset", "veryfast",
-                "-crf", "28", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", destino)
-        ok(f"{bytes_humanos(arq.stat().st_size)} → {bytes_humanos(destino.stat().st_size)}: {destino}")
-
     def pdf_juntar():
         if not garantir_cmd("qpdf"):
             return
@@ -22501,7 +22544,8 @@ def menu_conversor_arquivos():
         ("🖼️ Várias imagens → um PDF (documento escaneado)", imagens_para_pdf),
         ("🎬 Vídeo → GIF", video_gif),
         ("🎬 Vídeo → áudio (MP3, M4A...)", lambda: audio(EXT_VIDEO, "De qual vídeo?")),
-        ("🎬 Comprimir vídeo (720p/480p)", comprimir_video),
+        # "Comprimir vídeo" saiu daqui: 🎬 Vídeos → 📉 Reduzir a resolução / comprimir faz o mesmo e mais
+        # (modo "arquivo bem menor", mantém trilhas e legendas, ajusta HDR e 60→30 quadros)
         ("🎵 Áudio → outro formato (ex.: áudio do WhatsApp .opus → MP3)", lambda: audio(EXT_AUDIO, "Qual áudio?")),
         ("📄 PDF: juntar vários", pdf_juntar),
         ("📄 PDF: separar páginas", pdf_paginas),
@@ -25009,6 +25053,7 @@ def menu_celular():
         ("📲 Espelhar e transmitir a tela (scrcpy ou link pela internet)", menu_espelhar),
         ("📺 Controle da TV (infravermelho do celular ou Wi-Fi)", menu_tv),
         ("📡 Controle de outros aparelhos (som, projetor, ar)", menu_aparelhos),
+        ("📶 Modem: comandos AT (chamadas, SMS, sinal, APN; precisa de root)", menu_modem),
     ])
 
 
@@ -26090,7 +26135,7 @@ def menu_internet():
         ("📰 Notícias (RSS, modo leitura, ouvir)", menu_noticias),
         ("⬇️ Gerenciador de downloads (links, magnet, torrent)", menu_downloads),
         ("💬 Chat na rede local (sem internet)", menu_chat),
-        ("🌉 Pontes de conexão (proxy, túnel SSH, Tor, ngrok, Cloudflare, Tailscale...)", menu_pontes),
+        # 🌉 Pontes de conexão fica só em 🛡️ Rede e segurança (antes aparecia aqui também)
         (lambda: "🌐 Navegador pelo celular (abrir sites num link, pela conexão dele)" + _estado(SERVICO_NAVEGADOR),
          menu_navegador_web),
         ("🦊 Navegador no terminal (Browsh e w3m)", menu_navegador),
@@ -26657,7 +26702,7 @@ def menu_ocr():
         ("Tirar uma foto e ler o texto", lambda: ler_de("foto")),
         ("Ler de uma imagem do celular", lambda: ler_de("arquivo")),
         ("Ler do último print de tela", lambda: ler_de("print")),
-        ("🌐 Traduzir a tela (print → texto → tradução)", menu_traduzir_tela),
+        # 🌐 Traduzir a tela: no menu ✨ Inteligência artificial, logo abaixo deste
     ])
 
 
@@ -28805,6 +28850,20 @@ def menu_arte():
             destino.write_text("\n".join(imagem_em_blocos(arq, largura)) + "\n", "utf-8")
             ok(f"Salvo: {destino} (veja com: cat '{destino}')")
 
+
+    menu("🎨 Arte ASCII", [
+        ("Texto em letras grandes (figlet)", texto_grande),
+        ("Imagem no terminal (colorida)", imagem),
+        # tema, fonte, mensagem de boas-vindas e banner foram para
+        # ⚙️ Sistema e manutenção → 🎨 Aparência do terminal (são ajustes do terminal, não arte)
+    ])
+
+
+@submenu
+def menu_aparencia():
+    """Ajustes visuais do terminal: tema de cores, fonte, mensagem de boas-vindas e banner do menu."""
+    c = cfg()
+
     def tema():
         nomes = list(TEMAS_TERMUX) + ["Voltar ao tema padrão do Termux"]
         i = escolher("Tema de cores do Termux", nomes)
@@ -28849,16 +28908,15 @@ def menu_arte():
             shutil.copy2(backup, motd)
         ok("Pronto: abra uma nova sessão do Termux para ver.")
 
-    menu("🎨 Arte ASCII e visual do Termux", [
-        ("Texto em letras grandes (figlet)", texto_grande),
-        ("Imagem no terminal (colorida)", imagem),
+    menu("🎨 Aparência do terminal", [
         ("Tema de cores do Termux (Dracula, Nord...)", tema),
         ("🔤 Fonte do terminal (uma fonte baixada no celular)", trocar_fonte_terminal),
         ("Fonte do terminal: voltar à original", fonte_original_terminal),
         ("Mensagem de boas-vindas do Termux", boas_vindas),
         ("Banner do Termux-Toons: voltar ao original",
          lambda: (c.update(banner_texto=""), salvar_cfg(), ok("Banner original de volta."))),
-    ])
+    ], cabecalho=lambda: print(f"{DIM}Para um banner novo: 🎮 Diversão → 🎨 Arte ASCII → Texto em letras grandes "
+                               f"→ Usar como banner.{RST}"))
 
 
 # ── Trote / pegadinha (screamer): link que dá um susto em quem abrir ──
@@ -29266,7 +29324,7 @@ def mostrar_links_trote() -> None:
     for onde, link in links_trote():
         print(f"  {CIANO}{onde}:{RST}\n  {NEG}{link}{RST}")
     if not servico_ativo("tunel-trote"):
-        print(f"  {DIM}Para quem está fora do seu Wi-Fi, use 'Liberar para a internet'.{RST}")
+        print(f"  {DIM}Para quem está fora do seu Wi-Fi, use '🌍 Liberar na internet'.{RST}")
 
 
 def parar_trote() -> None:
@@ -29418,12 +29476,12 @@ def menu_trote():
         if servico_ativo("trote"):
             info("Notificações de VERDADE do Android só saem pelo link da internet (túnel) e se a pessoa "
                  "tocar em 'Permitir'. No link da rede Wi-Fi o navegador bloqueia e aparece a imitação "
-                 "dentro do site. Para mandar as de verdade, use 'Liberar para a internet'.")
+                 "dentro do site. Para mandar as de verdade, use '🌍 Liberar na internet'.")
 
     menu("👻 Trote / pegadinha (screamer)", [
         ("😈 Preparar e publicar o link do trote", iniciar),
         ("🔗 Ver o link", mostrar_links_trote),
-        ("🌍 Liberar para a internet (túnel)",
+        ("🌍 Liberar na internet (túnel)",
          lambda: abrir_tunel("tunel-trote", cfg()["trote_porta"]) if servico_ativo("trote") else info("Publique o trote primeiro.")),
         ("🛑 Tirar do ar", parar_trote),
         ("✏️ Personalizar (som, imagem, mensagem, efeitos...)", menu_editar_trote),
@@ -29436,7 +29494,7 @@ def menu_diversao():
         ("🎮 Jogos (2048, tetris, sudoku, snake, campo minado...)", menu_jogos),
         ("🎓 Aprender programação (Python, Bash, Git e BASIC retrô)", menu_aprender),
         ("📖 Leitor de livros (EPUB, PDF) e audiolivro", menu_livros),
-        ("🎨 Arte ASCII, banner e tema do Termux", menu_arte),
+        ("🎨 Arte ASCII (texto grande e imagem no terminal)", menu_arte),
         ("👻 Trote / pegadinha: link que dá um susto (screamer)", menu_trote),
     ])
 
@@ -29959,7 +30017,7 @@ def menu_agendador():
             arq = LOG_DIR / f"cron-{t[0]}.log"
             print(arq.read_text("utf-8", errors="replace")[-4000:] if arq.exists() else "Ainda não rodou.")
 
-    menu("⏲️ Tarefas agendadas (cron)", [
+    menu("⏲️ Agendar comandos (cron)", [
         ("Agendar uma tarefa", nova),
         ("Ver tarefas agendadas", listar),
         ("Rodar uma tarefa agora (teste)", rodar_agora),
@@ -30076,7 +30134,7 @@ def menu_programacao():
     menu("🛠️ Programação e servidores", [
         ("🗃️ Banco de dados (SQLite, MariaDB, PostgreSQL)", menu_banco_de_dados),
         ("🐙 GitHub no celular (clonar, commit, push, issues)", menu_github),
-        ("⏲️ Tarefas agendadas (cron)", menu_agendador),
+        ("⏲️ Agendar comandos (cron: limpeza, backup, comando seu)", menu_agendador),
         ("🖥️ Servidores (Minecraft, Jellyfin, Navidrome)", menu_servidores),
         ("💻 Ambiente de desenvolvimento (Neovim, compiladores)", menu_dev),
     ])
@@ -31101,7 +31159,7 @@ def menu_config():
 
     menu("⚙️ Configurações e diagnóstico", [
         ("🩺 Diagnóstico (o que está instalado e funcionando)", diagnostico),
-        ("📦 Instalar os essenciais (python, tmux, termux-api, git)", instalar_essenciais),
+        # "📦 Instalar os essenciais" virou um item de ⚙️ Sistema e manutenção → 📦 Instalar dependências
         ("Ver configuração atual", mostrar),
         (lambda: f"Comando sh nos bots ({'permitido' if c['bot_permitir_shell'] else 'bloqueado'})", shell_bots),
         ("Editar config.json no editor", editar_json),
@@ -31166,6 +31224,41 @@ def instalar_essenciais() -> None:
     ok("Essenciais instalados.")
 
 
+# Um lugar só para instalar dependências por área. Antes havia "Instalar dependências" em 🎵 Música e em
+# 🎬 Vídeos e "Instalar os essenciais" em ⚙️ Configurações. Cada opção do menu continua instalando sozinha
+# o que falta (perguntando antes); isto aqui serve para deixar tudo pronto de uma vez.
+GRUPOS_DEPENDENCIAS = [
+    ("Essenciais (python, tmux, termux-api, git, curl, nano, rich)", instalar_essenciais),
+    ("Música (yt-dlp, ffmpeg, mpv e mutagen para as capas)", garantir_deps_musica),
+    ("Vídeos (yt-dlp e ffmpeg)", lambda: garantir_deps_musica(com_player=False)),
+]
+
+
+def instalar_dependencias() -> None:
+    marcados = escolher_varios("O que instalar? (Espaço marca, Enter confirma)", [g[0] for g in GRUPOS_DEPENDENCIAS])
+    if not marcados:
+        info("Nada marcado.")
+        return
+    for i in marcados:
+        rotulo, instalar = GRUPOS_DEPENDENCIAS[i]
+        titulo(rotulo)
+        instalar()
+    ok("Pronto.")
+
+
+@submenu
+def menu_sistema():
+    """Junta as três categorias de manutenção que ficavam soltas no menu principal
+    (🔄 Atualização, 🧹 Otimização e limpeza, ⚙️ Configurações e diagnóstico)."""
+    menu("⚙️ Sistema e manutenção", [
+        ("🔄 Atualização (Termux, pip, repositórios, Termux-Toons)", menu_atualizar),
+        ("🧹 Otimização e limpeza (caches, arquivos grandes e duplicados)", menu_otimizacao),
+        ("📦 Instalar dependências (essenciais, música, vídeos)", instalar_dependencias),
+        ("🎨 Aparência do terminal (tema, fonte, boas-vindas, banner)", menu_aparencia),
+        ("⚙️ Configurações e diagnóstico", menu_config),
+    ])
+
+
 # ════════════════════════════════════════════════════════════════════
 #  Menu principal e linha de comando
 # ════════════════════════════════════════════════════════════════════
@@ -31211,6 +31304,10 @@ def _indice_busca() -> list:
         ("🤖 Bots Telegram / Discord 24h", "telegram discord bot chatbot robo", menu_bots),
         ("🔎 Scraping e monitoramento", "scraping monitorar monitoramento site preco alerta mudanca", menu_monitor),
         ("🛡️ Rede e segurança", "nmap ssh wireguard vpn porta firewall rede wifi scan seguranca", menu_rede),
+        ("🌉 Pontes de conexão", "ponte pontes proxy tunel ssh tor onion ngrok cloudflare localtunnel serveo pinggy "
+                                 "tailscale zerotier smart dns link publico", menu_pontes),
+        ("🔗 Endereço fixo com o seu domínio (Cloudflare)", "endereco fixo dominio cloudflare tunel token link fixo",
+         menu_tunel_fixo),
         ("🐧 Linux de verdade (proot-distro)", "debian ubuntu arch alpine kali linux distro proot gnu", menu_proot),
         ("🖥️ Interface gráfica da distro (Termux:X11)", "x11 interface grafica desktop gui tela", menu_x11),
         ("🗄️ Arquivos e backup", "gerenciador arquivos nuvem rclone backup pasta compartilhar", menu_arquivos),
@@ -31230,11 +31327,17 @@ def _indice_busca() -> list:
          tela_player),
         ("🎬 Vídeos (TikTok, YouTube)", "video videos youtube tiktok instagram baixar download yt-dlp", menu_videos),
         ("📺 Compartilhar filme por link", "filme video streaming link assistir compartilhar serie", menu_midia),
+        ("🍿 Catálogo do TorBox", "torbox catalogo biblioteca debrid filmes series", menu_torbox),
+        ("📉 Reduzir a resolução / comprimir vídeo", "reduzir resolucao comprimir compactar diminuir video filme 4k "
+                                                    "1080p 720p whatsapp travando leve tamanho", reduzir_resolucao),
         ("🧮 Calculadora científica", "calcular calculadora conta matematica cientifica", menu_calculadora),
         ("🧰 Utilitários", "utilitarios ferramentas notas tarefas lembretes agenda senhas", menu_utilitarios),
         ("📝 Notas", "nota notas anotacao anotacoes bloco texto", menu_notas),
-        ("⏰ Lembretes", "lembrete lembretes lembrar reminder avisar", menu_lembretes),
-        ("⏱️ Relógio (alarme, cronômetro, timer)", "alarme cronometro timer temporizador despertador relogio", menu_relogio),
+        ("✅ Lista de afazeres", "afazeres tarefas todo to-do lista fazer pendencias checklist", tarefas_tui),
+        ("⏰ Lembretes e alarmes", "lembrete lembretes lembrar reminder avisar alarme despertador acordar",
+         menu_lembretes),
+        ("⏱️ Cronômetro, timer e Pomodoro", "cronometro timer temporizador pomodoro relogio contagem regressiva",
+         menu_relogio),
         ("📅 Agenda", "agenda compromisso evento eventos calendario", menu_agenda),
         ("📐 Conversor de unidades", "converter conversor unidade medida moeda temperatura peso distancia", menu_conversor),
         ("💰 Controle de gastos", "gasto gastos despesa dinheiro orcamento financeiro conta", menu_gastos),
@@ -31260,12 +31363,14 @@ def _indice_busca() -> list:
          "ar-condicionado tv box conversor infravermelho ir controle remoto universal flipper", menu_aparelhos),
         ("🖥️ Resolução da tela", "resolucao tela dpi densidade pixel diminuir baixar jogo app leve desempenho fps "
                                  "lag travando wm size", menu_resolucao),
-        ("📡 Modem (AT / 3GPP)", "modem at comando 3gpp sinal operadora", menu_modem),
+        ("📶 Modem (AT / 3GPP)", "modem at comando 3gpp sinal operadora apn imei", menu_modem),
         ("🌐 Internet e comunicação", "internet email noticias downloads navegador chat links", menu_internet),
         ("📧 E-mail", "email e-mail gmail outlook yahoo icloud caixa entrada enviar anexo", menu_email),
         ("📰 Notícias (RSS)", "noticias noticia rss feed jornal g1 bbc folha", menu_noticias),
         ("⬇️ Downloads (aria2, torrent)", "download downloads baixar aria2 torrent magnet fila", menu_downloads),
         ("💬 Chat na rede local", "chat mensagem rede local lan conversar sem internet", menu_chat),
+        ("🌐 Navegador pelo celular (abrir sites num link)", "navegador celular proxy web link abrir site vlc "
+                                                           "rammerhead modo completo", menu_navegador_web),
         ("🌐 Navegador no terminal", "navegador browser browsh w3m web site pesquisar", menu_navegador),
         ("🔗 Encurtador, pastebin e enviar arquivo", "encurtador link pastebin enviar arquivo url curto", menu_links),
         ("👤 Meus dados na internet", "meus dados pessoais pegada digital privacidade lgpd sobre mim exposto cpf nome "
@@ -31282,7 +31387,10 @@ def _indice_busca() -> list:
         ("🔐 Vazamentos de e-mail e senha", "vazamento vazou senha email pwned haveibeenpwned exposto",
          _md_abrir_grupo("vazamentos")),
         ("✨ Inteligência artificial", "ia ai inteligencia artificial claude chatgpt gemini llama voz ocr", menu_ia),
-        ("💬 Assistente na nuvem (Claude, ChatGPT, Gemini)", "claude chatgpt gpt gemini assistente nuvem api conversar", menu_llm),
+        ("💬 Conversar com a IA na nuvem (Claude, ChatGPT, Gemini)", "claude chatgpt gpt gemini assistente nuvem api "
+                                                                     "conversar chat perguntar", conversa_ia),
+        ("🧠 IA local, sem internet (llama.cpp)", "ia local offline llama llama.cpp gguf modelo gemma qwen llm sem internet",
+         menu_llm),
         ("🎤 Voz para texto e texto para voz", "voz texto whisper ditado transcrever audio fala tts falar", menu_voz),
         ("🔎 OCR: texto de foto ou print", "ocr texto foto imagem tesseract ler print extrair", menu_ocr),
         ("🌐 Traduzir a tela", "traduzir tela print captura screenshot ocr texto jogo app idioma tradução",
@@ -31291,7 +31399,9 @@ def _indice_busca() -> list:
         ("🎯 Jogos", "jogo jogos 2048 campo minado sudoku forca velha tetris snake adivinhe quiz recorde", menu_jogos),
         ("🎓 Aprender programação", "aprender python bash git basic curso licao exercicio programar programacao", menu_aprender),
         ("📖 Leitor de livros e audiolivro", "livro livros leitor epub pdf txt audiolivro ler", menu_livros),
-        ("🎨 Arte ASCII, banner e tema do Termux", "arte ascii figlet banner tema cores dracula nord gruvbox", menu_arte),
+        ("🎨 Arte ASCII", "arte ascii figlet texto grande letras imagem terminal desenho", menu_arte),
+        ("🎨 Aparência do terminal (tema, fonte, banner)", "aparencia tema cores dracula nord gruvbox banner boas vindas "
+                                                          "motd visual terminal", menu_aparencia),
         ("🔤 Fonte do terminal", "fonte fontes letra font ttf otf tipografia mono nerd font jetbrains terminal",
          trocar_fonte_terminal),
         ("👻 Trote / pegadinha (screamer)", "trote pegadinha screamer susto brincadeira", menu_trote),
@@ -31299,11 +31409,14 @@ def _indice_busca() -> list:
         ("💻 Ambiente de desenvolvimento", "dev desenvolvimento neovim nvim lsp code-server vscode clang rust go ide", menu_dev),
         ("🗃️ Banco de dados (SQLite, MySQL, PostgreSQL)", "banco dados sqlite mariadb mysql postgresql sql csv", menu_banco_de_dados),
         ("🐙 GitHub (gh)", "github gh repositorio repo commit push pr issue clonar", menu_github),
-        ("⏲️ Tarefas agendadas (cron)", "cron agendar tarefa agendada crontab horario periodico", menu_agendador),
+        ("⏲️ Agendar comandos (cron)", "cron agendar tarefa agendada crontab horario periodico comando", menu_agendador),
         ("🖥️ Servidores (Minecraft, Jellyfin, Navidrome)", "minecraft jellyfin navidrome servidor server jogo media", menu_servidores),
+        ("⚙️ Sistema e manutenção", "sistema manutencao atualizar limpar configurar", menu_sistema),
+        ("📦 Instalar dependências", "instalar dependencias essenciais pacotes yt-dlp ffmpeg mpv requisitos",
+         instalar_dependencias),
         ("🔄 Atualização", "atualizar atualizacao upgrade pkg pip espelho repositorio", menu_atualizar),
         ("🧹 Otimização e limpeza", "limpar limpeza cache espaco otimizar lixo duplicados temporarios", menu_otimizacao),
-        ("⚙️ Configurações e diagnóstico", "configuracao configuracoes diagnostico config token reset essenciais", menu_config),
+        ("⚙️ Configurações e diagnóstico", "configuracao configuracoes diagnostico config token reset", menu_config),
     ]
 
 
@@ -31373,17 +31486,14 @@ def menu_principal() -> None:
         ("🎵 Música, rádio e podcasts", menu_musica),
         ("🎬 Vídeos", menu_videos),
         ("📺 Compartilhar filme por link", menu_midia),
-        ("🧮 Calculadora científica", menu_calculadora),
-        ("🧰 Utilitários", menu_utilitarios),
+        ("🧰 Utilitários (calculadora, notas, senhas...)", menu_utilitarios),
         ("📲 Celular e sistema", menu_celular),
         ("🌐 Internet", menu_internet),
         ("👤 Meus dados na internet", menu_meus_dados),
         ("✨ Inteligência artificial", menu_ia),
         ("🎮 Diversão e aprendizado", menu_diversao),
         ("🛠️ Programação e servidores", menu_programacao),
-        ("🔄 Atualização", menu_atualizar),
-        ("🧹 Otimização e limpeza", menu_otimizacao),
-        ("⚙️ Configurações e diagnóstico", menu_config),
+        ("⚙️ Sistema e manutenção (atualizar, limpar, configurar)", menu_sistema),
     ], sair="Sair", cabecalho=cabecalho)
 
 
@@ -31428,6 +31538,7 @@ def main(argv=None) -> int:
     p.add_argument("--nivel", type=int, choices=sorted(NIVEIS_VIDEO), default=1080, help="resolução: 1080, 720...")
     p.add_argument("--saida", help="arquivo de destino (padrão: ao lado do original)")
     p.add_argument("--fps30", action="store_true", help="também baixa para 30 quadros por segundo")
+    p.add_argument("--menor", action="store_true", help="arquivo bem menor (comprime mais; bom para o WhatsApp)")
     p = sub.add_parser("midia", help="servidor de vídeo (links de compartilhamento) em primeiro plano")
     p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--porta", type=int)
@@ -31522,7 +31633,7 @@ def main(argv=None) -> int:
         elif args.comando == SERVICO_TUNEL_FIXO:
             rodar_tunel_fixo()
         elif args.comando == SERVICO_REDUZIR:
-            reduzir_video_cli(args.fonte, args.nivel, args.saida, args.fps30)
+            reduzir_video_cli(args.fonte, args.nivel, args.saida, args.fps30, args.menor)
         elif args.comando == "midia":
             servir_midia(args.host, args.porta or cfg()["midia_porta"])
         elif args.comando == "desktop":
