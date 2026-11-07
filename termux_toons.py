@@ -12023,17 +12023,17 @@ def equalizar_arquivo(arq: Path, cadeia: str) -> bool:
 
 
 def comando_ytdlp(alvo: str, formato: str | None = None, eq: dict | None = None,
-                  lista: Path | None = None, pasta: Path | None = None) -> list:
+                  lista: Path | None = None, pasta: Path | None = None, nome_arquivo: str | None = None) -> list:
     """Melhor áudio, convertido para o formato escolhido, com capa (quando o formato aceita) e metadados. Com
     `eq` o nome do arquivo ganha '(EQ preset)' (quem grava o filtro é baixar_musica); `lista` recebe o caminho
-    final de cada arquivo baixado."""
+    final de cada arquivo baixado; `nome_arquivo` troca o título do vídeo pelo nome dado (ex.: '01 - Música')."""
     formato = formato if formato in FORMATOS_MUSICA else cfg().get("formato_musica", "opus")
     cadeia = cadeia_eq(eq) if eq else ""
     if cadeia and formato == "original":  # o original pode vir num formato que não sei regravar
         formato = "opus"
     _, opcoes, capa = FORMATOS_MUSICA.get(formato, FORMATOS_MUSICA["opus"])
     selecao = "bestaudio[ext=m4a]/bestaudio/best" if formato == "m4a" else "bestaudio/best"
-    nome = "%(title)s" + (f" (EQ {nome_eq(eq)})" if cadeia else "")
+    nome = (nome_arquivo.replace("%", "%%") if nome_arquivo else "%(title)s") + (f" (EQ {nome_eq(eq)})" if cadeia else "")
     return ["yt-dlp", "-f", selecao, "--extract-audio", *opcoes, *(["--embed-thumbnail"] if capa else []),
             *(["--print-to-file", "after_move:filepath", str(lista)] if lista else []),
             "--add-metadata", "-o", str((pasta or pasta_musicas()) / f"{nome}.%(ext)s"), alvo]
@@ -12075,24 +12075,30 @@ def garantir_deps_musica(com_player: bool = True, capa: bool | None = None) -> b
 
 
 def baixar_musica(alvo: str, formato: str | None = None, eq: dict | None = None) -> bool:
+    return _baixar_audio(alvo, formato, eq)[0]
+
+
+def _baixar_audio(alvo: str, formato: str | None = None, eq: dict | None = None, pasta: Path | None = None,
+                  nome_arquivo: str | None = None) -> tuple:
+    """(deu certo, arquivos baixados). Sem `pasta`, salva na pasta das músicas."""
     if not garantir_deps_musica(com_player=False, capa=True):  # baixar não precisa do player
-        return False
-    pasta = pasta_para_salvar(pasta_musicas())
+        return False, []
+    pasta = pasta or pasta_para_salvar(pasta_musicas())
     if pasta is None:
-        return False
+        return False, []
     cadeia = cadeia_eq(eq) if eq else ""
     if cadeia and (formato or cfg().get("formato_musica")) == "original":
         info("Para gravar o equalizador o áudio precisa ser convertido: vai em Opus.")
     lista = DATA_DIR / "tmp" / f"baixados-{os.getpid()}.txt"
     lista.parent.mkdir(parents=True, exist_ok=True)
     lista.unlink(missing_ok=True)
-    deu_certo = rodar(comando_ytdlp(alvo, formato, eq, lista, pasta)).returncode == 0
+    deu_certo = rodar(comando_ytdlp(alvo, formato, eq, lista, pasta, nome_arquivo)).returncode == 0
     arquivos = relatar_baixados(lista)
     if cadeia:
         equalizados = all([equalizar_arquivo(arq, cadeia) for arq in arquivos])
         _avisar_galeria(arquivos)  # o arquivo foi regravado com o equalizador
-        return equalizados and deu_certo
-    return deu_certo
+        return equalizados and deu_certo, arquivos
+    return deu_certo, arquivos
 
 
 def buscar_youtube(termo: str, n: int = 10) -> list:
@@ -13220,6 +13226,364 @@ def descobrir_musica() -> None:
         tocar_mpv([arquivo], titulo=titulo_forcado)
 
 
+# ── Álbuns e artistas: catálogo do Deezer, áudio do YouTube ──────────
+# A lista de faixas (de um álbum, ou de todas as músicas de um artista) vem da API pública do Deezer, que não
+# pede chave nem conta e sabe a ordem das faixas, o ano e a discografia inteira. Cada faixa toca ou é baixada do
+# YouTube pelo yt-dlp (busca "Artista - Música audio"), como já acontece com os links do Spotify. Os downloads
+# ficam em pastas (Artista/Álbum (ano)/01 - Música) com as etiquetas certas (artista, álbum, faixa, ano), e
+# baixar de novo pula o que já está no celular.
+
+DEEZER_API = "https://api.deezer.com"
+DEEZER_TIPOS = {"album": "álbum", "ep": "EP", "single": "single", "compile": "coletânea"}
+
+
+def _deezer(caminho: str, **params) -> dict:
+    url = url_com(f"{DEEZER_API}/{caminho.lstrip('/')}", **params)
+    for tentativa in range(3):
+        try:
+            status, dados, _ = baixar_url(url, timeout=20)
+        except OSError as e:
+            raise ToonsError(f"Não consegui falar com o catálogo de músicas (Deezer): {e}") from None
+        if status >= 400:
+            raise ToonsError(f"O catálogo de músicas (Deezer) respondeu HTTP {status}.")
+        try:
+            resposta = json.loads(dados.decode("utf-8", "replace"))
+        except ValueError:
+            raise ToonsError("O catálogo de músicas (Deezer) mandou uma resposta inválida.") from None
+        erro = resposta.get("error") if isinstance(resposta, dict) else None
+        if not erro:
+            return resposta if isinstance(resposta, dict) else {}
+        if erro.get("code") == 4 and tentativa < 2:   # muitos pedidos por segundo: espera e tenta de novo
+            time.sleep(2)
+            continue
+        raise ToonsError(f"Catálogo de músicas (Deezer): {erro.get('message') or erro}")
+    raise ToonsError("O catálogo de músicas (Deezer) está recusando pedidos agora. Tente daqui a pouco.")
+
+
+def _deezer_lista(caminho: str, maximo: int = 1000) -> list:
+    """Junta as páginas de uma lista do Deezer (ele manda até 100 por vez e o endereço da próxima em 'next')."""
+    itens, indice = [], 0
+    while len(itens) < maximo:
+        resposta = _deezer(caminho, index=indice, limit=min(100, maximo - len(itens)))
+        dados = resposta.get("data") or []
+        itens += dados
+        if not dados or not resposta.get("next"):
+            break
+        indice += len(dados)
+        time.sleep(0.15)
+    return itens[:maximo]
+
+
+def buscar_albuns(termo: str) -> list:
+    return [{"id": a["id"], "titulo": a.get("title") or "", "artista": (a.get("artist") or {}).get("name") or "",
+             "faixas": a.get("nb_tracks"), "tipo": a.get("record_type") or "album"}
+            for a in _deezer("search/album", q=termo, limit=25).get("data") or [] if a.get("id")]
+
+
+def buscar_artistas(termo: str) -> list:
+    return [{"id": a["id"], "nome": a.get("name") or "", "albuns": a.get("nb_album"), "fas": a.get("nb_fan")}
+            for a in _deezer("search/artist", q=termo, limit=20).get("data") or [] if a.get("id")]
+
+
+def faixas_do_album(album_id) -> tuple:
+    """(dados do álbum, faixas na ordem do disco)."""
+    album = _deezer(f"album/{album_id}")
+    dono = (album.get("artist") or {}).get("name") or ""
+    dados = {"id": album_id, "titulo": album.get("title") or "", "artista": dono,
+             "ano": (album.get("release_date") or "")[:4], "tipo": album.get("record_type") or "album"}
+    faixas = []
+    for i, f in enumerate(_deezer_lista(f"album/{album_id}/tracks", 500), 1):
+        faixas.append({"titulo": f.get("title") or "", "artista": (f.get("artist") or {}).get("name") or dono,
+                       "album": dados["titulo"], "albumartist": dono, "ano": dados["ano"],
+                       "faixa": f.get("track_position") or i, "disco": f.get("disk_number") or 1,
+                       "duracao": f.get("duration") or 0})
+    return dados, faixas
+
+
+def mais_ouvidas(artista: dict, n: int = 100) -> list:
+    return [{"titulo": f.get("title") or "", "artista": (f.get("artist") or {}).get("name") or artista["nome"],
+             "album": (f.get("album") or {}).get("title") or "", "albumartist": artista["nome"], "ano": "",
+             "faixa": 0, "disco": 1, "duracao": f.get("duration") or 0}
+            for f in _deezer_lista(f"artist/{artista['id']}/top", n)]
+
+
+def discografia(artista: dict) -> list:
+    """Álbuns, EPs, singles e coletâneas do artista, do mais antigo ao mais novo."""
+    albuns = [{"id": a["id"], "titulo": a.get("title") or "", "artista": artista["nome"],
+               "ano": (a.get("release_date") or "")[:4], "tipo": a.get("record_type") or "album"}
+              for a in _deezer_lista(f"artist/{artista['id']}/albums", 500) if a.get("id")]
+    return sorted(albuns, key=lambda a: a["ano"] or "9999")
+
+
+def _chave_musica(titulo: str) -> str:
+    """A mesma música em versões diferentes ("Remastered", "Ao vivo", "(feat. ...)") vira a mesma chave."""
+    base = re.sub(r"\s*[(\[][^)\]]*[)\]]", "", titulo)
+    base = re.sub(r"\s+-\s+.*$", "", base)
+    return re.sub(r"\W+", " ", sem_acento(base).lower()).strip()
+
+
+def faixas_dos_albuns(albuns: list, sem_repetir: bool = False) -> list:
+    """As faixas de vários álbuns, na ordem. Com `sem_repetir`, cada música entra uma vez só (a do lançamento
+    mais antigo), mesmo que apareça de novo em single, edição de luxo ou coletânea."""
+    todas, vistas = [], set()
+    for i, album in enumerate(albuns, 1):
+        print(f"\r  Lendo os álbuns no catálogo: {i}/{len(albuns)}   ", end="", flush=True)
+        try:
+            _, faixas = faixas_do_album(album["id"])
+        except ToonsError as e:
+            print()
+            aviso(f"Pulei '{album['titulo']}': {e}")
+            continue
+        for f in faixas:
+            chave = _chave_musica(f["titulo"])
+            if sem_repetir and chave in vistas:
+                continue
+            vistas.add(chave)
+            todas.append(f)
+        time.sleep(0.15)
+    print()
+    return todas
+
+
+def _busca_da_faixa(faixa: dict) -> str:
+    return f"{faixa['artista']} - {faixa['titulo']} audio"
+
+
+def _duracao_txt(segundos) -> str:
+    segundos = int(segundos or 0)
+    return f"{segundos // 60}:{segundos % 60:02d}" if segundos else "?"
+
+
+def listar_faixas_catalogo(titulo: str, faixas: list, limite: int = 40) -> None:
+    total = sum(int(f.get("duracao") or 0) for f in faixas)
+    print(f"\n{NEG}{titulo}{RST} {DIM}· {len(faixas)} faixa(s) · {total // 3600}h{total % 3600 // 60:02d}min{RST}")
+    for i, f in enumerate(faixas[:limite], 1):
+        numero = f["faixa"] if f.get("faixa") else i
+        extra = f" {DIM}— {f['artista']}{RST}" if f.get("artista") and f["artista"] != f.get("albumartist") else ""
+        print(f"  {DIM}{numero:>3}.{RST} {f['titulo']}{extra} {DIM}{_duracao_txt(f.get('duracao'))}{RST}")
+    if len(faixas) > limite:
+        print(f"  {DIM}... e mais {len(faixas) - limite}{RST}")
+
+
+def tocar_faixas(faixas: list, nome: str, aleatorio: bool = False) -> None:
+    """Toca as faixas no player: cada uma é procurada no YouTube na hora de tocar (a fila começa na hora)."""
+    if not faixas:
+        raise ToonsError("Nenhuma faixa para tocar.")
+    pasta = DATA_DIR / "tmp"
+    pasta.mkdir(parents=True, exist_ok=True)
+    fila = pasta / "fila-catalogo.m3u"
+    linhas = ["#EXTM3U"]
+    for f in faixas:
+        rotulo = re.sub(r"[\r\n,]+", " ", f"{f['artista']} - {f['titulo']}")
+        linhas += [f"#EXTINF:{int(f.get('duracao') or -1)},{rotulo}",
+                   "ytdl://ytsearch1:" + re.sub(r"[\r\n]+", " ", _busca_da_faixa(f))]
+    fila.write_text("\n".join(linhas) + "\n", "utf-8")
+    info(f"{len(faixas)} música(s) de {nome} na fila. Cada uma é procurada no YouTube na hora de tocar.")
+    tocar_mpv([], aleatorio=aleatorio, playlist=fila, stream=True)
+
+
+def _nome_arquivo(texto: str, limite: int = 120) -> str:
+    texto = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", str(texto)).strip().strip(".")
+    return texto[:limite].strip() or "sem nome"
+
+
+def _onde_salvar_faixa(faixa: dict, por_album: bool) -> tuple:
+    """(subpasta, nome do arquivo sem extensão): Artista/Álbum (ano)/01 - Música, ou Artista/Música."""
+    artista = _nome_arquivo(faixa.get("albumartist") or faixa["artista"], 80)
+    if not por_album:
+        return artista, _nome_arquivo(faixa["titulo"])
+    album = _nome_arquivo(faixa.get("album") or "Sem álbum", 80) + (f" ({faixa['ano']})" if faixa.get("ano") else "")
+    numero = f"{int(faixa.get('faixa') or 0):02d}"
+    if int(faixa.get("disco") or 1) > 1:
+        numero = f"{faixa['disco']}-{numero}"
+    return f"{artista}/{album}", f"{numero} - {_nome_arquivo(faixa['titulo'])}"
+
+
+def _ja_baixada(pasta: Path, nome: str) -> bool:
+    if not pasta.is_dir():
+        return False
+    return any(p.suffix.lower() in EXTENSOES_AUDIO and (p.stem == nome or p.stem.startswith(nome + " (EQ "))
+               for p in pasta.iterdir())
+
+
+def _etiquetar(arq: Path, faixa: dict) -> None:
+    """Grava artista, álbum, faixa e ano do catálogo (as etiquetas do vídeo do YouTube costumam vir erradas)."""
+    with contextlib.suppress(Exception):
+        from mutagen import File as ArquivoMutagen
+        audio = ArquivoMutagen(arq, easy=True)
+        if audio is None:
+            return
+        if audio.tags is None:
+            with contextlib.suppress(Exception):
+                audio.add_tags()
+        for chave, valor in (("title", faixa.get("titulo")), ("artist", faixa.get("artista")),
+                             ("album", faixa.get("album")), ("albumartist", faixa.get("albumartist")),
+                             ("date", faixa.get("ano")), ("tracknumber", faixa.get("faixa") or None),
+                             ("discnumber", faixa.get("disco") if int(faixa.get("disco") or 1) > 1 else None)):
+            if valor:
+                with contextlib.suppress(Exception):
+                    audio[chave] = [str(valor)]
+        audio.save()
+
+
+def baixar_faixas(faixas: list, formato: str | None, eq, por_album: bool) -> None:
+    """Baixa as faixas uma a uma (procurando cada uma no YouTube), em pastas por artista e álbum. Ctrl+C para e
+    guarda o que já foi; rodar de novo continua de onde parou."""
+    raiz = pasta_para_salvar(pasta_musicas())
+    if raiz is None:
+        return
+    baixadas, puladas, falhas = 0, 0, []
+    try:
+        for i, f in enumerate(faixas, 1):
+            subpasta, nome = _onde_salvar_faixa(f, por_album)
+            destino = raiz / subpasta
+            if _ja_baixada(destino, nome):
+                puladas += 1
+                print(f"{DIM}({i}/{len(faixas)}) já está no celular: {subpasta}/{nome}{RST}")
+                continue
+            print(f"\n{NEG}({i}/{len(faixas)}) {f['artista']} - {f['titulo']}{RST}")
+            destino.mkdir(parents=True, exist_ok=True)
+            deu_certo, arquivos = _baixar_audio(f"ytsearch1:{_busca_da_faixa(f)}", formato, eq, destino, nome)
+            for arq in arquivos:
+                _etiquetar(arq, f)
+            if deu_certo and arquivos:
+                baixadas += 1
+            else:
+                falhas.append(f"{f['artista']} - {f['titulo']}")
+    except KeyboardInterrupt:
+        print()
+        aviso("Download interrompido. O que já baixou ficou salvo; baixar de novo continua de onde parou.")
+    print()
+    ok(f"{baixadas} música(s) baixada(s)" + (f", {puladas} já estavam no celular" if puladas else "")
+       + f". Pasta: {onde_fica(raiz)}")
+    if falhas:
+        aviso(f"{len(falhas)} não deram certo: " + "; ".join(falhas[:8]) + (" ..." if len(falhas) > 8 else ""))
+
+
+def escolher_album(termo: str | None = None) -> dict | None:
+    termo = termo if termo is not None else perguntar("Álbum (pode pôr o artista junto: 'Djavan Luz')")
+    if not termo:
+        return None
+    info(f"Procurando álbuns de '{termo}'...")
+    albuns = buscar_albuns(termo)
+    if not albuns:
+        aviso("Nenhum álbum encontrado. Tente o nome do álbum com o do artista.")
+        return None
+    i = escolher("Qual álbum?", [f"{a['titulo']} {DIM}— {a['artista']} · {DEEZER_TIPOS.get(a['tipo'], a['tipo'])} · "
+                                 f"{a['faixas'] or '?'} faixas{RST}" for a in albuns], 1)
+    return None if i is None else albuns[i]
+
+
+def escolher_artista(termo: str | None = None) -> dict | None:
+    termo = termo if termo is not None else perguntar("Cantor, cantora ou banda")
+    if not termo:
+        return None
+    info(f"Procurando '{termo}'...")
+    artistas = buscar_artistas(termo)
+    if not artistas:
+        aviso("Ninguém encontrado com esse nome.")
+        return None
+    i = escolher("Qual?", [f"{a['nome']} {DIM}· {a['albuns'] or 0} álbuns · {a['fas'] or 0:,} fãs{RST}".replace(",", ".")
+                           for a in artistas], 1)
+    return None if i is None else artistas[i]
+
+
+def _formato_e_eq_download():
+    """Formato e equalizador para baixar; (None, None) se a pessoa cancelar."""
+    formato = escolher_formato_musica()
+    eq = perguntar_eq_download() if formato else False
+    return (None, None) if eq is False else (formato, eq)
+
+
+def _confirmar_lote(n: int) -> bool:
+    if n <= 30:
+        return True
+    return confirmar(f"São {n} músicas: vai demorar e gastar internet (umas {n * 4} MB). Continuar?", True)
+
+
+def ouvir_album() -> None:
+    album = escolher_album()
+    if not album:
+        return
+    dados, faixas = faixas_do_album(album["id"])
+    listar_faixas_catalogo(f"💿 {dados['titulo']} — {dados['artista']}" + (f" ({dados['ano']})" if dados["ano"] else ""),
+                   faixas)
+    tocar_faixas(faixas, f"'{dados['titulo']}'", aleatorio=False)
+
+
+def baixar_album() -> None:
+    album = escolher_album()
+    if not album:
+        return
+    dados, faixas = faixas_do_album(album["id"])
+    listar_faixas_catalogo(f"💿 {dados['titulo']} — {dados['artista']}" + (f" ({dados['ano']})" if dados["ano"] else ""),
+                   faixas)
+    if not confirmar(f"Baixar as {len(faixas)} faixas para {onde_fica(pasta_musicas())}?", True):
+        return
+    formato, eq = _formato_e_eq_download()
+    if formato:
+        baixar_faixas(faixas, formato, eq, por_album=True)
+
+
+def tocar_artista() -> None:
+    artista = escolher_artista()
+    if not artista:
+        return
+    opcoes = ["As mais ouvidas (até 100), das mais tocadas para as outras",
+              "As mais ouvidas, no aleatório",
+              "Todas as músicas (álbuns, EPs e singles, sem repetir), no aleatório",
+              "Todas as músicas, álbum por álbum, do mais antigo ao mais novo"]
+    i = escolher(f"Tocar {artista['nome']}: como?", opcoes, 1)
+    if i is None:
+        return
+    if i < 2:
+        faixas = mais_ouvidas(artista)
+    else:
+        albuns = [a for a in discografia(artista) if a["tipo"] != "compile"]
+        faixas = faixas_dos_albuns(albuns, sem_repetir=True)
+    tocar_faixas(faixas, artista["nome"], aleatorio=i in (1, 2))
+
+
+def baixar_artista() -> None:
+    artista = escolher_artista()
+    if not artista:
+        return
+    opcoes = ["As mais ouvidas (escolho quantas) — numa pasta com o nome do artista",
+              "Todos os álbuns — cada um na sua pasta",
+              "Todos os álbuns, EPs e singles — cada um na sua pasta",
+              "Escolher os álbuns"]
+    i = escolher(f"Baixar o quê de {artista['nome']}?", opcoes, 1)
+    if i is None:
+        return
+    if i == 0:
+        n = perguntar_int("Quantas das mais ouvidas?", 25, 1, 100)
+        faixas = mais_ouvidas(artista, n)
+        listar_faixas_catalogo(f"🎤 {artista['nome']}: as {len(faixas)} mais ouvidas", faixas)
+        por_album = False
+    else:
+        albuns = discografia(artista)
+        if i == 1:
+            albuns = [a for a in albuns if a["tipo"] == "album"]
+        elif i == 2:
+            albuns = [a for a in albuns if a["tipo"] != "compile"]
+        else:
+            sel = escolher_varios("Quais álbuns?", [f"{a['titulo']} {DIM}({a['ano'] or '?'}) · "
+                                                   f"{DEEZER_TIPOS.get(a['tipo'], a['tipo'])}{RST}" for a in albuns])
+            albuns = [albuns[k] for k in sel]
+        if not albuns:
+            aviso("Nenhum álbum para baixar.")
+            return
+        print(f"{DIM}{len(albuns)} lançamento(s): " + ", ".join(a["titulo"] for a in albuns[:12])
+              + (" ..." if len(albuns) > 12 else "") + RST)
+        faixas = faixas_dos_albuns(albuns)
+        por_album = True
+    if not faixas or not _confirmar_lote(len(faixas)):
+        return
+    formato, eq = _formato_e_eq_download()
+    if formato:
+        baixar_faixas(faixas, formato, eq, por_album=por_album)
+
+
 @submenu
 def menu_musica():
     c = cfg()
@@ -13316,7 +13680,11 @@ def menu_musica():
          tela_equalizador),
         ("🔎 Descobrir a música de um arquivo (pelo som)", descobrir_musica),
         ("Buscar e tocar (streaming)", buscar_tocar),
+        ("💿 Ouvir um álbum (buscar pelo nome)", ouvir_album),
+        ("🎤 Tocar todas as músicas de um cantor ou banda", tocar_artista),
         ("Buscar e baixar (escolhe o formato: MP3, Opus, M4A, FLAC...)", buscar_baixar),
+        ("💿 Baixar um álbum inteiro (pasta do álbum, faixas numeradas)", baixar_album),
+        ("🎤 Baixar as músicas de um cantor ou banda (mais ouvidas ou discografia)", baixar_artista),
         ("Baixar por link (YouTube, SoundCloud, playlist...)", baixar_link),
         ("Baixar do Spotify (link → busca no YouTube)", baixar_spotify),
         ("Tocar mix/rádio por busca", mix),
@@ -30847,7 +31215,8 @@ def _indice_busca() -> list:
         ("🖥️ Interface gráfica da distro (Termux:X11)", "x11 interface grafica desktop gui tela", menu_x11),
         ("🗄️ Arquivos e backup", "gerenciador arquivos nuvem rclone backup pasta compartilhar", menu_arquivos),
         ("🌐 Publicar página / site por link", "site html publicar pagina link servir web", publicar_site),
-        ("🎵 Música, rádio e podcasts", "musica mp3 audio tocar playlist som", menu_musica),
+        ("🎵 Música, rádio e podcasts", "musica mp3 audio tocar playlist som album cantor cantora banda artista discografia",
+         menu_musica),
         ("📻 Rádio online (mundo todo)", "radio fm estacao radios ao vivo mundo pais internacional idioma legenda",
          menu_radio),
         ("🎙️ Podcasts", "podcast podcasts episodio", menu_podcasts),
