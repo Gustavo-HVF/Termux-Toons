@@ -1,0 +1,66 @@
+{
+  "esquema": "lnux-perfil/1",
+  "id": "termux",
+  "nome": "Termux (Android)",
+  "descricao": "O app Termux no celular ou tablet Android (pkg, Termux:API, Termux:X11, proot-distro)",
+  "familia": "termux",
+  "detectar": {
+    "termux": true
+  },
+  "recursos": [
+    "termux",
+    "android",
+    "termux_api",
+    "infravermelho",
+    "termux_x11",
+    "proot_distro",
+    "tema_termux",
+    "adb"
+  ],
+  "elevar": [],
+  "pacotes": {
+    "gerenciador": "pkg",
+    "precisa_root": false,
+    "instalar": ["pkg", "install", "-y"],
+    "atualizar_indice": ["pkg", "update", "-y"],
+    "atualizar_sistema": ["pkg", "upgrade", "-y"],
+    "limpar_cache": ["apt", "clean"],
+    "remover_orfaos": ["apt", "autoremove", "-y"],
+    "pasta_cache": "$PREFIX/var/cache/apt",
+    "essenciais": ["python", "tmux", "termux-api", "git", "curl", "nano"],
+    "nomes_iguais_ao_canonico": true,
+    "nomes": {
+      "notify-send": null,
+      "xdg-open": null,
+      "wl-clipboard": null,
+      "xclip": null,
+      "espeak-ng": null,
+      "distrobox": null,
+      "podman": null,
+      "nmcli": null,
+      "vlc": null,
+      "pip": null,
+      "libreoffice": null
+    },
+    "modulos_python": {}
+  },
+  "caminhos": {
+    "downloads": "~/storage/downloads",
+    "musicas": "~/storage/music",
+    "videos": "~/storage/movies",
+    "imagens": "~/storage/pictures",
+    "dcim": "~/storage/dcim",
+    "documentos": "~/storage/shared/Documents",
+    "capturas_de_tela": "~/storage/shared/Pictures/Screenshots",
+    "compartilhado": "~/storage/shared",
+    "temporarios": "$PREFIX/tmp",
+    "prefixo": "$PREFIX"
+  },
+  "servicos": {
+    "comandos": {},
+    "nomes": {}
+  },
+  "dicas": {
+    "repositorios_extras": "Use ⚙️ Sistema e manutenção → 🔄 Atualização → Ativar repositórios extras (x11, root, tur)."
+  }
+}

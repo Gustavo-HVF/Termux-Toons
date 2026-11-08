@@ -1,19 +1,28 @@
-# Termux-Toons
+# LNUX
 
-Um canivete suíço em **um único arquivo Python** para transformar o celular Android
-(com [Termux](https://termux.dev)) em servidor, estação de desenvolvimento, central de
-automação, player de música e muito mais — tudo por um menu no terminal.
+Um canivete suíço para o terminal, num programa Python só (`lnux.py`), que roda no **celular Android**
+(com o [Termux](https://termux.dev)) e nas **distros Linux** (Debian/Ubuntu, Arch, Fedora, Alpine,
+openSUSE e outras). Servidor web, bots, downloads de música e vídeo, player, rede, arquivos, IA, jogos e
+muito mais, tudo por um menu no terminal.
 
 ```
-╔╦╗╔═╗╦═╗╔╦╗╦ ╦═╗ ╦  ╔╦╗╔═╗╔═╗╔╗╔╔═╗
- ║ ║╣ ╠╦╝║║║║ ║╔╩╦╝   ║ ║ ║║ ║║║║╚═╗
- ╩ ╚═╝╩╚═╩ ╩╚═╝╩ ╚═   ╩ ╚═╝╚═╝╝╚╝╚═╝
+╦   ╔╗╔ ╦ ╦ ═╗ ╦
+║   ║║║ ║ ║ ╔╩╦╝
+╩═╝ ╝╚╝ ╚═╝ ╩ ╚═
 ```
 
-Para abrir, o programa só precisa da biblioteca padrão do Python. Cada função instala o
-que precisa (`pkg install ...` ou `pip install ...`) **perguntando antes**.
+> O LNUX se chamava **Termux-Toons**. Quem já usava não perde nada: a pasta `~/.termux_toons` vira
+> `~/.lnux` na primeira abertura (com configuração, notas, playlists e logs), o atalho `toons` e o
+> `termux_toons.py` continuam funcionando, e os serviços e tarefas do cron criados antes seguem sendo
+> reconhecidos.
+
+Para abrir, o programa só precisa da biblioteca padrão do Python (3.9 ou mais novo). Cada função instala o
+que precisa **perguntando antes**, pelo gerenciador de pacotes do seu sistema (`pkg`, `apt`, `pacman`,
+`dnf`, `apk` ou `zypper`) ou pelo `pip`.
 
 ## Instalação
+
+### No celular (Termux)
 
 > Instale o **Termux** e o **Termux:API** pela mesma loja (F-Droid ou GitHub). A versão
 > da Play Store está desatualizada e não conversa com o Termux:API do F-Droid.
@@ -21,11 +30,78 @@ que precisa (`pkg install ...` ou `pip install ...`) **perguntando antes**.
 ```bash
 pkg update && pkg upgrade
 pkg install git python
-git clone https://github.com/Gustavo-HVF/Termux-Toons
-cd Termux-Toons
-bash instalar.sh        # instala tmux/termux-api, pede acesso ao armazenamento e cria o atalho "toons"
-toons                   # ou: python termux_toons.py
+git clone https://github.com/Gustavo-HVF/Termux-Toons LNUX
+cd LNUX
+bash instalar.sh        # instala tmux/termux-api, pede acesso ao armazenamento e cria o atalho "lnux"
+lnux                    # ou: python lnux.py
 ```
+
+### Numa distro Linux
+
+```bash
+git clone https://github.com/Gustavo-HVF/Termux-Toons LNUX
+cd LNUX
+bash instalar.sh        # instala python3, tmux, git, curl, xdg-utils e libnotify (pede a senha do sudo)
+lnux                    # ou: python3 lnux.py
+```
+
+O `instalar.sh` reconhece `apt`, `pacman`, `dnf`, `apk` e `zypper`. Em outra distro, instale `python3`,
+`tmux`, `git` e `curl` pelo seu sistema e rode `python3 lnux.py`.
+
+## Qual sistema você usa
+
+Na primeira vez, o LNUX pergunta **qual sistema você usa**, já sugerindo o que ele detectou (o Termux pelo
+`$PREFIX`; as distros pelo `/etc/os-release`). É só confirmar com Enter ou escolher outro. A escolha fica
+salva em `~/.lnux/config.json` e dá para trocar quando quiser em **⚙️ Sistema e manutenção → 🐧 Trocar o
+sistema** (ou `lnux sistema debian` no terminal; `lnux sistema` mostra o que ele sabe do sistema em uso).
+
+| Perfil | Para | Pacotes |
+|---|---|---|
+| Termux (Android) | o app Termux no celular ou tablet | `pkg` |
+| Debian / Ubuntu | Debian, Ubuntu, Mint, Pop!_OS, elementary, Zorin, Kali, Raspberry Pi OS... | `apt` |
+| Arch Linux | Arch, Manjaro, EndeavourOS, Garuda, CachyOS, Artix, SteamOS... | `pacman` |
+| Fedora / RHEL | Fedora, Nobara, RHEL, CentOS Stream, Rocky, AlmaLinux | `dnf` |
+| Alpine Linux | Alpine e postmarketOS (OpenRC) | `apk` |
+| openSUSE | Tumbleweed, Leap e SUSE Linux Enterprise | `zypper` |
+| Outro Linux | qualquer outra: funciona, mas os programas você instala à mão | — |
+
+**O menu mostra só o que funciona no sistema escolhido.** Cada perfil diz os recursos que o sistema tem
+(Termux:API, Android, área de trabalho, serviços do sistema...), e as opções que dependem de algo que ele não
+tem somem do menu e da busca. As exclusivas do Android ganham um equivalente quando ele existe:
+
+| No Termux (Android) | Numa distro Linux |
+|---|---|
+| 🐧 Linux de verdade (proot-distro) e desktop no Termux:X11 | 🐧 **Outras distros em contêineres** (Distrobox + Podman), com os apps delas no menu do computador |
+| 🔌 Depuração sem fio (ADB no próprio celular) | 📱 **Android conectado** (o mesmo ADB, para um celular ligado por USB ou Wi-Fi): print, gravação, apps, tempo de tela, Android/data no gerenciador de arquivos |
+| 📱 Termux:API | 🖥️ **Recursos do computador**: notificação (`notify-send`), webcam (`ffmpeg`), área de transferência (`wl-clipboard`/`xclip`), volume (`wpctl`/`pactl`) |
+| Abrir no VLC/MX Player do Android | Abre no **VLC ou mpv** do computador |
+| Ver outro celular no Termux:X11 (scrcpy) | **scrcpy** numa janela da área de trabalho |
+| Servidor SSH na porta 8022 | O **serviço SSH do sistema** (porta 22), pelo systemd ou OpenRC |
+| MariaDB/PostgreSQL rodando como usuário | O **serviço do banco** do sistema (prepara na primeira vez quando a distro pede) |
+| cron no tmux | O **cron do sistema** |
+| Backup do Termux | **Backup da pasta pessoal** (`~`), sem caches e sem a própria pasta Downloads |
+| Captura de tráfego com root (`su`) | `tcpdump` com `sudo` |
+| TRIM com root, telas do Android | `fstrim` com `sudo` |
+| Word/Excel → PDF pelo LibreOffice dentro do proot | O **LibreOffice** da distro |
+| Pastas `~/storage/downloads`, `~/storage/music`... | As pastas da pessoa (XDG): Downloads, Músicas, Vídeos, Imagens |
+
+Ficam **só no Termux**, porque precisam do Android ou do app Termux: sensores, SMS, GPS, lanterna, vibração,
+infravermelho (controle da TV por IR, TV-B-Gone, outros aparelhos; as Smart TVs pelo Wi-Fi funcionam nos dois),
+modem (comandos AT), resolução da tela, transmitir a tela por link, limpar o cache de todos os apps, Termux:X11,
+tema e fonte do Termux. O code-server e o Jellyfin/Navidrome aparecem onde a distro tem o pacote.
+
+Os comandos do Termux usados pelo programa (`termux-open-url`, `termux-notification`, `termux-clipboard-set`,
+`termux-tts-speak`, `termux-battery-status`, `termux-wifi-*`, `termux-camera-photo`,
+`termux-microphone-record`...) viram o equivalente do Linux automaticamente: `lnux sistema` mostra quais estão
+disponíveis no seu computador.
+
+### Uma distro nova: só um arquivo
+
+Tudo o que muda de um sistema para outro (gerenciador de pacotes, nome de cada pacote, pastas, `sudo`/`doas`,
+serviços e recursos) fica num arquivo JSON em [`distros/`](distros/README.md). Para suportar outra distro,
+copie um perfil parecido, ajuste e ponha em `distros/` ou em `~/.lnux/distros/`: o programa não precisa mudar.
+O passo a passo está em [distros/README.md](distros/README.md), e `python3 tests/verificar_perfis.py meu.json`
+diz o que falta no arquivo.
 
 ## Navegação
 
@@ -46,7 +122,7 @@ no meio do texto, tocar escolhe (ou marca, nas de várias opções) e há **✔ 
 **✖ cancelar** no fim; nas perguntas de Sim/Não, toque no botão.
 
 Digitar o número da opção também funciona como atalho. Se preferir o modo antigo, de
-digitar números, rode com `TOONS_NUMEROS=1 toons` (ele também é usado automaticamente
+digitar números, rode com `LNUX_NUMEROS=1 lnux` (ele também é usado automaticamente
 quando não há um terminal interativo, por exemplo em scripts).
 
 A primeira opção do menu, **🔍 Buscar**, acha qualquer função pelo nome sem você caçar
@@ -62,19 +138,19 @@ submenu por submenu: digite o que procura (**ignora acento e perdoa erro de digi
 | 2 | 🤖 **Bots Telegram / Discord 24h** | Bot do Telegram feito só com a biblioteca padrão (long polling) e bot do Discord com `discord.py`. Rodam em sessão **tmux** com **termux-wake-lock** e reinício automático. Só respondem a IDs permitidos. Comandos: `/status /bateria /ip /local /foto /falar /notificar /vibrar /lanterna /tv /sms /ia /servicos /sh`. |
 | 3 | 🔎 **Scraping e monitoramento** | Monitores de **preço** (alvo em R$), **notícias** (RSS/Atom), **status de site**, **texto que aparece/some** e **mudança de página**. Avisa por notificação, TTS e Telegram. Roda 24h no tmux. Os alertas de **chuva** e de **bateria** ficam em 🌦️ Previsão do tempo e em 🔋 Saúde da bateria. |
 | 4 | 🛡️ **Rede e segurança** *(só em equipamentos seus!)* | **🔍 Diagnóstico de rede**: info de rede, descoberta de dispositivos e varredura de portas com **nmap**, DNS/ping/traceroute, teste de velocidade, redes Wi-Fi próximas, captura com tcpdump (root) ou leitura de `.pcap`, **🔐 servidor SSH** (porta 8022), geração de config **WireGuard** + QR code para o app, **🌉 Pontes de conexão** (cada uma na sua janela: **túnel SSH** `ssh -D` com proxy SOCKS pelo seu servidor, criação e envio da chave; **Tor** com teste, troca de identidade e site publicado como endereço **.onion**; **Smart DNS** com teste de velocidade e comparação de respostas dos DNS; links públicos para qualquer porta do celular pelo **Cloudflare Tunnel**, **ngrok** (instala e guarda o authtoken), **localtunnel**, **serveo** e **pinggy**, com QR code; e redes privadas **Tailscale** e **ZeroTier**, mostrando o IP do celular e como acessá-lo do PC de qualquer lugar), **proxy para usar a internet do celular no PC ou no Chromebook**, que também pode sair pelo túnel SSH ou pelo Tor, (HTTP, SOCKS5 e SOCKS4 numa porta só; o PC liga no roteador/hotspot do celular, no cabo USB ou no mesmo Wi-Fi; mostra o endereço de cada rede e o passo a passo do Windows e do Chromebook, serve um script automático `proxy.pac` e uma página de teste, senha opcional, só aceita aparelhos da rede local, não deixa chegar aos serviços internos do celular e mostra quanto cada aparelho já gastou). O **🌐 navegador pelo celular** fica em 🌐 Internet e o **modem (comandos AT)** em 📲 Celular e sistema. |
-| 5 | 🐧 **Linux com proot-distro** | Instala Debian, Ubuntu, Arch, Alpine, Fedora..., entra na distro, roda comandos, atualiza, cria usuário com sudo, faz backup, reseta e remove. **Interface gráfica no Termux:X11**: instala XFCE, LXQt ou MATE na distro, abre o desktop no app Termux:X11 com som, aceleração pela GPU (experimental) e atalho na tela inicial. |
+| 5 | 🐧 **Linux com proot-distro** *(no Termux)* · **Outras distros em contêineres** *(nas distros)* | **Nas distros**: cria contêineres do Debian, Ubuntu, Arch, Fedora, Alpine, openSUSE ou Kali com o **Distrobox** (Podman), entra, roda comandos, atualiza e leva um app do contêiner para o menu do computador. **No Termux**: instala Debian, Ubuntu, Arch, Alpine, Fedora..., entra na distro, roda comandos, atualiza, cria usuário com sudo, faz backup, reseta e remove. **Interface gráfica no Termux:X11**: instala XFCE, LXQt ou MATE na distro, abre o desktop no app Termux:X11 com som, aceleração pela GPU (experimental) e atalho na tela inicial. |
 | 6 | 🗄️ **Arquivos e backup** | **📂 Gerenciador de arquivos**: Estilo ZArchiver, com as setas: navega pelas pastas, **copia, recorta e cola, renomeia, apaga**, cria pastas, mostra os **dados do arquivo** (tamanho, data, permissões, dono), busca por nome, mostra o conteúdo de textos, abre com um app, edita no nano, **compacta em .zip e extrai** .zip/.tar.gz/.7z/.rar. Três níveis de acesso: Termux, **ADB pela depuração sem fio** (abre `Android/data` e `Android/obb`, que o Android 11+ esconde, **sem root**) e **root** (tudo, até `/data/data`). · **🌍 Publicar site**: uma página/site HTML num link (rede local ou internet, pelo túnel da Cloudflare; não lista pastas nem mostra arquivos ocultos; **até 5 sites no ar ao mesmo tempo**, cada um com o seu link) com **endereço fixo com o seu domínio** (em 🛡️ Rede e segurança → 🌉 Pontes → ☁️ Cloudflare; túnel criado no painel da Cloudflare: cola o token do painel, o app descobre sozinho os endereços cadastrados e o que cada um abre, testa cada um pela internet; o link não muda mais, nem depois de reiniciar o celular, e vale também para o servidor de filmes e a API), com **QR code do link** na tela e **opção de baixar a imagem** (.png na pasta Download) e **ver quem acessou**: para cada visitante, o **IP real** (mesmo pelo túnel da Cloudflare, lido do cabeçalho `CF-Connecting-IP`, que só vale quando vem do próprio túnel: no Wi-Fi ninguém consegue fingir outro IP ou país), o **país** (bandeira) e, com endereço fixo, a **cidade e o estado** (cabeçalhos de localização da Cloudflare), o **aparelho, o modelo e o navegador** (Android/iPhone/Windows com versão, Samsung Internet, Brave, navegador do Instagram/Facebook/TikTok...), o idioma, **de onde veio** (Instagram, WhatsApp...), as **páginas vistas** (imagens, CSS e JS não contam como visita) e quando chegou; separa as **prévias de link** (WhatsApp, Telegram...), os buscadores e as **varreduras** de quem procura falhas (e mostra o que tentaram abrir); os acessos feitos no próprio celular não entram na conta. Dá para ver **tudo o que um visitante abriu**, os últimos acessos, **acompanhar ao vivo**, consultar a **operadora e a cidade aproximada** do IP, salvar numa **planilha .csv** e **receber uma notificação quando alguém novo abrir o link**. Se outro site ocupar o mesmo espaço, as visitas do anterior ficam guardadas à parte. É o registro de acessos ao seu próprio site, que dá para limpar quando quiser. **📡 Compartilhar na rede** (HTTP rápido e **Samba**, porta 4450, experimental), **☁️ Nuvem e sincronização** (**rclone**: Drive, Dropbox, OneDrive... copiar/sincronizar e servir via WebDAV com senha; **Syncthing**) e **💾 backup**/restauração do Termux em `.tar.gz`. |
 | 7 | 🎵 **Música, rádio e podcasts** | Organizado em **▶ Ouvir**, **⬇️ Baixar**, **📻 Rádio**, **🎙️ Podcasts** e **📚 Biblioteca e playlists**. Busca e toca por streaming, baixa no **formato que você escolher** (MP3, Opus, M4A, FLAC, WAV ou original), baixa por link (YouTube, SoundCloud, playlists) e por **link do Spotify** (procura a música no YouTube), mix/rádio por busca, **💿 álbuns** (busca pelo nome, mostra as faixas e toca o álbum inteiro em ordem, ou **baixa o álbum** numa pasta `Artista/Álbum (ano)` com as faixas numeradas) e **🎤 todas as músicas de um cantor ou banda** (toca as mais ouvidas ou a discografia inteira sem repetir, em ordem ou no aleatório; **baixa** as mais ouvidas, todos os álbuns ou só os que você escolher, cada álbum na sua pasta) — a lista de faixas vem do catálogo público do Deezer (sem conta nem chave), o áudio vem do YouTube, as etiquetas (artista, álbum, faixa, ano) saem certas e baixar de novo pula o que já está no celular, biblioteca local e playlists `.m3u`. **Player próprio**: tela *Tocando agora* com o nome da música e do artista, barra de tempo e a fila; continua tocando fora do menu, com **notificação de mídia** (anterior, pausar, tocar, pular, ⏩ +30 s e parar) e, se você quiser, **fala o nome de cada música** que começa. **Equalizador de 10 bandas** (31 Hz a 16 kHz) com pré-amplificador e presets, que vale para tudo o que tocar e pode ser gravado nas músicas baixadas. **Descobre a música de um arquivo pelo som** (mp3, mp4, opus...), com o Chromaprint e o AcoustID, e pergunta se quer tocar. · **rádio online do mundo todo** (mais de 50 mil estações: por país, idioma, gênero, mais ouvidas, surpresa, Brasil por gênero ou estado, favoritas), mostra a música que a rádio diz estar tocando e tem **legenda automática** da fala (whisper.cpp no celular), que pode ser traduzida para o português · **podcasts** (busca, seguir, ouvir e baixar episódios). |
 | 8 | 🎬 **Vídeos (TikTok, YouTube)** | Baixa vídeos no **formato e na qualidade que você escolher**, direto na **pasta Download do celular** (se o Termux não tiver a permissão, pede; o que tinha ficado preso numa pasta interna do Termux é levado para a pasta certa; mostra onde cada arquivo foi salvo e avisa a Galeria) (MP4, MKV, WebM ou só o áudio; 360p a 1080p) por link (TikTok, YouTube, Shorts, playlists e outros sites que o yt-dlp aceita), busca no YouTube e baixa, abre os vídeos baixados no player do Android e **assiste um link sem baixar** no VLC/MX Player (link direto de arquivo ou página do YouTube/TikTok, escolhendo a qualidade máxima: até 1080p, 720p ou 480p). **Reduz a resolução ou comprime um vídeo** (o único lugar com essa opção) que trava ou está grande demais para mandar (4K → 1440p, 1080p, 720p, 480p ou 360p), de um arquivo do celular ou **direto de um link, sem baixar o 4K**: imagem em H.264 (a mais leve de tocar), opção de baixar 60 para 30 quadros por segundo, cores de vídeo HDR ajustadas para a tela comum, todas as trilhas de áudio e legendas mantidas, modo **arquivo bem menor** para o WhatsApp, filme de cinema ou vídeo em pé sem esticar; mostra o andamento e quanto falta, ou converte em segundo plano e avisa com uma notificação (toque para abrir). Ao abrir um vídeo baixado em 4K, oferece fazer a cópia mais leve antes. |
 | 9 | 📺 **Compartilhar filme por link** | Servidor de vídeo próprio: **catálogo da sua biblioteca do TorBox** (todos os filmes e séries num link só, com episódios e continuar assistindo); escolha um filme do celular **ou cole qualquer link de vídeo (sem baixar o filme)**: link direto de arquivo (servidor seu, nuvem, debrid...) ou página de vídeo (YouTube, Vimeo... pelo yt-dlp), receba um **link secreto** (com prazo opcional) e quem abrir assiste num **player próprio** no navegador: barra de progresso com prévia do tempo, **troca de trilha de áudio** (dublado/original), legendas (arquivo ao lado, extra ou **embutidas**) com tamanho e sincronia ajustáveis, velocidade, tela cheia, janela flutuante, **toque duplo para pular 10 s**, atalhos de teclado, **continuar de onde parou** e botão **Abrir no VLC**. MKV, áudio AC3/DTS e várias trilhas são **convertidos na hora** pelo ffmpeg (a imagem é só copiada; HEVC é recodificado só se o navegador não tocar). Também **converte para MP4** de vez, se preferir. Com o **endereço fixo** (seu domínio, em 🌉 Pontes → ☁️ Cloudflare), o link do filme e do catálogo não muda mais. Vídeo 4K travando? No player, **Ajustes → Qualidade** (1080p, 720p, 480p...) faz o celular converter na hora numa resolução menor, que pesa menos para tocar e para a internet; a escolha fica guardada no aparelho de quem assiste, e o player sugere isso quando o vídeo trava várias vezes. Ou faça antes uma cópia mais leve em **🎬 Vídeos → Reduzir a resolução**. Copia o link, manda pelo menu de compartilhar do Android (WhatsApp, Telegram...) ou mostra um QR code. Servidor, **túnel Cloudflare** (para quem está fora do seu Wi-Fi), porta e limpeza dos links ficam em **⚙️ Servidor, túnel e ajustes**. Apagar um link vale na hora. |
 | 10 | 🧰 **Utilitários** | **🧮 Calculadora científica**: **Interface de calculadora com botões**: visor com a conta, a prévia do resultado e o modo DEG/RAD, e uma grade de botões que você percorre com as **setas** e aperta com **Enter** (o teclado também digita; Esc sai). Botões para trigonometria, `ln`/`log`, `e^x`, `√`, `∛`, potências, `n!`, `%`, `±`, `π`, `e`, `ans`, `EXP`, `mod`, fração, hexadecimal e histórico. Sem terminal interativo, abre o modo digitado. Na conta vale: `+ - * / ^`, `mod`, **fatorial** `5!`, **porcentagem** como no celular (`200+10%` = 220), `√9`, parênteses e **multiplicação implícita** (`2pi`, `3(4+5)`). Constantes `pi`, `e`, `tau`; **trigonometria** em graus ou radianos (`sin cos tan`, inversas, `sec csc cot`, hiperbólicas e inversas); `sqrt`, `raiz(x, n)`, `ln`, `log`, `log(x, base)`, `exp`, `mdc`, `mmc`, `comb`, `perm`; **estatística** (`soma`, `media`, `mediana`, `desvio`, `min`, `max`), `aleatorio`; números `1.5e3`, `0xFF`, `0b1010`; **variáveis** (`x = 5`), `ans` e histórico; comandos `hex`, `bin`, `oct` e `frac` para ver o resultado em outra base ou como fração. Não usa `eval`: só números e as funções da lista, com travas contra contas que travariam o celular. Não precisa instalar nada. · **Bloco de notas** (Markdown, tags, busca sem acento, exportar .zip) · **lista de afazeres** · **lembretes e alarmes** que tocam, vibram e falam (`18:30`, `amanhã 7h`, `25/12 08:00`, `em 10 min`; repetir todo dia, dias úteis, semanal ou mensal; serviço em segundo plano) · **cronômetro** com voltas, **timer** e **Pomodoro** em números grandes · **calendário** com as setas, **feriados nacionais** (Carnaval, Páscoa e Corpus Christi calculados), eventos e lembrete antes do evento · **conversor** de unidades (comprimento, massa, área com alqueire, volume, velocidade, tempo, dados, energia, pressão, temperatura) e **moedas** com a cotação do dia (funciona sem internet com a última cotação) · **controle de gastos** por categoria, orçamento do mês, histórico de 6 meses e planilha .csv · **cofre de senhas** criptografado (scrypt + AES), gerador de senha e frase-senha, verificação de senhas fracas/repetidas · **previsão do tempo** (Open-Meteo, por GPS ou cidade) e **alerta de chuva** · **QR code**: texto, **Wi-Fi** (conectar sem digitar a senha), **PIX copia e cola**, contato e **leitura** pela câmera · **tradutor** (detecta o idioma, traduz o que está copiado, fala a tradução) e **dicionário** português/inglês. |
-| 11 | 📲 **Celular e sistema** | **Depuração sem fio (ADB)**: Conecta o `adb` do Termux ao **próprio celular** pela Depuração por Wi-Fi (Android 11+), **sem PC e sem root**: pareamento guiado (acha a porta sozinho), status, shell e comandos do Android, **impedir que o Android mate o Termux** (o erro *signal 9* dos processos fantasmas, Android 12+), print e gravação de tela, instalar APK, logcat, `pm grant` e liberar a porta 5555 para um computador. · **Termux:API**: sensores, SMS (enviar/ler), notificações, câmera, localização, vibração, lanterna, área de transferência e volume · **Painel do sistema** ao vivo com **rich** (CPU, RAM, disco, bateria, serviços) · **Saúde da bateria**: registro, gráfico de 24 h, ciclos estimados, consumo por hora e alertas de **80% carregando**, bateria baixa e temperatura · **tempo de tela** e **internet gasta por app** (móvel e Wi-Fi) pelo ADB sem fio · **gerenciador de apps** pelo ADB, sem root: abrir, forçar parada, permissões, extrair APK, **desativar/remover bloatware** (reversível) · **resolução da tela**: diminui a resolução do celular inteiro ou de **um app só** (Android 12+), com root ou pelo ADB sem fio; toda mudança **volta sozinha em 1 minuto** se você não confirmar · **fotos**: organizar por data, repetidas, **parecidas**, comprimir e **tirar a localização (GPS)** antes de compartilhar · **conversor de arquivos**: imagens (JPG/PNG/WEBP/PDF), várias imagens → PDF, vídeo → GIF/áudio, áudio do WhatsApp → MP3, PDF juntar/separar/comprimir/para imagens/para texto e Word/Excel/PowerPoint → PDF (LibreOffice na distro) · **automação por eventos** (um "Tasker"): horário, intervalo, entrar/sair de um Wi-Fi, carregador, bateria → notificação, voz, vibração, volume, lanterna, link, Telegram, TV ou comando · **espelhar a tela** com scrcpy (outro celular aqui no Termux:X11, ou este celular num PC) e **transmitir a tela por link**: quem abre o link vê a tela no navegador, na mesma rede ou **pela internet com o túnel da Cloudflare**, sem instalar nada; o controle pelo navegador (toques, arrastar, Voltar/Início, digitar) é opcional e começa bloqueado. · **Controle da TV**: liga/desliga e controle remoto na tela (volume, canal, setas, OK) pelo **infravermelho do celular** (qualquer TV, com busca automática do código) ou pelo **Wi-Fi** (Samsung, LG, Android TV/Google TV, Roku), com atalho na tela inicial, automação e bot; **desligar TVs por perto** (TV-B-Gone) · **controle de outros aparelhos** por infravermelho (soundbar/som, projetor, TV box e **ar-condicionado** por presets), no estilo dos controles universais do Flipper Zero. · **📶 Modem (comandos AT)** (3GPP, só no seu aparelho e com root): chamadas (ATD/ATA/ATH), SMS (CMGS/CMGL/CMGD), sinal e registro (CSQ/CREG/COPS), APN e dados (CGDCONT/CGACT/CGPADDR) e informações do aparelho (IMEI/fabricante/modelo). |
+| 11 | 📲 **Celular e sistema** *(nas distros: 🖥️ Computador e Android conectado, com o ADB para um celular ligado por USB ou Wi-Fi e os recursos do computador no lugar do Termux:API)* | **Depuração sem fio (ADB)**: Conecta o `adb` do Termux ao **próprio celular** pela Depuração por Wi-Fi (Android 11+), **sem PC e sem root**: pareamento guiado (acha a porta sozinho), status, shell e comandos do Android, **impedir que o Android mate o Termux** (o erro *signal 9* dos processos fantasmas, Android 12+), print e gravação de tela, instalar APK, logcat, `pm grant` e liberar a porta 5555 para um computador. · **Termux:API**: sensores, SMS (enviar/ler), notificações, câmera, localização, vibração, lanterna, área de transferência e volume · **Painel do sistema** ao vivo com **rich** (CPU, RAM, disco, bateria, serviços) · **Saúde da bateria**: registro, gráfico de 24 h, ciclos estimados, consumo por hora e alertas de **80% carregando**, bateria baixa e temperatura · **tempo de tela** e **internet gasta por app** (móvel e Wi-Fi) pelo ADB sem fio · **gerenciador de apps** pelo ADB, sem root: abrir, forçar parada, permissões, extrair APK, **desativar/remover bloatware** (reversível) · **resolução da tela**: diminui a resolução do celular inteiro ou de **um app só** (Android 12+), com root ou pelo ADB sem fio; toda mudança **volta sozinha em 1 minuto** se você não confirmar · **fotos**: organizar por data, repetidas, **parecidas**, comprimir e **tirar a localização (GPS)** antes de compartilhar · **conversor de arquivos**: imagens (JPG/PNG/WEBP/PDF), várias imagens → PDF, vídeo → GIF/áudio, áudio do WhatsApp → MP3, PDF juntar/separar/comprimir/para imagens/para texto e Word/Excel/PowerPoint → PDF (LibreOffice na distro) · **automação por eventos** (um "Tasker"): horário, intervalo, entrar/sair de um Wi-Fi, carregador, bateria → notificação, voz, vibração, volume, lanterna, link, Telegram, TV ou comando · **espelhar a tela** com scrcpy (outro celular aqui no Termux:X11, ou este celular num PC) e **transmitir a tela por link**: quem abre o link vê a tela no navegador, na mesma rede ou **pela internet com o túnel da Cloudflare**, sem instalar nada; o controle pelo navegador (toques, arrastar, Voltar/Início, digitar) é opcional e começa bloqueado. · **Controle da TV**: liga/desliga e controle remoto na tela (volume, canal, setas, OK) pelo **infravermelho do celular** (qualquer TV, com busca automática do código) ou pelo **Wi-Fi** (Samsung, LG, Android TV/Google TV, Roku), com atalho na tela inicial, automação e bot; **desligar TVs por perto** (TV-B-Gone) · **controle de outros aparelhos** por infravermelho (soundbar/som, projetor, TV box e **ar-condicionado** por presets), no estilo dos controles universais do Flipper Zero. · **📶 Modem (comandos AT)** (3GPP, só no seu aparelho e com root): chamadas (ATD/ATA/ATH), SMS (CMGS/CMGL/CMGD), sinal e registro (CSQ/CREG/COPS), APN e dados (CGDCONT/CGACT/CGPADDR) e informações do aparelho (IMEI/fabricante/modelo). |
 | 12 | 🌐 **Internet e comunicação** | **E-mail** (Gmail, Outlook, Yahoo, iCloud...): caixa de entrada, não lidos, busca, ler, responder, anexos, apagar e enviar com anexo · **notícias** por RSS (g1, BBC, Agência Brasil, Folha, Tecnoblog...) com **modo leitura**, ouvir em voz alta e favoritos · **gerenciador de downloads** (aria2): links, **magnet** e **.torrent**, fila, pausar/continuar, acompanhar ao vivo · **chat na rede local** entre celulares, sem internet, com senha e envio de arquivos · **🌐 navegador pelo celular**: uma página web no celular em que você digita um endereço ou uma busca e o **celular carrega o site pela conexão dele** e devolve pronto (bom para pesquisar, ler notícias e Wikipédia; abre em qualquer aparelho pelo link, sem configurar), com os vídeos e músicas tocando no **VLC Web** com um toque (as pontes de conexão ficam em 🛡️ Rede e segurança) · **navegador no terminal**: **[Browsh](https://www.brow.sh/)** (sites modernos com o Firefox por trás, do `x11-repo`) e **w3m** (leve), pesquisa, modo leitura e salvar página · **encurtador de links**, **pastebin** e **enviar arquivo e gerar link** (temporário ou permanente), com QR code e histórico. |
 | 13 | 👤 **Meus dados na internet** | O que está **público sobre você**, num lugar só: **Receita Federal** (situação do CPF, comprovante do CNPJ, e-CAC; confere os dígitos do CPF e mostra a região onde foi emitido; dados abertos do seu **CNPJ/MEI**, que costumam expor o endereço de casa) e **Registrato** do Banco Central (contas, empréstimos e chaves PIX no seu CPF) · **Portal da Transparência** (servidor, Bolsa Família, BPC, diárias, sanções; consulta automática pelo CPF com a chave grátis da API) · **Tribunais de Justiça e TRFs** (Jus.br do CNJ com gov.br, o TJ do seu estado e o TRF da sua região com o CPF copiado, os 27 TJs e 6 TRFs, Jusbrasil e Escavador) · **Google** (nome exato, nome + cidade, PDFs e planilhas, CPF, e-mail, celular, @, imagens e notícias) · **LinkedIn, Instagram e Facebook** · **Diário Oficial** (DOU e os diários das prefeituras pelo **Querido Diário**, com o trecho e a cidade na tela) · **Lattes** · **vazamentos** (e-mail no Have I Been Pwned e **senha vazada** sem a senha sair do celular) · onde **pedir a remoção** dos seus dados. **Verificar tudo** faz as consultas e gera uma **página com todas as buscas prontas** para tocar.
 | 14 | ✨ **Inteligência artificial** | **Assistente na nuvem**: **Claude** (SDK oficial `anthropic`, modelo padrão `claude-opus-5-5`), **ChatGPT** ou **Gemini** com a sua chave de API; conversa com histórico, mandar **foto**, resumir **PDF/livro/página/texto copiado**, salvar a conversa como nota · **voz para texto** com **whisper.cpp** compilado no celular (transcreve **áudios do WhatsApp** e **ditado**, sem mandar nada para a internet) e texto para voz (idioma e velocidade) · **OCR**: lê o texto de foto, imagem ou do último print (tesseract, português e inglês), e copia, traduz, salva ou pergunta à IA. · **Traduzir a tela**: tire um print e a tradução chega numa notificação (ou capture pelo ADB/root; modo contínuo para jogos). · **Remover o fundo** de foto ou vídeo e deixar só a pessoa, no próprio celular: fundo transparente, tela verde, branco, preto, desfocado ou outra imagem. · **IA local, sem internet**: Clona e **compila o llama.cpp no próprio celular**, baixa modelos GGUF de 1B a 3B (Gemma 3 1B, Llama 3.2 1B/3B, Qwen2.5 1.5B/3B, Qwen3 1.7B, Gemma 2 2B ou URL própria, com download retomável), conversa no terminal (`llama-cli`) ou sobe o `llama-server` (interface web + API compatível com OpenAI). O bot e a API usam o modelo com `/ia`. |
 | 15 | 🎮 **Diversão e aprendizado** | **Jogos**: 2048, campo minado (3 níveis), sudoku com solução única, forca (6 temas), jogo da velha contra o celular (até "impossível"), Tetris, Snake, adivinhe o número e quiz de conhecimentos gerais, com recordes · **aprender programação**: lições de **Python**, **Bash** e **Git** com exercícios corrigidos na hora, **interpretador BASIC** retrô (PRINT, INPUT, IF/THEN, GOTO, GOSUB, FOR/NEXT, matrizes, SAVE/LOAD...) e gerador de **template para criar seu próprio jogo** · **leitor de livros** EPUB/PDF/TXT que lembra onde parou e lê em voz alta (audiolivro) · **arte ASCII**: texto grande (figlet) com arco-íris e imagem colorida no terminal (que pode virar o banner do menu) · **trote/pegadinha (screamer)**: publica um link (rede Wi-Fi ou túnel Cloudflare) com uma página que dá um susto em quem abrir — grito alto, imagem em tela cheia, tela piscando, vibração e notificações em sequência — **notificações de verdade do Android** pelo link da internet (túnel), quando a pessoa toca em "Permitir"; no link da rede Wi-Fi (sem HTTPS) o navegador bloqueia e aparece uma imitação dentro do site. Dá para personalizar no Termux o som, a imagem, a mensagem, o nome do site, a cor, o atraso, **quanto tempo dura o susto** (depois a página para tudo e revela que era trote) e ligar/desligar cada efeito (grito sintético e rosto embutidos quando você não escolhe os seus); o que você muda já vale no link publicado. A tela pisca no máximo 2 vezes por segundo (abaixo do limite de risco para epilepsia fotossensível) e não pisca nem treme para quem ativou "reduzir movimento" no celular. Use só com quem topa a brincadeira. |
 | 16 | 🛠️ **Programação e servidores** | **Banco de dados**: SQLite (tabelas, SQL, importar/exportar CSV) e servidores **MariaDB/MySQL** e **PostgreSQL** · **GitHub** com o `gh`: seus repositórios, clonar, issues, PRs, criar repositório e assistente de **commit e push** · **⏲️ agendar comandos** com cron (limpeza, atualização, backup ou comando seu, com log) · **servidores**: **Minecraft Java** (instala a versão e o Java certos, EULA, console e desligar salvando), **Jellyfin** (filmes e séries) e **Navidrome** (música). · **Ambiente de desenvolvimento**: Instala git, Neovim, C/C++ (clang/clangd), Rust (rust-analyzer), Go (gopls), pyright, lua-language-server; gera um `init.lua` com **LSP nativo** (sem plugins), configura git e chave SSH, testa os compiladores e roda o **code-server** (VS Code no navegador). Também instala o **Textual**, para criar seus próprios apps de terminal. |
-| 17 | ⚙️ **Sistema e manutenção** | Junta tudo o que é manutenção. **🔄 Atualização**: `pkg upgrade`, troca de espelho (`termux-change-repo`), repositórios extras (x11/root/tur), pacotes pip, `git pull` em vários repositórios e no próprio Termux-Toons, limpeza de cache e **atualizar tudo** de uma vez (Termux, pip, distros e Termux-Toons). O llama.cpp se atualiza em ✨ IA → IA local. · **🧹 Otimização e limpeza**: **Otimização rápida** (cache do apt, `~/.cache` com pip/yt-dlp/go, npm, temporários antigos, `__pycache__`, logs velhos e miniaturas da galeria) mostrando quanto liberou; escolher item a item; **limpar o cache de todos os apps** (`pm trim-caches` com root ou, **sem root, pela depuração sem fio** (📲 Celular e sistema → 🔌); se nenhum dos dois estiver disponível, abre a tela de armazenamento do Android); ver o que ocupa espaço; achar **arquivos grandes**, **duplicados** e pastas vazias; processos do Termux que mais usam RAM; parar todos os serviços; compilação dos apps e TRIM (root); atalhos para as telas de armazenamento e bateria. · **📦 Instalar dependências** por área, de uma vez (essenciais, música, vídeos; cada opção do menu também instala sozinha o que falta, perguntando antes) · **🎨 Aparência do terminal**: **tema de cores do Termux** (Dracula, Nord, Gruvbox...), **fonte do terminal** (usa uma fonte .ttf/.otf baixada no celular, até dentro de um .zip, e volta sozinha em 1 minuto se você não confirmar), mensagem de boas-vindas e banner original · **⚙️ Configurações e diagnóstico**: Ver e editar a configuração (`config.json`), liberar ou bloquear o comando `sh` dos bots, **diagnóstico** (programas e módulos instalados, Termux:API respondendo, serviços ativos). |
+| 17 | ⚙️ **Sistema e manutenção** | Junta tudo o que é manutenção. **🐧 Trocar o sistema** e ver o que o LNUX sabe dele (perfil, pastas, recursos e equivalentes). **🔄 Atualização**: `pkg upgrade`, troca de espelho (`termux-change-repo`), repositórios extras (x11/root/tur), pacotes pip, `git pull` em vários repositórios e no próprio LNUX, limpeza de cache e **atualizar tudo** de uma vez (Termux, pip, distros e LNUX). O llama.cpp se atualiza em ✨ IA → IA local. · **🧹 Otimização e limpeza**: **Otimização rápida** (cache do apt, `~/.cache` com pip/yt-dlp/go, npm, temporários antigos, `__pycache__`, logs velhos e miniaturas da galeria) mostrando quanto liberou; escolher item a item; **limpar o cache de todos os apps** (`pm trim-caches` com root ou, **sem root, pela depuração sem fio** (📲 Celular e sistema → 🔌); se nenhum dos dois estiver disponível, abre a tela de armazenamento do Android); ver o que ocupa espaço; achar **arquivos grandes**, **duplicados** e pastas vazias; processos do Termux que mais usam RAM; parar todos os serviços; compilação dos apps e TRIM (root); atalhos para as telas de armazenamento e bateria. · **📦 Instalar dependências** por área, de uma vez (essenciais, música, vídeos; cada opção do menu também instala sozinha o que falta, perguntando antes) · **🎨 Aparência do terminal**: **tema de cores do Termux** (Dracula, Nord, Gruvbox...), **fonte do terminal** (usa uma fonte .ttf/.otf baixada no celular, até dentro de um .zip, e volta sozinha em 1 minuto se você não confirmar), mensagem de boas-vindas e banner original · **⚙️ Configurações e diagnóstico**: Ver e editar a configuração (`config.json`), liberar ou bloquear o comando `sh` dos bots, **diagnóstico** (programas e módulos instalados, Termux:API respondendo, serviços ativos). |
 
 Antes de baixar, o programa **pergunta o formato** (e, no vídeo, a qualidade). A escolha fica lembrada e vira o
 padrão da próxima vez:
@@ -111,39 +187,42 @@ Na linha de comando: `baixar --formato mp3 ...` e `video --formato mp4 --qualida
 Os serviços em segundo plano chamam o próprio script; você também pode usar direto:
 
 ```bash
-python termux_toons.py                      # menu
-python termux_toons.py serve --framework stdlib --porta 8000
-python termux_toons.py bot telegram
-python termux_toons.py monitor [--uma-vez]
-python termux_toons.py dashboard | tarefas | snake | doctor
-python termux_toons.py basic [programa.bas]
-python termux_toons.py baixar "https://youtu.be/..." "artista - música" "https://open.spotify.com/track/..."
-python termux_toons.py video "https://www.tiktok.com/@user/video/..." "https://youtu.be/..."
-python termux_toons.py compartilhar ~/storage/downloads/filme.mp4 --horas 24   # cria o link e liga o servidor
-python termux_toons.py compartilhar "https://seu-servidor/Filme.mkv" --legenda filme.pt.srt
-python termux_toons.py compartilhar "https://www.youtube.com/watch?v=..."      # página de vídeo também vale
-python termux_toons.py assistir "https://seu-servidor/Filme.mkv"              # abre no VLC do celular
-python termux_toons.py navegador --porta 8101   # navegador pelo celular em primeiro plano (crie o link pelo menu antes)
-python termux_toons.py vlc-web              # baixa/atualiza do GitHub o VLC Web usado pelo navegador (--remover apaga)
-python termux_toons.py midia                # servidor de vídeo em primeiro plano
-python termux_toons.py site ~/storage/downloads/meu-site --porta 8097   # publica uma pasta como site
-python termux_toons.py tela --porta 8093   # transmite a tela (crie o link pelo menu antes)
-python termux_toons.py arquivos ~/storage/downloads   # gerenciador de arquivos
-python termux_toons.py desktop debian   # abre o desktop da distro no Termux:X11
-python termux_toons.py tocar                # biblioteca no aleatório
-python termux_toons.py tocar lofi hip hop   # mix por busca
-python termux_toons.py player pausar        # também: abrir, proxima, anterior, parar
-python termux_toons.py baixar "artista - música" --equalizador   # grava o equalizador no arquivo
-python termux_toons.py atualizar
-python termux_toons.py limpar                # otimização rápida, sem perguntas
-python termux_toons.py lembretes             # serviço de lembretes e alarmes
-python termux_toons.py bateria-log           # registro da bateria e alertas (80%, baixa, quente)
-python termux_toons.py automacao             # serviço de automação por eventos
-python termux_toons.py resolucao             # desfaz a última mudança de resolução ou volta a tela à de fábrica
-python termux_toons.py tv                    # liga/desliga a TV; também: ligar, desligar, vol+, vol-, mudo, controle
-python termux_toons.py tv desligar --tv Quarto
-python termux_toons.py tvbgone               # desliga as TVs por perto (TV-B-Gone)
-python termux_toons.py aparelho "Som da sala" Vol_up   # som/projetor/ar por infravermelho ('controle' abre a tela)
+python lnux.py                      # menu
+python lnux.py sistema               # o sistema em uso: perfil, pastas, recursos e equivalentes do Termux
+python lnux.py sistema --listar      # os perfis disponíveis (distros/*.json e ~/.lnux/distros/*.json)
+python lnux.py sistema arch          # troca o sistema (também pelo menu ⚙️ Sistema e manutenção)
+python lnux.py serve --framework stdlib --porta 8000
+python lnux.py bot telegram
+python lnux.py monitor [--uma-vez]
+python lnux.py dashboard | tarefas | snake | doctor
+python lnux.py basic [programa.bas]
+python lnux.py baixar "https://youtu.be/..." "artista - música" "https://open.spotify.com/track/..."
+python lnux.py video "https://www.tiktok.com/@user/video/..." "https://youtu.be/..."
+python lnux.py compartilhar ~/storage/downloads/filme.mp4 --horas 24   # cria o link e liga o servidor
+python lnux.py compartilhar "https://seu-servidor/Filme.mkv" --legenda filme.pt.srt
+python lnux.py compartilhar "https://www.youtube.com/watch?v=..."      # página de vídeo também vale
+python lnux.py assistir "https://seu-servidor/Filme.mkv"              # abre no VLC do celular
+python lnux.py navegador --porta 8101   # navegador pelo celular em primeiro plano (crie o link pelo menu antes)
+python lnux.py vlc-web              # baixa/atualiza do GitHub o VLC Web usado pelo navegador (--remover apaga)
+python lnux.py midia                # servidor de vídeo em primeiro plano
+python lnux.py site ~/storage/downloads/meu-site --porta 8097   # publica uma pasta como site
+python lnux.py tela --porta 8093   # transmite a tela (crie o link pelo menu antes)
+python lnux.py arquivos ~/storage/downloads   # gerenciador de arquivos
+python lnux.py desktop debian   # abre o desktop da distro no Termux:X11
+python lnux.py tocar                # biblioteca no aleatório
+python lnux.py tocar lofi hip hop   # mix por busca
+python lnux.py player pausar        # também: abrir, proxima, anterior, parar
+python lnux.py baixar "artista - música" --equalizador   # grava o equalizador no arquivo
+python lnux.py atualizar
+python lnux.py limpar                # otimização rápida, sem perguntas
+python lnux.py lembretes             # serviço de lembretes e alarmes
+python lnux.py bateria-log           # registro da bateria e alertas (80%, baixa, quente)
+python lnux.py automacao             # serviço de automação por eventos
+python lnux.py resolucao             # desfaz a última mudança de resolução ou volta a tela à de fábrica
+python lnux.py tv                    # liga/desliga a TV; também: ligar, desligar, vol+, vol-, mudo, controle
+python lnux.py tv desligar --tv Quarto
+python lnux.py tvbgone               # desliga as TVs por perto (TV-B-Gone)
+python lnux.py aparelho "Som da sala" Vol_up   # som/projetor/ar por infravermelho ('controle' abre a tela)
 ```
 
 ## Compartilhar um filme por link
@@ -272,8 +351,8 @@ site e passa WebSocket. O modo completo traz um motor assim, aberto: o
 **[Rammerhead](https://github.com/binary-person/rammerhead)** (MIT, sobre o `testcafe-hammerhead`), em Node.js,
 rodando no próprio celular.
 
-- Instale em *navegador pelo celular → 🧪 Modo completo → Instalar*: o Termux-Toons instala o `nodejs-lts` e o
-  Rammerhead pelo npm (algumas dezenas de MB) em `~/.termux_toons/motor-completo`. Ligue ali mesmo ou marque
+- Instale em *navegador pelo celular → 🧪 Modo completo → Instalar*: o LNUX instala o `nodejs-lts` e o
+  Rammerhead pelo npm (algumas dezenas de MB) em `~/.lnux/motor-completo`. Ligue ali mesmo ou marque
   *Ligar junto com o navegador*.
 - Com o motor ligado, a página inicial mostra a escolha **⚡ Leve / 🧪 Completo**. Ela vale para a busca, os
   atalhos e os visitados. A barra das páginas leves ganha *Abrir no modo completo*, e as páginas do modo completo
@@ -322,7 +401,7 @@ serve no mesmo link, em `/vlc/`.
 
 Em *✨ Inteligência artificial → 🌐 Traduzir a tela*: escolha o idioma do texto que está na tela e:
 
-- **Esperar eu tirar um print**: tire um print com os botões do celular (ligar + volume para baixo) no app que quer traduzir. O Termux-Toons percebe o print novo, lê o texto com o OCR (tesseract) e traduz; a tradução aparece no Termux e **numa notificação**, então dá para ficar no app (ou usar o Termux:Float por cima dele).
+- **Esperar eu tirar um print**: tire um print com os botões do celular (ligar + volume para baixo) no app que quer traduzir. O LNUX percebe o print novo, lê o texto com o OCR (tesseract) e traduz; a tradução aparece no Termux e **numa notificação**, então dá para ficar no app (ou usar o Termux:Float por cima dele).
 - **Modo contínuo**: traduz cada print novo até você parar (Ctrl+C), bom para jogos e mangás.
 - **Capturar direto (ADB ou root)**: conta alguns segundos para você trocar de app e captura a tela sozinho.
 - **Último print**: traduz o print mais recente.
@@ -334,7 +413,7 @@ O idioma do OCR é baixado na primeira vez (inglês, espanhol, japonês, coreano
 Em *✨ Inteligência artificial → ✂️ Remover o fundo*: escolha uma foto ou um vídeo e o fundo que vai no lugar: **transparente**, **tela verde** (para recortar no editor de vídeo), branco, preto, **desfocado** (modo retrato) ou **outra imagem** do celular.
 
 - Roda **no próprio celular**, com um modelo de recorte de pessoas e o `onnxruntime` do Termux (`python-onnxruntime`, instalado na primeira vez com `numpy` e `Pillow`). Nada vai para a internet; só o modelo é baixado, uma vez: **Preciso** (U²-Net para pessoas, 176 MB) ou **Rápido** (MODNet, 25 MB, melhor para vídeo).
-- **Foto** vira PNG transparente (ou JPG com o fundo novo) em `Download/Termux-Toons/Sem fundo`, com uma prévia no terminal.
+- **Foto** vira PNG transparente (ou JPG com o fundo novo) em `Download/LNUX/Sem fundo`, com uma prévia no terminal.
 - **Vídeo** é recortado quadro a quadro (até 1280 px) e mantém o som. Transparente sai em WebM (a galeria mostra o fundo preto, editores mantêm a transparência); com fundo, sai em MP4. Leva alguns segundos por quadro no celular, e a tela mostra quanto falta.
 
 ## Meus dados na internet
@@ -354,9 +433,9 @@ faltar. Feito para **pesquisar você mesmo(a)**.
   caracteres do hash SHA-1; a senha não sai do celular). A conferência do CPF (dígitos e região fiscal) é offline e
   aceita também o **CNPJ alfanumérico** (de julho de 2026 em diante).
 - **🚀 Verificar tudo e gerar o relatório**: faz as consultas e salva uma página HTML em
-  `Download/Termux-Toons/Meus dados` com os resultados e todas as buscas prontas, agrupadas por fonte. O CPF aparece
+  `Download/LNUX/Meus dados` com os resultados e todas as buscas prontas, agrupadas por fonte. O CPF aparece
   mascarado (`***.456.789-**`), mas os links levam os seus dados: apague quando não precisar mais.
-- **Os dados ficam no celular**: só na memória, ou em `~/.termux_toons/meus_dados.json` (permissão `600`) se você
+- **Os dados ficam no celular**: só na memória, ou em `~/.lnux/meus_dados.json` (permissão `600`) se você
   escolher guardar. *🗑️ Apagar meus dados deste celular* apaga o arquivo, os relatórios e, se quiser, a chave da API.
 
 ## Compilar o whisper.cpp e o llama.cpp no celular
@@ -364,9 +443,9 @@ faltar. Feito para **pesquisar você mesmo(a)**.
 A voz para texto, a legenda da rádio e a IA local compilam o código no próprio celular (`clang` + `cmake`). Erro
 `redefinition of 'vcvtnq_s32_f32'` no Termux de **32 bits** (`uname -m` mostra `armv7l` ou `armv8l`)? É uma
 incompatibilidade do ggml, a base dos dois projetos, com o `arm_neon.h` do clang quando ele compila para um
-processador ARMv8: o ggml declara a sua própria versão de funções que o clang também declara. O Termux-Toons
+processador ARMv8: o ggml declara a sua própria versão de funções que o clang também declara. O LNUX
 corrige isso sozinho antes de compilar e, se ainda assim falhar, compila de novo com `-DGGML_NATIVE=OFF` (sem as
-otimizações específicas do processador). Basta atualizar o Termux-Toons e mandar instalar de novo.
+otimizações específicas do processador). Basta atualizar o LNUX e mandar instalar de novo.
 
 À mão, sem atualizar: `cd ~/whisper.cpp && cmake -B build -DGGML_NATIVE=OFF && cmake --build build -j 4 --target
 whisper-cli`.
@@ -406,9 +485,9 @@ Em **📲 Celular e sistema → 🖥️ Resolução da tela** (precisa de root o
 
 **Toda mudança volta sozinha em 1 minuto se você não confirmar.** Depois de mudar aparece *Ficou bom? Manter
 assim?* com a contagem regressiva, já marcado em **Não**: se a tela ficar estranha, não precisa tocar em nada
-(ou só dê Enter). Quem desfaz é um vigia em outro processo, então volta mesmo que o Termux-Toons feche no meio.
+(ou só dê Enter). Quem desfaz é um vigia em outro processo, então volta mesmo que o LNUX feche no meio.
 Para voltar depois: **Voltar a tela à resolução de fábrica** / **Voltar um app à resolução normal**, ou
-`toons resolucao` no terminal.
+`lnux resolucao` no terminal.
 
 ## Controle da TV
 
@@ -434,11 +513,11 @@ desligar (Samsung, LG, Sony, Panasonic, Toshiba). Também dá para usar:
 - na **tela inicial** com o Termux:Widget (*Atalho na tela inicial*): "TV liga-desliga" funciona sem abrir o Termux;
 - numa **automação** (ex.: todo dia às 23h → desligar a TV; ao sair do Wi-Fi de casa → desligar);
 - no **bot** do Telegram/Discord: `/tv`, `/tv desligar`, `/tv mudo`, `/tv vol+`;
-- no terminal: `toons tv desligar`, `toons tv controle`.
+- no terminal: `lnux tv desligar`, `lnux tv controle`.
 
 **Desligar TVs por perto (TV-B-Gone):** em *📺 Controle da TV → 📴 Desligar TVs por perto*, o celular dispara o sinal
 de desligar de centenas de modelos, um atrás do outro — serve para desligar a TV de uma loja, academia ou sala de
-espera. No terminal: `toons tvbgone`.
+espera. No terminal: `lnux tvbgone`.
 
 ## Controle de outros aparelhos (som, projetor, ar-condicionado)
 
@@ -454,7 +533,7 @@ Em **📲 Celular e sistema → 📡 Controle de outros aparelhos** dá para con
 Adiciona igual à TV: escolhe a marca (da biblioteca universal do Flipper Zero, baixada na primeira vez), ou usa a
 **busca automática**, ou **importa um `.ir`** / cola um código. A tela do 🎮 controle remoto mostra só os botões que
 aquele aparelho tem; os outros ficam apagados. Também funciona na tela inicial (Termux:Widget) e no terminal
-(`toons aparelho "Som da sala" Vol_up`, `toons aparelho "Ar da sala" controle`).
+(`lnux aparelho "Som da sala" Vol_up`, `lnux aparelho "Ar da sala" controle`).
 
 > **Clonar o controle apontando ele para o celular não dá**: o Android tem emissor de infravermelho, mas não tem
 > receptor (nenhum celular comum tem). Para "copiar" um controle, importe o arquivo `.ir` dele (do Flipper-IRDB) ou
@@ -481,7 +560,7 @@ Na **rádio** a lista escolhida vira a fila, então `n`/`p` (e ⏭/⏮ da notifi
 Em *Música → 🔎 Descobrir a música de um arquivo*: escolha um áudio ou vídeo (mp3, mp4, opus, m4a...) e ele descobre o nome da música pelo som, mesmo que o arquivo se chame `VID_2026...mp4`. Mostra a música, o artista, o álbum e a certeza, outras opções parecidas e no fim pergunta **se você quer tocar** (o player mostra o nome descoberto).
 
 - Usa o **Chromaprint**, que tira a impressão digital dos 2 primeiros minutos de som, e o **AcoustID**, um serviço aberto e gratuito para uso não comercial, com a base do MusicBrainz.
-- Na primeira vez, o Termux-Toons compila a biblioteca do Chromaprint (uns 2 minutos; o Termux não tem pacote dela) e pede uma **chave grátis do AcoustID**: entre em <https://acoustid.org/new-application>, registre um aplicativo com qualquer nome e cole a *API key*.
+- Na primeira vez, o LNUX compila a biblioteca do Chromaprint (uns 2 minutos; o Termux não tem pacote dela) e pede uma **chave grátis do AcoustID**: entre em <https://acoustid.org/new-application>, registre um aplicativo com qualquer nome e cole a *API key*.
 - Funciona com a música inteira (ou quase), como a de um disco ou de um clipe. Trechos curtos, gravações com barulho, versões ao vivo e remixes costumam não ser reconhecidos.
 
 ### Equalizador
@@ -504,7 +583,7 @@ no Download, Documents e Fonts, **dentro de arquivos .zip** (é assim que o Goog
 as monoespaçadas do próprio Android. Mostra o nome da fonte e avisa se ela não for monoespaçada (no terminal as
 colunas ficariam tortas). A fonte vai para `~/.termux/font.ttf` e o Termux recarrega na hora; se você não
 confirmar em 1 minuto, volta à fonte de antes. **Fonte do terminal: voltar à original** devolve a fonte que você
-usava antes do Termux-Toons (ou a padrão do Termux).
+usava antes do LNUX (ou a padrão do Termux).
 
 ## Desktop da distro no Termux:X11
 
@@ -520,11 +599,11 @@ Menu **🐧 Linux de verdade → 🖥️ Interface gráfica da distro (Termux:X1
 
 Extras: escolher o **usuário** que abre o desktop (navegadores não gostam de root; crie um com *Criar usuário
 não-root com sudo*), **aceleração pela GPU** (virgl, experimental) e **atalho na tela inicial** pelo app
-Termux:Widget. Pela linha de comando: `python termux_toons.py desktop debian` (ou `--parar`).
+Termux:Widget. Pela linha de comando: `python lnux.py desktop debian` (ou `--parar`).
 
 ## Gerenciador de arquivos
 
-Menu **📂 Gerenciador de arquivos** (ou `python termux_toons.py arquivos [pasta]`). Enter abre a pasta ou mostra
+Menu **📂 Gerenciador de arquivos** (ou `python lnux.py arquivos [pasta]`). Enter abre a pasta ou mostra
 as ações do arquivo; Esc sobe uma pasta; **⚙ Ações nesta pasta** tem colar, marcar vários itens, nova pasta,
 **Ir para...** (Download, DCIM, Android/data, cartão SD, raiz do sistema...), busca, ocultos e ordenação.
 
@@ -545,8 +624,8 @@ no Download, ou o contrário.
 
 Tudo que fica rodando (servidor web, túnel, bots, monitoramento, llama-server, code-server,
 compartilhamentos, player, lembretes, registro da bateria, automação, downloads, agendador,
-bancos de dados e servidores) vira uma sessão tmux chamada `toons-<nome>`, com log em
-`~/.termux_toons/logs/`. O menu de cada seção tem *iniciar / parar / status e log / abrir a
+bancos de dados e servidores) vira uma sessão tmux chamada `lnux-<nome>`, com log em
+`~/.lnux/logs/`. O menu de cada seção tem *iniciar / parar / status e log / abrir a
 sessão* (para sair da sessão sem parar o serviço: `Ctrl+b` e depois `d`).
 
 O `termux-wake-lock` é ativado ao iniciar um serviço e liberado quando o último para. Para
@@ -555,7 +634,7 @@ Android.
 
 ## Segurança
 
-- A configuração fica em `~/.termux_toons/config.json` com permissão `600`.
+- A configuração fica em `~/.lnux/config.json` com permissão `600`.
 - A API exige token (`Authorization: Bearer <token>`); só `/` e `/api/ping` são públicas.
   Use o túnel da Cloudflare sabendo que a API fica exposta na internet.
 - Os bots ignoram quem não estiver na lista de IDs permitidos e respondem com o ID da
@@ -567,8 +646,9 @@ Android.
 ## Arquivos
 
 ```
-~/.termux_toons/
-├── config.json            # tokens, portas, monitores...
+~/.lnux/                   # era ~/.termux_toons (o nome antigo vira um atalho para esta pasta)
+├── config.json            # tokens, portas, monitores e o sistema escolhido ("sistema": "debian"...)
+├── distros/               # perfis de sistema seus (opcional; um com o mesmo id substitui o original)
 ├── logs/                  # um log por serviço
 ├── tarefas.json           # gerenciador de tarefas
 ├── meus_dados.json        # 👤 Meus dados na internet (só se você escolher guardar)
@@ -584,7 +664,8 @@ Android.
 ~/llama-models/            # modelos .gguf
 ```
 
-Defina `TOONS_DEBUG=1` para ver o traceback completo de erros inesperados.
+Defina `LNUX_DEBUG=1` para ver o traceback completo de erros inesperados e `LNUX_SISTEMA=fedora` para usar
+um perfil sem salvar a escolha (bom para testes). As variáveis antigas `TOONS_*` continuam valendo.
 
 ## Para quem mexe no código
 
@@ -593,10 +674,18 @@ duplicadas em menus diferentes, menus que nenhuma opção abre e entradas da �
 errado:
 
 ```bash
-python3 tests/verificar_menus.py            # sai com erro se achar algum problema
-python3 tests/verificar_menus.py --arvore   # também mostra a árvore inteira de menus
+python3 tests/verificar_menus.py            # duplicatas, busca, menus soltos e submenus vazios em cada sistema
+python3 tests/verificar_menus.py --arvore   # também mostra a árvore inteira, com o que cada opção exige
+python3 tests/verificar_perfis.py           # confere os perfis de distros/ contra o que o código usa
+python3 tests/testar_menus_por_sistema.py   # abre todos os menus em cada sistema, sem executar nenhuma ação
 ```
+
+Uma opção que só funciona em alguns sistemas se marca com `so_em("recurso", função)` (ex.:
+`so_em("termux_api", menu_sms)`, `so_em("!termux", backup_pessoal)`, `so_em("pacote:jellyfin-server", ...)`), e
+`por_sistema("rótulo no Termux", "rótulo no Linux")` troca o nome mostrado. Os recursos estão na lista `RECURSOS`
+do `lnux.py`.
 
 Para juntar opções relacionadas numa subcategoria sem criar uma função nova, use
 `grupo("Título", [(rótulo, função), ...])` como o alvo de um item de menu. O histórico da reorganização do menu
-está em [docs/relatorio-modulo-1.md](docs/relatorio-modulo-1.md).
+está em [docs/relatorio-modulo-1.md](docs/relatorio-modulo-1.md), e o da troca para LNUX com várias distros em
+[docs/relatorio-modulo-2.md](docs/relatorio-modulo-2.md).

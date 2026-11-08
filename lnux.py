@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Termux-Toons — um canivete suíço em Python para o Termux.
+LNUX — um canivete suíço para o terminal, no Termux (Android) e nas distros Linux.
+(Antes se chamava Termux-Toons; o termux_toons.py continua existindo e só chama este arquivo.)
+
+Na primeira vez, pergunta qual sistema a pessoa usa (sugerindo o detectado) e lê o perfil dele em
+distros/<id>.json: gerenciador de pacotes (pkg, apt, pacman, dnf, apk, zypper), nome de cada pacote,
+pastas, sudo/doas, serviços do sistema e recursos. O menu mostra só o que funciona no sistema escolhido,
+e as opções do Android ganham um equivalente quando existe (veja a seção "Sistemas" mais abaixo).
 
 Reúne em um único menu (cada categoria tem subcategorias; 🔍 Buscar acha qualquer opção pelo nome):
    1. Servidor web/API pessoal (Flask, FastAPI ou só biblioteca padrão) + túnel Cloudflare
@@ -40,8 +46,9 @@ O verificador tests/verificar_menus.py confere se não há opções duplicadas, 
 busca apontando para o lugar errado (rode antes de cada commit).
 
 Uso:
-    python termux_toons.py            # menu interativo
-    python termux_toons.py --help     # subcomandos (também usados pelo tmux)
+    python lnux.py            # menu interativo
+    python lnux.py sistema    # o sistema em uso (perfil, pastas, recursos); 'sistema arch' troca
+    python lnux.py --help     # subcomandos (também usados pelo tmux)
 
 Só precisa da biblioteca padrão do Python para abrir; o resto (flask, rich,
 pacotes do Termux...) é instalado sob demanda, perguntando antes.
@@ -84,6 +91,7 @@ import secrets
 import select
 import shlex
 import shutil
+import signal
 import socket
 import ssl
 import stat
@@ -92,7 +100,9 @@ import string
 import struct
 import subprocess
 import sys
+import sysconfig
 import tarfile
+import tempfile
 import textwrap
 import threading
 import time
@@ -116,7 +126,7 @@ try:
 except ImportError:  # sem terminal POSIX (ex.: Windows): só o modo numérico
     termios = tty = None
 
-VERSION = "1.3.0"
+VERSION = "2.0.0"  # 2.0: Termux-Toons virou LNUX, com perfis de distro
 SCRIPT = Path(__file__).resolve()
 try:  # muda a cada atualização do código: serve para reiniciar serviços que ainda rodam a versão antiga
     ASSINATURA = hashlib.sha1(SCRIPT.read_bytes()).hexdigest()[:10]
@@ -127,7 +137,8 @@ PREFIX = os.environ.get("PREFIX", "")
 IS_TERMUX = "com.termux" in PREFIX or "TERMUX_VERSION" in os.environ
 SHELL_BIN = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
 
-DATA_DIR = HOME / ".termux_toons"
+DATA_DIR = HOME / ".lnux"
+DATA_DIR_ANTIGO = HOME / ".termux_toons"  # pasta de quando o programa se chamava Termux-Toons
 CONFIG_FILE = DATA_DIR / "config.json"
 LOG_DIR = DATA_DIR / "logs"
 TASKS_FILE = DATA_DIR / "tarefas.json"
@@ -137,6 +148,29 @@ BASIC_DIR = DATA_DIR / "basic"
 DOWNLOADS = HOME / "storage" / "downloads"
 LLAMA_DIR = HOME / "llama.cpp"
 MODELS_DIR = HOME / "llama-models"
+
+
+def _env(nome: str, padrao: str | None = None) -> str | None:
+    """Variável de ambiente LNUX_<nome>. A antiga TOONS_<nome> (do Termux-Toons) continua valendo."""
+    return os.environ.get(f"LNUX_{nome}", os.environ.get(f"TOONS_{nome}", padrao))
+
+
+def migrar_pasta_de_dados() -> None:
+    """Na primeira vez que o LNUX abre, a pasta do Termux-Toons (~/.termux_toons) passa a ser a do LNUX
+    (~/.lnux), com configuração, logs, playlists, notas e tudo o mais. O nome antigo vira um atalho para a
+    pasta nova, então serviços e tarefas do cron criados antes continuam achando os arquivos."""
+    if DATA_DIR.exists() or DATA_DIR.is_symlink() or DATA_DIR_ANTIGO.is_symlink() or not DATA_DIR_ANTIGO.is_dir():
+        return
+    try:
+        DATA_DIR_ANTIGO.rename(DATA_DIR)
+        DATA_DIR_ANTIGO.symlink_to(DATA_DIR.name)
+    except OSError:
+        pass  # sem permissão para renomear: segue com a pasta nova vazia
+
+
+# Já no carregamento: a configuração não pode ser lida (e regravada) da pasta nova antes da migração.
+migrar_pasta_de_dados()
+
 USER_AGENT = (
     "Mozilla/5.0 (Linux; Android 14; Mobile) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36"
@@ -160,7 +194,7 @@ VERM, VERD, AMAR, AZUL, MAG, CIANO = _c(31), _c(32), _c(33), _c(34), _c(35), _c(
 DESTAQUE = _c("1;38;5;16;46")
 
 
-class ToonsError(Exception):
+class LnuxError(Exception):
     """Erro esperado: é mostrado ao usuário sem traceback."""
 
 
@@ -254,7 +288,7 @@ def perguntar_float(msg: str, padrao=None) -> float:
 
 # ── Navegação com as setas ──────────────────────────────────────────
 # Menus e listas são escolhidos com ↑/↓ e Enter. Sem terminal interativo
-# (saída redirecionada, scripts) ou com TOONS_NUMEROS=1, volta ao modo de
+# (saída redirecionada, scripts) ou com LNUX_NUMEROS=1, volta ao modo de
 # digitar o número da opção.
 
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -269,7 +303,7 @@ _SEQUENCIAS = {
 
 def setas_ativas() -> bool:
     return (termios is not None and sys.stdin.isatty() and sys.stdout.isatty()
-            and os.environ.get("TOONS_NUMEROS") != "1")
+            and _env("NUMEROS") != "1")
 
 
 def ler_tecla() -> str:
@@ -692,12 +726,12 @@ def executar(func, rotulo: str = "") -> None:
     except KeyboardInterrupt:
         print()
         aviso("Interrompido.")
-    except ToonsError as e:
+    except LnuxError as e:
         erro(str(e))
         falhou = True
     except Exception as e:  # noqa: BLE001 — o menu nunca deve morrer
         erro(f"Erro inesperado: {e!r}")
-        if os.environ.get("TOONS_DEBUG"):
+        if _env("DEBUG"):
             traceback.print_exc()
         falhou = True
     if not eh_submenu or falhou:
@@ -798,12 +832,23 @@ def _menu_setas(titulo_menu: str, itens: list, sair: str, cabecalho, sel: int, d
         _cursor(True)
 
 
+def _so_disponiveis(itens: list, descricoes):
+    """As opções que funcionam no sistema em uso (as marcadas com so_em/requer que ele não tem somem),
+    com as descrições acompanhando cada uma."""
+    visiveis = [(i, item) for i, item in enumerate(itens) if disponivel(item[1])]
+    novas = [descricoes[i] if i < len(descricoes) else "" for i, _ in visiveis] if descricoes else None
+    return [item for _, item in visiveis], novas
+
+
 def menu(titulo_menu: str, itens: list, sair: str = "Voltar", cabecalho=None, descricoes=None) -> None:
+    todos, todas_descricoes = itens, descricoes
     if setas_ativas():
         sel = 0
         while True:
+            # filtra a cada volta: trocar o sistema (⚙️ Sistema e manutenção) já muda o menu
+            itens, descricoes = _so_disponiveis(todos, todas_descricoes)
             try:
-                escolha = _menu_setas(titulo_menu, itens, sair, cabecalho, sel, descricoes)
+                escolha = _menu_setas(titulo_menu, itens, sair, cabecalho, min(sel, max(0, len(itens) - 1)), descricoes)
             except KeyboardInterrupt:
                 return
             if escolha is None:
@@ -812,6 +857,7 @@ def menu(titulo_menu: str, itens: list, sair: str = "Voltar", cabecalho=None, de
             rotulo, func = itens[escolha]
             executar(func, rotulo() if callable(rotulo) else rotulo)
     while True:
+        itens, descricoes = _so_disponiveis(todos, todas_descricoes)
         limpar()
         if cabecalho:
             cabecalho()
@@ -855,6 +901,9 @@ def grupo(titulo_menu: str, itens: list, descricoes=None, cabecalho=None):
 # ════════════════════════════════════════════════════════════════════
 
 def tem(cmd: str) -> bool:
+    """O comando existe aqui? Para os comandos termux-* fora do Termux, responde pelo equivalente do Linux."""
+    if str(cmd).startswith("termux-") and traduz_aqui(cmd):
+        return equivalente_existe(cmd)
     return shutil.which(cmd) is not None
 
 
@@ -864,6 +913,11 @@ def rodar(cmd, *, capturar=False, timeout=None, entrada=None, cwd=None,
     usa_shell = isinstance(cmd, str)
     if not usa_shell:
         cmd = [str(c) for c in cmd]
+        if cmd and traduz_aqui(cmd[0]):  # fora do Termux: o equivalente do Linux (veja TRADUCOES)
+            proc = rodar_traduzido(cmd, entrada, timeout)
+            if check and proc.returncode != 0:
+                raise LnuxError(proc.stderr.strip() or f"'{cmd[0]}' falhou.")
+            return proc
     if mostrar and not capturar:
         print(f"{DIM}$ {cmd if usa_shell else shlex.join(cmd)}{RST}", flush=True)
     try:
@@ -878,7 +932,7 @@ def rodar(cmd, *, capturar=False, timeout=None, entrada=None, cwd=None,
         proc = subprocess.CompletedProcess(cmd, 124, "", "tempo esgotado")
     if check and proc.returncode != 0:
         detalhe = (proc.stderr or "").strip()[-500:] if capturar else ""
-        raise ToonsError(f"Comando falhou (código {proc.returncode}). {detalhe}".strip())
+        raise LnuxError(f"Comando falhou (código {proc.returncode}). {detalhe}".strip())
     return proc
 
 
@@ -894,14 +948,34 @@ def cmd_self(*args: str) -> str:
 
 
 def instalar_pkg(*pacotes: str) -> bool:
-    if not IS_TERMUX:
-        aviso("Fora do Termux: instale manualmente → " + " ".join(pacotes))
+    """Instala pacotes pelo gerenciador do sistema em uso (pkg, apt, pacman, dnf, apk, zypper...).
+    Os nomes são os do Termux (o "nome canônico"); o perfil da distro diz o nome de cada um lá, ou que
+    ele não existe nos repositórios dela (aí mostra como instalar à mão, quando se sabe)."""
+    perfil = sistema()
+    if not perfil.comando("instalar"):
+        aviso(f"O LNUX não sabe instalar pacotes em {perfil.nome}: instale pelo gerenciador do seu sistema → "
+              f"{' '.join(pacotes)}. (Para ter suporte completo, crie um perfil: veja distros/README.md.)")
         return False
-    return rodar(["pkg", "install", "-y", *pacotes]).returncode == 0
+    nomes, faltam = [], []
+    for pacote in pacotes:
+        traduzido = perfil.pacote(pacote)
+        if traduzido is None:
+            faltam.append(pacote)
+        else:
+            nomes += traduzido
+    for pacote in faltam:
+        manual = INSTALACAO_MANUAL.get(pacote)
+        aviso(f"'{pacote}' não existe nos repositórios de {perfil.nome}." + (f" Para instalar: {manual}" if manual else ""))
+    if not nomes:
+        return False
+    return rodar_pacotes("instalar", *dict.fromkeys(nomes)) and not faltam
 
 
 def instalar_de_repo(repo: str, *pacotes: str) -> bool:
-    """Ativa um repositório extra (root-repo, tur-repo, x11-repo) e instala pacotes dele."""
+    """Ativa um repositório extra (root-repo, tur-repo, x11-repo) e instala pacotes dele.
+    Esses repositórios são do Termux: nas distros, os pacotes vêm dos repositórios normais."""
+    if not sistema().termux:
+        return instalar_pkg(*pacotes)
     if not instalar_pkg(repo):
         return False
     rodar(["pkg", "update", "-y"])
@@ -914,7 +988,10 @@ def garantir_cmd(cmd: str, pacote: str | None = None, perguntar_antes: bool = Tr
     if tem(cmd):
         return True
     pacote = pacote or cmd
-    aviso(f"'{cmd}' não encontrado (pacote: {pacote}{', do ' + repo if repo else ''}).")
+    nomes = sistema().pacote(pacote.split()[0]) if pacote else None
+    nome_aqui = " ".join(nomes) if nomes else pacote
+    origem = f", do {repo}" if repo and sistema().termux else ""
+    aviso(f"'{cmd}' não encontrado (pacote: {nome_aqui}{origem}).")
     if perguntar_antes and not confirmar(f"Instalar '{pacote}' agora?", True):
         return False
     if repo:
@@ -925,7 +1002,29 @@ def garantir_cmd(cmd: str, pacote: str | None = None, perguntar_antes: bool = Tr
 
 
 def instalar_pip(*pacotes: str) -> bool:
-    return rodar([sys.executable, "-m", "pip", "install", "-U", *pacotes]).returncode == 0
+    """Instala módulos Python. No Termux (ou num venv), pelo pip. Nas distros, primeiro pelo pacote da
+    distro (o perfil diz qual: python3-rich, python-pillow...); o que não houver vai pelo pip só para o
+    seu usuário (~/.local). Se a distro protege o Python dela (PEP 668), avisa antes de usar o pip."""
+    if sistema().termux or _python_proprio():
+        return rodar([sys.executable, "-m", "pip", "install", "-U", *pacotes]).returncode == 0
+    perfil = sistema()
+    pelo_sistema = {p: perfil.modulo_python(p) for p in pacotes if perfil.modulo_python(p)}
+    resto = [p for p in pacotes if p not in pelo_sistema]
+    if pelo_sistema:
+        nomes = [n for lista in pelo_sistema.values() for n in lista]
+        if not (perfil.comando("instalar") and rodar_pacotes("instalar", *dict.fromkeys(nomes))):
+            resto += list(pelo_sistema)  # não deu pelo sistema: tenta pelo pip
+    if not resto:
+        return True
+    if not modulo_existe("pip") and not instalar_pkg("pip"):
+        erro("O pip não está instalado (instale o pacote do pip da sua distro).")
+        return False
+    extra = ["--user"]
+    if _python_protegido():
+        info("A sua distro protege o Python dela (PEP 668): o pip vai instalar só para o seu usuário, em ~/.local, "
+             "sem mexer nos pacotes do sistema.")
+        extra.append("--break-system-packages")
+    return rodar([sys.executable, "-m", "pip", "install", "-U", *extra, *resto]).returncode == 0
 
 
 def modulo_existe(nome: str) -> bool:
@@ -966,6 +1065,8 @@ _ATALHOS_STORAGE = {"downloads": "Download", "dcim": "DCIM", "pictures": "Pictur
 def armazenamento_ok() -> bool:
     """O Termux enxerga a memória do celular? ~/storage/shared é o atalho que o termux-setup-storage cria; sem a
     permissão (ou com ela revogada), ele não existe ou não abre."""
+    if not sistema().termux:  # nas distros as pastas da pessoa estão sempre acessíveis
+        return True
     compartilhado = HOME / "storage" / "shared"
     try:  # tem que levar para fora do Termux: uma pasta 'shared' de verdade aqui dentro não conta
         return (compartilhado.is_dir() and not compartilhado.resolve().is_relative_to(HOME)
@@ -976,6 +1077,8 @@ def armazenamento_ok() -> bool:
 
 def _na_memoria_do_celular(pasta: Path) -> bool:
     """A pasta fica na memória do celular (~/storage/..., /storage/..., /sdcard/...)?"""
+    if not sistema().termux:
+        return False
     p = Path(os.path.expanduser(str(pasta))).absolute()
     base = HOME / "storage"
     return p == base or base in p.parents or str(p).startswith(("/storage/", "/sdcard"))
@@ -1029,6 +1132,8 @@ def _resgatar_downloads_presos() -> int:
 
 def garantir_storage() -> bool:
     """Garante acesso à memória do celular (~/storage, criado pelo termux-setup-storage)."""
+    if not sistema().termux:
+        return True
     if armazenamento_ok():
         _resgatar_downloads_presos()
         return True
@@ -1082,7 +1187,7 @@ def onde_fica(pasta: Path) -> str:
         return "⚠ sem acesso à memória do celular"
     with contextlib.suppress(OSError):
         real = pasta.resolve()
-        return f"{real}, dentro do Termux" if real.is_relative_to(HOME) else str(real)
+        return f"{real}, dentro do Termux" if sistema().termux and real.is_relative_to(HOME) else str(real)
     return str(pasta)
 
 
@@ -1113,7 +1218,10 @@ def pasta_download() -> Path:
     ~/storage/downloads é um atalho para /storage/emulated/0/Download; o Android mostra
     o atalho como se estivesse dentro do Termux (/data/data/com.termux/...), então aqui
     resolvemos para o caminho real. Cai em alternativas quando o atalho ainda não existe
-    (e ignora uma pasta 'downloads' de verdade dentro do Termux, que não é a do celular)."""
+    (e ignora uma pasta 'downloads' de verdade dentro do Termux, que não é a do celular).
+    Nas distros, é a pasta Downloads do perfil (a pasta XDG)."""
+    if not sistema().termux:
+        return DOWNLOADS
     for p in (HOME / "storage" / "downloads", Path("/storage/emulated/0/Download"), Path("/sdcard/Download")):
         try:
             if p.exists() and (p.is_symlink() or not p.is_relative_to(HOME)):
@@ -1136,6 +1244,842 @@ def fatiar(texto: str, tamanho: int) -> list:
 
 
 # ════════════════════════════════════════════════════════════════════
+#  Sistemas: perfis das distros e camada de compatibilidade
+# ════════════════════════════════════════════════════════════════════
+# O LNUX roda no Termux (Android) e em várias distros Linux. Tudo o que muda de um sistema para
+# outro fica num arquivo de perfil, distros/<id>.json (o formato está em distros/README.md):
+#   • o gerenciador de pacotes (instalar, atualizar, limpar) e o nome de cada pacote nele;
+#   • as pastas da pessoa (Download, Músicas...), o jeito de virar root (sudo/doas) e os serviços
+#     do sistema (systemd ou OpenRC);
+#   • os "recursos" que o sistema tem (Termux:API, Android, área de trabalho...), que decidem
+#     quais opções aparecem no menu.
+# Para uma distro nova basta criar o arquivo (em distros/ ou em ~/.lnux/distros/): o núcleo não muda.
+#
+# O resto do programa continua chamando os comandos do Termux (termux-open-url, termux-notification,
+# termux-clipboard-set...). Fora do Termux, rodar() e _tapi() trocam cada um pelo equivalente do Linux
+# (xdg-open, notify-send, wl-copy/xclip...) e tem() responde se esse equivalente existe aqui. Os que
+# não têm equivalente (SMS, GPS, lanterna, infravermelho...) somem do menu pelos recursos do perfil.
+
+PASTA_PERFIS = SCRIPT.parent / "distros"        # os perfis que vêm com o LNUX
+PASTA_PERFIS_USUARIO = DATA_DIR / "distros"      # perfis seus (um com o mesmo id substitui o original)
+ESQUEMA_PERFIL = "lnux-perfil/1"
+CAMPOS_PERFIL = ("esquema", "id", "nome", "familia", "recursos", "pacotes", "caminhos")
+ORDEM_PERFIS = ["termux", "debian", "arch", "fedora", "alpine", "opensuse"]  # "outro" sempre por último
+
+# Recursos que um perfil pode declarar. "bateria" não vai no arquivo: é descoberto na hora.
+RECURSOS = {
+    "termux": "app Termux: pkg, $PREFIX e as ferramentas termux-*",
+    "android": "o próprio aparelho é o Android (am, telas de configuração, root com su, /sdcard)",
+    "termux_api": "app Termux:API: sensores, SMS, GPS, lanterna e vibração",
+    "infravermelho": "emissor de infravermelho do celular (pelo Termux:API)",
+    "termux_x11": "app Termux:X11 (área de trabalho das distros no celular)",
+    "proot_distro": "proot-distro: outras distros dentro do Termux",
+    "tema_termux": "tema de cores e fonte do app Termux (~/.termux)",
+    "adb": "adb para controlar um Android (o próprio celular ou um ligado por USB ou Wi-Fi)",
+    "desktop": "área de trabalho Linux: abrir links e arquivos, notificações, área de transferência",
+    "servicos_sistema": "serviços do sistema (systemd ou OpenRC) para SSH, cron e bancos de dados",
+    "distrobox": "Distrobox + Podman: outras distros em contêineres",
+    "bateria": "o aparelho tem bateria (descoberto na hora)",
+}
+
+# Programas que nenhuma distro empacota (ou só algumas): como instalar à mão.
+INSTALACAO_MANUAL = {
+    "cloudflared": "https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/",
+    "code-server": "curl -fsSL https://code-server.dev/install.sh | sh",
+    "browsh": "https://www.brow.sh/downloads/",
+    "jellyfin-server": "https://jellyfin.org/downloads/server",
+    "navidrome": "https://www.navidrome.org/docs/installation/",
+    "deno": "curl -fsSL https://deno.land/install.sh | sh",
+    "llama-cpp": "compile pelo menu ✨ Inteligência artificial → 🧠 IA local",
+    "lua-language-server": "https://luals.github.io/#install",
+    "rust-analyzer": "rustup component add rust-analyzer",
+    "scrcpy": "https://github.com/Genymobile/scrcpy/blob/master/doc/linux.md",
+    "python-onnxruntime": "pip install --user onnxruntime",
+}
+
+# Perfis mínimos embutidos, para o LNUX abrir mesmo se a pasta distros/ não vier junto com o lnux.py.
+_PERFIS_RESERVA = [
+    {"esquema": ESQUEMA_PERFIL, "id": "termux", "nome": "Termux (Android)", "familia": "termux",
+     "descricao": "perfil embutido (a pasta distros/ não foi encontrada)", "detectar": {"termux": True},
+     "recursos": ["termux", "android", "termux_api", "infravermelho", "termux_x11", "proot_distro", "tema_termux", "adb"],
+     "elevar": [], "pacotes": {"gerenciador": "pkg", "precisa_root": False, "instalar": ["pkg", "install", "-y"],
+                               "atualizar_indice": ["pkg", "update", "-y"], "atualizar_sistema": ["pkg", "upgrade", "-y"],
+                               "nomes_iguais_ao_canonico": True, "nomes": {}, "modulos_python": {},
+                               "essenciais": ["python", "tmux", "termux-api", "git", "curl", "nano"]},
+     "caminhos": {"downloads": "~/storage/downloads"}},
+    {"esquema": ESQUEMA_PERFIL, "id": "outro", "nome": "Outro Linux", "familia": "linux",
+     "descricao": "perfil embutido (a pasta distros/ não foi encontrada)", "detectar": {},
+     "recursos": ["adb", "desktop"], "elevar": [["sudo"], ["doas"]],
+     "pacotes": {"gerenciador": None, "precisa_root": True, "nomes": {}, "modulos_python": {}, "essenciais": []},
+     "caminhos": {"downloads": "xdg:DOWNLOAD|~/Downloads"}},
+]
+
+
+def _pasta_xdg(nome: str) -> Path | None:
+    """Pasta do usuário pelo padrão XDG (~/.config/user-dirs.dirs), como 'Downloads' ou 'Músicas'."""
+    arq = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config") / "user-dirs.dirs"
+    with contextlib.suppress(OSError):
+        for linha in arq.read_text("utf-8").splitlines():
+            m = re.match(rf'\s*XDG_{nome}_DIR\s*=\s*"?([^"]*)"?', linha)
+            if m:
+                pasta = Path(os.path.expanduser(m.group(1).replace("$HOME", str(HOME))))
+                if pasta != HOME and pasta.is_dir():
+                    return pasta
+    return None
+
+
+def _resolver_caminho(texto: str) -> Path:
+    """'xdg:DOWNLOAD|~/Downloads' → a pasta XDG, se existir; se não, a próxima opção depois da barra."""
+    opcoes = [o.strip() for o in str(texto).split("|") if o.strip()]
+    for i, opcao in enumerate(opcoes):
+        if opcao.startswith("xdg:"):
+            nome, _, resto = opcao[4:].partition("/")
+            base = _pasta_xdg(nome.upper())
+            if base:
+                return base / resto if resto else base
+            continue
+        caminho = Path(os.path.expanduser(opcao.replace("$PREFIX", PREFIX or "/usr")))
+        if caminho.exists() or i == len(opcoes) - 1:
+            return caminho
+    return HOME
+
+
+class Perfil:
+    """Um sistema descrito por um arquivo distros/<id>.json."""
+
+    def __init__(self, dados: dict, arquivo: Path | None = None):
+        faltam = [c for c in CAMPOS_PERFIL if c not in dados]
+        nome_arq = arquivo.name if arquivo else dados.get("id", "?")
+        if faltam:
+            raise LnuxError(f"{nome_arq}: faltam os campos {', '.join(faltam)}")
+        if dados["esquema"] != ESQUEMA_PERFIL:
+            raise LnuxError(f"{nome_arq}: esquema '{dados['esquema']}' desconhecido (o LNUX lê '{ESQUEMA_PERFIL}')")
+        desconhecidos = set(dados["recursos"]) - set(RECURSOS)
+        if desconhecidos:
+            raise LnuxError(f"{nome_arq}: recursos desconhecidos: {', '.join(sorted(desconhecidos))}")
+        self.dados, self.arquivo = dados, arquivo
+        self.id, self.nome = dados["id"], dados["nome"]
+        self.descricao = dados.get("descricao", "")
+        self.familia = dados["familia"]
+        self.recursos = set(dados["recursos"])
+        self.pacotes = dados["pacotes"]
+        self.servicos = dados.get("servicos") or {}
+        self._caminhos: dict = {}
+
+    def __repr__(self) -> str:
+        return f"Perfil({self.id})"
+
+    @property
+    def termux(self) -> bool:
+        return self.familia == "termux"
+
+    @property
+    def android(self) -> bool:
+        return "android" in self.recursos
+
+    def pacote(self, canonico: str) -> list | None:
+        """Nomes do pacote nesta distro, a partir do nome do Termux. None = não existe nos repositórios dela."""
+        nomes = self.pacotes.get("nomes") or {}
+        if canonico in nomes:
+            return None if nomes[canonico] is None else str(nomes[canonico]).split()
+        return [canonico]  # sem tradução no perfil: tenta o mesmo nome
+
+    def modulo_python(self, nome_pip: str) -> list | None:
+        """Pacote da distro com esse módulo do pip (None = instalar pelo pip)."""
+        valor = (self.pacotes.get("modulos_python") or {}).get(nome_pip.lower())
+        return str(valor).split() if valor else None
+
+    def comando(self, acao: str) -> list | None:
+        """Comando do gerenciador de pacotes para 'instalar', 'atualizar_sistema'... (None = não há)."""
+        cmd = self.pacotes.get(acao)
+        return list(cmd) if cmd else None
+
+    def caminho(self, chave: str) -> Path:
+        """Pasta do tipo pedido ('downloads', 'musicas', 'videos', 'imagens', 'dcim', 'documentos',
+        'capturas_de_tela', 'compartilhado', 'temporarios', 'prefixo')."""
+        if chave not in self._caminhos:
+            texto = (self.dados.get("caminhos") or {}).get(chave)
+            if texto is None:  # perfil sem essa pasta: usa a de Download
+                texto = (self.dados.get("caminhos") or {}).get("downloads", "~")
+            self._caminhos[chave] = _resolver_caminho(texto)
+        return self._caminhos[chave]
+
+    def servico(self, chave: str) -> str | None:
+        """Nome do serviço do sistema (ex.: 'ssh' é 'ssh' no Debian e 'sshd' no Arch)."""
+        return (self.servicos.get("nomes") or {}).get(chave)
+
+    def dica(self, chave: str) -> str:
+        return (self.dados.get("dicas") or {}).get(chave, "")
+
+
+_PERFIS: dict | None = None
+_SISTEMA: Perfil | None = None
+_RECURSOS_NA_HORA: dict = {}
+
+
+def perfis() -> dict:
+    """{id: Perfil} dos arquivos em distros/ e em ~/.lnux/distros/, na ordem em que aparecem na escolha."""
+    global _PERFIS
+    if _PERFIS is None:
+        achados = {}
+        for dados in _PERFIS_RESERVA:
+            achados[dados["id"]] = Perfil(dados)
+        for pasta in (PASTA_PERFIS, PASTA_PERFIS_USUARIO):
+            for arq in sorted(pasta.glob("*.json")) if pasta.is_dir() else []:
+                try:
+                    perfil = Perfil(json.loads(arq.read_text("utf-8")), arq)
+                except (OSError, ValueError, LnuxError) as e:
+                    aviso(f"Perfil de sistema ignorado ({arq}): {e}")
+                    continue
+                achados[perfil.id] = perfil
+        ordem = {ident: i for i, ident in enumerate(ORDEM_PERFIS)}
+        _PERFIS = dict(sorted(achados.items(), key=lambda kv: (kv[0] == "outro", ordem.get(kv[0], 99), kv[0])))
+    return _PERFIS
+
+
+def os_release() -> dict:
+    """Os campos de /etc/os-release (ID, ID_LIKE, PRETTY_NAME...)."""
+    for arq in (Path("/etc/os-release"), Path("/usr/lib/os-release")):
+        try:
+            texto = arq.read_text("utf-8")
+        except OSError:
+            continue
+        dados = {}
+        for linha in texto.splitlines():
+            chave, sep, valor = linha.partition("=")
+            if sep:
+                dados[chave.strip()] = valor.strip().strip("'\"")
+        return dados
+    return {}
+
+
+def detectar_sistema() -> tuple:
+    """(perfil, motivo) mais provável para este aparelho: o Termux pelo $PREFIX, uma distro pelo
+    /etc/os-release (ID e ID_LIKE) e, se nada bater, pelo gerenciador de pacotes que existir."""
+    todos = perfis()
+    if "com.termux" in PREFIX or "TERMUX_VERSION" in os.environ:
+        for perfil in todos.values():
+            if (perfil.dados.get("detectar") or {}).get("termux"):
+                return perfil, "o LNUX está rodando dentro do app Termux"
+    rel = os_release()
+    nome_os = rel.get("PRETTY_NAME") or rel.get("NAME") or ""
+    for ident in [rel.get("ID", ""), *rel.get("ID_LIKE", "").split()]:
+        for perfil in todos.values():
+            if ident and ident.lower() in (perfil.dados.get("detectar") or {}).get("os_release", []):
+                return perfil, f"o sistema se identifica como {nome_os or ident}"
+    for perfil in todos.values():
+        comando = next((c for c in (perfil.dados.get("detectar") or {}).get("comandos", []) if shutil.which(c)), None)
+        if comando:
+            return perfil, f"existe o comando {comando}" + (f" ({nome_os})" if nome_os else "")
+    return todos.get("outro") or next(iter(todos.values())), \
+        f"nenhum perfil reconheceu {nome_os or 'este sistema'}"
+
+
+def sistema_salvo() -> Perfil | None:
+    """O sistema escolhido pela pessoa (ou o da variável LNUX_SISTEMA, para testes e scripts)."""
+    escolhido = _env("SISTEMA") or cfg().get("sistema")
+    return perfis().get(escolhido) if escolhido else None
+
+
+def sistema() -> Perfil:
+    """O perfil em uso. Sem escolha salva, usa o detectado (sem perguntar: a pergunta é no menu)."""
+    if _SISTEMA is None:
+        aplicar_sistema(sistema_salvo() or detectar_sistema()[0])
+    return _SISTEMA
+
+
+def aplicar_sistema(perfil: Perfil) -> None:
+    """Passa a usar o perfil: pastas, gerenciador de pacotes, recursos e o que aparece no menu."""
+    global _SISTEMA, IS_TERMUX, DOWNLOADS
+    _SISTEMA = perfil
+    IS_TERMUX = perfil.termux
+    DOWNLOADS = perfil.caminho("downloads")
+    _RECURSOS_NA_HORA.clear()
+
+
+def _recurso_na_hora(nome: str) -> bool:
+    if nome not in _RECURSOS_NA_HORA:
+        if nome == "bateria":
+            base = Path("/sys/class/power_supply")
+            _RECURSOS_NA_HORA[nome] = "termux_api" in sistema().recursos or \
+                (not sistema().android and base.is_dir() and any(base.glob("BAT*")))
+        else:
+            _RECURSOS_NA_HORA[nome] = False
+    return _RECURSOS_NA_HORA[nome]
+
+
+def tem_recurso(expressao: str) -> bool:
+    """O sistema em uso tem o recurso? Aceita 'adb', '!android' (não ter), 'termux_api|desktop' (um ou
+    outro) e 'pacote:jellyfin-server' (a distro tem esse pacote nos repositórios)."""
+    for opcao in str(expressao).split("|"):
+        opcao = opcao.strip()
+        negar, nome = opcao.startswith("!"), opcao.lstrip("!")
+        if nome.startswith("pacote:"):
+            existe = sistema().pacote(nome[len("pacote:"):]) is not None and \
+                (sistema().termux or bool(sistema().comando("instalar")))
+        elif nome == "bateria":
+            existe = _recurso_na_hora(nome)
+        else:
+            existe = nome in sistema().recursos
+        if existe != negar:
+            return True
+    return False
+
+
+def so_em(expressao: str, func):
+    """Marca uma opção de menu para aparecer só nos sistemas que têm o recurso (veja tem_recurso).
+    Ex.: ("📱 Termux:API", so_em("termux_api", menu_termux_api))."""
+    func._requer = expressao
+    return func
+
+
+def so_em_itens(expressao: str, itens: list) -> list:
+    """so_em() para uma lista de opções de uma vez (ex.: as quatro de itens_servico)."""
+    return [(rotulo, so_em(expressao, func)) for rotulo, func in itens]
+
+
+def requer(expressao: str):
+    """Decorador com o mesmo efeito de so_em() para funções de módulo."""
+    return lambda func: so_em(expressao, func)
+
+
+def disponivel(func) -> bool:
+    """A opção que abre `func` funciona no sistema em uso?"""
+    requisito = getattr(func, "_requer", None)
+    return requisito is None or tem_recurso(requisito)
+
+
+def por_sistema(termux: str, linux: str):
+    """Rótulo de menu que muda com o sistema (ex.: 'no player do Android' × 'no player do computador')."""
+    return lambda: termux if sistema().termux else linux
+
+
+# ── root, pacotes e serviços do sistema ─────────────────────────────
+
+def como_root(cmd: list) -> list | None:
+    """O comando com sudo/doas na frente (o que o perfil indicar), ou ele mesmo para quem já é root.
+    None = não há como virar root aqui. Sem terminal, o sudo não pergunta a senha (falha na hora)."""
+    if not cmd:
+        return None
+    if getattr(os, "geteuid", lambda: 0)() == 0:
+        return list(cmd)
+    for prefixo in sistema().dados.get("elevar") or []:
+        if prefixo and shutil.which(prefixo[0]):
+            extra = ["-n"] if prefixo[0] == "sudo" and not sys.stdin.isatty() else []
+            return [*prefixo, *extra, *cmd]
+    return None
+
+
+def comando_pacotes(acao: str, *extras: str) -> list | None:
+    """Comando do gerenciador de pacotes do perfil (com sudo, se a distro pede root)."""
+    base = sistema().comando(acao)
+    if not base:
+        return None
+    cmd = [*base, *extras]
+    return como_root(cmd) if sistema().pacotes.get("precisa_root") else cmd
+
+
+def rodar_pacotes(acao: str, *extras: str, capturar: bool = False) -> bool:
+    """Roda uma ação do gerenciador de pacotes ('instalar', 'atualizar_sistema', 'limpar_cache'...)."""
+    if not sistema().comando(acao):
+        aviso(f"O perfil {sistema().nome} não tem o comando '{acao}': faça pelo gerenciador do seu sistema.")
+        return False
+    cmd = comando_pacotes(acao, *extras)
+    if cmd is None:
+        erro("Para isso é preciso ser root: instale e configure o sudo (ou o doas), ou rode o LNUX como root.")
+        return False
+    return rodar(cmd, capturar=capturar).returncode == 0
+
+
+def servico_do_sistema(chave: str, acao: str) -> bool:
+    """Liga, desliga ou mostra um serviço do sistema (ssh, cron, mariadb, postgresql) pelo systemd ou OpenRC,
+    com os comandos e os nomes do perfil. `acao`: 'iniciar', 'parar', 'ligar_no_boot' ou 'status'."""
+    perfil = sistema()
+    nome = perfil.servico(chave)
+    modelo = (perfil.servicos.get("comandos") or {}).get(acao)
+    if not nome or not modelo:
+        aviso(f"O perfil {perfil.nome} não diz como controlar o serviço '{chave}'.")
+        return False
+    if acao in ("iniciar", "ligar_no_boot"):
+        preparar = (perfil.servicos.get("preparar") or {}).get(chave)
+        if preparar and not _preparado(preparar.get("se_faltar")):
+            info(f"Preparando o {chave} pela primeira vez...")
+            for passo in preparar.get("comandos", []):
+                cmd = como_root(passo)
+                if cmd is None or rodar(cmd).returncode != 0:
+                    erro(f"A preparação do {chave} falhou.")
+                    return False
+    cmd = [parte.replace("{servico}", nome) for parte in modelo]
+    cmd = cmd if acao == "status" else como_root(cmd)
+    if cmd is None:
+        erro("Para controlar serviços do sistema é preciso ser root (sudo ou doas).")
+        return False
+    return rodar(cmd).returncode == 0
+
+
+def _preparado(caminho: str | None) -> bool:
+    """O arquivo que mostra que o serviço já foi preparado existe? (com root: costuma ficar numa pasta fechada)."""
+    if not caminho:
+        return True
+    with contextlib.suppress(OSError):
+        if Path(caminho).exists():
+            return True
+    cmd = como_root(["test", "-e", caminho])
+    return bool(cmd) and rodar(cmd, capturar=True, mostrar=False, timeout=60).returncode == 0
+
+
+def _python_proprio() -> bool:
+    """O Python que roda o LNUX é de um venv/conda/pyenv (e não o da distro)? Aí o pip direto é o certo."""
+    return sys.prefix != getattr(sys, "base_prefix", sys.prefix) or not sys.executable.startswith(("/usr/", "/bin/"))
+
+
+def _python_protegido() -> bool:
+    """A distro marcou o Python dela como "externally managed" (PEP 668: Debian 12+, Ubuntu 23.04+, Fedora 38+...)."""
+    with contextlib.suppress(KeyError, OSError):
+        return (Path(sysconfig.get_paths()["stdlib"]) / "EXTERNALLY-MANAGED").exists()
+    return False
+
+
+# ── tradução dos comandos do Termux para o Linux ─────────────────────
+
+def _resultado(cmd: list, codigo: int = 0, saida_txt: str = "", erro_txt: str = "") -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(cmd, codigo, saida_txt, erro_txt)
+
+
+def _executar(cmd: list, entrada: str | None = None, timeout: float | None = 30,
+              sem_saida: bool = False) -> subprocess.CompletedProcess:
+    """Roda um programa do sistema e devolve o resultado (nunca levanta exceção)."""
+    destino = subprocess.DEVNULL if sem_saida else subprocess.PIPE
+    try:
+        proc = subprocess.run(cmd, input=entrada, text=True, errors="replace", timeout=timeout,
+                              stdout=destino, stderr=destino, stdin=None if entrada is not None else subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return _resultado(cmd, 1, "", str(e))
+    return _resultado(cmd, proc.returncode, proc.stdout or "", proc.stderr or "")
+
+
+def _desanexado(cmd: list) -> subprocess.CompletedProcess:
+    """Abre um programa gráfico (navegador, player) sem esperar ele fechar."""
+    try:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError as e:
+        return _resultado(cmd, 1, "", str(e))
+    return _resultado(cmd, 0)
+
+
+def _tem_tela() -> bool:
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def _opcoes(args: list, com_valor: set = frozenset(), sem_valor: set = frozenset()) -> tuple:
+    """Separa '--opção valor' dos argumentos soltos, do jeito dos comandos termux-*. Opções que não estão em
+    `sem_valor` levam um valor (é o caso da maioria)."""
+    opcoes, soltos, i = {}, [], 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("-") and len(a) > 1:
+            if a in sem_valor or (a not in com_valor and i + 1 >= len(args)):
+                opcoes[a] = True
+            else:
+                opcoes[a] = args[i + 1] if i + 1 < len(args) else ""
+                i += 1
+        else:
+            soltos.append(a)
+        i += 1
+    return opcoes, soltos
+
+
+def _area_transferencia(ler: bool) -> list | None:
+    """Programa para ler/gravar a área de transferência: Wayland (wl-clipboard) ou X11 (xclip/xsel)."""
+    if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-copy"):
+        return ["wl-paste", "-n"] if ler else ["wl-copy"]
+    if os.environ.get("DISPLAY"):
+        if shutil.which("xclip"):
+            return ["xclip", "-selection", "clipboard", *(["-o"] if ler else [])]
+        if shutil.which("xsel"):
+            return ["xsel", "-ob" if ler else "-ib"]
+    return None
+
+
+def _t_abrir_url(cmd, entrada, timeout):
+    _, soltos = _opcoes(cmd[1:])
+    return _desanexado(["xdg-open", soltos[-1]]) if soltos else _resultado(cmd, 1, "", "sem endereço")
+
+
+def _t_abrir(cmd, entrada, timeout):
+    _, soltos = _opcoes(cmd[1:], com_valor={"--content-type"}, sem_valor={"--send", "--view", "--chooser"})
+    return _desanexado(["xdg-open", soltos[-1]]) if soltos else _resultado(cmd, 1, "", "sem arquivo")
+
+
+def _t_compartilhar(cmd, entrada, timeout):
+    # Linux não tem o "compartilhar" do Android: texto vai para a área de transferência; arquivo, a pasta abre
+    _, soltos = _opcoes(cmd[1:], sem_valor={"-d"})
+    if soltos:
+        info(f"Para compartilhar, mande o arquivo pelo app que quiser: {soltos[-1]}")
+        return _desanexado(["xdg-open", str(Path(soltos[-1]).parent)])
+    texto = entrada if entrada is not None else ""
+    copiar = _area_transferencia(ler=False)
+    if copiar and _executar(copiar, texto, sem_saida=True).returncode == 0:
+        info("Copiado: cole no app em que quer compartilhar.")
+        return _resultado(cmd, 0)
+    print(texto)
+    return _resultado(cmd, 0)
+
+
+def _t_copiar(cmd, entrada, timeout):
+    texto = entrada if entrada is not None else " ".join(cmd[1:])
+    programa = _area_transferencia(ler=False)
+    # sem capturar a saída: o xclip continua rodando para servir o que foi copiado e prenderia o pipe
+    return _executar(programa, texto, timeout, sem_saida=True) if programa else _resultado(cmd, 1, "", "sem área de transferência")
+
+
+def _t_colar(cmd, entrada, timeout):
+    programa = _area_transferencia(ler=True)
+    return _executar(programa, timeout=timeout) if programa else _resultado(cmd, 1, "", "sem área de transferência")
+
+
+def _t_notificar(cmd, entrada, timeout):
+    opcoes, _ = _opcoes(cmd[1:], sem_valor={"--ongoing", "--sound", "--alert-once", "--help"})
+    if opcoes.get("--type") == "media" or opcoes.get("--ongoing"):
+        # notificações "presas" (player, andamento) viram janelas novas a cada atualização no Linux: não mostra
+        return _resultado(cmd, 0)
+    titulo_n = opcoes.get("--title") or opcoes.get("-t") or "LNUX"
+    texto = opcoes.get("--content") or opcoes.get("-c") or (entrada or "")
+    urgencia = ["-u", "critical"] if opcoes.get("--priority") in ("high", "max") else []
+    return _executar(["notify-send", "-a", "LNUX", *urgencia, str(titulo_n), str(texto)], timeout=timeout)
+
+
+def _t_falar(cmd, entrada, timeout):
+    opcoes, soltos = _opcoes(cmd[1:])
+    texto = " ".join(soltos) if soltos else (entrada or "")
+    idioma = str(opcoes.get("-l") or "pt").lower()
+    regiao = str(opcoes.get("-n") or ("br" if idioma == "pt" else "")).lower()
+    try:
+        velocidade = float(opcoes.get("-r") or 1.0)
+    except ValueError:
+        velocidade = 1.0
+    for programa in ("espeak-ng", "espeak"):
+        if shutil.which(programa):
+            voz = f"{idioma}-{regiao}" if regiao else idioma
+            return _executar([programa, "-v", voz, "-s", str(int(175 * velocidade)), texto], timeout=timeout)
+    if shutil.which("spd-say"):
+        return _executar(["spd-say", "-w", "-l", idioma, texto], timeout=timeout)
+    return _resultado(cmd, 1, "", "sem programa de voz (instale o espeak-ng)")
+
+
+def _t_motores_voz(cmd, entrada, timeout):
+    programa = next((p for p in ("espeak-ng", "espeak", "spd-say") if shutil.which(p)), None)
+    lista = [{"name": programa, "label": programa, "default": True}] if programa else []
+    return _resultado(cmd, 0, json.dumps(lista))
+
+
+def _t_bateria(cmd, entrada, timeout):
+    base = Path("/sys/class/power_supply")
+    baterias = sorted(base.glob("BAT*")) if base.is_dir() else []
+    if not baterias:
+        return _resultado(cmd, 1, "", "Este computador não tem bateria.")
+
+    def ler(pasta: Path, nome: str) -> str:
+        with contextlib.suppress(OSError):
+            return (pasta / nome).read_text().strip()
+        return ""
+
+    bat = baterias[0]
+    ligado = any(ler(p, "online") == "1" for p in base.iterdir()
+                 if ler(p, "type") in ("Mains", "USB", "USB_C", "USB_PD"))
+    estados = {"Charging": "CHARGING", "Discharging": "DISCHARGING", "Full": "FULL", "Not charging": "NOT_CHARGING"}
+    temperatura = ler(bat, "temp")
+    dados = {
+        "health": (ler(bat, "health") or "Good").upper().replace(" ", "_"),
+        "percentage": int(ler(bat, "capacity") or 0),
+        "plugged": "PLUGGED_AC" if ligado else "UNPLUGGED",
+        "status": estados.get(ler(bat, "status"), "UNKNOWN"),
+        "temperature": int(temperatura) / 10 if temperatura.lstrip("-").isdigit() else None,
+        "current": int(ler(bat, "current_now") or 0) * (1 if ler(bat, "status") == "Charging" else -1),
+    }
+    return _resultado(cmd, 0, json.dumps(dados))
+
+
+def _campos_nmcli(linha: str) -> list:
+    """Divide uma linha do 'nmcli -t' (os ':' dentro dos valores vêm escapados com '\\')."""
+    return [p.replace("\\:", ":") for p in re.split(r"(?<!\\):", linha)]
+
+
+def _t_wifi_info(cmd, entrada, timeout):
+    proc = _executar(["nmcli", "-t", "-f", "ACTIVE,SSID,BSSID,FREQ,SIGNAL,RATE", "dev", "wifi"], timeout=20)
+    for linha in proc.stdout.splitlines():
+        campos = _campos_nmcli(linha)
+        if len(campos) >= 6 and campos[0] == "yes":
+            sinal = int(campos[4] or 0)
+            return _resultado(cmd, 0, json.dumps({
+                "ssid": campos[1], "bssid": campos[2], "frequency_mhz": int(re.sub(r"\D", "", campos[3]) or 0),
+                "rssi": sinal // 2 - 100, "link_speed_mbps": int(re.sub(r"\D", "", campos[5]) or 0),
+                "ip": ip_local(), "supplicant_state": "COMPLETED"}))
+    return _resultado(cmd, 0, json.dumps({"ssid": "<unknown ssid>", "supplicant_state": "DISCONNECTED"}))
+
+
+def _t_wifi_redes(cmd, entrada, timeout):
+    proc = _executar(["nmcli", "-t", "-f", "SSID,BSSID,FREQ,SIGNAL", "dev", "wifi", "list", "--rescan", "auto"], timeout=40)
+    redes = []
+    for linha in proc.stdout.splitlines():
+        campos = _campos_nmcli(linha)
+        if len(campos) >= 4:
+            redes.append({"ssid": campos[0], "bssid": campos[1],
+                          "frequency_mhz": int(re.sub(r"\D", "", campos[2]) or 0), "rssi": int(campos[3] or 0) // 2 - 100})
+    return _resultado(cmd, 0 if proc.returncode == 0 else 1, json.dumps(redes), proc.stderr)
+
+
+def _t_wifi_ligar(cmd, entrada, timeout):
+    ligar = (cmd[1:] or ["true"])[0].lower() in ("true", "1", "on")
+    return _executar(["nmcli", "radio", "wifi", "on" if ligar else "off"], timeout=timeout)
+
+
+def _t_volume(cmd, entrada, timeout):
+    # o Termux usa 0–15 no fluxo "music"; aqui vira 0–100% da saída de som padrão
+    if len(cmd) >= 3:
+        porcento = max(0, min(100, round(int(cmd[2]) * 100 / 15)))
+        if shutil.which("wpctl"):
+            return _executar(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{porcento}%"], timeout=timeout)
+        if shutil.which("pactl"):
+            return _executar(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{porcento}%"], timeout=timeout)
+        return _executar(["amixer", "-q", "set", "Master", f"{porcento}%"], timeout=timeout)
+    porcento = None
+    if shutil.which("wpctl"):
+        m = re.search(r"([\d.]+)", _executar(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"]).stdout)
+        porcento = round(float(m.group(1)) * 100) if m else None
+    if porcento is None and shutil.which("pactl"):
+        m = re.search(r"(\d+)%", _executar(["pactl", "get-sink-volume", "@DEFAULT_SINK@"]).stdout)
+        porcento = int(m.group(1)) if m else None
+    if porcento is None and shutil.which("amixer"):
+        m = re.search(r"\[(\d+)%\]", _executar(["amixer", "get", "Master"]).stdout)
+        porcento = int(m.group(1)) if m else None
+    if porcento is None:
+        return _resultado(cmd, 1, "", "não achei o controle de volume (wpctl, pactl ou amixer)")
+    return _resultado(cmd, 0, json.dumps([{"stream": "music", "volume": round(porcento * 15 / 100),
+                                           "max_volume": 15, "percentual": porcento}]))
+
+
+def _cameras() -> list:
+    return sorted(Path("/dev").glob("video[0-9]*"))
+
+
+def _t_foto(cmd, entrada, timeout):
+    opcoes, soltos = _opcoes(cmd[1:])
+    if not soltos:
+        return _resultado(cmd, 1, "", "falta o arquivo da foto")
+    cameras = _cameras()
+    indice = int(opcoes.get("-c") or 0) if str(opcoes.get("-c") or 0).isdigit() else 0
+    dispositivo = str(cameras[min(indice, len(cameras) - 1)]) if cameras else "/dev/video0"
+    return _executar(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "v4l2", "-i", dispositivo,
+                      "-frames:v", "1", soltos[-1]], timeout=timeout or 40)
+
+
+def _t_microfone(cmd, entrada, timeout):
+    pid_arq = DATA_DIR / "tmp" / "microfone.pid"
+    opcoes, _ = _opcoes(cmd[1:], sem_valor={"-q", "-i", "-d"})
+    if opcoes.get("-q"):  # parar a gravação
+        with contextlib.suppress(OSError, ValueError):
+            pid = int(pid_arq.read_text())
+            os.kill(pid, signal.SIGINT)  # o ffmpeg fecha o arquivo direitinho com Ctrl+C
+            for _ in range(50):
+                time.sleep(0.1)
+                with contextlib.suppress(ChildProcessError):
+                    os.waitpid(pid, os.WNOHANG)
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    break
+        pid_arq.unlink(missing_ok=True)
+        return _resultado(cmd, 0)
+    arquivo = opcoes.get("-f")
+    if not arquivo:
+        return _resultado(cmd, 1, "", "falta o arquivo da gravação (-f)")
+    limite = int(opcoes.get("-l") or 0) if str(opcoes.get("-l") or 0).isdigit() else 0
+    entrada_som = ["-f", "pulse", "-i", "default"] if shutil.which("pactl") or shutil.which("pw-cli") \
+        else ["-f", "alsa", "-i", "default"]
+    pid_arq.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        proc = subprocess.Popen(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *entrada_som,
+                                 *(["-t", str(limite)] if limite else []), "-c:a", "aac", str(arquivo)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                start_new_session=True)
+    except OSError as e:
+        return _resultado(cmd, 1, "", str(e))
+    pid_arq.write_text(str(proc.pid))
+    return _resultado(cmd, 0)
+
+
+def _t_nada(cmd, entrada, timeout):
+    """Comandos que no Linux não têm o que fazer (manter acordado, avisar a galeria, recarregar o Termux...)."""
+    return _resultado(cmd, 0)
+
+
+_sempre = lambda: True  # noqa: E731
+_com_tela = lambda: _tem_tela() and bool(shutil.which("xdg-open"))  # noqa: E731
+
+# comando do Termux → (existe o equivalente aqui?, como rodar o equivalente)
+TRADUCOES = {
+    "termux-open-url": (_com_tela, _t_abrir_url),
+    "termux-open": (_com_tela, _t_abrir),
+    "termux-share": (_com_tela, _t_compartilhar),
+    "termux-clipboard-set": (lambda: _area_transferencia(False) is not None, _t_copiar),
+    "termux-clipboard-get": (lambda: _area_transferencia(True) is not None, _t_colar),
+    "termux-notification": (lambda: _tem_tela() and bool(shutil.which("notify-send")), _t_notificar),
+    "termux-notification-remove": (_sempre, _t_nada),
+    "termux-tts-speak": (lambda: any(shutil.which(p) for p in ("espeak-ng", "espeak", "spd-say")), _t_falar),
+    "termux-tts-engines": (_sempre, _t_motores_voz),
+    "termux-battery-status": (lambda: _recurso_na_hora("bateria"), _t_bateria),
+    "termux-wifi-connectioninfo": (lambda: bool(shutil.which("nmcli")), _t_wifi_info),
+    "termux-wifi-scaninfo": (lambda: bool(shutil.which("nmcli")), _t_wifi_redes),
+    "termux-wifi-enable": (lambda: bool(shutil.which("nmcli")), _t_wifi_ligar),
+    "termux-volume": (lambda: any(shutil.which(p) for p in ("wpctl", "pactl", "amixer")), _t_volume),
+    "termux-camera-photo": (lambda: bool(shutil.which("ffmpeg")) and bool(_cameras()), _t_foto),
+    "termux-microphone-record": (lambda: bool(shutil.which("ffmpeg")), _t_microfone),
+    "termux-wake-lock": (_sempre, _t_nada),
+    "termux-wake-unlock": (_sempre, _t_nada),
+    "termux-media-scan": (_sempre, _t_nada),
+    "termux-reload-settings": (_sempre, _t_nada),
+    "termux-setup-storage": (_sempre, _t_nada),
+}
+# O que precisa estar instalado para cada equivalente (nome canônico do pacote, que o perfil traduz).
+PACOTES_DOS_EQUIVALENTES = {
+    "termux-open-url": "xdg-open", "termux-open": "xdg-open", "termux-share": "xdg-open",
+    "termux-clipboard-set": "wl-clipboard" if os.environ.get("WAYLAND_DISPLAY") else "xclip",
+    "termux-clipboard-get": "wl-clipboard" if os.environ.get("WAYLAND_DISPLAY") else "xclip",
+    "termux-notification": "notify-send", "termux-tts-speak": "espeak-ng", "termux-wifi-connectioninfo": "nmcli",
+    "termux-wifi-scaninfo": "nmcli", "termux-camera-photo": "ffmpeg", "termux-microphone-record": "ffmpeg",
+}
+
+
+def traduz_aqui(nome: str) -> bool:
+    """O comando é do Termux e estamos fora dele (então vale o equivalente do Linux)?"""
+    return str(nome).startswith("termux-") and not sistema().termux
+
+
+def equivalente_existe(nome: str) -> bool:
+    traducao = TRADUCOES.get(nome)
+    return bool(traducao) and bool(traducao[0]())
+
+
+def rodar_traduzido(cmd: list, entrada: str | None = None, timeout: float | None = None) -> subprocess.CompletedProcess:
+    """Roda o equivalente do Linux de um comando termux-* (código 127 se não houver equivalente aqui)."""
+    cmd = [str(c) for c in cmd]
+    traducao = TRADUCOES.get(cmd[0])
+    if not traducao:
+        return _resultado(cmd, 127, "", f"'{cmd[0]}' é do Termux (Android) e não tem equivalente em {sistema().nome}.")
+    if not traducao[0]():
+        pacote = PACOTES_DOS_EQUIVALENTES.get(cmd[0])
+        dica = f" (instale: {' '.join(sistema().pacote(pacote) or [pacote])})" if pacote else ""
+        return _resultado(cmd, 127, "", f"Falta o equivalente de '{cmd[0]}' neste computador{dica}.")
+    return traducao[1](cmd, entrada, timeout)
+
+
+# ── pastas da pessoa ─────────────────────────────────────────────────
+
+_ATALHOS_PARA_PASTAS = {"downloads": "downloads", "download": "downloads", "dcim": "dcim", "pictures": "imagens",
+                        "music": "musicas", "movies": "videos", "documents": "documentos", "shared": "compartilhado"}
+
+
+def caminho_do_usuario(caminho) -> Path:
+    """Traduz os caminhos do Termux (~/storage/downloads, ~/storage/shared/Movies...) para as pastas do sistema
+    em uso (no Linux, as pastas XDG: Downloads, Vídeos...). No Termux devolve o mesmo caminho."""
+    p = Path(os.path.expanduser(str(caminho)))
+    perfil = sistema()
+    if perfil.termux:
+        return p
+    try:
+        partes = p.relative_to(HOME / "storage").parts
+    except ValueError:
+        return p
+    if not partes:
+        return perfil.caminho("compartilhado")
+    if partes[0] == "shared" and len(partes) > 1 and partes[1].lower() in _ATALHOS_PARA_PASTAS:
+        return perfil.caminho(_ATALHOS_PARA_PASTAS[partes[1].lower()]).joinpath(*partes[2:])
+    chave = _ATALHOS_PARA_PASTAS.get(partes[0])
+    return perfil.caminho(chave).joinpath(*partes[1:]) if chave else p
+
+
+def pasta_usuario(*partes: str) -> Path:
+    """pasta_usuario('downloads') = ~/storage/downloads no Termux e ~/Downloads (ou a pasta XDG) no Linux."""
+    return caminho_do_usuario(HOME.joinpath("storage", *partes))
+
+
+# ── a escolha do sistema ─────────────────────────────────────────────
+
+def escolher_sistema(primeira_vez: bool = False) -> Perfil | None:
+    """Pergunta qual sistema a pessoa usa, sugerindo o detectado. Salva a escolha e passa a usá-la."""
+    detectado, motivo = detectar_sistema()
+    lista = list(perfis().values())
+    atual = sistema_salvo()
+    limpar()
+    titulo("🐧 Qual sistema você usa?")
+    if primeira_vez:
+        print("O LNUX funciona no Termux (Android) e em várias distros Linux. O menu mostra só o que funciona\n"
+              "no sistema escolhido, e os programas são instalados pelo gerenciador de pacotes dele.\n")
+    print(f"  {CIANO}Detectei: {NEG}{detectado.nome}{RST}{CIANO} ({motivo}).{RST}")
+    if atual:
+        print(f"  {DIM}Escolhido antes: {atual.nome}.{RST}")
+    print(f"  {DIM}Confirme com Enter ou escolha outro. Dá para trocar depois em ⚙️ Sistema e manutenção.{RST}\n")
+    rotulos = [f"{p.nome}" + ("  ← detectado" if p is detectado else "") + (f"  {DIM}{p.descricao}{RST}" if p.descricao else "")
+               for p in lista]
+    i = escolher("Sistema", rotulos, str(lista.index(detectado) + 1))
+    if i is None:
+        return None
+    perfil = lista[i]
+    c = cfg()
+    c["sistema"] = perfil.id
+    salvar_cfg()
+    aplicar_sistema(perfil)
+    ok(f"Sistema: {perfil.nome}. O menu agora mostra o que funciona nele.")
+    return perfil
+
+
+def preparar_sistema(interativo: bool) -> None:
+    """Na abertura: usa o sistema salvo; na primeira vez, pergunta (ou, sem terminal, usa o detectado)."""
+    salvo = sistema_salvo()
+    if salvo:
+        aplicar_sistema(salvo)
+        return
+    if interativo and sys.stdin.isatty() and sys.stdout.isatty():
+        if escolher_sistema(primeira_vez=True):
+            return
+    aplicar_sistema(detectar_sistema()[0])
+
+
+@submenu
+def menu_trocar_sistema() -> None:
+    if escolher_sistema():
+        pausar()
+
+
+def mostrar_sistema() -> None:
+    """O que o LNUX sabe do sistema em uso (perfil, pastas, gerenciador e recursos)."""
+    perfil = sistema()
+    detectado, motivo = detectar_sistema()
+    rel = os_release()
+    print(f"  {CIANO}Sistema em uso{RST}   {NEG}{perfil.nome}{RST} ({perfil.id}, arquivo "
+          f"{perfil.arquivo or 'embutido'})")
+    print(f"  {CIANO}Detectado{RST}        {detectado.nome} — {motivo}")
+    if rel.get("PRETTY_NAME"):
+        print(f"  {CIANO}os-release{RST}       {rel['PRETTY_NAME']}")
+    gerenciador = perfil.pacotes.get("gerenciador") or "nenhum (instale os programas à mão)"
+    print(f"  {CIANO}Pacotes{RST}          {gerenciador}" + (" (com sudo)" if perfil.pacotes.get("precisa_root") else ""))
+    for chave, nome in (("downloads", "Downloads"), ("musicas", "Músicas"), ("videos", "Vídeos"), ("imagens", "Imagens")):
+        print(f"  {CIANO}{nome:<17}{RST}{perfil.caminho(chave)}")
+    print(f"\n  {NEG}Recursos{RST} (decidem o que aparece no menu)")
+    for recurso, descricao in RECURSOS.items():
+        marca = f"{VERD}✔{RST}" if tem_recurso(recurso) else f"{DIM}✖{RST}"
+        print(f"   {marca} {recurso:<17} {DIM}{descricao}{RST}")
+    if not perfil.termux:
+        print(f"\n  {NEG}Equivalentes dos comandos do Termux{RST}")
+        for nome in TRADUCOES:
+            if TRADUCOES[nome][1] is not _t_nada:
+                marca = f"{VERD}✔{RST}" if equivalente_existe(nome) else f"{AMAR}✖{RST}"
+                print(f"   {marca} {nome}")
+
+
+# ════════════════════════════════════════════════════════════════════
 #  Configuração e arquivos JSON
 # ════════════════════════════════════════════════════════════════════
 
@@ -1151,6 +2095,7 @@ PADRAO_CFG = {
     "alerta_tts": False,
     "alerta_telegram": True,
     "tts_idioma": "",
+    "sistema": "",  # id do perfil em distros/ (vazio = perguntar na próxima abertura)
     "pasta_musicas": "~/storage/downloads",
     "pasta_videos": "~/storage/downloads",
     "formato_musica": "opus",
@@ -1163,7 +2108,7 @@ PADRAO_CFG = {
     "sites": {},
     "site_avisar_visitas": False,
     "proxy_porta": 3128,
-    "proxy_usuario": "toons",
+    "proxy_usuario": "lnux",
     "proxy_senha": None,  # None: ainda não escolheu; "": sem senha
     "proxy_saida": "",  # "" direto; "ssh" pelo túnel SSH; "tor" pelo Tor
     "navegador_porta": 8101,
@@ -1295,8 +2240,24 @@ def mascarar(segredo: str) -> str:
 #  Serviços em segundo plano: tmux + termux-wake-lock
 # ════════════════════════════════════════════════════════════════════
 
+PREFIXO_SESSAO = "lnux-"
+PREFIXOS_SESSAO_ANTIGOS = ("toons-",)  # serviços ligados pelo Termux-Toons continuam sendo vistos e paráveis
+
+
 def sessao(nome: str) -> str:
-    return f"toons-{nome}"
+    """Nome da sessão tmux de um serviço novo."""
+    return PREFIXO_SESSAO + nome
+
+
+def _sessao_existente(nome: str) -> str | None:
+    """A sessão que está rodando o serviço: a de nome novo ou, se for de antes da troca de nome, a antiga."""
+    if not tem("tmux"):
+        return None
+    for prefixo in (PREFIXO_SESSAO, *PREFIXOS_SESSAO_ANTIGOS):
+        # "=" força nome exato (sem isso o tmux aceita prefixos).
+        if rodar(["tmux", "has-session", "-t", "=" + prefixo + nome], capturar=True, mostrar=False).returncode == 0:
+            return prefixo + nome
+    return None
 
 
 def log_de(nome: str) -> Path:
@@ -1304,23 +2265,24 @@ def log_de(nome: str) -> Path:
 
 
 def servico_ativo(nome: str) -> bool:
-    if not tem("tmux"):
-        return False
-    # "=" força nome exato (sem isso o tmux aceita prefixos).
-    return rodar(["tmux", "has-session", "-t", "=" + sessao(nome)],
-                 capturar=True, mostrar=False).returncode == 0
+    return _sessao_existente(nome) is not None
 
 
 def servicos_ativos() -> list:
     if not tem("tmux"):
         return []
     nomes = saida(["tmux", "list-sessions", "-F", "#{session_name}"], timeout=5)
-    return [s[len("toons-"):] for s in nomes.splitlines() if s.startswith("toons-")]
+    ativos = []
+    for s in nomes.splitlines():
+        prefixo = next((p for p in (PREFIXO_SESSAO, *PREFIXOS_SESSAO_ANTIGOS) if s.startswith(p)), None)
+        if prefixo and s[len(prefixo):] not in ativos:
+            ativos.append(s[len(prefixo):])
+    return ativos
 
 
 def iniciar_servico(nome: str, comando: str, reiniciar: bool = False,
                     wake_lock: bool = True, com_log: bool = True) -> bool:
-    """Roda `comando` numa sessão tmux destacada, com log em ~/.termux_toons/logs."""
+    """Roda `comando` numa sessão tmux destacada, com log em ~/.lnux/logs."""
     if not garantir_cmd("tmux"):
         return False
     if servico_ativo(nome):
@@ -1352,7 +2314,7 @@ def parar_servico(nome: str) -> None:
     if not servico_ativo(nome):
         info(f"'{nome}' não está rodando.")
         return
-    rodar(["tmux", "kill-session", "-t", "=" + sessao(nome)], mostrar=False)
+    rodar(["tmux", "kill-session", "-t", "=" + (_sessao_existente(nome) or sessao(nome))], mostrar=False)
     ok(f"'{nome}' parado.")
     if not servicos_ativos() and tem("termux-wake-unlock"):
         rodar(["termux-wake-unlock"], mostrar=False, timeout=10)
@@ -1384,9 +2346,9 @@ def abrir_sessao(nome: str) -> None:
     info("Para sair SEM parar o serviço: Ctrl+b e depois d.")
     time.sleep(1.5)
     if os.environ.get("TMUX"):
-        rodar(["tmux", "switch-client", "-t", "=" + sessao(nome)], mostrar=False)
+        rodar(["tmux", "switch-client", "-t", "=" + (_sessao_existente(nome) or sessao(nome))], mostrar=False)
     else:
-        rodar(["tmux", "attach", "-t", "=" + sessao(nome)], mostrar=False)
+        rodar(["tmux", "attach", "-t", "=" + (_sessao_existente(nome) or sessao(nome))], mostrar=False)
 
 
 def itens_servico(nome: str, rotulo: str, iniciar) -> list:
@@ -1404,25 +2366,31 @@ def itens_servico(nome: str, rotulo: str, iniciar) -> list:
 # ════════════════════════════════════════════════════════════════════
 
 def _tapi(cmd: list, timeout: float = 30, entrada: str | None = None, json_saida: bool = True):
-    if not tem(cmd[0]):
-        raise ToonsError(f"'{cmd[0]}' não encontrado. Instale com 'pkg install termux-api' "
-                         "e instale também o app Termux:API (F-Droid).")
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                              timeout=timeout, input=entrada)
-    except subprocess.TimeoutExpired:
-        raise ToonsError(f"'{cmd[0]}' não respondeu em {timeout:.0f}s. O app Termux:API está "
-                         "instalado e com as permissões concedidas?") from None
+    """Roda um comando do Termux:API e lê a resposta (JSON). Fora do Termux, roda o equivalente do Linux."""
+    if traduz_aqui(cmd[0]):
+        proc = rodar_traduzido(cmd, entrada, timeout)
+        if proc.returncode == 127:
+            raise LnuxError(proc.stderr)
+    else:
+        if not tem(cmd[0]):
+            raise LnuxError(f"'{cmd[0]}' não encontrado. Instale com 'pkg install termux-api' "
+                             "e instale também o app Termux:API (F-Droid).")
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                                  timeout=timeout, input=entrada)
+        except subprocess.TimeoutExpired:
+            raise LnuxError(f"'{cmd[0]}' não respondeu em {timeout:.0f}s. O app Termux:API está "
+                             "instalado e com as permissões concedidas?") from None
     texto = proc.stdout.strip()
     if proc.returncode != 0 and not texto:
-        raise ToonsError(proc.stderr.strip() or f"'{cmd[0]}' falhou.")
+        raise LnuxError(proc.stderr.strip() or f"'{cmd[0]}' falhou.")
     if json_saida and texto:
         try:
             dados = json.loads(texto)
         except json.JSONDecodeError:
             return texto
         if isinstance(dados, dict) and dados.get("error"):
-            raise ToonsError(f"{cmd[0]}: {dados['error']}")
+            raise LnuxError(f"{cmd[0]}: {dados['error']}")
         return dados
     return texto
 
@@ -1430,7 +2398,7 @@ def _tapi(cmd: list, timeout: float = 30, entrada: str | None = None, json_saida
 def bateria() -> dict:
     dados = _tapi(["termux-battery-status"], 15)
     if not isinstance(dados, dict):
-        raise ToonsError(f"Resposta inesperada: {dados}")
+        raise LnuxError(f"Resposta inesperada: {dados}")
     return dados
 
 
@@ -1467,7 +2435,7 @@ def lanterna(ligar: bool) -> None:
 def localizacao(provedor: str = "network") -> dict:
     dados = _tapi(["termux-location", "-p", provedor, "-r", "once"], 90)
     if not isinstance(dados, dict) or "latitude" not in dados:
-        raise ToonsError("Localização indisponível (GPS/localização do Android ligada?).")
+        raise LnuxError("Localização indisponível (GPS/localização do Android ligada?).")
     return dados
 
 
@@ -1476,7 +2444,7 @@ def foto(destino: str | Path | None = None, camera: int = 0) -> Path:
     destino.parent.mkdir(parents=True, exist_ok=True)
     _tapi(["termux-camera-photo", "-c", str(camera), str(destino)], 40, json_saida=False)
     if not destino.exists() or destino.stat().st_size == 0:
-        raise ToonsError("A foto não foi gerada (o Termux:API tem permissão de câmera?).")
+        raise LnuxError("A foto não foi gerada (o Termux:API tem permissão de câmera?).")
     return destino
 
 
@@ -1574,7 +2542,7 @@ def status_sistema(com_bateria: bool = True) -> dict:
         try:
             b = bateria()
             dados["bateria"] = {k: b.get(k) for k in ("percentage", "status", "temperature", "plugged")}
-        except ToonsError:
+        except LnuxError:
             dados["bateria"] = None
     return dados
 
@@ -1601,14 +2569,14 @@ def formatar_status(s: dict) -> str:
 PAGINA_HTML = """<!doctype html>
 <html lang="pt-BR"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Termux-Toons</title>
+<title>LNUX</title>
 <style>
  body{font-family:system-ui,sans-serif;background:#111;color:#eee;margin:0;padding:16px;max-width:640px}
  h1{font-size:1.4em} input,button,textarea{font-size:1em;padding:8px;margin:4px 0;border-radius:6px;border:1px solid #444;background:#222;color:#eee}
  button{background:#2a6;border:0;cursor:pointer} input,textarea{width:100%;box-sizing:border-box}
  pre{background:#000;padding:10px;border-radius:6px;white-space:pre-wrap;word-break:break-word}
 </style></head><body>
-<h1>📱 Termux-Toons API</h1>
+<h1>📱 LNUX API</h1>
 <input id="tk" type="password" placeholder="Token da API (fica salvo neste navegador)">
 <div>
  <button onclick="api('GET','/api/status')">Status</button>
@@ -1661,7 +2629,7 @@ class ToonsAPI:
             ("GET", "/api/local"): (True, lambda d: localizacao(d.get("provedor", "network"))),
             ("GET", "/api/servicos"): (True, lambda d: {"ativos": servicos_ativos()}),
             ("POST", "/api/notificar"): (True, lambda d: notificar(
-                str(d.get("titulo", "Termux-Toons")), _exigir(d, "texto"))),
+                str(d.get("titulo", "LNUX")), _exigir(d, "texto"))),
             ("POST", "/api/falar"): (True, lambda d: falar(_exigir(d, "texto"))),
             ("POST", "/api/vibrar"): (True, lambda d: vibrar(int(d.get("ms", 500)))),
             ("POST", "/api/lanterna"): (True, lambda d: lanterna(_bool(d.get("ligar", True)))),
@@ -1706,7 +2674,7 @@ class ToonsAPI:
                 dados.update(extra)
         try:
             resultado = func(dados)
-        except (ToonsError, ValueError, KeyError) as e:
+        except (LnuxError, ValueError, KeyError) as e:
             return self._json(400, {"erro": str(e)})
         except Exception as e:  # noqa: BLE001
             return self._json(500, {"erro": repr(e)})
@@ -1716,7 +2684,7 @@ class ToonsAPI:
 def _rodar_flask(api: ToonsAPI, host: str, porta: int) -> None:
     from flask import Flask, Response, request
 
-    app = Flask("termux_toons")
+    app = Flask("lnux")
     app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
 
     @app.route("/", defaults={"caminho": ""}, methods=["GET", "POST"])
@@ -1735,7 +2703,7 @@ def _rodar_fastapi(api: ToonsAPI, host: str, porta: int) -> None:
     from fastapi.responses import Response
     from starlette.concurrency import run_in_threadpool
 
-    app = FastAPI(title="Termux-Toons API", version=VERSION)
+    app = FastAPI(title="LNUX API", version=VERSION)
 
     async def tudo(caminho, request):
         corpo = await request.body()
@@ -1751,7 +2719,7 @@ def _rodar_fastapi(api: ToonsAPI, host: str, porta: int) -> None:
 
 def _rodar_stdlib(api: ToonsAPI, host: str, porta: int) -> None:
     class Handler(BaseHTTPRequestHandler):
-        server_version = f"TermuxToons/{VERSION}"
+        server_version = f"LNUX/{VERSION}"
 
         def _tratar(self):
             url = urllib.parse.urlsplit(self.path)
@@ -1791,10 +2759,10 @@ def servir(framework: str, host: str, porta: int) -> None:
     """Sobe o servidor em primeiro plano (é o que roda dentro do tmux)."""
     faltando = [m for m, _ in DEPENDENCIAS_WEB.get(framework, []) if not modulo_existe(m)]
     if faltando:
-        raise ToonsError(f"Faltam módulos para {framework}: {', '.join(faltando)}. "
+        raise LnuxError(f"Faltam módulos para {framework}: {', '.join(faltando)}. "
                          "Instale pelo menu do servidor web ou use --framework stdlib.")
     api = ToonsAPI()
-    log(f"Termux-Toons API ({framework}) em http://{host}:{porta}")
+    log(f"LNUX API ({framework}) em http://{host}:{porta}")
     log(f"Na rede local: http://{ip_local()}:{porta}  |  Ctrl+C para parar")
     runner = {"flask": _rodar_flask, "fastapi": _rodar_fastapi}.get(framework, _rodar_stdlib)
     runner(api, host, porta)
@@ -1946,10 +2914,10 @@ def rodar_tunel_fixo() -> None:
     na linha de comando nem no log)."""
     token = cfg().get("tunel_fixo_token")
     if not token:
-        raise ToonsError("Nenhum token configurado. Use 'Endereço fixo → Colar o token do túnel'.")
+        raise LnuxError("Nenhum token configurado. Use 'Endereço fixo → Colar o token do túnel'.")
     programa = shutil.which("cloudflared")
     if not programa:
-        raise ToonsError("O cloudflared não está instalado (pkg install cloudflared).")
+        raise LnuxError("O cloudflared não está instalado (pkg install cloudflared).")
     sys.stdout.flush()
     os.execve(programa, [programa, "tunnel", "--no-autoupdate", "run"], {**os.environ, "TUNNEL_TOKEN": token})
 
@@ -1963,7 +2931,7 @@ def _o_que_roda_na_porta(porta: int) -> str:
                                  ("Transmissão da tela", "tela_porta", "tela"), ("Trote", "trote_porta", "trote")):
         if c.get(chave) == porta:
             return nome + ("" if servico_ativo(servico) else " (desligado)")
-    return "nada do Termux-Toons nessa porta agora"
+    return "nada do LNUX nessa porta agora"
 
 
 def _portas_uteis() -> list:
@@ -2020,7 +2988,7 @@ def _testar_endereco_fixo(host: str) -> str:
 def ligar_tunel_fixo() -> bool:
     """Liga o túnel fixo em segundo plano e confere se a Cloudflare aceitou o token."""
     if not cfg().get("tunel_fixo_token"):
-        raise ToonsError("Cole primeiro o token do túnel ('Endereço fixo → Colar o token do túnel').")
+        raise LnuxError("Cole primeiro o token do túnel ('Endereço fixo → Colar o token do túnel').")
     if not garantir_cmd("cloudflared"):
         return False
     if servico_ativo(SERVICO_TUNEL_FIXO):
@@ -2038,7 +3006,7 @@ def ligar_tunel_fixo() -> bool:
         if re.search(r"Unauthorized|token is not valid|Invalid tunnel secret|tunnel not found|failed to unmarshal",
                      texto, re.I):
             parar_servico(SERVICO_TUNEL_FIXO)
-            raise ToonsError("A Cloudflare recusou o token. No painel, abra o túnel e copie o comando de novo "
+            raise LnuxError("A Cloudflare recusou o token. No painel, abra o túnel e copie o comando de novo "
                              "(se você apagou o túnel ou trocou o token, o antigo deixa de valer).")
         if "Registered tunnel connection" in texto:
             ok("Túnel fixo conectado.")
@@ -2084,7 +3052,7 @@ def menu_tunel_fixo():
              "Ele fica só neste celular, no config.json (permissão 600).")
         token = token_do_tunel(perguntar("Comando ou token do túnel"))
         if not token:
-            raise ToonsError("Não achei um token de túnel aí. Ele começa com eyJ e é bem comprido; copie de novo o "
+            raise LnuxError("Não achei um token de túnel aí. Ele começa com eyJ e é bem comprido; copie de novo o "
                              "comando da tela de instalação do túnel no painel.")
         trocou = token != c.get("tunel_fixo_token")
         c["tunel_fixo_token"] = token
@@ -2101,7 +3069,7 @@ def menu_tunel_fixo():
         info("Use só se o endereço cadastrado no painel não aparecer sozinho em 'Ver os endereços'.")
         host = re.sub(r"^https?://|/.*$", "", perguntar("Endereço (ex.: site.seudominio.com.br)").strip().lower())
         if not re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+", host):
-            raise ToonsError("Escreva só o endereço, como site.seudominio.com.br.")
+            raise LnuxError("Escreva só o endereço, como site.seudominio.com.br.")
         opcoes = _portas_uteis()
         i = escolher("O que esse endereço abre? (a mesma porta que está no painel)",
                      [f"{n} · localhost:{p}" for p, n in opcoes] + ["Outra porta..."])
@@ -2214,7 +3182,7 @@ def menu_web():
 #  2. Bots de Telegram e Discord (24h com tmux + wake-lock)
 # ════════════════════════════════════════════════════════════════════
 
-AJUDA_BOT = """🤖 Termux-Toons — comandos
+AJUDA_BOT = """🤖 LNUX — comandos
 {p}status – resumo do celular
 {p}bateria – nível da bateria
 {p}ip – IP local e público
@@ -2249,7 +3217,7 @@ class BotCore:
             return [{"texto": f"Comando desconhecido. Use {self.p}ajuda"}]
         try:
             resp = func(arg.strip())
-        except ToonsError as e:
+        except LnuxError as e:
             return [{"texto": f"⚠️ {e}"}]
         except Exception as e:  # noqa: BLE001
             return [{"texto": f"💥 Erro: {e!r}"}]
@@ -2288,7 +3256,7 @@ class BotCore:
     def c_notificar(self, arg):
         if not arg:
             return {"texto": f"Uso: {self.p}notificar <texto>"}
-        notificar("Termux-Toons bot", arg, som=True)
+        notificar("LNUX bot", arg, som=True)
         return {"texto": "🔔 Notificação enviada."}
 
     def c_vibrar(self, arg):
@@ -2326,7 +3294,7 @@ class BotCore:
 
     def c_sh(self, arg):
         if not cfg().get("bot_permitir_shell"):
-            return {"texto": "⛔ Comando sh desabilitado. Ative em Configurações do Termux-Toons."}
+            return {"texto": "⛔ Comando sh desabilitado. Ative em Configurações do LNUX."}
         if not arg:
             return {"texto": f"Uso: {self.p}sh <comando>"}
         try:
@@ -2373,7 +3341,7 @@ def tg_chamar(token: str, metodo: str, dados: dict | None = None, arquivos: dict
         except (ValueError, OSError):
             resp = {"ok": False, "description": f"HTTP {e.code}"}
     if not resp.get("ok"):
-        raise ToonsError(f"Telegram: {resp.get('description', 'erro desconhecido')}")
+        raise LnuxError(f"Telegram: {resp.get('description', 'erro desconhecido')}")
     return resp["result"]
 
 
@@ -2407,12 +3375,12 @@ class TelegramBot:
         if comando in ("/foto", "/local", "/ia"):
             try:
                 tg_chamar(self.token, "sendChatAction", {"chat_id": chat_id, "action": "typing"})
-            except (ToonsError, OSError):
+            except (LnuxError, OSError):
                 pass
         for resposta in self.core.tratar(texto):
             try:
                 self.enviar(chat_id, resposta)
-            except (ToonsError, OSError) as e:
+            except (LnuxError, OSError) as e:
                 log(f"Falha ao responder {chat_id}: {e}")
 
     def rodar(self) -> None:
@@ -2427,7 +3395,7 @@ class TelegramBot:
                 updates = tg_chamar(self.token, "getUpdates", {
                     "timeout": 50, "offset": self.offset, "allowed_updates": ["message"]}, timeout=70)
                 espera = 1
-            except (ToonsError, OSError, ValueError) as e:
+            except (LnuxError, OSError, ValueError) as e:
                 log(f"Falha de rede/API: {e}. Nova tentativa em {espera}s.")
                 time.sleep(espera)
                 espera = min(espera * 2, 60)
@@ -2444,8 +3412,8 @@ class TelegramBot:
                     log(f"Bloqueado: chat_id={chat_id} user_id={user_id} texto={texto[:40]!r}")
                     try:
                         tg_enviar_texto(self.token, chat_id, f"⛔ Não autorizado.\nSeu chat_id é {chat_id}.\n"
-                                        "Cadastre-o no Termux-Toons → Configurações.")
-                    except (ToonsError, OSError):
+                                        "Cadastre-o no LNUX → Configurações.")
+                    except (LnuxError, OSError):
                         pass
                     continue
                 log(f"{chat_id}: {texto}")
@@ -2500,13 +3468,13 @@ def executar_bot(tipo: str) -> None:
     c = cfg()
     if tipo == "telegram":
         if not c["telegram_token"]:
-            raise ToonsError("Token do Telegram não configurado.")
+            raise LnuxError("Token do Telegram não configurado.")
         TelegramBot(c["telegram_token"], c["telegram_ids_permitidos"]).rodar()
     else:
         if not c["discord_token"]:
-            raise ToonsError("Token do Discord não configurado.")
+            raise LnuxError("Token do Discord não configurado.")
         if not modulo_existe("discord"):
-            raise ToonsError("Módulo discord.py não instalado (pip install discord.py).")
+            raise LnuxError("Módulo discord.py não instalado (pip install discord.py).")
         rodar_discord(c["discord_token"], c["discord_ids_permitidos"])
 
 
@@ -2525,7 +3493,7 @@ def menu_bots():
             try:
                 eu = tg_chamar(token, "getMe", timeout=15)
                 ok(f"Token válido: @{eu.get('username')}")
-            except (ToonsError, OSError) as e:
+            except (LnuxError, OSError) as e:
                 aviso(f"Não consegui validar o token agora ({e}). Salvando mesmo assim.")
             c["telegram_token"] = token
         atuais = ",".join(map(str, c["telegram_ids_permitidos"]))
@@ -2536,7 +3504,7 @@ def menu_bots():
 
     def descobrir_chat_id():
         if not c["telegram_token"]:
-            raise ToonsError("Configure o token primeiro.")
+            raise LnuxError("Configure o token primeiro.")
         if servico_ativo("bot-telegram"):
             info("O bot está rodando: mande /start para ele e veja o chat_id na resposta.")
             return
@@ -2561,7 +3529,7 @@ def menu_bots():
 
     def iniciar_telegram():
         if not c["telegram_token"]:
-            raise ToonsError("Configure o token do Telegram primeiro.")
+            raise LnuxError("Configure o token do Telegram primeiro.")
         if iniciar_servico("bot-telegram", cmd_self("bot", "telegram"), reiniciar=True):
             info("Dica: desative a otimização de bateria do Termux no Android para ficar 24h no ar.")
 
@@ -2581,7 +3549,7 @@ def menu_bots():
 
     def iniciar_discord():
         if not c["discord_token"]:
-            raise ToonsError("Configure o token do Discord primeiro.")
+            raise LnuxError("Configure o token do Discord primeiro.")
         if not garantir_modulo("discord", "discord.py"):
             return
         iniciar_servico("bot-discord", cmd_self("bot", "discord"), reiniciar=True)
@@ -2613,7 +3581,7 @@ def menu_termux_api():
     def ler_sensor_menu():
         nomes = sensores()
         if not nomes:
-            raise ToonsError("Nenhum sensor encontrado.")
+            raise LnuxError("Nenhum sensor encontrado.")
         i = escolher("Qual sensor?", nomes)
         if i is not None:
             mostrar_dados(ler_sensor(nomes[i]))
@@ -2631,7 +3599,7 @@ def menu_termux_api():
                   f"[{sms.get('type', '')}]\n  {sms.get('body', '')}\n")
 
     def notificacao():
-        notificar(perguntar("Título", "Termux-Toons"), perguntar("Texto", "Olá do Python!"), som=True)
+        notificar(perguntar("Título", "LNUX"), perguntar("Texto", "Olá do Python!"), som=True)
         ok("Notificação enviada.")
 
     def tirar_foto():
@@ -2654,20 +3622,25 @@ def menu_termux_api():
             _tapi(["termux-clipboard-set"], 10, entrada=novo, json_saida=False)
             ok("Copiado.")
 
-    menu("📱 Termux:API", [
-        ("Listar sensores", listar_sensores),
-        ("Ler um sensor", ler_sensor_menu),
-        ("Enviar SMS", enviar_sms),
-        ("Ler últimos SMS", ler_sms),
+    # Fora do Termux os mesmos itens usam o equivalente do Linux (notify-send, webcam, wl-copy/xclip, volume);
+    # os que só o Android tem (sensores, SMS, GPS, vibração, lanterna) somem.
+    menu("📱 Termux:API" if sistema().termux else "🖥️ Recursos do computador", [
+        ("Listar sensores", so_em("termux_api", listar_sensores)),
+        ("Ler um sensor", so_em("termux_api", ler_sensor_menu)),
+        ("Enviar SMS", so_em("termux_api", enviar_sms)),
+        ("Ler últimos SMS", so_em("termux_api", ler_sms)),
         ("Enviar notificação", notificacao),
-        ("Tirar foto", tirar_foto),
-        ("Localização atual", local),
-        ("Vibrar", lambda: vibrar(perguntar_int("Duração (ms)", 500, 50, 5000))),
-        ("Lanterna liga/desliga", lambda: lanterna(confirmar("Ligar a lanterna?", True))),
+        (por_sistema("Tirar foto", "Tirar foto com a webcam"), tirar_foto),
+        ("Localização atual", so_em("termux_api", local)),
+        ("Vibrar", so_em("termux_api", lambda: vibrar(perguntar_int("Duração (ms)", 500, 50, 5000)))),
+        ("Lanterna liga/desliga", so_em("termux_api", lambda: lanterna(confirmar("Ligar a lanterna?", True)))),
         ("Área de transferência", clipboard),
         # o controle da TV pelo infravermelho fica só em 📲 Celular e sistema → 📺 Controle da TV
         ("Volume do sistema", lambda: mostrar_dados(_tapi(["termux-volume"], 15))),
-        ("Instalar o pacote termux-api", lambda: instalar_pkg("termux-api")),
+        ("Instalar o pacote termux-api", so_em("termux", lambda: instalar_pkg("termux-api"))),
+        ("Instalar os programas dos equivalentes (notify-send, área de transferência, voz)",
+         so_em("!termux", lambda: instalar_pkg("xdg-open", "notify-send", "espeak-ng",
+                                               "wl-clipboard" if os.environ.get("WAYLAND_DISPLAY") else "xclip"))),
     ])
 
 
@@ -2710,9 +3683,9 @@ def baixar_arquivo(url: str, destino: Path) -> Path:
         if e.code == 416 and inicio:  # já estava completo
             parcial.replace(destino)
             return destino
-        raise ToonsError(f"HTTP {e.code} ao baixar {url}") from None
+        raise LnuxError(f"HTTP {e.code} ao baixar {url}") from None
     except OSError as e:
-        raise ToonsError(f"Falha de rede: {e}") from None
+        raise LnuxError(f"Falha de rede: {e}") from None
     with resp:
         if inicio and resp.status != 206:
             inicio = 0  # servidor ignorou o Range: recomeça
@@ -2739,7 +3712,7 @@ def baixar_arquivo(url: str, destino: Path) -> Path:
                         print(f"\r  {bytes_humanos(baixado)}  {bytes_humanos(vel)}/s   ", end="", flush=True)
     print()
     if total and baixado < total:
-        raise ToonsError("Download incompleto. Rode de novo para continuar de onde parou.")
+        raise LnuxError("Download incompleto. Rode de novo para continuar de onde parou.")
     parcial.replace(destino)
     return destino
 
@@ -2761,14 +3734,14 @@ def modelo_atual() -> Path:
         return Path(escolhido)
     baixados = modelos_baixados()
     if not baixados:
-        raise ToonsError("Nenhum modelo .gguf em ~/llama-models. Baixe um no menu.")
+        raise LnuxError("Nenhum modelo .gguf em ~/llama-models. Baixe um no menu.")
     return baixados[0]
 
 
 def ia_perguntar(prompt: str, historico: list | None = None, timeout: float = 300) -> str:
     """Pergunta ao llama-server (API compatível com OpenAI) rodando no celular."""
     if not prompt:
-        raise ToonsError("Escreva uma pergunta.")
+        raise LnuxError("Escreva uma pergunta.")
     porta = cfg()["llama_porta"]
     mensagens = list(historico or []) + [{"role": "user", "content": prompt}]
     req = urllib.request.Request(
@@ -2779,12 +3752,12 @@ def ia_perguntar(prompt: str, historico: list | None = None, timeout: float = 30
         with _SEM_PROXY.open(req, timeout=timeout) as r:
             dados = json.loads(r.read().decode())
     except (OSError, ValueError) as e:
-        raise ToonsError(f"O llama-server não respondeu em 127.0.0.1:{porta}. Inicie-o no menu "
+        raise LnuxError(f"O llama-server não respondeu em 127.0.0.1:{porta}. Inicie-o no menu "
                          f"'LLMs locais' ({e}).") from None
     try:
         return dados["choices"][0]["message"]["content"].strip()
     except (KeyError, IndexError, TypeError):
-        raise ToonsError(f"Resposta inesperada do servidor: {str(dados)[:200]}") from None
+        raise LnuxError(f"Resposta inesperada do servidor: {str(dados)[:200]}") from None
 
 
 @submenu
@@ -2823,7 +3796,7 @@ def menu_llm():
     def escolher_modelo():
         baixados = modelos_baixados()
         if not baixados:
-            raise ToonsError("Nenhum modelo baixado ainda.")
+            raise LnuxError("Nenhum modelo baixado ainda.")
         i = escolher("Modelo padrão", [f"{m.name} ({bytes_humanos(m.stat().st_size)})" for m in baixados])
         if i is not None:
             c["llama_modelo"] = str(baixados[i])
@@ -2833,7 +3806,7 @@ def menu_llm():
     def conversar():
         binario = llama_bin("llama-cli")
         if not binario:
-            raise ToonsError("llama-cli não encontrado. Compile o llama.cpp ou instale 'llama-cpp'.")
+            raise LnuxError("llama-cli não encontrado. Compile o llama.cpp ou instale 'llama-cpp'.")
         modelo = modelo_atual()
         info(f"Modelo: {modelo.name} — digite /exit ou Ctrl+C para sair.")
         extra = shlex.split(perguntar("Argumentos extras (opcional)", ""))
@@ -2842,7 +3815,7 @@ def menu_llm():
     def iniciar_servidor():
         binario = llama_bin("llama-server")
         if not binario:
-            raise ToonsError("llama-server não encontrado. Compile o llama.cpp primeiro.")
+            raise LnuxError("llama-server não encontrado. Compile o llama.cpp primeiro.")
         modelo = modelo_atual()
         host = "0.0.0.0" if confirmar("Deixar acessível na rede Wi-Fi? (sem senha!)", False) else "127.0.0.1"
         porta = c["llama_porta"]
@@ -2894,7 +3867,9 @@ def menu_llm():
     menu("🧠 LLMs locais (llama.cpp)", [
         ("Instalar dependências de compilação (git, cmake, clang)", instalar_deps),
         ("Baixar/atualizar e COMPILAR o llama.cpp no celular", compilar),
-        ("Alternativa rápida: instalar llama.cpp pronto (pkg llama-cpp)", lambda: instalar_pkg("llama-cpp")),
+        (por_sistema("Alternativa rápida: instalar llama.cpp pronto (pkg llama-cpp)",
+                     "Alternativa rápida: instalar o llama.cpp pronto da distro"),
+         so_em("pacote:llama-cpp", lambda: instalar_pkg("llama-cpp"))),
         ("Baixar modelo (1B a 3B)", baixar_modelo),
         ("Escolher modelo padrão", escolher_modelo),
         ("Conversar no terminal (llama-cli)", conversar),
@@ -2927,7 +3902,7 @@ def corrigir_ggml_arm32(repo: Path) -> int:
     fim = texto.find("#endif // !defined(__aarch64__)", inicio)
     if inicio < 0 or fim < 0:
         return 0
-    marca = "// Termux-Toons: nome próprio, não bate com o arm_neon.h"
+    marca = "// LNUX: nome próprio, não bate com o arm_neon.h"
     bloco, trocas = re.subn(r"^inline static ([\w ]+?) (v\w+)\(",
                             lambda m: f"#define {m[2]} ggml_{m[2]}  {marca}\ninline static {m[1]} ggml_{m[2]}(",
                             texto[inicio:fim], flags=re.M)
@@ -2940,7 +3915,7 @@ def atualizar_repo_ggml(repo: Path, url: str) -> None:
     """Clona, ou atualiza tirando antes a correção (senão o git pull recusa o arquivo mexido)."""
     for cmd, pacote in (("git", "git"), ("cmake", "cmake"), ("clang", "clang"), ("make", "make")):
         if not garantir_cmd(cmd, pacote):
-            raise ToonsError(f"'{cmd}' é necessário para compilar.")
+            raise LnuxError(f"'{cmd}' é necessário para compilar.")
     if (repo / ".git").exists():
         info(f"Atualizando o código do {repo.name}...")
         rodar(["git", "-C", repo, "checkout", "--", str(GGML_IMPL)], capturar=True)
@@ -2958,7 +3933,7 @@ def compilar_ggml(repo: Path, alvos: list, pergunta_jobs: str = "", extras_se_fa
     configurar = ["cmake", "-S", repo, "-B", build, "-DCMAKE_BUILD_TYPE=Release"]
     if rodar(configurar).returncode != 0:
         if not extras_se_falhar:
-            raise ToonsError("A configuração do cmake falhou (veja as mensagens acima).")
+            raise LnuxError("A configuração do cmake falhou (veja as mensagens acima).")
         aviso("A configuração falhou; tentando de novo com opções mais simples...")
         configurar += extras_se_falhar
         rodar(configurar, check=True)
@@ -3029,7 +4004,7 @@ class _CacheBateria(threading.Thread):
         while True:
             try:
                 self.valor = bateria()
-            except ToonsError:
+            except LnuxError:
                 self.valor = None
             time.sleep(20)
 
@@ -3095,7 +4070,7 @@ def _dashboard_rich(cpu, bat, fixo) -> None:
                 celula.append(f" {valor}", style="default")
                 tabela.add_row(rotulo, celula)
         return Panel(Group(tabela, Text("\nCtrl+C para sair", style="dim")),
-                     title="📊 Termux-Toons Dashboard", border_style="cyan")
+                     title="📊 LNUX Dashboard", border_style="cyan")
 
     try:
         with Live(render(), refresh_per_second=2, screen=True) as live:
@@ -3235,7 +4210,7 @@ def instalar_textual() -> None:
 #  6. Ambiente de desenvolvimento
 # ════════════════════════════════════════════════════════════════════
 
-NVIM_INIT_LUA = r"""-- Gerado pelo Termux-Toons: Neovim com LSP nativo, sem plugins.
+NVIM_INIT_LUA = r"""-- Gerado pelo LNUX: Neovim com LSP nativo, sem plugins.
 vim.g.mapleader = " "
 local o = vim.opt
 o.number = true
@@ -3401,13 +4376,19 @@ def menu_dev():
         ("Rust: rust + rust-analyzer", lambda: instalar_pkg("rust", "rust-analyzer")),
         ("Go: golang + gopls", instalar_go),
         ("Python/Bash LSP: pyright e bash-language-server (via Node.js)", instalar_pyright),
-        ("Lua LSP: lua-language-server", lambda: instalar_pkg("lua-language-server")),
+        ("Lua LSP: lua-language-server", so_em("pacote:lua-language-server", lambda: instalar_pkg("lua-language-server"))),
         ("Configurar Neovim com LSP (gera init.lua)", configurar_neovim),
         ("Configurar git e chave SSH", configurar_git),
         ("Testar compiladores (C, Rust, Go, Python)", testar_compiladores),
-        ("code-server (VS Code no navegador): instalar", instalar_code_server),
-        *itens_servico("code-server", "code-server", iniciar_code_server),
-        ("code-server: mostrar senha", senha_code_server),
+        ("code-server (VS Code no navegador): instalar", so_em("pacote:code-server", instalar_code_server)),
+        *so_em_itens("pacote:code-server", itens_servico("code-server", "code-server", iniciar_code_server)),
+        ("code-server: mostrar senha", so_em("pacote:code-server", senha_code_server)),
+        # nas distros o code-server não vem nos repositórios: o projeto tem um script de instalação próprio
+        ("code-server (VS Code no navegador): como instalar", so_em("!termux", lambda: info(
+            "Instale pelo script oficial (ele usa o gerenciador de pacotes da sua distro):\n"
+            f"    {INSTALACAO_MANUAL['code-server']}\n"
+            "Depois: 'code-server' no terminal e abra http://127.0.0.1:8080 (a senha fica em "
+            "~/.config/code-server/config.yaml)."))),
         ("Textual: biblioteca para criar seus próprios apps de terminal", instalar_textual),
     ])
 
@@ -3491,7 +4472,7 @@ def ler_feed(dados: bytes) -> list:
     try:
         raiz = ET.fromstring(dados)
     except ET.ParseError as e:
-        raise ToonsError(f"Feed inválido: {e}") from None
+        raise LnuxError(f"Feed inválido: {e}") from None
 
     def filho(el, nome):
         for f in el:
@@ -3548,7 +4529,7 @@ def checar_monitor(m: dict, est: dict) -> tuple:
     if tipo == "rss":
         codigo, dados, _ = baixar_url(m["url"])
         if codigo >= 400:
-            raise ToonsError(f"HTTP {codigo}")
+            raise LnuxError(f"HTTP {codigo}")
         itens = ler_feed(dados)
         primeira = "vistos" not in est
         vistos = set(est.get("vistos", []))
@@ -3564,7 +4545,7 @@ def checar_monitor(m: dict, est: dict) -> tuple:
 
     codigo, pagina = baixar_pagina(m["url"])
     if codigo >= 400:
-        raise ToonsError(f"HTTP {codigo}")
+        raise LnuxError(f"HTTP {codigo}")
 
     if tipo == "texto":
         alvo = m["texto"].lower()
@@ -3579,10 +4560,10 @@ def checar_monitor(m: dict, est: dict) -> tuple:
     if tipo == "preco":
         achado = re.search(m["regex"], pagina, re.I | re.S)
         if not achado:
-            raise ToonsError("preço não encontrado na página (ajuste a regex)")
+            raise LnuxError("preço não encontrado na página (ajuste a regex)")
         valor = parse_preco(achado.group(1) if achado.groups() else achado.group(0))
         if valor is None:
-            raise ToonsError(f"não entendi o preço '{achado.group(0)[:40]}'")
+            raise LnuxError(f"não entendi o preço '{achado.group(0)[:40]}'")
         alvo, anterior = float(m["alvo"]), est.get("preco")
         est["preco"] = valor
         alerta = None
@@ -3600,7 +4581,7 @@ def checar_monitor(m: dict, est: dict) -> tuple:
         alerta = f"🔄 {nome} mudou!\n{m['url']}" if anterior and anterior != assinatura else None
         return alerta, assinatura[:12]
 
-    raise ToonsError(f"tipo de monitor desconhecido: {tipo}")
+    raise LnuxError(f"tipo de monitor desconhecido: {tipo}")
 
 
 def disparar_alerta(texto: str, m: dict | None = None) -> None:
@@ -3608,19 +4589,19 @@ def disparar_alerta(texto: str, m: dict | None = None) -> None:
     c = cfg()
     try:
         nid = str(int(hashlib.md5(m["id"].encode()).hexdigest()[:6], 16)) if m else None
-        notificar("Termux-Toons", texto, nid=nid, som=True)
-    except ToonsError as e:
+        notificar("LNUX", texto, nid=nid, som=True)
+    except LnuxError as e:
         log(f"Notificação falhou: {e}")
     if c.get("alerta_tts"):
         try:
             falar(texto.splitlines()[0])
-        except ToonsError as e:
+        except LnuxError as e:
             log(f"TTS falhou: {e}")
     if c.get("alerta_telegram") and c.get("telegram_token"):
         for chat in c.get("telegram_ids_permitidos", []):
             try:
                 tg_enviar_texto(c["telegram_token"], chat, texto)
-            except (ToonsError, OSError) as e:
+            except (LnuxError, OSError) as e:
                 log(f"Telegram falhou para {chat}: {e}")
 
 
@@ -3680,7 +4661,7 @@ def menu_monitor():
         dados = {"tipo": tipo}
         dados["url"] = perguntar("URL" + (" do feed" if tipo == "rss" else ""))
         if not dados["url"].startswith(("http://", "https://")):
-            raise ToonsError("A URL precisa começar com http:// ou https://")
+            raise LnuxError("A URL precisa começar com http:// ou https://")
         dados["nome"] = perguntar("Nome do monitor", urllib.parse.urlsplit(dados["url"]).netloc)
         if tipo == "texto":
             dados["texto"] = perguntar("Texto a procurar")
@@ -3697,7 +4678,7 @@ def menu_monitor():
             try:
                 _, resumo = checar_monitor(dados, {})
                 ok(f"Preço encontrado agora: {resumo}")
-            except (ToonsError, OSError) as e:
+            except (LnuxError, OSError) as e:
                 aviso(f"Teste falhou: {e}. Salve mesmo assim e ajuste depois, se quiser.")
         elif tipo == "rss":
             dados["filtro"] = perguntar("Só avisar se o título contiver (opcional)", "")
@@ -3724,7 +4705,7 @@ def menu_monitor():
 
     def escolher_monitor(msg):
         if not c["monitores"]:
-            raise ToonsError("Nenhum monitor cadastrado.")
+            raise LnuxError("Nenhum monitor cadastrado.")
         i = escolher(msg, [f"{m['nome']} [{m['tipo']}]" for m in c["monitores"]])
         return None if i is None else c["monitores"][i]
 
@@ -3757,7 +4738,7 @@ def menu_monitor():
                                          c["alerta_telegram"])
         salvar_cfg()
         if confirmar("Disparar um alerta de teste agora?", True):
-            disparar_alerta("✅ Teste de alerta do Termux-Toons")
+            disparar_alerta("✅ Teste de alerta do LNUX")
 
     menu("🔎 Scraping e monitoramento", [
         ("Adicionar monitor (preço, notícia, status, texto...)", adicionar),
@@ -3796,7 +4777,7 @@ CREG_ESTADOS = {
 def _modem_dispositivo() -> str:
     dev = cfg().get("modem_dispositivo", "")
     if not dev:
-        raise ToonsError("Nenhuma porta do modem escolhida. Use 'Procurar a porta do modem' primeiro.")
+        raise LnuxError("Nenhuma porta do modem escolhida. Use 'Procurar a porta do modem' primeiro.")
     return dev
 
 
@@ -3831,7 +4812,7 @@ def modem_enviar(comando: str, espera: float = 3.0, final: str | None = None, de
     `final`, se dado, é um texto enviado logo depois (ex.: Ctrl-Z para concluir um SMS).
     `dev` usa outra porta sem mexer na configuração (para testar portas)."""
     if not tem_root():
-        raise ToonsError("Falar com o modem exige root (o comando 'su' não respondeu).")
+        raise LnuxError("Falar com o modem exige root (o comando 'su' não respondeu).")
     dev = dev or _modem_dispositivo()
     variaveis = {"DEV": dev, "BAUD": str(cfg().get("modem_baud", "115200")), "CMD": comando,
                  "TO": f"{espera:g}", "FIM": final or "", "LER": _MODEM_LER, "SCRIPT": _MODEM_SCRIPT}
@@ -3843,7 +4824,7 @@ def modem_enviar(comando: str, espera: float = 3.0, final: str | None = None, de
     proc = rodar(["su", "-c", linha], capturar=True, timeout=limite + 15, mostrar=False)
     saida_bruta = proc.stdout or ""
     if "__SEM_PORTA__" in saida_bruta:
-        raise ToonsError(f"Não consegui abrir {dev}. É a porta certa? O modem pede root e a porta exata do seu chip.")
+        raise LnuxError(f"Não consegui abrir {dev}. É a porta certa? O modem pede root e a porta exata do seu chip.")
     return _modem_limpar(saida_bruta, comando)
 
 
@@ -3858,14 +4839,14 @@ def _modem_limpar(saida_bruta: str, comando: str) -> str:
 
 
 def modem_ok(comando: str, espera: float = 3.0) -> str:
-    """Envia o comando e confere se o modem terminou com OK; erro ou silêncio vira ToonsError.
+    """Envia o comando e confere se o modem terminou com OK; erro ou silêncio vira LnuxError.
     Devolve a resposta sem a linha final 'OK'."""
     resposta = modem_enviar(comando, espera)
     if _MODEM_FALHA.search(resposta):
-        raise ToonsError(f"O modem respondeu com erro:\n{resposta}")
+        raise LnuxError(f"O modem respondeu com erro:\n{resposta}")
     linhas = resposta.split("\n")
     if "OK" not in linhas:
-        raise ToonsError(f"O modem não confirmou '{comando}' com OK (em até {espera:g}s):\n"
+        raise LnuxError(f"O modem não confirmou '{comando}' com OK (em até {espera:g}s):\n"
                          f"{resposta or '(sem resposta — a porta é a certa?)'}")
     del linhas[len(linhas) - 1 - linhas[::-1].index("OK")]
     return "\n".join(linhas)
@@ -3874,7 +4855,7 @@ def modem_ok(comando: str, espera: float = 3.0) -> str:
 def _sms_modo_texto() -> None:
     """SMS em modo texto, com o conjunto de caracteres ASCII (IRA) quando o modem aceita."""
     modem_ok("AT+CMGF=1")
-    with contextlib.suppress(ToonsError):
+    with contextlib.suppress(LnuxError):
         modem_ok('AT+CSCS="IRA"')
 
 
@@ -3912,7 +4893,7 @@ def menu_modem():
 
     def procurar_porta():
         if not tem_root():
-            raise ToonsError("Procurar a porta do modem exige root.")
+            raise LnuxError("Procurar a porta do modem exige root.")
         info("Procurando portas do modem e testando com 'AT' (precisa responder OK)...")
         # só nós de caractere que existem ('ls' com um padrão sem resultado sairia com erro e
         # esconderia os que existem); o 'exit 0' evita o mesmo problema com o último teste
@@ -3922,12 +4903,12 @@ def menu_modem():
         candidatos = list(dict.fromkeys(l.strip() for l in existentes.splitlines() if l.strip()))
         funcionam = []
         for dev in candidatos:
-            with contextlib.suppress(ToonsError):
+            with contextlib.suppress(LnuxError):
                 if re.search(r"^OK$", modem_enviar("AT", espera=1.5, dev=dev), re.M):
                     funcionam.append(dev)
                     print(f"  {VERD}✔{RST} {dev}")
         if not funcionam:
-            raise ToonsError("Nenhuma porta respondeu 'AT'. Seu aparelho pode não expor o modem, ou a porta tem "
+            raise LnuxError("Nenhuma porta respondeu 'AT'. Seu aparelho pode não expor o modem, ou a porta tem "
                              "outro nome. Veja 'ls /dev/' com root ou informe o caminho manualmente.")
         i = escolher("Qual porta usar?", funcionam)
         if i is not None:
@@ -3953,7 +4934,7 @@ def menu_modem():
                 resposta = modem_ok(cmd)
                 valor = "\n".join(l for l in resposta.splitlines() if l.upper() != "OK") or "?"
                 print(f"  {CIANO}{rotulo:<26}{RST} {valor}")
-            except ToonsError as e:
+            except LnuxError as e:
                 print(f"  {CIANO}{rotulo:<26}{RST} {VERM}{e}{RST}")
 
     # ── Rede ──
@@ -3964,7 +4945,7 @@ def menu_modem():
         valor = _so_valor(modem_ok("AT+CREG?"), "+CREG")
         estado = valor.split(",")[1].strip() if "," in valor else valor
         print(f"  Registro na rede: {NEG}{CREG_ESTADOS.get(estado, 'código ' + estado)}{RST}")
-        with contextlib.suppress(ToonsError):
+        with contextlib.suppress(LnuxError):
             atual = _so_valor(modem_ok("AT+COPS?"), "+COPS")
             nome = re.search(r'"([^"]+)"', atual)
             if nome:
@@ -3988,7 +4969,7 @@ def menu_modem():
         elif i == 1:
             codigo = perguntar("Código da operadora (MCCMNC, ex.: 72410)")
             if not re.fullmatch(r"\d{5,6}", codigo):
-                raise ToonsError("O código MCCMNC tem 5 ou 6 dígitos (ex.: 72410).")
+                raise LnuxError("O código MCCMNC tem 5 ou 6 dígitos (ex.: 72410).")
             modem_ok(f'AT+COPS=1,2,"{codigo}"', espera=120)
             ok("Operadora selecionada.")
 
@@ -3996,14 +4977,14 @@ def menu_modem():
     def ligar():
         numero = perguntar("Número para ligar (com DDD)")
         if not re.fullmatch(r"[+0-9*#]{2,20}", numero or ""):
-            raise ToonsError("Número inválido.")
+            raise LnuxError("Número inválido.")
         if not confirmar(f"Ligar para {numero}? (pode gastar créditos)", False):
             return
         # o ';' faz uma chamada de VOZ; alguns modems só dão OK quando atendem, então o
         # silêncio aqui não é erro — só um código de falha é
         resposta = modem_enviar(f"ATD{numero};", espera=5)
         if _MODEM_FALHA.search(resposta):
-            raise ToonsError(f"A chamada não completou:\n{resposta}")
+            raise LnuxError(f"A chamada não completou:\n{resposta}")
         ok(f"Chamando {numero}... Use 'Encerrar a chamada' para desligar.")
 
     def atender():
@@ -4016,7 +4997,7 @@ def menu_modem():
     def enviar_sms():
         numero = perguntar("Número de destino (com DDD)")
         if not re.fullmatch(r"[+0-9]{3,20}", numero or ""):
-            raise ToonsError("Número inválido.")
+            raise LnuxError("Número inválido.")
         texto = perguntar("Mensagem")
         # o modo texto só leva ASCII com segurança: acentos viram letras sem acento
         ascii_ = unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
@@ -4025,7 +5006,7 @@ def menu_modem():
             aviso(f"Sem acentos/emojis, a mensagem vai assim: {ascii_}")
             texto = ascii_
         if len(texto) > 160:
-            raise ToonsError(f"A mensagem tem {len(texto)} caracteres; um SMS em modo texto leva até 160.")
+            raise LnuxError(f"A mensagem tem {len(texto)} caracteres; um SMS em modo texto leva até 160.")
         if not texto or not confirmar(f"Enviar SMS para {numero}? (pode gastar créditos)", False):
             return
         _sms_modo_texto()
@@ -4034,7 +5015,7 @@ def menu_modem():
         if re.search(r"\+CMGS:|^OK$", resposta, re.M) and not _MODEM_FALHA.search(resposta):
             ok("SMS enviado.")
         else:
-            raise ToonsError(f"Não confirmou o envio:\n{resposta or '(sem resposta)'}")
+            raise LnuxError(f"Não confirmou o envio:\n{resposta or '(sem resposta)'}")
 
     def ler_sms():
         _sms_modo_texto()
@@ -4072,7 +5053,7 @@ def menu_modem():
         if not apn:
             return
         if not re.fullmatch(r"[A-Za-z0-9._-]{1,100}", apn):
-            raise ToonsError("APN inválida: use só letras, números, ponto, hífen e sublinhado.")
+            raise LnuxError("APN inválida: use só letras, números, ponto, hífen e sublinhado.")
         cid = perguntar_int("Número do contexto (geralmente 1)", 1, 1, 15)
         modem_ok(f'AT+CGDCONT={cid},"IP","{apn}"')
         ok(f"APN '{apn}' definida no contexto {cid}.")
@@ -4084,13 +5065,13 @@ def menu_modem():
 
     def endereco_ip():
         resposta = ""
-        with contextlib.suppress(ToonsError):
+        with contextlib.suppress(LnuxError):
             resposta = modem_ok("AT+CGPADDR")
         # contextos sem conexão aparecem vazios ou como 0.0.0.0
         ips = [ip for ip in re.findall(r'\+CGPADDR:\s*\d+,"?([0-9.:]+)"?', resposta)
                if ip.strip("0.:")]
         if not ips:
-            with contextlib.suppress(ToonsError):
+            with contextlib.suppress(LnuxError):
                 ips = [ip for ip in re.findall(r"(\d+\.\d+\.\d+\.\d+)", modem_ok("AT+CIFSR"))
                        if ip != "0.0.0.0"]
         print(f"  IP da conexão de dados: {NEG}{ips[0] if ips else '(sem IP / dados desligados)'}{RST}")
@@ -4106,7 +5087,7 @@ def menu_modem():
                 cmd = "AT" + cmd
             try:
                 print(modem_enviar(cmd, espera=30) or "(sem resposta)")
-            except ToonsError as e:
+            except LnuxError as e:
                 erro(str(e))
 
     menu("📡 Modem (comandos AT / 3GPP)", [
@@ -4392,7 +5373,7 @@ class ServidorProxy:
                     usuario, _, senha = base64.b64decode(credencial).decode("utf-8").partition(":")
             if not self._senha_confere(usuario, senha):
                 return await responder("407 Proxy Authentication Required", "Este proxy precisa de usuário e senha.\n",
-                                       'Proxy-Authenticate: Basic realm="Proxy do celular (Termux-Toons)", charset="UTF-8"\r\n')
+                                       'Proxy-Authenticate: Basic realm="Proxy do celular (LNUX)", charset="UTF-8"\r\n')
         if metodo.upper() == "CONNECT":  # HTTPS: só abre o túnel até o site
             host, _, porta = alvo.rpartition(":")
             host = host.strip("[]")
@@ -4522,7 +5503,7 @@ def servir_proxy(porta: int) -> None:
         resource.setrlimit(resource.RLIMIT_NOFILE, (min(maximo, 8192) if maximo > 0 else 8192, maximo))
     c = cfg()
     senha = c.get("proxy_senha") or ""
-    servidor = ServidorProxy(porta, c.get("proxy_usuario") or "toons" if senha else "", senha, ESTADO_PROXY,
+    servidor = ServidorProxy(porta, c.get("proxy_usuario") or "lnux" if senha else "", senha, ESTADO_PROXY,
                              saida_do_proxy())
     try:
         asyncio.run(servidor.rodar())
@@ -4544,7 +5525,7 @@ def _script_pac(host: str, porta: int) -> str:
 
 def _pagina_proxy(host: str, porta: int, com_senha: bool) -> str:
     """O que aparece ao abrir http://IP:PORTA no PC: confirma que ele alcança o celular e diz como configurar."""
-    senha = "<p>O navegador vai pedir <b>usuário e senha</b> (os que aparecem no Termux-Toons).</p>" if com_senha else ""
+    senha = "<p>O navegador vai pedir <b>usuário e senha</b> (os que aparecem no LNUX).</p>" if com_senha else ""
     return f"""<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Proxy do celular</title>
 <style>body{{font:16px/1.5 system-ui,sans-serif;max-width:640px;margin:2em auto;padding:0 16px;color:#222}}
@@ -4581,7 +5562,7 @@ def instrucoes_proxy() -> None:
         print(f"  {NEG}{ip}{RST}  porta {NEG}{porta}{RST}  {DIM}← {tipo}{RST}")
     ip = enderecos[0][0]
     if c.get("proxy_senha"):
-        print(f"  Usuário {NEG}{c.get('proxy_usuario') or 'toons'}{RST} · senha {NEG}{c['proxy_senha']}{RST} "
+        print(f"  Usuário {NEG}{c.get('proxy_usuario') or 'lnux'}{RST} · senha {NEG}{c['proxy_senha']}{RST} "
               f"{DIM}(o navegador pergunta na primeira vez){RST}")
     passos = [
         ("Windows 10/11", f"Configurações → Rede e Internet → Proxy → Configuração manual de proxy → Usar um servidor "
@@ -4625,7 +5606,7 @@ def ligar_proxy() -> None:
         salvar_cfg()
     porta = c["proxy_porta"]
     if not porta_livre(porta, espera=2):
-        raise ToonsError(f"A porta {porta} já está em uso por outro programa. Troque a porta neste menu.")
+        raise LnuxError(f"A porta {porta} já está em uso por outro programa. Troque a porta neste menu.")
     servico_saida = {"ssh": SERVICO_PONTE_SSH, "tor": SERVICO_TOR}.get(c.get("proxy_saida") or "")
     if servico_saida and not servico_ativo(servico_saida):
         aviso(f"A saída escolhida ({_nome_saida(c.get('proxy_saida'))}) está desligada: os sites só vão abrir "
@@ -4665,7 +5646,7 @@ def menu_proxy():
         if i is None:
             return
         if opcoes[i].startswith("Mostrar"):
-            print(f"  Usuário {NEG}{c.get('proxy_usuario') or 'toons'}{RST} · senha {NEG}{c['proxy_senha']}{RST}")
+            print(f"  Usuário {NEG}{c.get('proxy_usuario') or 'lnux'}{RST} · senha {NEG}{c['proxy_senha']}{RST}")
             return
         c["proxy_senha"] = secrets.token_urlsafe(6) if i == 0 else ""
         salvar_cfg()
@@ -5507,7 +6488,7 @@ def _arquivo_cookies_visitante(jar, pagina: str) -> Path | None:
 def _resolver_com_ytdlp(pagina: str, jar=None, saida: tuple | None = None) -> dict:
     """Roda o yt-dlp na página e devolve {'url', 'titulo', 'protocolo', 'cabecalhos', 'cookies'}."""
     if not tem("yt-dlp"):
-        raise ToonsError("O yt-dlp não está instalado no celular. No Termux-Toons: menu do navegador → ▶ VLC Web "
+        raise LnuxError("O yt-dlp não está instalado no celular. No LNUX: menu do navegador → ▶ VLC Web "
                          "→ Instalar o yt-dlp (ou 'pkg install python-yt-dlp').")
     comando = ["yt-dlp", "-j", "--no-playlist", "--no-warnings", "-f", NAV_YTDLP_FORMATO, "-S", NAV_YTDLP_ORDEM]
     if saida:
@@ -5528,7 +6509,7 @@ def _resolver_com_ytdlp(pagina: str, jar=None, saida: tuple | None = None) -> di
         motivo = re.sub(r"^ERROR:\s*(\[[^\]]+\]\s*)?", "", motivo[-1]) if motivo else ""
         if re.search(r"(?i)log ?in|cookies|private|rate.?limit|sign in", motivo):
             motivo += " (esse site pede login para este vídeo; entre na conta pelo navegador e tente de novo)"
-        raise ToonsError("O yt-dlp não achou um vídeo nessa página" + (f": {motivo[:300]}" if motivo else "."))
+        raise LnuxError("O yt-dlp não achou um vídeo nessa página" + (f": {motivo[:300]}" if motivo else "."))
     return {"url": dados["url"], "titulo": str(dados.get("title") or "Vídeo")[:200],
             "protocolo": str(dados.get("protocol") or ""),
             "cabecalhos": {k: v for k, v in (dados.get("http_headers") or {}).items()
@@ -5610,7 +6591,7 @@ NAV_ICONE = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><defs>
              'stroke-width="2.4"/><path d="M45.5 44.2v6.6l5-3.3z" fill="#fff"/></svg>')
 
 
-NAV_JS = r"""/* Termux-Toons · navegador pelo celular: faz o JavaScript da página também passar pelo celular e desenha a
+NAV_JS = r"""/* LNUX · navegador pelo celular: faz o JavaScript da página também passar pelo celular e desenha a
    barra de endereço (num Shadow DOM, para o CSS do site não bagunçar a barra nem a barra bagunçar o site). */
 (function () {
   'use strict';
@@ -5623,7 +6604,7 @@ NAV_JS = r"""/* Termux-Toons · navegador pelo celular: faz o JavaScript da pág
   var NOSSO = /^\/(?:p|m|_tt|vlc)\//;
   var IGNORAR = /^(?:#|(?:data|blob|javascript|vbscript|about|mailto|tel|sms|intent|magnet|geo|market|whatsapp|tg|file|chrome):)/i;
   var RE_LISTA = /\.(?:m3u8|mpd)$/i;
-  /* páginas de vídeo que o yt-dlp abre (igual a NAV_PAGINAS_VIDEO do Termux-Toons) */
+  /* páginas de vídeo que o yt-dlp abre (igual a NAV_PAGINAS_VIDEO do LNUX) */
   var RE_PAGINA_VIDEO = new RegExp('^https?://(?:[\\w-]+\\.)*(?:' + [
     'youtube\\.com/(?:watch|shorts/|live/|embed/)', 'youtu\\.be/',
     'tiktok\\.com/(?:@[^/?#]+/(?:video|photo)/|t/|v/|embed/)', '(?:vm|vt)\\.tiktok\\.com/',
@@ -6310,7 +7291,7 @@ h2 button{font:inherit;font-size:12.5px;text-transform:none;letter-spacing:0;col
 </main>
 <footer class="rodape">Os sites veem o IP do celular, e os dados gastos são os do celular. Sites que dependem muito de JavaScript
 (apps, redes sociais) podem abrir mal.<br>
-<a href="#" id="semhist"></a> · <a href="/sair">Sair deste aparelho</a> · Termux-Toons __VERSAO__</footer>
+<a href="#" id="semhist"></a> · <a href="/sair">Sair deste aparelho</a> · LNUX __VERSAO__</footer>
 <script>
 (function () {
   var CFG = __CONFIG__;
@@ -6346,7 +7327,7 @@ h2 button{font:inherit;font-size:12.5px;text-transform:none;letter-spacing:0;col
   });
   desenharMotores();
 
-  /* modo leve / completo (o completo só aparece com o motor ligado no Termux-Toons) */
+  /* modo leve / completo (o completo só aparece com o motor ligado no LNUX) */
   modo = CFG.completo && LS.get('modo', 'leve') === 'completo' ? 'completo' : 'leve';
   function desenharModo() {
     $('modo').value = modo;
@@ -6501,7 +7482,7 @@ def _pagina_erro_navegador(mensagem: str, alvo: str = "", icone: str = "&#128533
 
 def _pagina_sem_acesso() -> bytes:
     return _pagina_simples("Link inválido", f"""{_logo(64)}<h1>Este navegador precisa do link completo</h1>
-<p>Abra o link que recebeu (ele termina em <b>?t=…</b>). Se não tiver, peça a quem ligou o navegador no Termux-Toons.</p>
+<p>Abra o link que recebeu (ele termina em <b>?t=…</b>). Se não tiver, peça a quem ligou o navegador no LNUX.</p>
 <p>Se você usava este link e ele parou, foi criado um link novo.</p>""")
 
 
@@ -6659,7 +7640,7 @@ def vlc_web_versao_remota(timeout: float = 12) -> str | None:
 
 def instalar_vlc_web(progresso=None) -> dict:
     """Baixa o VLC Web do GitHub (o zip da branch principal) e guarda só os arquivos do site em
-    ~/.termux_toons/vlc-web. A versão antiga só é trocada depois que a nova chegou inteira."""
+    ~/.lnux/vlc-web. A versão antiga só é trocada depois que a nova chegou inteira."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     temp = DATA_DIR / "vlc-web.zip.part"
     novo = DATA_DIR / "vlc-web.novo"
@@ -6678,10 +7659,10 @@ def instalar_vlc_web(progresso=None) -> dict:
                     progresso(feito, total)
     except urllib.error.HTTPError as e:
         temp.unlink(missing_ok=True)
-        raise ToonsError(f"O GitHub respondeu HTTP {e.code} ao baixar o VLC Web.") from None
+        raise LnuxError(f"O GitHub respondeu HTTP {e.code} ao baixar o VLC Web.") from None
     except OSError as e:
         temp.unlink(missing_ok=True)
-        raise ToonsError(f"Não consegui baixar o VLC Web do GitHub: {e}") from None
+        raise LnuxError(f"Não consegui baixar o VLC Web do GitHub: {e}") from None
     shutil.rmtree(novo, ignore_errors=True)
     novo.mkdir(parents=True)
     raiz = novo.resolve()
@@ -6703,12 +7684,12 @@ def instalar_vlc_web(progresso=None) -> dict:
                     shutil.copyfileobj(origem, saida_arq)
     except (zipfile.BadZipFile, OSError) as e:
         shutil.rmtree(novo, ignore_errors=True)
-        raise ToonsError(f"O arquivo do VLC Web veio com defeito ({e}). Tente de novo.") from None
+        raise LnuxError(f"O arquivo do VLC Web veio com defeito ({e}). Tente de novo.") from None
     finally:
         temp.unlink(missing_ok=True)
     if not (novo / "index.html").is_file():
         shutil.rmtree(novo, ignore_errors=True)
-        raise ToonsError("O zip do VLC Web não trouxe o index.html.")
+        raise LnuxError("O zip do VLC Web não trouxe o index.html.")
     versao = {"sha": commit if re.fullmatch(r"[0-9a-f]{40}", commit) else "",
               "data": datetime.now().isoformat(timespec="seconds"), "repo": VLC_WEB_REPO}
     (novo / ".versao.json").write_text(json.dumps(versao), "utf-8")
@@ -6783,7 +7764,7 @@ def _vlc_estado_json() -> dict:
 # Sites como TikTok, Instagram e Facebook quebram no modo leve porque o JavaScript deles confere o próprio
 # endereço, usa WebSocket e guarda dados por site. Serviços como o blockaway e o CroxyProxy resolvem isso com um
 # motor que REESCREVE O JAVASCRIPT dos sites. O Rammerhead (github.com/binary-person/rammerhead, MIT) é um motor
-# assim, aberto, em Node.js. O Termux-Toons o instala pelo npm em ~/.termux_toons/motor-completo e o roda em
+# assim, aberto, em Node.js. O LNUX o instala pelo npm em ~/.lnux/motor-completo e o roda em
 # 127.0.0.1; o navegador pelo celular confere o link secreto e repassa a ele os endereços /<sessão>/<site>.
 # Cada visitante tem a sua sessão (cookie navrh). O motor também nunca abre a rede local (servidor.js).
 
@@ -6799,12 +7780,12 @@ NAV_SALTO = {"connection", "keep-alive", "proxy-connection", "proxy-authorizatio
 _NAV_MOTOR_ESTADO = {"quando": 0.0, "no_ar": False, "porta": 0}
 
 NAV_MOTOR_JS = r"""'use strict';
-/* Termux-Toons · modo completo do navegador pelo celular (EXPERIMENTAL).
+/* LNUX · modo completo do navegador pelo celular (EXPERIMENTAL).
    Usa o Rammerhead (github.com/binary-person/rammerhead, licença MIT), que roda sobre o testcafe-hammerhead: ele
    reescreve o JavaScript dos sites para eles "acharem" que estão no próprio endereço, guarda os cookies e o
    localStorage de cada site e passa WebSocket. É o mesmo tipo de motor de sites como o blockaway e o CroxyProxy.
-   Só escuta em 127.0.0.1: quem fala com ele é o navegador pelo celular (Termux-Toons, em Python), que confere o
-   link secreto e repassa os pedidos. Este arquivo é reescrito pelo Termux-Toons a cada vez que o motor liga. */
+   Só escuta em 127.0.0.1: quem fala com ele é o navegador pelo celular (LNUX, em Python), que confere o
+   link secreto e repassa os pedidos. Este arquivo é reescrito pelo LNUX a cada vez que o motor liga. */
 const fs = require('fs');
 const path = require('path');
 const net = require('net');
@@ -6888,7 +7869,7 @@ const porta = parseInt(process.argv[2] || '8102', 10);
 let segredo = '';
 try { segredo = fs.readFileSync(path.join(__dirname, 'segredo'), 'utf8').trim(); } catch (e) { /* sem arquivo */ }
 if (!segredo) {
-  console.error('Falta o arquivo "segredo": instale o modo completo pelo Termux-Toons.');
+  console.error('Falta o arquivo "segredo": instale o modo completo pelo LNUX.');
   process.exit(1);
 }
 const pastaSessoes = path.join(__dirname, 'sessoes');
@@ -6962,7 +7943,7 @@ logger.info('(motor) Modo completo ouvindo em http://127.0.0.1:' + porta);
 """
 
 NAV_BARRA_COMPLETO_JS = r"""(function () {
-  /* Termux-Toons · minibarra das páginas abertas no modo completo (motor Rammerhead). Só botões e
+  /* LNUX · minibarra das páginas abertas no modo completo (motor Rammerhead). Só botões e
      location.assign: o motor reescreve links e atributos criados por script, então nada aqui usa href. */
   try {
     if (window.top !== window.self || window.__ttCompleto) return;
@@ -7023,11 +8004,11 @@ def _segredo_motor() -> str:
 
 
 def _escrever_arquivos_motor() -> None:
-    """servidor.js (sempre a versão deste Termux-Toons), package.json e o segredo (permissão 600)."""
+    """servidor.js (sempre a versão deste LNUX), package.json e o segredo (permissão 600)."""
     MOTOR_DIR.mkdir(parents=True, exist_ok=True)
     (MOTOR_DIR / "servidor.js").write_text(NAV_MOTOR_JS, "utf-8")
     (MOTOR_DIR / "package.json").write_text(json.dumps(
-        {"name": "termux-toons-motor-completo", "private": True, "description": "Modo completo do navegador "
+        {"name": "lnux-motor-completo", "private": True, "description": "Modo completo do navegador "
          "pelo celular (Rammerhead)", "dependencies": MOTOR_PACOTE}, indent=2), "utf-8")
     segredo = MOTOR_DIR / "segredo"
     if not _segredo_motor():
@@ -7095,7 +8076,7 @@ class _CorpoInvalido(Exception):
 
 
 class _HandlerNavegador(BaseHTTPRequestHandler):
-    server_version = "TermuxToons"
+    server_version = "LNUX"
     protocol_version = "HTTP/1.1"   # mantém a conexão aberta entre os pedidos (as páginas carregam bem mais rápido)
     timeout = 90                    # conexões paradas fecham sozinhas
     token = ""
@@ -7405,7 +8386,7 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
             return
         if not _motor_no_ar(self.porta_completo):
             self._responder(503, _pagina_erro_navegador(
-                "O modo completo está desligado. No Termux-Toons: navegador pelo celular → Modo completo.", real))
+                "O modo completo está desligado. No LNUX: navegador pelo celular → Modo completo.", real))
             return
         if not _destino_motor_ok(real):
             self._responder(403, _pagina_erro_navegador(
@@ -7455,7 +8436,7 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
         if not _motor_no_ar(self.porta_completo):
             leve = _nav_link(destino) if destino.startswith(("http://", "https://")) else None
             self._responder(503, _pagina_erro_navegador(
-                "O modo completo está desligado. Ligue no Termux-Toons ou use o modo leve.", destino)
+                "O modo completo está desligado. Ligue no LNUX ou use o modo leve.", destino)
                 if not leve else _pagina_erro_navegador("O modo completo está desligado.", destino))
             return
         if "websocket" in (self.headers.get("Upgrade") or "").lower():
@@ -7663,7 +8644,7 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
         if not pronto or time.time() - pronto[0] > 20 * 60 or not _video_ytdlp_ativo(pronto[1]["id"]):
             try:
                 info = _resolver_com_ytdlp(real, _sessao_navegador(sid)[1], _ConexaoNav.saida)
-            except ToonsError as e:
+            except LnuxError as e:
                 self._json({"ok": False, "erro": str(e)})
                 return
             caminho = _registrar_video_ytdlp(info)
@@ -7909,9 +8890,9 @@ class _HandlerNavegador(BaseHTTPRequestHandler):
 
 
 def _script_vlc_integracao() -> str:
-    dados = {"nome": "Termux-Toons", "versao": VERSION, "assinar": "/_tt/assinar?u=", "inicio": "/",
+    dados = {"nome": "LNUX", "versao": VERSION, "assinar": "/_tt/assinar?u=", "inicio": "/",
              "vlc": "/_tt/vlc?u="}
-    return f"<script>window.TERMUX_TOONS={_json_no_html(dados)};</script>"
+    return f"<script>window.LNUX=window.TERMUX_TOONS={_json_no_html(dados)};</script>"
 
 
 def _saida_navegador() -> tuple | None:
@@ -7928,7 +8909,7 @@ def servir_navegador(porta: int) -> None:
     """Servidor do navegador pelo celular (roda dentro do tmux)."""
     c = cfg()
     if not c.get("navegador_token"):
-        raise ToonsError("Crie o navegador pelo menu primeiro (ele gera o link secreto).")
+        raise LnuxError("Crie o navegador pelo menu primeiro (ele gera o link secreto).")
     saida = _saida_navegador()
     _ConexaoNav.saida = _ConexaoNavTLS.saida = saida
     _HandlerNavegador.token = c["navegador_token"]
@@ -8021,7 +9002,7 @@ def ligar_navegador() -> None:
         c["navegador_token"] = secrets.token_urlsafe(18)
     salvar_cfg()
     if not porta_livre(c["navegador_porta"], espera=2):
-        raise ToonsError(f"A porta {c['navegador_porta']} está em uso por outro programa. Troque no menu.")
+        raise LnuxError(f"A porta {c['navegador_porta']} está em uso por outro programa. Troque no menu.")
     saida = c.get("navegador_saida")
     servico_saida = {"ssh": SERVICO_PONTE_SSH, "tor": SERVICO_TOR}.get(saida or "")
     if servico_saida and not servico_ativo(servico_saida):
@@ -8202,7 +9183,7 @@ def _descricao_motor() -> str:
 
 
 def instalar_motor_completo() -> bool:
-    """Instala o Node.js (se faltar) e o Rammerhead pelo npm em ~/.termux_toons/motor-completo."""
+    """Instala o Node.js (se faltar) e o Rammerhead pelo npm em ~/.lnux/motor-completo."""
     aviso("Modo completo é EXPERIMENTAL: usa o Rammerhead (github.com/binary-person/rammerhead, MIT), que reescreve "
           "o JavaScript dos sites, como o blockaway. Baixa algumas dezenas de MB e pesa mais no celular.")
     if not garantir_cmd("node", "nodejs-lts") or not garantir_cmd("npm", "nodejs-lts"):
@@ -8231,7 +9212,7 @@ def ligar_motor_completo(religar_navegador: bool = True) -> bool:
     _escrever_arquivos_motor()
     porta = int(cfg().get("navegador_completo_porta") or 8102)
     if not porta_livre(porta, espera=2):
-        raise ToonsError(f"A porta {porta} (do modo completo) está em uso por outro programa. Troque no menu.")
+        raise LnuxError(f"A porta {porta} (do modo completo) está em uso por outro programa. Troque no menu.")
     ligou = iniciar_servico(SERVICO_MOTOR, f"cd {shlex.quote(str(MOTOR_DIR))} && node servidor.js {porta}",
                             reiniciar=True)
     if ligou and religar_navegador and servico_ativo(SERVICO_NAVEGADOR):
@@ -8558,14 +9539,14 @@ def instalar_ngrok() -> bool:
     arq = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "amd64", "amd64": "amd64", "i686": "386",
            "i386": "386"}.get(maquina, "arm" if maquina.startswith("arm") else None)
     if not arq:
-        raise ToonsError(f"Não sei qual ngrok serve para o processador '{maquina}'.")
+        raise LnuxError(f"Não sei qual ngrok serve para o processador '{maquina}'.")
     url = f"https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-{arq}.tgz"
     info(f"Baixando o ngrok ({arq})...")
     dados = pedir_bytes(url, timeout=180)
     with tarfile.open(fileobj=io.BytesIO(dados), mode="r:gz") as tar:
         membro = next((m for m in tar.getmembers() if m.isfile() and Path(m.name).name == "ngrok"), None)
         if membro is None:
-            raise ToonsError("O pacote baixado não tem o programa ngrok.")
+            raise LnuxError("O pacote baixado não tem o programa ngrok.")
         conteudo = tar.extractfile(membro).read()
     NGROK_BIN.parent.mkdir(parents=True, exist_ok=True)
     tmp = NGROK_BIN.with_suffix(".tmp")
@@ -8592,9 +9573,9 @@ def configurar_token_ngrok() -> bool:
     info("Crie uma conta grátis em ngrok.com e copie o 'Authtoken' em dashboard.ngrok.com → Your Authtoken.")
     token = re.sub(r"^.*add-authtoken\s+", "", perguntar("Authtoken do ngrok (ou o comando inteiro)").strip())
     if not re.fullmatch(r"[A-Za-z0-9_-]{20,}", token):
-        raise ToonsError("Isso não parece um authtoken do ngrok (é um texto comprido, só letras, números e _).")
+        raise LnuxError("Isso não parece um authtoken do ngrok (é um texto comprido, só letras, números e _).")
     if rodar([programa, "config", "add-authtoken", token], capturar=True, mostrar=False).returncode != 0:
-        raise ToonsError("O ngrok não aceitou guardar o token.")
+        raise LnuxError("O ngrok não aceitou guardar o token.")
     ok("Authtoken guardado.")
     return True
 
@@ -8704,7 +9685,7 @@ def ligar_ponte_ssh() -> bool:
     c = cfg()
     destino = c.get("ssh_ponte_destino")
     if not destino:
-        raise ToonsError("Configure primeiro o servidor (usuário@endereço).")
+        raise LnuxError("Configure primeiro o servidor (usuário@endereço).")
     if not garantir_cmd("ssh", "openssh"):
         return False
     porta_socks = c.get("ssh_ponte_socks", 1080)
@@ -8723,11 +9704,11 @@ def ligar_ponte_ssh() -> bool:
             texto = log_de(SERVICO_PONTE_SSH).read_text("utf-8", errors="replace")
         if "Permission denied" in texto:
             parar_servico(SERVICO_PONTE_SSH)
-            raise ToonsError("O servidor recusou a entrada: falta a chave deste celular nele. Use 'Criar a chave "
+            raise LnuxError("O servidor recusou a entrada: falta a chave deste celular nele. Use 'Criar a chave "
                              "deste celular e colocar no servidor'.")
         if re.search(r"Could not resolve|Connection refused|timed out|No route", texto):
             parar_servico(SERVICO_PONTE_SSH)
-            raise ToonsError("Não consegui chegar no servidor: " + texto.strip().splitlines()[-1][-200:])
+            raise LnuxError("Não consegui chegar no servidor: " + texto.strip().splitlines()[-1][-200:])
         if not porta_livre(porta_socks):
             ok(f"Túnel ligado: proxy SOCKS5 em {endereco if endereco != '0.0.0.0' else ip_local()}:{porta_socks}, "
                "saindo pelo seu servidor.")
@@ -8744,7 +9725,7 @@ def menu_ponte_ssh():
     def configurar():
         destino = perguntar("Servidor (usuário@endereço)", c.get("ssh_ponte_destino") or "").strip()
         if not re.fullmatch(r"[\w.-]+@[\w.:-]+", destino):
-            raise ToonsError("Escreva no formato usuário@endereço (ex.: joao@meuservidor.com).")
+            raise LnuxError("Escreva no formato usuário@endereço (ex.: joao@meuservidor.com).")
         c["ssh_ponte_destino"] = destino
         c["ssh_ponte_porta"] = perguntar_int("Porta do SSH no servidor", c.get("ssh_ponte_porta", 22), 1, 65535)
         c["ssh_ponte_socks"] = perguntar_int("Porta do proxy SOCKS aqui no celular", c.get("ssh_ponte_socks", 1080),
@@ -8758,7 +9739,7 @@ def menu_ponte_ssh():
         arq = _chave_ssh()
         if not arq.exists():
             arq.parent.mkdir(mode=0o700, exist_ok=True)
-            rodar(["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "termux-toons", "-f", str(arq)], capturar=True,
+            rodar(["ssh-keygen", "-t", "ed25519", "-N", "", "-C", "lnux", "-f", str(arq)], capturar=True,
                   check=True)
             ok("Chave criada.")
         publica = arq.with_suffix(".pub").read_text().strip()
@@ -8877,11 +9858,11 @@ def tor_nova_identidade() -> None:
             while chunk := s.recv(1024):
                 resposta += chunk
     except OSError as e:
-        raise ToonsError(f"Não consegui falar com o Tor (ele está ligado?): {e}") from None
+        raise LnuxError(f"Não consegui falar com o Tor (ele está ligado?): {e}") from None
     if resposta.count(b"250") >= 2:
         ok("Pronto: as próximas conexões usam caminhos novos (o Tor só deixa trocar a cada 10 segundos).")
     else:
-        raise ToonsError(f"O Tor recusou: {resposta.decode(errors='replace').strip()[:200]}")
+        raise LnuxError(f"O Tor recusou: {resposta.decode(errors='replace').strip()[:200]}")
 
 
 def mostrar_onion() -> None:
@@ -8912,7 +9893,7 @@ def menu_ponte_tor():
             info("O Tor está desligado.")
             return
         if not tem("curl"):
-            raise ToonsError("Instale o curl para testar (pkg install curl).")
+            raise LnuxError("Instale o curl para testar (pkg install curl).")
         proc = rodar(["curl", "-s", "--max-time", "40", "--socks5-hostname", f"127.0.0.1:{PORTA_TOR}",
                       "https://check.torproject.org/api/ip"], capturar=True, mostrar=False, timeout=60)
         try:
@@ -9102,7 +10083,7 @@ def menu_ponte_dns():
         texto = perguntar("IPs do seu Smart DNS (separados por espaço)", " ".join(c.get("smartdns_ips") or []))
         ips = [ip for ip in texto.replace(",", " ").split() if _ip_valido(ip)]
         if texto.strip() and not ips:
-            raise ToonsError("Não achei nenhum IP válido aí (ex.: 54.229.171.243).")
+            raise LnuxError("Não achei nenhum IP válido aí (ex.: 54.229.171.243).")
         c["smartdns_ips"] = ips
         salvar_cfg()
         ok(f"Guardado: {', '.join(ips) or 'nenhum'}.")
@@ -9173,7 +10154,7 @@ def _usar_rede_privada(rede: str) -> None:
 def _testar_aparelho() -> None:
     alvo = perguntar("IP do outro aparelho na rede (ex.: 100.101.102.103)").strip()
     if not _ip_valido(alvo):
-        raise ToonsError("Escreva um IP, como 100.101.102.103.")
+        raise LnuxError("Escreva um IP, como 100.101.102.103.")
     porta = perguntar_int("Porta para testar (22 = SSH, 3389 = área de trabalho remota do Windows)", 22, 1, 65535)
     inicio = time.perf_counter()
     try:
@@ -9287,7 +10268,7 @@ def menu_rede():
                 for chave in ("ssid", "bssid", "ip", "link_speed_mbps", "rssi", "frequency_mhz"):
                     if chave in wifi:
                         print(f"  {chave:<11} {wifi[chave]}")
-        except ToonsError as e:
+        except LnuxError as e:
             aviso(f"Wi-Fi: {e}")
 
     def descobrir():
@@ -9348,11 +10329,27 @@ def menu_rede():
     def wifi_proximas():
         redes = _tapi(["termux-wifi-scaninfo"], 30)
         if not isinstance(redes, list):
-            raise ToonsError(f"Resposta inesperada: {redes} (localização precisa estar ligada)")
+            raise LnuxError(f"Resposta inesperada: {redes} (localização precisa estar ligada)")
         for r in sorted(redes, key=lambda x: x.get("rssi", -999), reverse=True):
             print(f"  {r.get('rssi', '?'):>4} dBm  {r.get('frequency_mhz', '?'):>5} MHz  {r.get('ssid') or '(oculta)'}")
 
     def trafego():
+        if not sistema().android:  # Linux: o tcpdump com sudo, na interface da rota padrão
+            if not garantir_cmd("tcpdump"):
+                return
+            rota = saida(["ip", "route", "show", "default"])
+            m = re.search(r"\bdev\s+(\S+)", rota)
+            interface = perguntar("Interface", m.group(1) if m else "eth0")
+            n = perguntar_int("Quantos pacotes capturar", 200, 1)
+            arq = DATA_DIR / f"captura_{datetime.now():%Y%m%d_%H%M%S}.pcap"
+            cmd = como_root(["tcpdump", "-i", interface, "-c", str(n), "-w", str(arq)])
+            if cmd is None:
+                raise LnuxError("Capturar pacotes exige root (sudo ou doas).")
+            rodar(cmd)
+            if arq.exists():
+                rodar(como_root(["chown", f"{os.getuid()}:{os.getgid()}", str(arq)]) or ["true"], capturar=True)
+            info(f"Captura salva em {arq}. Abra no Wireshark ou leia com: tcpdump -nn -r {arq}")
+            return
         if tem_root():
             if not garantir_cmd("tcpdump", repo="root-repo"):
                 return
@@ -9384,10 +10381,18 @@ def menu_rede():
         usuario = saida(["whoami"]) or getpass.getuser()
         ok(f"SSH na porta 8022. De outro computador:\n    ssh -p 8022 {usuario}@{ip_local()}")
 
+    def ssh_ligar_sistema():
+        if not tem("sshd") and not tem("/usr/sbin/sshd") and not Path("/usr/sbin/sshd").exists():
+            if not confirmar("O servidor SSH não parece instalado. Instalar agora?", True) or not instalar_pkg("openssh"):
+                return
+        if servico_do_sistema("ssh", "ligar_no_boot") and servico_do_sistema("ssh", "iniciar"):
+            ok(f"SSH ligado na porta 22. De outro computador:\n    ssh {getpass.getuser()}@{ip_local()}")
+            info("A senha é a do seu usuário neste computador (ou use uma chave: 'Autorizar uma chave pública').")
+
     def ssh_chave():
         chave = perguntar("Cole a chave pública (ssh-ed25519 AAAA... / ssh-rsa ...)")
         if not chave.startswith(("ssh-", "ecdsa-", "sk-")):
-            raise ToonsError("Isso não parece uma chave pública SSH.")
+            raise LnuxError("Isso não parece uma chave pública SSH.")
         pasta = HOME / ".ssh"
         pasta.mkdir(mode=0o700, exist_ok=True)
         arq = pasta / "authorized_keys"
@@ -9405,7 +10410,7 @@ def menu_rede():
         privada = saida(["wg", "genkey"])
         publica = rodar(["wg", "pubkey"], capturar=True, entrada=privada + "\n", mostrar=False).stdout.strip()
         if not privada or not publica:
-            raise ToonsError("Falha ao gerar as chaves.")
+            raise LnuxError("Falha ao gerar as chaves.")
         ok(f"Chave pública deste cliente: {NEG}{publica}{RST}")
         endereco = perguntar("Endereço deste cliente na VPN", "10.8.0.2/32")
         dns = perguntar("DNS", "1.1.1.1")
@@ -9437,10 +10442,15 @@ def menu_rede():
                 ("Redes Wi-Fi próximas", wifi_proximas),
                 ("Análise de tráfego (tcpdump / .pcap)", trafego),
             ])),
-        ("🔐 Servidor SSH (porta 8022)", grupo("🔐 Servidor SSH", [
-            ("Instalar e definir senha", ssh_configurar),
-            ("Iniciar o servidor (porta 8022)", ssh_iniciar),
-            ("Parar o servidor", lambda: rodar(["pkill", "sshd"])),
+        (por_sistema("🔐 Servidor SSH (porta 8022)", "🔐 Servidor SSH (porta 22)"), grupo("🔐 Servidor SSH", [
+            ("Instalar e definir senha", so_em("termux", ssh_configurar)),
+            ("Iniciar o servidor (porta 8022)", so_em("termux", ssh_iniciar)),
+            ("Parar o servidor", so_em("termux", lambda: rodar(["pkill", "sshd"]))),
+            # no Linux o sshd é um serviço do sistema (systemd/OpenRC), com o nome que o perfil da distro diz
+            ("Instalar o servidor SSH", so_em("!termux", lambda: instalar_pkg("openssh"))),
+            ("Ligar o servidor SSH (e ao iniciar o computador)", so_em("servicos_sistema", ssh_ligar_sistema)),
+            ("Desligar o servidor SSH", so_em("servicos_sistema", lambda: servico_do_sistema("ssh", "parar"))),
+            ("Status do servidor SSH", so_em("servicos_sistema", lambda: servico_do_sistema("ssh", "status"))),
             ("Autorizar uma chave pública", ssh_chave),
         ])),
         ("🔒 WireGuard: gerar chaves + config + QR code", wireguard),
@@ -10018,7 +11028,7 @@ class Basic:
 
     def repl(self) -> None:
         BASIC_DIR.mkdir(parents=True, exist_ok=True)
-        print(f"{VERD}TOONS BASIC {VERSION}{RST} — digite AJUDA para ver os comandos, SAIR para voltar.\nPRONTO")
+        print(f"{VERD}LNUX BASIC {VERSION}{RST} — digite AJUDA para ver os comandos, SAIR para voltar.\nPRONTO")
         while True:
             try:
                 linha = input("> ")
@@ -10080,7 +11090,7 @@ class Basic:
 
 
 TEMPLATE_JOGO = r'''#!/usr/bin/env python3
-"""Meu jogo de terminal — gerado pelo Termux-Toons. Edite à vontade!
+"""Meu jogo de terminal — gerado pelo LNUX. Edite à vontade!
 
 Mova o @ com as setas ou WASD, pegue os $ e fuja dos X. q para sair.
 """
@@ -10272,7 +11282,7 @@ def script_desktop(distro: str, iniciar: str, usuario: str = "", gpu: bool = Fal
     login = ["proot-distro", "login", distro, "--shared-tmp"] + (["--user", usuario] if usuario else [])
     linhas = [
         f"#!{PREFIX or '/data/data/com.termux/files/usr'}/bin/bash",
-        f"# Gerado pelo Termux-Toons: abre o desktop da distro '{distro}' no app Termux:X11.",
+        f"# Gerado pelo LNUX: abre o desktop da distro '{distro}' no app Termux:X11.",
         'export XDG_RUNTIME_DIR="${TMPDIR:-/tmp}"',
         "pkill -f com.termux.x11 >/dev/null 2>&1  # servidor X de uma sessão anterior",
         "command -v pulseaudio >/dev/null && pulseaudio --start --exit-idle-time=-1 "
@@ -10300,11 +11310,11 @@ def iniciar_desktop(distro: str, usuario: str | None = None) -> bool:
     if not garantir_cmd("proot-distro") or not garantir_termux_x11():
         return False
     if distro not in distros_instaladas():
-        raise ToonsError(f"A distro '{distro}' não está instalada (veja em 'Listar distros instaladas').")
+        raise LnuxError(f"A distro '{distro}' não está instalada (veja em 'Listar distros instaladas').")
     info("Procurando o ambiente gráfico instalado na distro...")
     iniciar = ambiente_da_distro(distro)
     if not iniciar:
-        raise ToonsError(f"Nenhum ambiente gráfico instalado no '{distro}'. Use 'Instalar um ambiente gráfico' primeiro.")
+        raise LnuxError(f"Nenhum ambiente gráfico instalado no '{distro}'. Use 'Instalar um ambiente gráfico' primeiro.")
     c = cfg()
     usuario = c.get("x11_usuarios", {}).get(distro, "") if usuario is None else usuario
     gpu = bool(c.get("x11_gpu"))
@@ -10368,7 +11378,7 @@ def menu_x11():
         with manter_acordado():
             proc = rodar(["proot-distro", "login", distro, "--", "sh", "-c", _script_instalar(ambiente)])
         if proc.returncode != 0:
-            raise ToonsError("A instalação falhou (veja as mensagens acima). Tente 'Atualizar pacotes das distros' e repita.")
+            raise LnuxError("A instalação falhou (veja as mensagens acima). Tente 'Atualizar pacotes das distros' e repita.")
         ok("Ambiente gráfico instalado.")
         if confirmar("Instalar também um navegador (Firefox; no Ubuntu, o Epiphany)?", True):
             # no Ubuntu o Firefox e o Chromium vêm por snap, que não roda no proot
@@ -10429,6 +11439,99 @@ def menu_x11():
     ])
 
 
+# ── Nas distros: outras distros em contêineres (Distrobox + Podman) ──
+# O proot-distro é do Termux. No Linux, o equivalente é o Distrobox: cada distro roda num contêiner do Podman
+# (ou Docker) que compartilha a pasta pessoal, o som e as janelas com o computador, e os apps de lá podem
+# aparecer no menu do sistema.
+
+IMAGENS_DISTROBOX = [
+    ("Debian (estável)", "docker.io/library/debian:stable", "debian"),
+    ("Ubuntu 24.04", "docker.io/library/ubuntu:24.04", "ubuntu"),
+    ("Arch Linux", "docker.io/library/archlinux:latest", "arch"),
+    ("Fedora", "registry.fedoraproject.org/fedora-toolbox:latest", "fedora"),
+    ("Alpine", "docker.io/library/alpine:latest", "alpine"),
+    ("openSUSE Tumbleweed", "registry.opensuse.org/opensuse/distrobox:latest", "opensuse"),
+    ("Kali Linux", "docker.io/kalilinux/kali-rolling:latest", "kali"),
+]
+
+
+def conteineres_distrobox() -> list:
+    """Nomes dos contêineres criados pelo Distrobox (a 2ª coluna do 'distrobox list')."""
+    linhas = saida(["distrobox", "list", "--no-color"], timeout=60).splitlines()
+    return [partes[1].strip() for partes in (l.split("|") for l in linhas[1:]) if len(partes) >= 3 and partes[1].strip()]
+
+
+@submenu
+def menu_distrobox():
+    def pronto() -> bool:
+        if tem("distrobox") and (tem("podman") or tem("docker")):
+            return True
+        aviso("Falta o Distrobox (e o Podman, que roda os contêineres).")
+        return confirmar("Instalar agora?", True) and instalar_pkg("distrobox", "podman") and tem("distrobox")
+
+    def escolher_conteiner(msg: str = "Qual contêiner?") -> str | None:
+        nomes = conteineres_distrobox()
+        if not nomes:
+            info("Nenhum contêiner criado ainda: use 'Criar um contêiner'.")
+            return None
+        i = escolher(msg, nomes)
+        return nomes[i] if i is not None else None
+
+    def criar():
+        if not pronto():
+            return
+        i = escolher("Qual distro?", [n for n, _, _ in IMAGENS_DISTROBOX] + ["Outra imagem (digitar)"])
+        if i is None:
+            return
+        if i < len(IMAGENS_DISTROBOX):
+            _, imagem, nome_padrao = IMAGENS_DISTROBOX[i]
+        else:
+            imagem, nome_padrao = perguntar("Imagem (ex.: docker.io/library/debian:12)"), "minha-distro"
+        nome = perguntar("Nome do contêiner", nome_padrao).strip() or nome_padrao
+        info("Baixando a imagem e criando o contêiner (a primeira vez leva alguns minutos)...")
+        if rodar(["distrobox", "create", "--yes", "--name", nome, "--image", imagem]).returncode == 0:
+            ok(f"Contêiner '{nome}' criado. Use 'Entrar' para abrir o terminal dele.")
+
+    def entrar():
+        if pronto() and (nome := escolher_conteiner("Entrar em qual?")):
+            info("Para sair do contêiner: exit (ou Ctrl+D).")
+            rodar(["distrobox", "enter", nome], mostrar=False)
+
+    def comando():
+        if pronto() and (nome := escolher_conteiner()):
+            cmd = perguntar("Comando (ex.: sudo apt install htop)")
+            if cmd:
+                rodar(["distrobox", "enter", nome, "--", "sh", "-c", cmd])
+
+    def exportar_app():
+        if pronto() and (nome := escolher_conteiner()):
+            app = perguntar("Nome do app instalado no contêiner (ex.: firefox, gimp, code)").strip()
+            if app and rodar(["distrobox", "enter", nome, "--", "distrobox-export", "--app", app]).returncode == 0:
+                ok(f"'{app}' aparece agora no menu de aplicativos do computador (abre de dentro do '{nome}').")
+
+    def parar():
+        if pronto() and (nome := escolher_conteiner("Parar qual?")):
+            rodar(["distrobox", "stop", "--yes", nome])
+
+    def remover():
+        if pronto() and (nome := escolher_conteiner("Remover qual?")):
+            if confirmar(f"Apagar o contêiner '{nome}' e tudo o que foi instalado nele? (a pasta pessoal fica)", False):
+                rodar(["distrobox", "rm", "--force", nome])
+
+    menu("🐧 Outras distros em contêineres (Distrobox)", [
+        ("Instalar o Distrobox e o Podman", lambda: instalar_pkg("distrobox", "podman")),
+        ("Criar um contêiner (Debian, Ubuntu, Arch, Fedora, Alpine, openSUSE, Kali...)", criar),
+        ("Listar os contêineres", lambda: pronto() and rodar(["distrobox", "list"], mostrar=False)),
+        ("Entrar num contêiner (terminal)", entrar),
+        ("Rodar um comando dentro de um contêiner", comando),
+        ("Levar um app do contêiner para o menu do computador (distrobox-export)", exportar_app),
+        ("Atualizar todos os contêineres", lambda: pronto() and rodar(["distrobox", "upgrade", "--all"])),
+        ("Parar um contêiner", parar),
+        ("Remover um contêiner", remover),
+    ], cabecalho=lambda: print(f"{DIM}Cada distro roda num contêiner que usa a sua pasta pessoal, o som e as janelas "
+                               f"deste computador. Sem root e sem mexer no sistema.{RST}"))
+
+
 @submenu
 def menu_proot():
     def instalar_distro():
@@ -10467,7 +11570,7 @@ def menu_proot():
         nome = escolher_distro_instalada()
         usuario = perguntar("Nome do novo usuário")
         if not nome or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,30}", usuario or ""):
-            raise ToonsError("Nome de usuário inválido (use letras minúsculas, números, _ e -).")
+            raise LnuxError("Nome de usuário inválido (use letras minúsculas, números, _ e -).")
         script = (
             "set -e; "
             "if command -v apt-get >/dev/null; then apt-get update && apt-get install -y sudo; "
@@ -10519,7 +11622,7 @@ def menu_proot():
 # ════════════════════════════════════════════════════════════════════
 
 def _pasta_compartilhada_padrao() -> str:
-    compartilhado = HOME / "storage" / "shared"
+    compartilhado = pasta_usuario("shared")
     return str(compartilhado if compartilhado.exists() else HOME)
 
 
@@ -10598,7 +11701,7 @@ def _encurtar_registro(arq: Path) -> None:
 class _HandlerSite(SimpleHTTPRequestHandler):
     """Entrega os arquivos de uma pasta como site: abre o index.html, mas não lista pastas
     nem mostra arquivos ocultos (.git, .env...). Também anota quem acessou (IP, país, aparelho)."""
-    server_version = f"TermuxToons/{VERSION}"
+    server_version = f"LNUX/{VERSION}"
     arquivo_visitas: Path | None = None  # para onde anotar as visitas (um processo por site)
     nome_site = ""  # aparece no aviso de visitante novo
     vistos: set = set()  # IPs que já abriram uma página: o aviso é só para quem é novo
@@ -10728,7 +11831,7 @@ def servir_site(pasta: str, porta: int, visitas: str | None = None, nome: str = 
     """Sobe o site em primeiro plano (é o que roda dentro do tmux)."""
     pasta = str(Path(os.path.expanduser(pasta)).resolve())
     if not Path(pasta).is_dir():
-        raise ToonsError(f"Pasta não encontrada: {pasta}")
+        raise LnuxError(f"Pasta não encontrada: {pasta}")
     _HandlerSite.arquivo_visitas = Path(visitas) if visitas else None
     _HandlerSite.nome_site = nome or Path(pasta).name
     if _HandlerSite.arquivo_visitas:  # quem já tinha vindo antes não é "visitante novo"
@@ -10769,7 +11872,7 @@ def _porta_do_site(n: int, preferida: int) -> int:
     for porta in (cfg()["site_porta"], *range(8111, 8131)):
         if porta not in ocupadas and porta_livre(porta):
             return porta
-    raise ToonsError("Não achei uma porta livre para o site. Troque 'site_porta' em Configurações.")
+    raise LnuxError("Não achei uma porta livre para o site. Troque 'site_porta' em Configurações.")
 
 
 def links_do_site(n: int) -> list:
@@ -11253,7 +12356,7 @@ def _ip_da_internet(ip: str) -> bool:
 
 def _consultar_ip(ip: str) -> dict:
     """Operadora, cidade e estado aproximados de um IP público (ipwho.is; se falhar, ipinfo.io)."""
-    with contextlib.suppress(ToonsError):
+    with contextlib.suppress(LnuxError):
         d = pedir_json(f"https://ipwho.is/{urllib.parse.quote(ip)}?lang=pt-BR", timeout=12)
         if isinstance(d, dict) and d.get("success"):
             con = d.get("connection") or {}
@@ -11261,7 +12364,7 @@ def _consultar_ip(ip: str) -> dict:
                     "estado": d.get("region_code") or d.get("region") or "", "pais": d.get("country_code") or ""}
     d = pedir_json(f"https://ipinfo.io/{urllib.parse.quote(ip)}/json", timeout=12)
     if not isinstance(d, dict) or d.get("bogon"):
-        raise ToonsError("resposta sem dados")
+        raise LnuxError("resposta sem dados")
     return {"operadora": re.sub(r"^AS\d+\s+", "", d.get("org") or ""), "cidade": d.get("city") or "",
             "estado": d.get("region") or "", "pais": d.get("country") or ""}
 
@@ -11289,7 +12392,7 @@ def _consultar_operadoras(grupos: list) -> None:
             print(f"\r  {DIM}consultando {i}/{len(faltam)}...{RST}\033[K", end="", flush=True)
             try:
                 cache[ip] = {**_consultar_ip(ip), "em": time.time()}
-            except ToonsError as e:
+            except LnuxError as e:
                 print()
                 aviso(f"{ip}: {e}")
             time.sleep(0.3)  # sem pressa: os serviços gratuitos limitam os pedidos
@@ -11545,7 +12648,7 @@ def alternar_aviso_visitas() -> None:
     if not tem("termux-notification"):
         aviso("Para a notificação aparecer, instale o Termux:API: 'pkg install termux-api' e o app Termux:API.")
     if sites_no_ar():
-        print(f"  {DIM}Um site que já estava no ar antes desta versão do Termux-Toons precisa ser publicado de "
+        print(f"  {DIM}Um site que já estava no ar antes desta versão do LNUX precisa ser publicado de "
               f"novo para avisar.{RST}")
 
 
@@ -11606,7 +12709,7 @@ def qr_do_site(n: int | None = None) -> None:
     print(f"  {CIANO}{onde}:{RST} {NEG}{link}{RST}")
     if confirmar("Baixar o QR code (imagem .png na pasta Download)?", True) \
             and not salvar_qr(link, f"site {_dados_site(n)['nome']}"):
-        raise ToonsError("Não consegui salvar a imagem do QR code.")
+        raise LnuxError("Não consegui salvar a imagem do QR code.")
 
 
 def publicar_site() -> None:
@@ -11672,7 +12775,7 @@ def publicar_site() -> None:
                 return
             pasta, pagina = alvo.parent, "" if alvo.name == "index.html" else alvo.name
     else:
-        raise ToonsError(f"Escolha um arquivo .html ou uma pasta: {alvo}")
+        raise LnuxError(f"Escolha um arquivo .html ou uma pasta: {alvo}")
     servico, tunel = _servico_site(n), _tunel_site(n)
     anterior = _dados_site(n)["porta"]
     if servico_ativo(servico):
@@ -11771,7 +12874,7 @@ def menu_arquivos():
         if not garantir_cmd("rclone"):
             return
         pasta = os.path.expanduser(perguntar("Pasta a servir", _pasta_compartilhada_padrao()))
-        usuario = perguntar("Usuário", "toons")
+        usuario = perguntar("Usuário", "lnux")
         senha = perguntar("Senha", secrets.token_urlsafe(8))
         comando = shlex.join(["rclone", "serve", "webdav", pasta, "--addr", ":8091",
                               "--user", usuario, "--pass", senha])
@@ -11819,6 +12922,40 @@ def menu_arquivos():
         if iniciar_servico("samba", shlex.join(["smbd", "--foreground", "--no-process-group",
                                                 "--debug-stdout", "-s", str(conf)])):
             info(f"Conecte em smb://{ip_local()}:4450/termux  (usuário {usuario})")
+
+    def backup_pessoal():
+        """Linux: a pasta pessoal (~) num .tar.gz, sem caches, sem a própria pasta Downloads e sem o que é grande
+        e se baixa de novo (modelos de IA, build do llama.cpp, node_modules)."""
+        pasta = DOWNLOADS if DOWNLOADS.is_dir() else HOME
+        excluir = [f"--exclude=./{HOME.name}/.cache", f"--exclude=./{HOME.name}/.local/share/Trash",
+                   f"--exclude=./{HOME.name}/{DOWNLOADS.relative_to(HOME)}" if DOWNLOADS.is_relative_to(HOME) else "",
+                   "--exclude=node_modules", "--exclude=*.part"]
+        if confirmar("Deixar de fora modelos LLM, o build do llama.cpp e contêineres (bem grandes)?", True):
+            excluir += [f"--exclude=./{HOME.name}/llama-models", f"--exclude=./{HOME.name}/llama.cpp/build",
+                        f"--exclude=./{HOME.name}/.local/share/containers"]
+        destino = pasta / f"lnux-backup-{getpass.getuser()}-{datetime.now():%Y%m%d-%H%M}.tar.gz"
+        info(f"Criando {destino} (a pasta {HOME}) ...")
+        proc = rodar(["tar", "-zcf", destino, "-C", HOME.parent, *[e for e in excluir if e], f"./{HOME.name}"])
+        if destino.exists():
+            ok(f"Backup pronto: {destino} ({bytes_humanos(destino.stat().st_size)})")
+            if proc.returncode != 0:
+                aviso("O tar avisou de algum problema (pode ser só arquivo em uso ou sem permissão).")
+        else:
+            erro("O backup não foi criado.")
+
+    def restaurar_pessoal():
+        candidatos = sorted(set(DOWNLOADS.glob("lnux-backup-*.tar.gz")) | set(HOME.glob("lnux-backup-*.tar.gz")))
+        if candidatos:
+            i = escolher("Backup", [p.name for p in candidatos])
+            arq = candidatos[i] if i is not None else None
+        else:
+            arq = Path(os.path.expanduser(perguntar("Caminho do .tar.gz"))) if confirmar("Informar o caminho?") else None
+        if not arq or not arq.exists():
+            return
+        aviso(f"A restauração SOBRESCREVE os arquivos de {HOME} que estiverem no backup.")
+        if confirmar(f"Restaurar {arq.name}?", False):
+            rodar(["tar", "-zxf", arq, "-C", HOME.parent, "--keep-newer-files"])
+            ok("Restaurado (arquivos mais novos que os do backup foram mantidos).")
 
     def backup():
         base = _caminho_termux()
@@ -11884,10 +13021,13 @@ def menu_arquivos():
             ("Samba (SMB): configurar e iniciar", samba),
             ("Samba (SMB): parar", lambda: parar_servico("samba")),
         ])),
-        ("💾 Backup do Termux (fazer e restaurar)", grupo("💾 Backup do Termux", [
-            ("Backup do Termux (.tar.gz em Downloads)", backup),
-            ("Restaurar backup do Termux", restaurar),
-        ])),
+        (por_sistema("💾 Backup do Termux (fazer e restaurar)", "💾 Backup da pasta pessoal (fazer e restaurar)"),
+         grupo("💾 Backup", [
+             ("Backup do Termux (.tar.gz em Downloads)", so_em("termux", backup)),
+             ("Restaurar backup do Termux", so_em("termux", restaurar)),
+             ("Backup da pasta pessoal (.tar.gz em Downloads)", so_em("!termux", backup_pessoal)),
+             ("Restaurar backup da pasta pessoal", so_em("!termux", restaurar_pessoal)),
+         ])),
     ])
 
 
@@ -11902,7 +13042,7 @@ CONTROLES_MPV = ("Controles: Espaço pausa · ←/→ 5s · ↑/↓ 1min · 9/0 
 
 
 def pasta_musicas() -> Path:
-    return Path(os.path.expanduser(cfg()["pasta_musicas"]))
+    return caminho_do_usuario(cfg()["pasta_musicas"])
 
 
 # formato: (descrição no menu, opções do yt-dlp, leva a capa embutida?)
@@ -11970,7 +13110,7 @@ def filtro_mpv_eq(eq: dict | None = None) -> str:
     """O --af do mpv com o equalizador, se ele estiver ligado ('' se desligado ou plano)."""
     eq = eq or equalizador()
     cadeia = cadeia_eq(eq) if eq["ligado"] else ""
-    return f"@toons-eq:lavfi=[{cadeia}]" if cadeia else ""
+    return f"@lnux-eq:lavfi=[{cadeia}]" if cadeia else ""
 
 
 def aplicar_eq_no_player(eq: dict) -> bool:
@@ -12145,7 +13285,7 @@ def buscar_youtube(termo: str, n: int = 10) -> list:
             resultados.append({"id": partes[0], "titulo": partes[1], "duracao": partes[2], "canal": partes[3],
                                "url": f"https://www.youtube.com/watch?v={partes[0]}"})
     if not resultados:
-        raise ToonsError("Nada encontrado. " + (proc.stderr or "").strip()[-300:])
+        raise LnuxError("Nada encontrado. " + (proc.stderr or "").strip()[-300:])
     return resultados
 
 
@@ -12163,8 +13303,8 @@ def escolher_resultado(termo: str) -> dict | None:
 # parar), anuncia por voz a música que começou (se a pessoa ligar) e some com a notificação quando acaba.
 # Na rádio, próxima/anterior trocam de estação e a legenda automática transcreve a fala (LegendaRadio).
 
-MPV_SOCKET = Path(os.environ.get("TMPDIR") or "/tmp") / f"toons-mpv-{getattr(os, 'getuid', lambda: 0)()}.sock"
-NOTIFICACAO_PLAYER = "toons-player"
+MPV_SOCKET = Path(os.environ.get("TMPDIR") or "/tmp") / f"lnux-mpv-{getattr(os, 'getuid', lambda: 0)()}.sock"
+NOTIFICACAO_PLAYER = "lnux-player"
 
 
 class Mpv:
@@ -12248,7 +13388,7 @@ def iniciar_player(alvos: list, aleatorio: bool = False, playlist: Path | None =
     parar_player()
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     cmd = ["mpv", "--no-video", "--input-terminal=no", "--msg-level=all=warn", "--idle=no",
-           f"--input-ipc-server={MPV_SOCKET}", f"--script-opts=toons-tipo={tipo}{',toons-titulo=sim' if titulo else ''}",
+           f"--input-ipc-server={MPV_SOCKET}", f"--script-opts=lnux-tipo={tipo}{',lnux-titulo=sim' if titulo else ''}",
            *([f"--force-media-title={titulo}"] if titulo else []),
            *_opcoes_mpv(alvos, aleatorio, playlist, stream, inicio)]
     with open(log_de("player"), "w") as arq_log:
@@ -12259,7 +13399,7 @@ def iniciar_player(alvos: list, aleatorio: bool = False, playlist: Path | None =
     except OSError:
         proc.kill()
         detalhe = log_de("player").read_text("utf-8", errors="replace").strip().splitlines()[-3:]
-        raise ToonsError("O mpv não abriu. " + " ".join(detalhe)) from None
+        raise LnuxError("O mpv não abriu. " + " ".join(detalhe)) from None
     if tem("termux-wake-lock"):  # com a tela apagada o Android pausaria o som
         rodar(["termux-wake-lock"], mostrar=False, timeout=10)
     subprocess.Popen([sys.executable, str(SCRIPT), "player", "--vigiar"], stdin=subprocess.DEVNULL,
@@ -12273,8 +13413,8 @@ def faixa_atual(mpv: Mpv) -> dict:
     pos, total = mpv.get("playlist-pos", -1), mpv.get("playlist-count", 0)
     caminho = mpv.get("path") or mpv.get(f"playlist/{pos}/filename") or ""
     opcoes = mpv.get("script-opts") or {}
-    tipo = opcoes.get("toons-tipo", "musica")
-    if opcoes.get("toons-titulo"):  # nome dado ao tocar ("Música — Artista"), por cima das etiquetas
+    tipo = opcoes.get("lnux-tipo", "musica")
+    if opcoes.get("lnux-titulo"):  # nome dado ao tocar ("Música — Artista"), por cima das etiquetas
         titulo, _, subtitulo = str(mpv.get("media-title") or caminho).partition(" — ")
     elif tipo == "radio":
         titulo = mpv.get(f"playlist/{pos}/title") or meta.get("icy-name") or caminho
@@ -12295,7 +13435,7 @@ def faixa_atual(mpv: Mpv) -> dict:
 
 def _acao_mpv(*comando) -> str:
     """Linha de shell para um botão da notificação: manda `comando` ao mpv pelo socket (rápido, sem abrir o
-    Termux-Toons inteiro)."""
+    LNUX inteiro)."""
     pedido = (json.dumps({"command": list(comando)}) + "\n").encode()
     codigo = f"import socket;s=socket.socket(socket.AF_UNIX);s.connect({str(MPV_SOCKET)!r});s.sendall({pedido!r})"
     return shlex.join([sys.executable, "-c", codigo])
@@ -12305,7 +13445,7 @@ CAPAS_DIR = DATA_DIR / "capas"
 
 
 def capa_da_faixa(caminho: str, radio: dict | None = None) -> Path | None:
-    """Capa quadrada de 256 px, guardada em ~/.termux_toons/capas: a embutida no arquivo, a miniatura do YouTube
+    """Capa quadrada de 256 px, guardada em ~/.lnux/capas: a embutida no arquivo, a miniatura do YouTube
     ou o ícone da rádio. None se não houver (um arquivo vazio no cache lembra que não tem)."""
     if not caminho:
         return None
@@ -12402,7 +13542,7 @@ def vigiar_player() -> None:
                 anunciada = faixa
                 if ler_json(CONFIG_FILE, {}).get("player_anunciar") and tem("termux-tts-speak"):
                     quem = f" de {f['subtitulo'].split(' · ')[0]}" if f["tipo"] != "radio" and f["subtitulo"] else ""
-                    with contextlib.suppress(ToonsError):
+                    with contextlib.suppress(LnuxError):
                         falar(f"Tocando agora: {faixa}{quem}")
             time.sleep(1)
     finally:
@@ -12457,7 +13597,7 @@ class LegendaRadio:
 
     @staticmethod
     def _limpar_sobras() -> None:
-        """Apaga a pasta (e encerra o ffmpeg) de legendas de um Termux-Toons que morreu sem fechar."""
+        """Apaga a pasta (e encerra o ffmpeg) de legendas de um LNUX que morreu sem fechar."""
         for velha in (DATA_DIR / "tmp").glob("legenda-*"):
             with contextlib.suppress(OSError, ValueError):
                 if Path(f"/proc/{int(velha.name.split('-')[1])}").exists():
@@ -12993,12 +14133,12 @@ def tela_equalizador() -> None:
 
 def tocar_mpv(alvos: list, aleatorio: bool = False, playlist: Path | None = None, stream: bool = False,
               inicio: int = 0, tipo: str = "musica", titulo: str | None = None) -> None:
-    """Toca no player do Termux-Toons (tela 'Tocando agora' e notificação com botões). Sem terminal interativo,
+    """Toca no player do LNUX (tela 'Tocando agora' e notificação com botões). Sem terminal interativo,
     toca no próprio terminal com os controles do mpv."""
     if not tem("mpv") and not garantir_deps_musica():
         return
     if not alvos and not playlist:
-        raise ToonsError("Nada para tocar.")
+        raise LnuxError("Nada para tocar.")
     if not setas_ativas():
         print(CONTROLES_MPV)
         rodar(["mpv", "--no-video", "--term-osd-bar", *([f"--force-media-title={titulo}"] if titulo else []),
@@ -13048,7 +14188,7 @@ def _spotify_busca(pagina: str) -> str:
     if titulo_musica:
         artista = descricao.split("·")[0].strip() if "·" in descricao else ""
         return f"{artista} - {titulo_musica}".strip(" -")
-    raise ToonsError("Não consegui ler o nome da música no Spotify.")
+    raise LnuxError("Não consegui ler o nome da música no Spotify.")
 
 
 def spotify_para_buscas(url: str) -> list:
@@ -13056,18 +14196,18 @@ def spotify_para_buscas(url: str) -> list:
     url = url.split("?")[0]
     status, pagina = baixar_pagina(url)
     if status >= 400:
-        raise ToonsError(f"Spotify respondeu HTTP {status}.")
+        raise LnuxError(f"Spotify respondeu HTTP {status}.")
     if "/track/" in url:
         return [_spotify_busca(pagina)]
     faixas = list(dict.fromkeys(re.findall(r'content="(https://open\.spotify\.com/track/[A-Za-z0-9]+)"', pagina)))
     if not faixas:
-        raise ToonsError("Nenhuma faixa encontrada na página (playlists privadas/dinâmicas não funcionam).")
+        raise LnuxError("Nenhuma faixa encontrada na página (playlists privadas/dinâmicas não funcionam).")
     buscas = []
     for i, faixa in enumerate(faixas[:50], 1):
         print(f"\r  Lendo faixas do Spotify: {i}/{min(len(faixas), 50)}", end="", flush=True)
         try:
             buscas.append(_spotify_busca(baixar_pagina(faixa)[1]))
-        except (ToonsError, OSError):
+        except (LnuxError, OSError):
             pass
     print()
     return buscas
@@ -13098,7 +14238,7 @@ ACOUSTID_NOVA_CHAVE = "https://acoustid.org/new-application"
 
 
 def biblioteca_chromaprint() -> str | None:
-    """A libchromaprint que o Termux-Toons compilou, ou uma que já exista no sistema."""
+    """A libchromaprint que o LNUX compilou, ou uma que já exista no sistema."""
     compilada = CHROMAPRINT_DIR / "build" / "src" / "libchromaprint.so"
     if compilada.exists():
         return str(compilada)
@@ -13109,7 +14249,7 @@ def biblioteca_chromaprint() -> str | None:
 def compilar_chromaprint() -> None:
     for cmd, pacote in (("git", "git"), ("cmake", "cmake"), ("clang", "clang"), ("make", "make"), ("ffmpeg", "ffmpeg")):
         if not garantir_cmd(cmd, pacote):
-            raise ToonsError(f"'{cmd}' é necessário para compilar.")
+            raise LnuxError(f"'{cmd}' é necessário para compilar.")
     if (CHROMAPRINT_DIR / ".git").exists():
         rodar(["git", "-C", CHROMAPRINT_DIR, "pull", "--ff-only"])
     else:
@@ -13123,7 +14263,7 @@ def compilar_chromaprint() -> None:
         rodar(configurar + ["-DFFT_LIB=fftw3"], check=True)
     rodar(["cmake", "--build", build, "-j", str(min(4, os.cpu_count() or 4))], check=True)
     if not biblioteca_chromaprint():
-        raise ToonsError("O Chromaprint compilou, mas a biblioteca não apareceu em ~/chromaprint/build/src.")
+        raise LnuxError("O Chromaprint compilou, mas a biblioteca não apareceu em ~/chromaprint/build/src.")
     ok("Chromaprint pronto.")
 
 
@@ -13145,19 +14285,19 @@ def impressao_digital(arquivo: Path) -> tuple:
     try:
         duracao = int(float(sonda.stdout.strip()))
     except ValueError:
-        raise ToonsError("Não consegui ler esse arquivo (é mesmo um áudio ou vídeo?).") from None
+        raise LnuxError("Não consegui ler esse arquivo (é mesmo um áudio ou vídeo?).") from None
     pcm = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(arquivo), "-vn", "-ac", "1",
                           "-ar", "11025", "-t", "120", "-f", "s16le", "-"], capture_output=True, timeout=300).stdout
     if len(pcm) < 11025 * 2 * 5:
-        raise ToonsError("O arquivo não tem som suficiente (pelo menos 5 segundos) para reconhecer.")
+        raise LnuxError("O arquivo não tem som suficiente (pelo menos 5 segundos) para reconhecer.")
     contexto = lib.chromaprint_new(1)  # CHROMAPRINT_ALGORITHM_DEFAULT: o que o AcoustID usa
     try:
         if not (lib.chromaprint_start(contexto, 11025, 1) and lib.chromaprint_feed(contexto, pcm, len(pcm) // 2)
                 and lib.chromaprint_finish(contexto)):
-            raise ToonsError("O Chromaprint não conseguiu processar o som.")
+            raise LnuxError("O Chromaprint não conseguiu processar o som.")
         saida = ctypes.c_char_p()
         if not lib.chromaprint_get_fingerprint(contexto, ctypes.byref(saida)):
-            raise ToonsError("O Chromaprint não devolveu a impressão digital.")
+            raise LnuxError("O Chromaprint não devolveu a impressão digital.")
         impressao = saida.value.decode()
         lib.chromaprint_dealloc(saida)
     finally:
@@ -13173,16 +14313,16 @@ def consultar_acoustid(chave: str, duracao: int, impressao: str) -> list:
     try:
         bruto = pedir_bytes("https://api.acoustid.org/v2/lookup", corpo,
                             {"Content-Type": "application/x-www-form-urlencoded"}, 40)
-    except ToonsError as e:
+    except LnuxError as e:
         if "API key" in str(e) or '"code": 4' in str(e):
             cfg().pop("acoustid_chave", None)  # a próxima vez pergunta de novo
             salvar_cfg()
-            raise ToonsError("O AcoustID não aceitou a chave. Confira em acoustid.org (a 'API key' do aplicativo) "
+            raise LnuxError("O AcoustID não aceitou a chave. Confira em acoustid.org (a 'API key' do aplicativo) "
                              "e tente de novo.") from None
         raise
     dados = json.loads(bruto.decode("utf-8", errors="replace") or "{}")
     if dados.get("status") != "ok":
-        raise ToonsError(f"O AcoustID respondeu: {(dados.get('error') or {}).get('message', 'erro')}")
+        raise LnuxError(f"O AcoustID respondeu: {(dados.get('error') or {}).get('message', 'erro')}")
     achados = {}
     for resultado in dados.get("results") or []:
         for gravacao in resultado.get("recordings") or []:
@@ -13207,7 +14347,7 @@ def chave_acoustid() -> str | None:
         return c["acoustid_chave"]
     info("O AcoustID é gratuito, mas pede uma chave de aplicativo (uma vez só): entre em "
          f"{ACOUSTID_NOVA_CHAVE} com a conta do MusicBrainz ou do Google, registre um aplicativo com qualquer nome "
-         "(ex.: Termux-Toons) e copie a 'API key'.")
+         "(ex.: LNUX) e copie a 'API key'.")
     if tem("termux-open-url") and confirmar("Abrir a página agora?", True):
         rodar(["termux-open-url", ACOUSTID_NOVA_CHAVE], capturar=True, timeout=20)
     chave = perguntar("Cole a API key do AcoustID (Enter cancela)", "").strip()
@@ -13224,7 +14364,7 @@ def descobrir_musica() -> None:
     if not arquivo or not garantir_cmd("ffmpeg"):
         return
     if not biblioteca_chromaprint():
-        info("Para reconhecer pelo som o Termux-Toons usa o Chromaprint, que precisa ser compilado uma vez "
+        info("Para reconhecer pelo som o LNUX usa o Chromaprint, que precisa ser compilado uma vez "
              "(uns 2 minutos).")
         if not confirmar("Compilar agora?", True):
             return
@@ -13276,21 +14416,21 @@ def _deezer(caminho: str, **params) -> dict:
         try:
             status, dados, _ = baixar_url(url, timeout=20)
         except OSError as e:
-            raise ToonsError(f"Não consegui falar com o catálogo de músicas (Deezer): {e}") from None
+            raise LnuxError(f"Não consegui falar com o catálogo de músicas (Deezer): {e}") from None
         if status >= 400:
-            raise ToonsError(f"O catálogo de músicas (Deezer) respondeu HTTP {status}.")
+            raise LnuxError(f"O catálogo de músicas (Deezer) respondeu HTTP {status}.")
         try:
             resposta = json.loads(dados.decode("utf-8", "replace"))
         except ValueError:
-            raise ToonsError("O catálogo de músicas (Deezer) mandou uma resposta inválida.") from None
+            raise LnuxError("O catálogo de músicas (Deezer) mandou uma resposta inválida.") from None
         erro = resposta.get("error") if isinstance(resposta, dict) else None
         if not erro:
             return resposta if isinstance(resposta, dict) else {}
         if erro.get("code") == 4 and tentativa < 2:   # muitos pedidos por segundo: espera e tenta de novo
             time.sleep(2)
             continue
-        raise ToonsError(f"Catálogo de músicas (Deezer): {erro.get('message') or erro}")
-    raise ToonsError("O catálogo de músicas (Deezer) está recusando pedidos agora. Tente daqui a pouco.")
+        raise LnuxError(f"Catálogo de músicas (Deezer): {erro.get('message') or erro}")
+    raise LnuxError("O catálogo de músicas (Deezer) está recusando pedidos agora. Tente daqui a pouco.")
 
 
 def _deezer_lista(caminho: str, maximo: int = 1000) -> list:
@@ -13363,7 +14503,7 @@ def faixas_dos_albuns(albuns: list, sem_repetir: bool = False) -> list:
         print(f"\r  Lendo os álbuns no catálogo: {i}/{len(albuns)}   ", end="", flush=True)
         try:
             _, faixas = faixas_do_album(album["id"])
-        except ToonsError as e:
+        except LnuxError as e:
             print()
             aviso(f"Pulei '{album['titulo']}': {e}")
             continue
@@ -13401,7 +14541,7 @@ def listar_faixas_catalogo(titulo: str, faixas: list, limite: int = 40) -> None:
 def tocar_faixas(faixas: list, nome: str, aleatorio: bool = False) -> None:
     """Toca as faixas no player: cada uma é procurada no YouTube na hora de tocar (a fila começa na hora)."""
     if not faixas:
-        raise ToonsError("Nenhuma faixa para tocar.")
+        raise LnuxError("Nenhuma faixa para tocar.")
     pasta = DATA_DIR / "tmp"
     pasta.mkdir(parents=True, exist_ok=True)
     fila = pasta / "fila-catalogo.m3u"
@@ -13748,7 +14888,7 @@ EXTENSOES_VIDEO = {".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi"}
 
 
 def pasta_videos() -> Path:
-    return Path(os.path.expanduser(cfg()["pasta_videos"]))
+    return caminho_do_usuario(cfg()["pasta_videos"])
 
 
 # formato: (descrição no menu, preferência de codecs para o -S do yt-dlp, opções do contêiner)
@@ -13883,8 +15023,9 @@ def menu_videos():
     menu("🎬 Vídeos (TikTok, YouTube...)", [
         ("Baixar por link (TikTok, YouTube, Shorts, playlist...)", por_link),
         ("Buscar no YouTube e baixar", buscar_baixar),
-        ("Abrir vídeo baixado no player do Android", abrir),
-        ("Assistir um link sem baixar (VLC, MX Player...)", assistir_link_no_celular),
+        (por_sistema("Abrir vídeo baixado no player do Android", "Abrir vídeo baixado no player do computador"), abrir),
+        (por_sistema("Assistir um link sem baixar (VLC, MX Player...)", "Assistir um link sem baixar (VLC, mpv...)"),
+         assistir_link_no_celular),
         # única opção de reduzir/comprimir vídeo (antes repetida no 📺 servidor de filmes e no 🔁 Conversor)
         ("📉 Reduzir a resolução / comprimir um vídeo (4K → 1080p, 720p, 480p...)", reduzir_resolucao),
         (lambda: f"Pasta dos vídeos ({onde_fica(pasta_videos())})", mudar_pasta),
@@ -14073,6 +15214,7 @@ PAGINA_FILME = r"""<!doctype html>
  'use strict';
  var C = JSON.parse(document.getElementById('cfg').textContent);
  function $(id) { return document.getElementById(id); }
+ /* as chaves 'toons:...' do localStorage ficam com o nome antigo: guardam onde cada pessoa parou de assistir */
  var v = $('v'), P = $('player'), BASE = '/v/' + C.token, CHAVE = 'toons:' + C.token;
  var ICONE = {
   play: 'M8 5v14l11-7z', pausa: 'M6 19h4V5H6v14zm8-14v14h4V5h-4z',
@@ -14674,7 +15816,7 @@ PAGINA_FILME = r"""<!doctype html>
  // ── Começo ──
  if ('mediaSession' in navigator) {
   try {
-   navigator.mediaSession.metadata = new MediaMetadata({title: C.titulo, artist: 'Termux-Toons'});
+   navigator.mediaSession.metadata = new MediaMetadata({title: C.titulo, artist: 'LNUX'});
    navigator.mediaSession.setActionHandler('play', function () { tocarVideo(); });
    navigator.mediaSession.setActionHandler('pause', function () { v.pause(); });
    navigator.mediaSession.setActionHandler('seekbackward', function () { pularRel(-10); });
@@ -14750,7 +15892,7 @@ def info_pagina(pagina: str, renovar: bool = False) -> dict:
         if achado and not renovar and time.time() - achado[0] < 3600:
             return achado[1]
         if not tem("yt-dlp"):
-            raise ToonsError("Links de página (YouTube, Vimeo...) precisam do yt-dlp: pkg install python-yt-dlp")
+            raise LnuxError("Links de página (YouTube, Vimeo...) precisam do yt-dlp: pkg install python-yt-dlp")
         proc = rodar(["yt-dlp", "-j", "--no-playlist", "--no-warnings", "-f", FORMATO_PAGINA, pagina],
                      capturar=True, timeout=180, mostrar=False)
         dados = None
@@ -14758,7 +15900,7 @@ def info_pagina(pagina: str, renovar: bool = False) -> dict:
             dados = json.loads(proc.stdout.strip().splitlines()[-1]) if proc.returncode == 0 else None
         formatos = [f for f in ((dados.get("requested_formats") or [dados]) if dados else []) if f.get("url")]
         if not formatos:
-            raise ToonsError("O yt-dlp não achou um vídeo nessa página. " + (proc.stderr or "").strip()[-300:])
+            raise LnuxError("O yt-dlp não achou um vídeo nessa página. " + (proc.stderr or "").strip()[-300:])
         for velho in (achado[1]["enderecos"] if achado else []):
             _CABECALHOS_LINK.pop(velho, None)
         for f in formatos[:2]:
@@ -15261,7 +16403,7 @@ def info_link(url: str) -> dict:
 # (um link secreto só, /tb/<código>) e cada vídeo vira um "compartilhamento virtual" que abre no
 # mesmo player: o link de download é pedido ao TorBox na hora de assistir. A chave nunca sai do celular.
 
-TORBOX_API = os.environ.get("TOONS_TORBOX_API", "https://api.torbox.app/v1/api")
+TORBOX_API = _env("TORBOX_API", "https://api.torbox.app/v1/api")
 TORBOX_TIPOS = {"t": ("torrents", "torrent_id"), "u": ("usenet", "usenet_id"), "w": ("webdl", "web_id")}
 EXTENSOES_VIDEO_TORBOX = EXTENSOES_VIDEO | {".ts", ".m2ts", ".wmv", ".flv", ".mpg", ".mpeg"}
 _TORBOX: dict = {"quando": 0.0, "chave": "", "itens": [], "links": {}}
@@ -15283,7 +16425,7 @@ def torbox_chamar(caminho: str, chave: str, **params):
     """Chama a API do TorBox e devolve o campo 'data' da resposta."""
     url = f"{TORBOX_API}/{caminho}" + ("?" + urllib.parse.urlencode(params) if params else "")
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {chave}", "Accept": "application/json",
-                                               "User-Agent": f"TermuxToons/{VERSION}"})
+                                               "User-Agent": f"LNUX/{VERSION}"})
     try:
         with urllib.request.urlopen(req, timeout=30) as resposta:
             dados = json.loads(resposta.read() or b"{}")
@@ -15293,12 +16435,12 @@ def torbox_chamar(caminho: str, chave: str, **params):
             corpo = json.loads(e.read() or b"{}")
             detalhe = str(corpo.get("detail") or corpo.get("error") or "")
         if e.code in (401, 403):
-            raise ToonsError("O TorBox recusou a chave da API (confira em torbox.app → Settings → API).") from None
-        raise ToonsError(f"O TorBox respondeu HTTP {e.code}. {detalhe}".strip()) from None
+            raise LnuxError("O TorBox recusou a chave da API (confira em torbox.app → Settings → API).") from None
+        raise LnuxError(f"O TorBox respondeu HTTP {e.code}. {detalhe}".strip()) from None
     except (OSError, ValueError) as e:
-        raise ToonsError(f"Não consegui falar com o TorBox: {e}") from None
+        raise LnuxError(f"Não consegui falar com o TorBox: {e}") from None
     if isinstance(dados, dict) and dados.get("success") is False:
-        raise ToonsError(f"TorBox: {dados.get('detail') or dados.get('error') or 'erro desconhecido'}")
+        raise LnuxError(f"TorBox: {dados.get('detail') or dados.get('error') or 'erro desconhecido'}")
     return dados.get("data") if isinstance(dados, dict) else dados
 
 
@@ -15331,7 +16473,7 @@ def torbox_biblioteca(chave: str, renovar: bool = False) -> list:
         for letra, (rota, _) in TORBOX_TIPOS.items():
             try:
                 lista = torbox_chamar(f"{rota}/mylist", chave, bypass_cache="true") or []
-            except ToonsError:
+            except LnuxError:
                 if letra == "t":  # os torrents são o principal; usenet e web podem não existir no seu plano
                     raise
                 continue
@@ -15355,7 +16497,7 @@ def torbox_link(chave: str, letra: str, id_item: int, fid: int, renovar: bool = 
     url = torbox_chamar(f"{rota}/requestdl", chave, token=chave, file_id=fid, zip_link="false", redirect="false",
                         **{campo: id_item})
     if not isinstance(url, str) or not eh_link(url):
-        raise ToonsError("O TorBox não devolveu um link para este arquivo (ele ainda está sendo baixado?).")
+        raise LnuxError("O TorBox não devolveu um link para este arquivo (ele ainda está sendo baixado?).")
     with _TORBOX_TRAVA:
         _TORBOX["links"][(letra, id_item, fid)] = (time.time(), url)
     return url
@@ -15378,7 +16520,7 @@ def item_torbox(token: str):
         return None
     letra, id_item, fid = m.group(1), int(m.group(2)), int(m.group(3))
     item = {"token": token, "torbox": [letra, id_item, fid], "titulo": "Vídeo", "voltar": f"/tb/{catalogo}"}
-    with contextlib.suppress(ToonsError):
+    with contextlib.suppress(LnuxError):
         entrada = next((it for it in torbox_biblioteca(chave) if it["tipo"] == letra and it["id"] == id_item), None)
         videos = entrada["videos"] if entrada else []
         n = next((i for i, v in enumerate(videos) if v["fid"] == fid), None)
@@ -15721,7 +16863,7 @@ def _numero(consulta: dict, chave: str, padrao: float) -> float:
 
 
 class _HandlerMidia(BaseHTTPRequestHandler):
-    server_version = f"TermuxToons/{VERSION}-{ASSINATURA}"
+    server_version = f"LNUX/{VERSION}-{ASSINATURA}"
     timeout = 120  # solta conexões paradas
     maximo_transmissoes = 3
 
@@ -15746,7 +16888,7 @@ class _HandlerMidia(BaseHTTPRequestHandler):
     def _aviso(self, status: int, msg: str, com_corpo: bool) -> None:
         import html as html_mod
         corpo = ("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,"
-                 "initial-scale=1'><title>Termux-Toons</title><body style='margin:0;min-height:100vh;display:grid;"
+                 "initial-scale=1'><title>LNUX</title><body style='margin:0;min-height:100vh;display:grid;"
                  "place-items:center;font-family:system-ui,sans-serif;background:#09090b;color:#f4f4f5'>"
                  "<div style='text-align:center;padding:24px'><div style='font-size:48px'>🎬</div>"
                  f"<h2 style='font-weight:600'>{html_mod.escape(msg)}</h2></div>").encode()
@@ -15780,7 +16922,7 @@ class _HandlerMidia(BaseHTTPRequestHandler):
             try:
                 letra, id_item, _ = item["torbox"]
                 dados = _baixar_legenda_link(torbox_link(_torbox_config()[0], letra, id_item, legenda["ref"]))
-            except ToonsError:
+            except LnuxError:
                 dados = None
         else:
             try:
@@ -15903,7 +17045,7 @@ class _HandlerMidia(BaseHTTPRequestHandler):
         if item.get("pagina") or item.get("torbox"):  # pede endereços novos: os antigos podem ter expirado
             try:
                 fonte = fontes_de(item, renovar=True)[0]
-            except ToonsError as e:
+            except LnuxError as e:
                 return self._json(200, {"ok": False, "erro": str(e)}, com_corpo)
         if eh_link(fonte):
             try:
@@ -15932,7 +17074,7 @@ class _HandlerMidia(BaseHTTPRequestHandler):
                                  "style-src 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'"})
         try:
             itens = torbox_biblioteca(chave, renovar=consulta.get("renovar") == ["1"])
-        except ToonsError as e:
+        except LnuxError as e:
             return self._json(502, {"erro": str(e)}, com_corpo)
         saida = [{**{k: it[k] for k in ("tipo", "id", "nome", "tamanho", "data", "pronto", "progresso")},
                   "videos": [{"nome": v["nome"], "tamanho": v["tamanho"],
@@ -15958,7 +17100,7 @@ class _HandlerMidia(BaseHTTPRequestHandler):
             return self._estado(item, com_corpo)
         try:
             fontes = fontes_de(item)
-        except ToonsError as e:
+        except LnuxError as e:
             return self._aviso(502, str(e), com_corpo)
         sonda = sonda_em_cache(fontes)
         consulta = urllib.parse.parse_qs(partes.query)
@@ -16035,9 +17177,9 @@ def criar_compartilhamento(alvo, titulo_filme: str | None = None, horas: float |
     else:
         arq = Path(os.path.expanduser(str(alvo)))
         if not arq.is_file():
-            raise ToonsError(f"Arquivo não encontrado: {arq}")
+            raise LnuxError(f"Arquivo não encontrado: {arq}")
         if arq.suffix.lower() not in EXTENSOES_VIDEO:
-            raise ToonsError(f"Só compartilho vídeos ({', '.join(sorted(EXTENSOES_VIDEO))}); este é '{arq.suffix}'.")
+            raise LnuxError(f"Só compartilho vídeos ({', '.join(sorted(EXTENSOES_VIDEO))}); este é '{arq.suffix}'.")
         item["caminho"] = str(arq.resolve())
         padrao = titulo_do_arquivo(arq)
     agora = time.time()
@@ -16125,13 +17267,13 @@ def garantir_servidor_midia() -> bool:
     porta = cfg()["midia_porta"]
     if servico_ativo("midia"):
         versao = _versao_servidor_midia(porta)
-        if not versao or f"TermuxToons/{VERSION}-{ASSINATURA}" in versao:
+        if not versao or f"LNUX/{VERSION}-{ASSINATURA}" in versao:
             return True
-        info("O servidor de vídeo ainda roda o código antigo do Termux-Toons (de antes da atualização); reiniciando...")
+        info("O servidor de vídeo ainda roda o código antigo do LNUX (de antes da atualização); reiniciando...")
         parar_servico("midia")
         time.sleep(1)
     if not porta_livre(porta):
-        raise ToonsError(f"A porta {porta} já está em uso por outro programa. Troque em 'Porta do servidor'.")
+        raise LnuxError(f"A porta {porta} já está em uso por outro programa. Troque em 'Porta do servidor'.")
     return iniciar_servico("midia", cmd_self("midia", "--porta", str(porta)), reiniciar=True)
 
 
@@ -16148,14 +17290,18 @@ def mostrar_links(item: dict) -> None:
 
 
 def abrir_no_android(alvo: str, pacote: str | None = None) -> None:
-    """Abre um vídeo (link ou arquivo) num app do Android, como o VLC: o app toca direto, sem baixar."""
+    """Abre um vídeo (link ou arquivo) num app do Android, como o VLC: o app toca direto, sem baixar.
+    No computador, abre no VLC (ou no mpv, ou no player padrão) dele."""
+    if not sistema().android:
+        _abrir_no_player_do_computador(alvo, preferir_vlc=pacote == VLC_ANDROID)
+        return
     if not eh_link(alvo):
         if not tem("termux-open"):
-            raise ToonsError("'termux-open' não encontrado (só existe dentro do Termux).")
+            raise LnuxError("'termux-open' não encontrado (só existe dentro do Termux).")
         rodar(["termux-open", "--content-type", "video/*", alvo], capturar=True, timeout=20)
         return
     if not tem("am"):
-        raise ToonsError("Comando 'am' não encontrado (só existe dentro do Termux).")
+        raise LnuxError("Comando 'am' não encontrado (só existe dentro do Termux).")
     cmd = ["am", "start", "-a", "android.intent.action.VIEW", "-t", "video/*", "-d", alvo]
     if pacote:
         cmd += ["-p", pacote]
@@ -16163,8 +17309,21 @@ def abrir_no_android(alvo: str, pacote: str | None = None) -> None:
     texto = f"{proc.stdout or ''}{proc.stderr or ''}"
     if proc.returncode != 0 or re.search(r"\bError\b", texto):
         dica_vlc = "O VLC está instalado? " if pacote == VLC_ANDROID else ""
-        raise ToonsError(f"{dica_vlc}O Android não abriu o vídeo: {texto.strip()[-200:]}")
+        raise LnuxError(f"{dica_vlc}O Android não abriu o vídeo: {texto.strip()[-200:]}")
     ok("Abrindo no app de vídeo...")
+
+
+def _abrir_no_player_do_computador(alvo: str, preferir_vlc: bool = True) -> None:
+    if not _tem_tela():
+        raise LnuxError("Abrir um player precisa de uma área de trabalho (não há DISPLAY nem WAYLAND_DISPLAY).")
+    ordem = ["vlc", "mpv"] if preferir_vlc else ["mpv", "vlc"]
+    programa = next((p for p in ordem if tem(p)), None)
+    cmd = [programa, alvo] if programa else (["xdg-open", alvo] if tem("xdg-open") else None)
+    if not cmd:
+        raise LnuxError("Nenhum player encontrado: instale o VLC ou o mpv.")
+    if _desanexado(cmd).returncode != 0:
+        raise LnuxError(f"Não consegui abrir o {cmd[0]}.")
+    ok(f"Abrindo no {cmd[0]}...")
 
 
 def _eh_arquivo_de_video(url: str) -> bool:
@@ -16184,13 +17343,13 @@ def endereco_para_assistir(url: str, nivel: int | None = None, pagina: bool | No
     if not pagina:
         return url
     if not garantir_deps_musica(com_player=False):
-        raise ToonsError("Sem o yt-dlp não consigo achar o vídeo dessa página.")
+        raise LnuxError("Sem o yt-dlp não consigo achar o vídeo dessa página.")
     info("É uma página: procurando o endereço do vídeo com o yt-dlp...")
     proc = rodar(["yt-dlp", "-g", "-f", "b", *(["-S", f"res:{nivel}"] if nivel else []), "--no-warnings",
                   "--no-playlist", url], capturar=True, timeout=120)
     enderecos = (proc.stdout or "").split()
     if proc.returncode != 0 or not enderecos:
-        raise ToonsError("O yt-dlp não achou um vídeo nesse link. " + (proc.stderr or "").strip()[-300:])
+        raise LnuxError("O yt-dlp não achou um vídeo nesse link. " + (proc.stderr or "").strip()[-300:])
     return enderecos[0]
 
 
@@ -16202,7 +17361,7 @@ def assistir_link_no_celular(url: str | None = None) -> None:
     if not url:
         return
     if not eh_link(url):
-        raise ToonsError("O link precisa começar com http:// ou https://")
+        raise LnuxError("O link precisa começar com http:// ou https://")
     pagina, nivel = not _eh_arquivo_de_video(url), None
     if pagina:  # o site tem várias resoluções: dá para pedir uma mais leve
         opcoes = [("Melhor disponível", None), ("Até 1080p", 1080), ("Até 720p — se costuma travar", 720),
@@ -16291,7 +17450,7 @@ def converter_para_mp4(origem: Path):
         resultado = rodar(cmd)
     if resultado.returncode != 0 or not parcial.exists():
         parcial.unlink(missing_ok=True)
-        raise ToonsError("O ffmpeg não conseguiu converter este arquivo.")
+        raise LnuxError("O ffmpeg não conseguiu converter este arquivo.")
     parcial.replace(destino)
     if legenda is not None:
         rodar(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(origem), "-map", f"0:s:{legenda}",
@@ -16477,7 +17636,7 @@ def _ffmpeg_com_andamento(cmd: list, duracao: float | None, avisar) -> tuple:
 
 
 def _destino_reduzido(fonte: str, nivel: int) -> Path:
-    """Ao lado do original (ou em Download/Termux-Toons/Convertidos), com a resolução no nome."""
+    """Ao lado do original (ou em Download/LNUX/Convertidos), com a resolução no nome."""
     if eh_link(fonte):
         nome = urllib.parse.unquote(os.path.basename(urllib.parse.urlsplit(fonte).path)) or "video"
         pasta = (pasta_para_salvar(pasta_videos()) if sys.stdin.isatty() else None) or pasta_saida("Convertidos")
@@ -16501,7 +17660,7 @@ def executar_reducao(fonte: str, nivel: int, destino: Path, fps30: bool = False,
     """Faz a cópia mais leve. Na tela mostra o andamento; em segundo plano escreve no log e na notificação."""
     sonda = sonda or sondar_video(fonte)
     if not sonda or not sonda["video"]:
-        raise ToonsError("Não consegui ler a imagem desse vídeo (o ffprobe não abriu o arquivo ou o link).")
+        raise LnuxError("Não consegui ler a imagem desse vídeo (o ffprobe não abriu o arquivo ou o link).")
     duracao = _duracao(sonda)
     parcial = destino.with_name(destino.name + ".part")  # só vira o arquivo final se terminar sem erro
     gravar_json(ESTADO_REDUZIR, {"fonte": fonte, "destino": str(destino), "nivel": nivel, "inicio": time.time()})
@@ -16517,8 +17676,8 @@ def executar_reducao(fonte: str, nivel: int, destino: Path, fps30: bool = False,
         ultimo.update(pct=pct if pct is not None else ultimo["pct"], quando=agora)
         log(texto)
         if tem("termux-notification"):
-            with contextlib.suppress(ToonsError, OSError):
-                _tapi(["termux-notification", "--id", "toons-reduzir", "--ongoing", "--alert-once",
+            with contextlib.suppress(LnuxError, OSError):
+                _tapi(["termux-notification", "--id", "lnux-reduzir", "--ongoing", "--alert-once",
                        "--title", f"📉 Reduzindo para {nome_nivel(nivel)}", "--content", f"{destino.name}\n{texto}"],
                       15, json_saida=False)
 
@@ -16534,13 +17693,13 @@ def executar_reducao(fonte: str, nivel: int, destino: Path, fps30: bool = False,
         raise
     finally:
         if segundo_plano and tem("termux-notification-remove"):
-            rodar(["termux-notification-remove", "toons-reduzir"], capturar=True, mostrar=False, timeout=10)
+            rodar(["termux-notification-remove", "lnux-reduzir"], capturar=True, mostrar=False, timeout=10)
     if not segundo_plano:
         print()
     ESTADO_REDUZIR.unlink(missing_ok=True)
     if codigo != 0 or not parcial.exists() or parcial.stat().st_size == 0:
         parcial.unlink(missing_ok=True)
-        raise ToonsError("O ffmpeg não conseguiu converter este vídeo." + (f"\n{erros[-400:]}" if erros else ""))
+        raise LnuxError("O ffmpeg não conseguiu converter este vídeo." + (f"\n{erros[-400:]}" if erros else ""))
     parcial.replace(destino)
     return destino
 
@@ -16551,15 +17710,15 @@ def reduzir_video_cli(fonte: str, nivel: int, destino: str | None, fps30: bool, 
     log(f"Reduzindo {fonte} para {nome_nivel(nivel)}{' (arquivo menor)' if menor else ''} → {destino_p}")
     try:
         pronto = executar_reducao(fonte, nivel, destino_p, fps30, segundo_plano=True, menor=menor)
-    except ToonsError as e:
+    except LnuxError as e:
         log(f"Falhou: {e}")
         notificar_seguro("❌ Não deu para reduzir o vídeo", str(e).splitlines()[0])
         raise
     tamanho_txt = bytes_humanos(pronto.stat().st_size)
     log(f"Pronto: {pronto} ({tamanho_txt})")
     if tem("termux-notification"):
-        with contextlib.suppress(ToonsError, OSError):
-            _tapi(["termux-notification", "--id", "toons-reduzido", "--title", f"✅ Vídeo pronto em {nome_nivel(nivel)}",
+        with contextlib.suppress(LnuxError, OSError):
+            _tapi(["termux-notification", "--id", "lnux-reduzido", "--title", f"✅ Vídeo pronto em {nome_nivel(nivel)}",
                    "--content", f"{pronto.name} ({tamanho_txt}). Toque para abrir.",
                    "--action", shlex.join(["termux-open", "--content-type", "video/*", str(pronto)])],
                   15, json_saida=False)
@@ -16587,7 +17746,7 @@ def _andamento_em_segundo_plano() -> bool:
                 Path(estado["destino"] + ".part").unlink(missing_ok=True)
             ESTADO_REDUZIR.unlink(missing_ok=True)
             if tem("termux-notification-remove"):
-                rodar(["termux-notification-remove", "toons-reduzir"], capturar=True, mostrar=False, timeout=10)
+                rodar(["termux-notification-remove", "lnux-reduzir"], capturar=True, mostrar=False, timeout=10)
             ok("Conversão cancelada.")
             return False
         if i != 0:
@@ -16609,7 +17768,7 @@ def _escolher_fonte_para_reduzir():
     if not link:
         return None
     if not eh_link(link):
-        raise ToonsError("O link precisa começar com http:// ou https://")
+        raise LnuxError("O link precisa começar com http:// ou https://")
     if not _eh_arquivo_de_video(link):
         info("Esse link é de uma página de vídeo (YouTube, TikTok...): o próprio site tem resoluções menores, "
              "então é só baixar já na qualidade que você quer.")
@@ -16633,7 +17792,7 @@ def reduzir_resolucao(fonte: str | Path | None = None, perguntar_modo: bool = Tr
     info("Lendo o vídeo...")
     sonda = sondar_video(fonte)
     if not sonda or not sonda["video"]:
-        raise ToonsError("Não consegui ler a imagem desse vídeo (o ffprobe não abriu o arquivo ou o link).")
+        raise LnuxError("Não consegui ler a imagem desse vídeo (o ffprobe não abriu o arquivo ou o link).")
     video = sonda["video"][0]
     nivel, (largura, altura), fps = nivel_video(video), _dimensoes(video), quadros_por_segundo(video)
     resumo = [f"{largura}x{altura} ({nome_nivel(nivel)})", str(video.get("codec_name", "?")).upper()]
@@ -16705,7 +17864,7 @@ def reduzir_resolucao(fonte: str | Path | None = None, perguntar_modo: bool = Tr
 
 def videos_para_compartilhar() -> list:
     """[(data, tamanho, caminho)] dos vídeos nas pastas de vídeo/downloads/filmes, os mais novos primeiro."""
-    pastas = [pasta_videos(), DOWNLOADS, HOME / "storage" / "movies", HOME / "storage" / "shared" / "Movies"]
+    pastas = [pasta_videos(), DOWNLOADS, pasta_usuario("movies"), pasta_usuario("shared", "Movies")]
     vistos, achados = set(), []
     for pasta in pastas:
         if not pasta.is_dir():
@@ -16728,7 +17887,7 @@ def _escolher_video():
         return videos[i][2]
     caminho = Path(os.path.expanduser(perguntar("Caminho do arquivo")))
     if not caminho.is_file():
-        raise ToonsError(f"Arquivo não encontrado: {caminho}")
+        raise LnuxError(f"Arquivo não encontrado: {caminho}")
     return caminho
 
 
@@ -16749,7 +17908,7 @@ def conferir_link(url: str) -> dict:
     """Confere um link sem baixar o vídeo e mostra as faixas: {'pagina', 'titulo', 'tamanho', 'sonda'}.
     Link direto de arquivo passa como está; página (YouTube, Vimeo, Google Drive...) é lida pelo yt-dlp."""
     if not eh_link(url):
-        raise ToonsError("O link precisa começar com http:// ou https://")
+        raise LnuxError("O link precisa começar com http:// ou https://")
     info("Conferindo o link (sem baixar o vídeo)...")
     try:
         dados = info_link(url)
@@ -16762,16 +17921,16 @@ def conferir_link(url: str) -> dict:
         titulo, fontes = titulo_do_link(url, dados["nome"]), [url]
     else:  # página de vídeo, ou um site que só responde a quem parece navegador: o yt-dlp tenta achar o vídeo
         if not tem("yt-dlp") and not garantir_deps_musica(com_player=False):
-            raise ToonsError("Para links de página (YouTube, Vimeo...) é preciso o yt-dlp.")
+            raise LnuxError("Para links de página (YouTube, Vimeo...) é preciso o yt-dlp.")
         info("Não é um link direto de arquivo: procurando o vídeo na página com o yt-dlp...")
         try:
             achado = info_pagina(url)
-        except ToonsError as e:
+        except LnuxError as e:
             if dados["status"] >= 400:
-                raise ToonsError(f"O site respondeu HTTP {dados['status']}: o link pode ter expirado ou exigir "
+                raise LnuxError(f"O site respondeu HTTP {dados['status']}: o link pode ter expirado ou exigir "
                                  "login.") from None
             if dados.get("erro"):
-                raise ToonsError(f"Não consegui acessar o link: {dados['erro']}") from None
+                raise LnuxError(f"Não consegui acessar o link: {dados['erro']}") from None
             raise e
         ok(f"Vídeo encontrado: {achado['titulo']}")
         titulo, fontes = achado["titulo"], achado["enderecos"]
@@ -16835,7 +17994,7 @@ def menu_torbox():
 
     def exigir_chave():
         if not c.get("torbox_chave"):
-            raise ToonsError("Configure primeiro a chave da API do TorBox (primeira opção deste menu).")
+            raise LnuxError("Configure primeiro a chave da API do TorBox (primeira opção deste menu).")
         if not c.get("torbox_catalogo"):
             c["torbox_catalogo"] = secrets.token_urlsafe(12)
             salvar_cfg()
@@ -17048,7 +18207,7 @@ def menu_midia():
             abrir_no_android(alvo, VLC_ANDROID if i == 0 else None)
 
     def trocar_endereco(item):
-        info("Cole o novo link do mesmo vídeo. Quem já tem o link do Termux-Toons não precisa receber outro.")
+        info("Cole o novo link do mesmo vídeo. Quem já tem o link do LNUX não precisa receber outro.")
         url = perguntar("Novo link do vídeo").strip()
         if not url:
             return
@@ -17164,14 +18323,20 @@ def menu_midia():
 #  14. Atualização
 # ════════════════════════════════════════════════════════════════════
 
-REPO_TOONS = "https://github.com/Gustavo-HVF/Termux-Toons"
+# o repositório ainda se chama Termux-Toons no GitHub (renomear lá redireciona o endereço antigo)
+REPO_LNUX = "https://github.com/Gustavo-HVF/Termux-Toons"
 
 
-def atualizar_termux() -> None:
-    if not IS_TERMUX:
-        aviso("Isto só funciona dentro do Termux.")
+def atualizar_sistema_pacotes() -> None:
+    """Atualiza os pacotes do sistema: 'pkg upgrade' no Termux; nas distros, os comandos do perfil
+    (apt-get update + upgrade, pacman -Syu, dnf upgrade, apk upgrade, zypper update)."""
+    perfil = sistema()
+    if not perfil.comando("atualizar_sistema"):
+        aviso(f"O perfil {perfil.nome} não sabe atualizar o sistema: use o gerenciador de pacotes da sua distro.")
         return
-    rodar(["pkg", "upgrade", "-y"])
+    if not perfil.termux and perfil.comando("atualizar_indice"):  # no Termux o 'pkg upgrade' já atualiza a lista
+        rodar_pacotes("atualizar_indice")
+    rodar_pacotes("atualizar_sistema")
 
 
 def atualizar_pip() -> None:
@@ -17198,12 +18363,12 @@ def atualizar_gits() -> None:
         rodar(["git", "-C", repo, "pull", "--ff-only"])
 
 
-def atualizar_toons() -> None:
+def atualizar_lnux() -> None:
     if (SCRIPT.parent / ".git").exists() and tem("git"):
         if rodar(["git", "-C", SCRIPT.parent, "pull", "--ff-only"]).returncode == 0:
-            ok("Termux-Toons atualizado. Reabra o programa para usar a versão nova.")
+            ok("LNUX atualizado. Reabra o programa para usar a versão nova.")
     else:
-        info(f"Este arquivo não está num clone git. Para atualizar:\n  git clone {REPO_TOONS}")
+        info(f"Este arquivo não está num clone git. Para atualizar:\n  git clone {REPO_LNUX}")
 
 
 def ativar_repos() -> None:
@@ -17215,26 +18380,35 @@ def ativar_repos() -> None:
         rodar(["pkg", "update", "-y"])
 
 
+def repositorios_extras_distro() -> None:
+    """Nas distros, os repositórios extras (RPM Fusion, AUR, Packman...) se ativam do jeito de cada uma:
+    o perfil traz a dica."""
+    print(sistema().dica("repositorios_extras") or "O perfil desta distro não tem dicas de repositórios extras.")
+
+
 def atualizar_tudo() -> None:
-    atualizar_termux()
+    atualizar_sistema_pacotes()
     atualizar_pip()
-    atualizar_distros()
-    atualizar_toons()
+    if tem_recurso("proot_distro"):
+        atualizar_distros()
+    atualizar_lnux()
     ok("Tudo atualizado.")
 
 
 @submenu
 def menu_atualizar():
     menu("🔄 Atualização", [
-        ("Atualizar o Termux (pkg upgrade)", atualizar_termux),
-        ("Trocar o espelho dos repositórios (termux-change-repo)", lambda: rodar(["termux-change-repo"])),
-        ("Ativar repositórios extras (x11, root, tur)", ativar_repos),
+        (lambda: "Atualizar o Termux (pkg upgrade)" if sistema().termux else
+         f"Atualizar o sistema ({sistema().pacotes.get('gerenciador') or 'gerenciador da distro'})", atualizar_sistema_pacotes),
+        ("Trocar o espelho dos repositórios (termux-change-repo)", so_em("termux", lambda: rodar(["termux-change-repo"]))),
+        ("Ativar repositórios extras (x11, root, tur)", so_em("termux", ativar_repos)),
+        ("Repositórios extras da distro (como ativar)", so_em("!termux", repositorios_extras_distro)),
         ("Atualizar pacotes Python opcionais (pip)", atualizar_pip),
         ("Atualizar repositórios git de uma pasta (git pull)", atualizar_gits),
-        ("Atualizar o Termux-Toons", atualizar_toons),
+        ("Atualizar o LNUX", atualizar_lnux),
         # "Limpar cache de pacotes" saiu daqui: a ⚡ Otimização rápida (🧹 Otimização e limpeza) já limpa o
         # cache do apt e o ~/.cache (onde fica o cache do pip) e agora também faz o "apt autoremove"
-        ("Atualizar TUDO (Termux, pip, distros, Termux-Toons)", atualizar_tudo),
+        (por_sistema("Atualizar TUDO (Termux, pip, distros, LNUX)", "Atualizar TUDO (sistema, pip e LNUX)"), atualizar_tudo),
     ])
 
 
@@ -17246,8 +18420,11 @@ _ROOT: bool | None = None
 
 
 def tem_root() -> bool:
-    """True se o 'su' existe e devolve uid 0 (pergunta ao Magisk/KernelSU só uma vez)."""
+    """True se o 'su' existe e devolve uid 0 (pergunta ao Magisk/KernelSU só uma vez). Só no Android: no Linux
+    o 'su' pediria a senha do root, e o que precisa de root lá usa o sudo (como_root)."""
     global _ROOT
+    if not sistema().android:
+        return False
     if _ROOT is None:
         _ROOT = tem("su") and saida(["su", "-c", "id -u"], timeout=20) == "0"
     return _ROOT
@@ -17310,7 +18487,7 @@ def _pycaches() -> list:
     return achados
 
 
-def _sobras_toons() -> list:
+def _sobras_lnux() -> list:
     """Logs antigos, logs de serviços parados, fotos temporárias e legendas extraídas (refeitas quando preciso)."""
     ativos = set(servicos_ativos())
     itens = list(LOG_DIR.glob("*.log.old")) if LOG_DIR.exists() else []
@@ -17366,7 +18543,7 @@ LIMPADORES = [
      True),
     ("Arquivos temporários antigos ($PREFIX/tmp)", lambda: _limpador_lista(_arquivos_tmp_antigos), True),
     ("Pastas __pycache__ na home", lambda: _limpador_lista(_pycaches), True),
-    ("Logs antigos, fotos temporárias e legendas extraídas do Termux-Toons", lambda: _limpador_lista(_sobras_toons), True),
+    ("Logs antigos, fotos temporárias e legendas extraídas do LNUX", lambda: _limpador_lista(_sobras_lnux), True),
     ("Miniaturas da galeria (.thumbnails, o Android recria)", lambda: _limpador_lista(_miniaturas), True),
     ("Downloads incompletos (.part, .ytdl) em Downloads", lambda: _limpador_lista(_downloads_incompletos), False),
     ("Build do llama.cpp (precisa recompilar depois)",
@@ -17432,6 +18609,9 @@ def otimizacao_rapida(interativo: bool = True) -> None:
 
 def _abrir_tela_android(acao: str, dado: str | None = None) -> bool:
     """Abre uma tela de configurações do Android (o 'am' do Termux funciona sem root)."""
+    if not sistema().android:  # no computador, quem abre a tela é a pessoa, no celular
+        info("Abra essa tela no celular: Configurações → Sistema → Opções do desenvolvedor.")
+        return False
     if not tem("am"):
         aviso("Comando 'am' não encontrado (só existe dentro do Termux).")
         return False
@@ -17451,7 +18631,8 @@ TELAS_ANDROID = [
 
 def _escolher_pasta(msg: str = "Onde procurar?"):
     opcoes = [("Downloads", DOWNLOADS), ("Armazenamento interno (tudo)", HOME / "storage" / "shared"),
-              ("Home do Termux", HOME), ("Outra pasta...", None)]
+              ("Home do Termux", HOME), ("Outra pasta...", None)] if sistema().termux else \
+        [("Downloads", DOWNLOADS), ("Pasta pessoal", HOME), ("Raiz do sistema (/)", Path("/")), ("Outra pasta...", None)]
     disponiveis = [(nome, p) for nome, p in opcoes if p is None or p.exists()]
     i = escolher(msg, [nome for nome, _ in disponiveis])
     if i is None:
@@ -17460,7 +18641,7 @@ def _escolher_pasta(msg: str = "Onde procurar?"):
     if pasta is None:
         pasta = Path(os.path.expanduser(perguntar("Caminho da pasta", str(HOME))))
     if not pasta.is_dir():
-        raise ToonsError(f"Pasta não encontrada: {pasta}")
+        raise LnuxError(f"Pasta não encontrada: {pasta}")
     return pasta
 
 
@@ -17531,15 +18712,34 @@ def menu_otimizacao():
 
     def otimizar_apps_root():
         if not tem_root():
-            raise ToonsError("Precisa de root. Sem root, o Android faz isso sozinho quando o aparelho "
+            raise LnuxError("Precisa de root. Sem root, o Android faz isso sozinho quando o aparelho "
                              "fica carregando e parado.")
         info("Compilando os apps em segundo plano (pode levar vários minutos, deixe carregando)...")
         rodar(["su", "-c", "cmd package bg-dexopt-job"])
         ok("Otimização dos apps concluída.")
 
+    def trim_linux():
+        cmd = como_root(["fstrim", "-av"])
+        if cmd is None:
+            raise LnuxError("O TRIM precisa de root (sudo ou doas).")
+        info("Avisando o SSD dos blocos livres (o systemd costuma fazer isso toda semana sozinho)...")
+        rodar(cmd)
+
+    def limpar_pacotes_distro():
+        perfil = sistema()
+        pasta = Path(perfil.pacotes.get("pasta_cache") or "/nao-existe")
+        antes = tamanho(pasta) if pasta.is_dir() else 0
+        if antes:
+            info(f"Cache de pacotes ({pasta}): {bytes_humanos(antes)}")
+        if rodar_pacotes("limpar_cache") and perfil.comando("remover_orfaos") and \
+                confirmar("Remover também os pacotes que nada mais usa (órfãos)?", True):
+            rodar_pacotes("remover_orfaos")
+        if antes and pasta.is_dir():
+            ok(f"Liberado: {bytes_humanos(max(0, antes - tamanho(pasta)))}")
+
     def trim_root():
         if not tem_root():
-            raise ToonsError("Precisa de root. Sem root, o Android roda o TRIM sozinho durante a "
+            raise LnuxError("Precisa de root. Sem root, o Android roda o TRIM sozinho durante a "
                              "manutenção noturna (carregando e com a tela desligada).")
         rodar(["su", "-c", "sm fstrim"])
         ok("TRIM solicitado ao armazenamento.")
@@ -17552,7 +18752,7 @@ def menu_otimizacao():
         try:
             filhos = list(pasta.iterdir())
         except OSError as e:
-            raise ToonsError(f"Sem acesso a {pasta}: {e}") from None
+            raise LnuxError(f"Sem acesso a {pasta}: {e}") from None
         tamanhos = sorted(((tamanho(f), f) for f in filhos), reverse=True)
         total = sum(t for t, _ in tamanhos) or 1
         print(f"\n{NEG}{pasta}{RST} — {bytes_humanos(total)}")
@@ -17668,7 +18868,7 @@ def menu_otimizacao():
     def parar_tudo():
         ativos = servicos_ativos()
         if not ativos:
-            info("Nenhum serviço do Termux-Toons rodando.")
+            info("Nenhum serviço do LNUX rodando.")
             return
         if confirmar(f"Parar {', '.join(ativos)}?", True):
             for nome in ativos:
@@ -17682,16 +18882,18 @@ def menu_otimizacao():
     menu("🧹 Otimização e limpeza", [
         ("⚡ Otimização rápida (limpa tudo que é seguro)", rapida),
         ("Escolher o que limpar (mostra o tamanho de cada item)", escolher_limpeza),
-        ("Limpar cache de TODOS os apps (root ou depuração sem fio)", cache_todos_apps),
+        ("Limpar cache de TODOS os apps (root ou depuração sem fio)", so_em("android", cache_todos_apps)),
+        ("Limpar o cache de pacotes da distro (com sudo)", so_em("!termux", limpar_pacotes_distro)),
         ("Ver o que ocupa espaço", espaco),
         ("Arquivos grandes", grandes),
         ("Arquivos duplicados", duplicados),
         ("Pastas vazias", pastas_vazias),
-        ("Processos do Termux que mais usam RAM", processos),
-        ("Parar todos os serviços do Termux-Toons", parar_tudo),
-        ("Otimizar apps — compilação em segundo plano (root)", otimizar_apps_root),
-        ("TRIM do armazenamento (root)", trim_root),
-        ("Atalhos para telas do Android (armazenamento, bateria...)", telas),
+        (por_sistema("Processos do Termux que mais usam RAM", "Processos que mais usam RAM"), processos),
+        ("Parar todos os serviços do LNUX", parar_tudo),
+        ("Otimizar apps — compilação em segundo plano (root)", so_em("android", otimizar_apps_root)),
+        ("TRIM do armazenamento (root)", so_em("android", trim_root)),
+        ("TRIM do SSD (fstrim, com sudo)", so_em("!android", trim_linux)),
+        ("Atalhos para telas do Android (armazenamento, bateria...)", so_em("android", telas)),
     ])
 
 
@@ -17769,12 +18971,12 @@ def adb_aparelhos() -> list:
 
 
 def adb_alvo() -> str:
-    """O aparelho conectado (o último que o Termux-Toons conectou, se houver vários)."""
+    """O aparelho conectado (o último que o LNUX conectou, se houver vários)."""
     if not garantir_adb():
-        raise ToonsError("Sem o adb (pacote android-tools).")
+        raise LnuxError("Sem o adb (pacote android-tools).")
     aparelhos = adb_aparelhos()
     if not aparelhos:
-        raise ToonsError("Nenhum aparelho conectado. Use 'Conectar' (ou 'Parear', na primeira vez).")
+        raise LnuxError("Nenhum aparelho conectado. Use 'Conectar' (ou 'Parear', na primeira vez).")
     preferido = cfg().get("adb_endereco")
     return preferido if preferido in aparelhos else aparelhos[0]
 
@@ -17835,8 +19037,10 @@ def menu_adb():
              "  2. Toque em 'Parear dispositivo com código de pareamento'.\n"
              "  3. Volte aqui e digite a porta e o código que aparecem lá. É preciso parear uma vez só.")
         info(DICA_TELA_DIVIDIDA)
-        if confirmar("Abrir as Opções do desenvolvedor agora?", True):
+        if sistema().android and confirmar("Abrir as Opções do desenvolvedor agora?", True):
             _abrir_tela_android(TELA_DEPURACAO)
+        elif not sistema().android:
+            info("O celular e este computador precisam estar na mesma rede Wi-Fi.")
         achados = adb_mdns()["pairing"]
         ip, porta = achados[0] if achados else (ip_local(), None)
         if achados:
@@ -17849,7 +19053,7 @@ def menu_adb():
         proc = adb("pair", f"[{ip}]:{porta}" if ":" in ip else f"{ip}:{porta}", codigo, timeout=30)
         texto = f"{proc.stdout or ''}{proc.stderr or ''}".strip()
         if "Successfully paired" not in texto:
-            raise ToonsError(f"O pareamento falhou: {texto or 'sem resposta'}. O código expira rápido: gere outro "
+            raise LnuxError(f"O pareamento falhou: {texto or 'sem resposta'}. O código expira rápido: gere outro "
                              "e tente de novo.")
         ok("Pareado! Agora conectando...")
         adb_conectar()
@@ -17925,7 +19129,7 @@ def menu_adb():
             return
         apk = apks[i] if i < len(apks) else Path(os.path.expanduser(perguntar("Caminho do APK")))
         if not apk.is_file():
-            raise ToonsError(f"Arquivo não encontrado: {apk}")
+            raise LnuxError(f"Arquivo não encontrado: {apk}")
         info(f"Instalando {apk.name}...")
         proc = adb("install", "-r", str(apk), serial=serial, timeout=600)
         texto = f"{proc.stdout or ''}{proc.stderr or ''}".strip()
@@ -17975,9 +19179,10 @@ def menu_adb():
         adb_shell("settings put global adb_wifi_enabled 0")
         ok("Depuração por Wi-Fi desligada (para usar de novo: ligue nas Opções do desenvolvedor e use 'Conectar').")
 
-    menu("🔌 Depuração sem fio (ADB pelo Wi-Fi)", [
-        ("Abrir as Opções do desenvolvedor", abrir_opcoes),
-        ("Parear este celular (primeira vez)", parear),
+    menu("🔌 Depuração sem fio (ADB pelo Wi-Fi)" if sistema().android else "📱 Android conectado (ADB)", [
+        ("Abrir as Opções do desenvolvedor", so_em("android", abrir_opcoes)),
+        (por_sistema("Parear este celular (primeira vez)", "Parear um celular pelo Wi-Fi (primeira vez; por USB não precisa)"),
+         parear),
         (lambda: f"Conectar{' (' + c['adb_endereco'] + ')' if c.get('adb_endereco') else ''}", adb_conectar),
         ("Status: aparelhos conectados", status),
         ("Impedir que o Android mate o Termux (signal 9, Android 12+)", impedir_morte),
@@ -18028,7 +19233,7 @@ COMANDOS_ADB = {
          "tcpip 5555", "perigoso"),
         ("adb -s <série> <comando>", "Escolhe o aparelho quando há mais de um conectado (a série vem do adb devices). "
          "-d escolhe o único aparelho USB, -e o único emulador, e a variável ANDROID_SERIAL define um padrão. Aqui o "
-         "Termux-Toons já faz isso sozinho.", None, ""),
+         "LNUX já faz isso sozinho.", None, ""),
         ("adb help", "Lista todos os comandos que o adb aceita, com as opções de cada um.", "help", "local"),
     ]),
     "📂 Arquivos e shell": ("Copiar arquivos entre o Termux e o celular e usar o shell do Android.", [
@@ -18274,13 +19479,18 @@ def _menu_categoria_adb(nome: str) -> None:
          descricoes=[desc for _, desc, _, _ in comandos])
 
 
+def DICA_ADB() -> str:  # noqa: N802 — onde a pessoa conecta o adb, com o nome do menu em cada sistema
+    return "🔌 Depuração sem fio, em Celular e sistema" if sistema().android else \
+        "📱 Android conectado, em Computador e Android conectado"
+
+
 @submenu
 def menu_comandos_adb():
     menu("📖 Comandos do ADB", [(f"{nome} ({len(cmds)})", submenu(lambda n=nome: _menu_categoria_adb(n)))
                                for nome, (_, cmds) in COMANDOS_ADB.items()],
          descricoes=[desc for desc, _ in COMANDOS_ADB.values()],
          cabecalho=lambda: print(f"{DIM}Da documentação oficial do adb. Escolha um para ver a descrição e rodar "
-                                 f"(precisa estar conectado pela depuração sem fio).{RST}"))
+                                 f"(precisa estar conectado: {'depuração sem fio' if sistema().android else 'USB ou Wi-Fi'}).{RST}"))
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -18313,7 +19523,11 @@ def _privado_do_termux(caminho: str) -> bool:
 
 class AcessoTermux:
     """Arquivos com a permissão do próprio Termux (Python puro)."""
-    nome, rotulo = "termux", "Termux (normal)"
+    nome = "termux"
+
+    @property
+    def rotulo(self) -> str:
+        return "Termux (normal)" if sistema().termux else "Normal (este computador)"
 
     def listar(self, pasta: str) -> list:
         itens = []
@@ -18329,9 +19543,9 @@ class AcessoTermux:
                                   "tamanho": None if eh_pasta or st is None else st.st_size,
                                   "data": st.st_mtime if st else 0})
         except PermissionError:
-            raise ToonsError("Sem permissão para abrir esta pasta com o acesso do Termux.") from None
+            raise LnuxError("Sem permissão para abrir esta pasta com o acesso do Termux.") from None
         except OSError as e:
-            raise ToonsError(f"Não consegui abrir a pasta: {e.strerror or e}") from None
+            raise LnuxError(f"Não consegui abrir a pasta: {e.strerror or e}") from None
         return itens
 
     def dados(self, caminho: str) -> dict:
@@ -18393,8 +19607,13 @@ class AcessoShell(AcessoTermux):
 
     def __init__(self, nome: str):
         self.nome = nome
-        self.rotulo = "Root (vê tudo)" if nome == "root" else "ADB / depuração sem fio (Android/data, obb...)"
+        self._rotulo = "Root (vê tudo)" if nome == "root" else (
+            "ADB / depuração sem fio (Android/data, obb...)" if sistema().android else "Android conectado (ADB)")
         self.serial = adb_alvo() if nome == "adb" else None
+
+    @property
+    def rotulo(self) -> str:
+        return self._rotulo
 
     def sh(self, comando: str, timeout: float | None = 120) -> subprocess.CompletedProcess:
         cmd = ["su", "-c", comando] if self.nome == "root" else ["adb", "-s", self.serial, "shell", comando]
@@ -18405,7 +19624,7 @@ class AcessoShell(AcessoTermux):
         proc = self.sh(comando, timeout)
         if proc.returncode != 0:
             texto = f"{proc.stderr or ''}{proc.stdout or ''}".strip()
-            raise ToonsError(texto[-300:] or f"O comando falhou (código {proc.returncode}).")
+            raise LnuxError(texto[-300:] or f"O comando falhou (código {proc.returncode}).")
         return (proc.stdout or "").strip()
 
     def listar(self, pasta: str) -> list:
@@ -18416,10 +19635,10 @@ class AcessoShell(AcessoTermux):
                        f"[ -d {shlex.quote(pasta)} ] || echo NAO_EXISTE; [ -r {shlex.quote(pasta)} ] || echo SEM_PERMISSAO")
         saida_sh = proc.stdout or ""
         if "NAO_EXISTE" in saida_sh:
-            raise ToonsError(f"A pasta não existe (ou não aparece com o acesso {self.rotulo}).")
+            raise LnuxError(f"A pasta não existe (ou não aparece com o acesso {self.rotulo}).")
         if "SEM_PERMISSAO" in saida_sh or (proc.returncode != 0 and not saida_sh.strip()
                                            and "Permission denied" in (proc.stderr or "")):
-            raise ToonsError(f"Sem permissão para abrir esta pasta com o acesso {self.rotulo}.")
+            raise LnuxError(f"Sem permissão para abrir esta pasta com o acesso {self.rotulo}.")
         itens = []
         for linha in saida_sh.splitlines():
             partes = linha.split("|", 3)
@@ -18481,14 +19700,14 @@ def criar_acesso(nome: str):
         return AcessoTermux()
     if nome == "root":
         if not tem_root():
-            raise ToonsError("Este celular não tem root (o comando su não respondeu).")
+            raise LnuxError("Este celular não tem root (o comando su não respondeu).")
         return AcessoShell("root")
     if not garantir_adb():
-        raise ToonsError("Sem o adb (pacote android-tools).")
+        raise LnuxError("Sem o adb (pacote android-tools).")
     if not adb_aparelhos():
         info("A depuração sem fio não está conectada. Ligue a 'Depuração por Wi-Fi' nas Opções do desenvolvedor.")
         if not adb_conectar():
-            raise ToonsError("Não conectou. Na primeira vez, use 'Depuração sem fio → Parear este celular'.")
+            raise LnuxError("Não conectou. Na primeira vez, use 'Depuração sem fio → Parear este celular'.")
     return AcessoShell("adb")
 
 
@@ -18554,20 +19773,20 @@ def transferir(origem, caminhos: list, destino, pasta: str, mover: bool) -> int:
                 if origem.nome == "termux" and _privado_do_termux(caminho):  # Termux privado -> ADB
                     proc = adb("push", caminho, alvo, serial=adb_acesso.serial, timeout=None)
                     if proc.returncode != 0:
-                        raise ToonsError((proc.stderr or proc.stdout or "").strip()[-300:])
+                        raise LnuxError((proc.stderr or proc.stdout or "").strip()[-300:])
                     if mover:
                         origem.apagar(caminho)
                 elif destino.nome == "termux" and _privado_do_termux(pasta):  # ADB -> Termux privado
                     proc = adb("pull", "-a", caminho, alvo, serial=adb_acesso.serial, timeout=None)
                     if proc.returncode != 0:
-                        raise ToonsError((proc.stderr or proc.stdout or "").strip()[-300:])
+                        raise LnuxError((proc.stderr or proc.stdout or "").strip()[-300:])
                     if mover:
                         adb_acesso.apagar(caminho)
                 else:  # os dois lados no armazenamento: o shell do ADB faz direto
                     (adb_acesso.mover if mover else adb_acesso.copiar)(os.path.realpath(caminho), os.path.realpath(pasta), final)
             feitos += 1
             ok(f"{'Movido' if mover else 'Copiado'}: {nome}" + (f" → {final}" if final != nome else ""))
-        except (OSError, shutil.Error, ToonsError) as e:
+        except (OSError, shutil.Error, LnuxError) as e:
             erro(f"{nome}: {e}")
     return feitos
 
@@ -18583,7 +19802,7 @@ def extrair(arquivo: str, pasta: str) -> str:
             raiz = os.path.realpath(destino)
             for membro in z.namelist():  # nada de '../' saindo da pasta
                 if not os.path.realpath(os.path.join(raiz, membro)).startswith(raiz + os.sep) and membro.strip("/"):
-                    raise ToonsError(f"Arquivo suspeito dentro do zip: {membro}")
+                    raise LnuxError(f"Arquivo suspeito dentro do zip: {membro}")
             z.extractall(destino)
     elif baixo.endswith((".tar", ".tar.gz", ".tgz", ".tar.xz", ".txz", ".tar.bz2", ".tbz2")):
         with tarfile.open(arquivo) as t:
@@ -18593,13 +19812,13 @@ def extrair(arquivo: str, pasta: str) -> str:
                 raiz = os.path.realpath(destino)
                 if any(not os.path.realpath(os.path.join(raiz, m.name)).startswith(raiz) or m.issym() or m.islnk()
                        for m in t.getmembers()):
-                    raise ToonsError("O arquivo tem caminhos ou links suspeitos; não extraí.")
+                    raise LnuxError("O arquivo tem caminhos ou links suspeitos; não extraí.")
                 t.extractall(destino)
     else:
         if not garantir_cmd("7z", "p7zip"):
-            raise ToonsError("Para .7z e .rar é preciso o 7z (pkg install p7zip).")
+            raise LnuxError("Para .7z e .rar é preciso o 7z (pkg install p7zip).")
         if rodar(["7z", "x", f"-o{destino}", "-y", arquivo]).returncode != 0:
-            raise ToonsError("O 7z não conseguiu extrair (senha errada ou arquivo corrompido?).")
+            raise LnuxError("O 7z não conseguiu extrair (senha errada ou arquivo corrompido?).")
     return destino
 
 
@@ -18620,6 +19839,16 @@ def compactar(caminhos: list, destino: str) -> None:
 
 def _atalhos_de_pasta(acesso) -> list:
     """[(rótulo, caminho)] para 'Ir para...'."""
+    if not sistema().android and acesso.nome == "termux":  # computador: as pastas da pessoa e os discos
+        perfil = sistema()
+        atalhos = [("🏠 Pasta pessoal", str(HOME))]
+        atalhos += [(f"   {nome}", str(perfil.caminho(chave))) for nome, chave in
+                    (("Downloads", "downloads"), ("Documentos", "documentos"), ("Imagens", "imagens"),
+                     ("Músicas", "musicas"), ("Vídeos", "videos")) if perfil.caminho(chave).is_dir()]
+        for base in (Path("/media") / getpass.getuser(), Path("/run/media") / getpass.getuser(), Path("/mnt")):
+            with contextlib.suppress(OSError):
+                atalhos += [(f"💾 {d.name}", str(d)) for d in sorted(base.iterdir()) if d.is_dir()]
+        return atalhos + [("⚙ Raiz do sistema (/)", "/")]
     atalhos = [("📱 Armazenamento interno", ARMAZENAMENTO)]
     atalhos += [(f"   {nome}", f"{ARMAZENAMENTO}/{nome}") for nome in
                 ("Download", "DCIM", "Pictures", "Movies", "Music", "Documents", "WhatsApp/Media", "Android/media")]
@@ -18677,7 +19906,7 @@ def gerenciador_arquivos(inicio: str | None = None) -> None:
             if acesso.nome != "termux" and not os.access(caminho, os.R_OK):
                 aviso("O Termux não enxerga este arquivo direto. Use 'Copiar para Download' e abra de lá.")
             elif not tem("termux-open"):
-                raise ToonsError("'termux-open' não encontrado (só existe dentro do Termux).")
+                raise LnuxError("'termux-open' não encontrado (só existe dentro do Termux).")
             else:
                 rodar(["termux-open", "--chooser", caminho], capturar=True, timeout=20)
         elif acao == "ver":
@@ -18692,17 +19921,20 @@ def gerenciador_arquivos(inicio: str | None = None) -> None:
             novo = perguntar("Novo nome", nome).strip()
             if novo and novo != nome:
                 if "/" in novo:
-                    raise ToonsError("O nome não pode ter '/'.")
+                    raise LnuxError("O nome não pode ter '/'.")
                 if acesso.existe(os.path.join(os.path.dirname(caminho), novo)):
-                    raise ToonsError(f"Já existe '{novo}' nesta pasta.")
+                    raise LnuxError(f"Já existe '{novo}' nesta pasta.")
                 acesso.renomear(caminho, novo)
                 ok(f"Renomeado para {novo}")
         elif acao in ("copiar", "mover"):
             estado["clip"] = (acesso, [caminho], acao == "mover")
             ok(f"{'Recortado' if acao == 'mover' else 'Copiado'}. Vá até a pasta de destino e use ⚙ → Colar aqui.")
         elif acao == "download":
-            transferir(acesso, [caminho], AcessoTermux() if acesso.nome == "termux" else acesso,
-                       f"{ARMAZENAMENTO}/Download", False)
+            if sistema().android:
+                transferir(acesso, [caminho], AcessoTermux() if acesso.nome == "termux" else acesso,
+                           f"{ARMAZENAMENTO}/Download", False)
+            else:  # no computador: para a pasta Downloads dele (vale também para um arquivo do Android conectado)
+                transferir(acesso, [caminho], AcessoTermux(), str(DOWNLOADS), False)
         elif acao == "extrair":
             info("Extraindo...")
             ok(f"Extraído em {extrair(caminho, pasta)}")
@@ -18713,12 +19945,12 @@ def gerenciador_arquivos(inicio: str | None = None) -> None:
         elif acao == "editar":
             editor = os.environ.get("EDITOR") or next((e for e in ("nano", "nvim", "vi") if tem(e)), None)
             if not editor:
-                raise ToonsError("Nenhum editor encontrado (pkg install nano).")
+                raise LnuxError("Nenhum editor encontrado (pkg install nano).")
             rodar([editor, caminho])
             return
         elif acao == "enviar":
             if not tem("termux-share"):
-                raise ToonsError("Precisa do Termux:API (pkg install termux-api).")
+                raise LnuxError("Precisa do Termux:API (pkg install termux-api).")
             rodar(["termux-share", "-a", "send", caminho], capturar=True, timeout=30)
         elif acao == "apagar":
             tipo = "a pasta e TUDO dentro dela" if item["pasta"] else "o arquivo"
@@ -18752,7 +19984,7 @@ def gerenciador_arquivos(inicio: str | None = None) -> None:
                     try:
                         acesso.apagar(c)
                         ok(f"Apagado: {os.path.basename(c)}")
-                    except (OSError, ToonsError) as e:
+                    except (OSError, LnuxError) as e:
                         erro(f"{os.path.basename(c)}: {e}")
         elif "Tamanho" in acao:
             info("Somando...")
@@ -18818,13 +20050,15 @@ def gerenciador_arquivos(inicio: str | None = None) -> None:
         elif acao == "acesso":
             niveis = [("Termux (normal)", "termux"),
                       ("ADB / depuração sem fio — abre Android/data, Android/obb e mais, sem root", "adb"),
-                      ("Root — tudo, inclusive os dados dos apps", "root")]
+                      ("Root — tudo, inclusive os dados dos apps", "root")] if sistema().android else \
+                [("Normal (este computador)", "termux"),
+                 ("Android conectado (ADB por USB ou Wi-Fi) — as pastas do celular, inclusive Android/data", "adb")]
             j = escolher("Nível de acesso", [r for r, _ in niveis])
             if j is not None:
                 try:
                     acesso = criar_acesso(niveis[j][1])
                     ok(f"Acesso: {acesso.rotulo}")
-                except ToonsError as e:
+                except LnuxError as e:
                     erro(str(e))
                 pausar()
         elif acao == "ocultos":
@@ -18844,7 +20078,7 @@ def gerenciador_arquivos(inicio: str | None = None) -> None:
         limpar()
         try:
             itens, problema = acesso.listar(pasta), ""
-        except ToonsError as e:
+        except LnuxError as e:
             itens, problema = [], str(e)
         # No Android 11+ o Termux vê Android/data e Android/obb vazias (ou só com a pasta dele), sem erro:
         # oferece abrir com o acesso ADB (ou root), que enxerga as pastas dos outros apps.
@@ -18862,7 +20096,7 @@ def gerenciador_arquivos(inicio: str | None = None) -> None:
                     acesso = criar_acesso(niveis[j])
                     ok(f"Acesso: {acesso.rotulo}")
                     continue
-                except ToonsError as e:
+                except LnuxError as e:
                     erro(str(e))
                     pausar()
             limpar()
@@ -18906,8 +20140,8 @@ def gerenciador_arquivos(inicio: str | None = None) -> None:
                 pasta = item["caminho"]
             else:
                 acoes_item(item)
-        except (OSError, shutil.Error, zipfile.BadZipFile, tarfile.TarError, ToonsError) as e:
-            erro(str(e) if isinstance(e, ToonsError) else f"Falhou: {e}")
+        except (OSError, shutil.Error, zipfile.BadZipFile, tarfile.TarError, LnuxError) as e:
+            erro(str(e) if isinstance(e, LnuxError) else f"Falhou: {e}")
             pausar()
 
 
@@ -18927,39 +20161,39 @@ def _calc_int(x, nome: str) -> int:
     if isinstance(x, float) and x.is_integer():
         x = int(x)
     if not isinstance(x, int):
-        raise ToonsError(f"{nome} só aceita números inteiros.")
+        raise LnuxError(f"{nome} só aceita números inteiros.")
     return x
 
 
 def _calc_verificar(v):
     """Barra resultados enormes, infinitos ou complexos."""
     if isinstance(v, complex):
-        raise ToonsError("Resultado complexo (raiz/potência fracionária de número negativo).")
+        raise LnuxError("Resultado complexo (raiz/potência fracionária de número negativo).")
     if isinstance(v, int):
         if v.bit_length() > CALC_MAX_BITS:
-            raise ToonsError("Número grande demais.")
+            raise LnuxError("Número grande demais.")
     elif math.isnan(v) or math.isinf(v):
-        raise ToonsError("Resultado indefinido ou infinito.")
+        raise LnuxError("Resultado indefinido ou infinito.")
     return v
 
 
 def _calc_pot(a, b):
     if isinstance(a, int) and isinstance(b, int) and abs(a) > 1 and b > 0 \
             and b * math.log2(abs(a)) > CALC_MAX_BITS:
-        raise ToonsError("Potência grande demais.")
+        raise LnuxError("Potência grande demais.")
     return _calc_verificar(operator.pow(a, b))
 
 
 def _calc_div(a, b):
     if b == 0:
-        raise ToonsError("Divisão por zero.")
+        raise LnuxError("Divisão por zero.")
     return operator.truediv(a, b)
 
 
 def _calc_fatorial(n):
     n = _calc_int(n, "Fatorial")
     if not 0 <= n <= CALC_MAX_FATORIAL:
-        raise ToonsError(f"Fatorial vale de 0 a {CALC_MAX_FATORIAL}.")
+        raise LnuxError(f"Fatorial vale de 0 a {CALC_MAX_FATORIAL}.")
     return math.factorial(n)
 
 
@@ -18976,7 +20210,7 @@ def _calc_funcoes(graus: bool) -> dict:
 
     def tan(x):
         if graus and (x - 90) % 180 == 0:
-            raise ToonsError("A tangente não existe nesse ângulo.")
+            raise LnuxError("A tangente não existe nesse ângulo.")
         return 0 if graus and x % 180 == 0 else math.tan(a_rad(x))
 
     def log(x, base=10):
@@ -18985,11 +20219,11 @@ def _calc_funcoes(graus: bool) -> dict:
     def raiz(x, n=2):
         n = _calc_int(n, "raiz")
         if n == 0:
-            raise ToonsError("Raiz de índice zero não existe.")
+            raise LnuxError("Raiz de índice zero não existe.")
         if x < 0 and n % 2:  # raiz ímpar de negativo é real: raiz(-27, 3) = -3
             return -(abs(x) ** (1 / n))
         if x < 0:
-            raise ToonsError("Raiz par de número negativo não é real.")
+            raise LnuxError("Raiz par de número negativo não é real.")
         r = x ** (1 / n)
         return round(r) if round(r) ** n == x else r  # raiz(8, 3) dá 2, não 2.0000000000000004
 
@@ -18997,14 +20231,14 @@ def _calc_funcoes(graus: bool) -> dict:
         def g(x):
             v = f(x)
             if v == 0:
-                raise ToonsError(f"{nome} não existe nesse ângulo.")
+                raise LnuxError(f"{nome} não existe nesse ângulo.")
             return 1 / v
         return g
 
     def lista(f, minimo=1):
         def g(*v):
             if len(v) < minimo:
-                raise ToonsError(f"Informe pelo menos {minimo} número(s), separados por vírgula.")
+                raise LnuxError(f"Informe pelo menos {minimo} número(s), separados por vírgula.")
             return f(v)
         return g
 
@@ -19068,7 +20302,7 @@ def _calc_preparar(texto: str, funcoes: dict) -> str:
     while pos < len(texto):
         m = _CALC_TOKEN.match(texto, pos)
         if not m:
-            raise ToonsError(f"Caractere inválido: '{texto[pos:].strip()[0]}'.")
+            raise LnuxError(f"Caractere inválido: '{texto[pos:].strip()[0]}'.")
         pos = m.end()
         if m.group(1):
             tokens.append(("num", m.group(1)))
@@ -19090,15 +20324,15 @@ def _calc_preparar(texto: str, funcoes: dict) -> str:
                 if nivel == 0:
                     break
             else:
-                raise ToonsError("Parênteses não fecham.")
+                raise LnuxError("Parênteses não fecham.")
         elif fim >= len(tokens) or tokens[fim][0] not in ("num", "nome"):
-            raise ToonsError("'√' precisa de um número depois.")
+            raise LnuxError("'√' precisa de um número depois.")
         tokens[i:fim + 1] = [("nome", "sqrt"), ("op", "(")] + tokens[i + 1:fim + 1] + [("op", ")")]
 
     def inicio_operando(saida, simbolo):
         """Índice onde começa o número, nome ou (grupo) logo antes de '!' ou '%'."""
         if not saida:
-            raise ToonsError(f"'{simbolo}' precisa de um número antes.")
+            raise LnuxError(f"'{simbolo}' precisa de um número antes.")
         if saida[-1] == ("op", ")"):
             nivel = 0
             for i in range(len(saida) - 1, -1, -1):
@@ -19106,10 +20340,10 @@ def _calc_preparar(texto: str, funcoes: dict) -> str:
                 if nivel == 0:
                     # inclui o nome da função: sqrt(4)! → fat(sqrt(4))
                     return i - 1 if i and saida[i - 1][0] == "nome" and saida[i - 1][1] in funcoes else i
-            raise ToonsError("Parênteses não fecham.")
+            raise LnuxError("Parênteses não fecham.")
         if saida[-1][0] in ("num", "nome"):
             return len(saida) - 1
-        raise ToonsError(f"'{simbolo}' precisa de um número antes.")
+        raise LnuxError(f"'{simbolo}' precisa de um número antes.")
 
     saida = []
     for i, tok in enumerate(tokens):
@@ -19134,16 +20368,16 @@ def _calc_preparar(texto: str, funcoes: dict) -> str:
 
 
 def calc_avaliar(texto: str, variaveis: dict | None = None, graus: bool = True):
-    """Calcula uma expressão e devolve int ou float. Erros viram ToonsError."""
+    """Calcula uma expressão e devolve int ou float. Erros viram LnuxError."""
     variaveis = variaveis or {}
     constantes = {"pi": math.pi, "e": math.e, "tau": math.tau, "inf": math.inf, **variaveis}
     funcoes = _calc_funcoes(graus)
     texto = (texto.strip().replace("×", "*").replace("÷", "/").replace("π", "pi")
              .replace("−", "-"))
     if not texto:
-        raise ToonsError("Digite uma conta.")
+        raise LnuxError("Digite uma conta.")
     if len(texto) > 500:
-        raise ToonsError("Expressão longa demais.")
+        raise LnuxError("Expressão longa demais.")
     texto = _calc_preparar(texto, funcoes)
 
     def calc(no):
@@ -19154,12 +20388,12 @@ def calc_avaliar(texto: str, variaveis: dict | None = None, graus: bool = True):
         if isinstance(no, ast.Name):
             if no.id in constantes:
                 return constantes[no.id]
-            raise ToonsError(f"'{no.id}' não existe. Digite 'ajuda' para ver as funções.")
+            raise LnuxError(f"'{no.id}' não existe. Digite 'ajuda' para ver as funções.")
         if isinstance(no, ast.UnaryOp) and isinstance(no.op, (ast.USub, ast.UAdd)):
             valor = calc(no.operand)
             return -valor if isinstance(no.op, ast.USub) else valor
         if isinstance(no, ast.Tuple):
-            raise ToonsError("Use ponto para decimais (3.5); a vírgula separa argumentos, como em log(8, 2).")
+            raise LnuxError("Use ponto para decimais (3.5); a vírgula separa argumentos, como em log(8, 2).")
         # porcentagem como no celular: 200 + 10% = 220, 200 - 10% = 180
         if (isinstance(no, ast.BinOp) and isinstance(no.op, (ast.Add, ast.Sub))
                 and isinstance(no.right, ast.Call) and isinstance(no.right.func, ast.Name)
@@ -19171,28 +20405,28 @@ def calc_avaliar(texto: str, variaveis: dict | None = None, graus: bool = True):
             return _calc_verificar(_CALC_BINARIOS[type(no.op)](calc(no.left), calc(no.right)))
         if isinstance(no, ast.Call) and isinstance(no.func, ast.Name) and not no.keywords:
             if no.func.id not in funcoes:
-                raise ToonsError(f"Função '{no.func.id}' não existe. Digite 'ajuda'.")
+                raise LnuxError(f"Função '{no.func.id}' não existe. Digite 'ajuda'.")
             try:
                 return _calc_verificar(funcoes[no.func.id](*[calc(a) for a in no.args]))
             except TypeError:
-                raise ToonsError(f"Quantidade de argumentos errada em {no.func.id}(). Digite 'ajuda'.") from None
-        raise ToonsError("Não entendi essa expressão (use * entre números, ex.: 2*pi, 3*(4+5)).")
+                raise LnuxError(f"Quantidade de argumentos errada em {no.func.id}(). Digite 'ajuda'.") from None
+        raise LnuxError("Não entendi essa expressão (use * entre números, ex.: 2*pi, 3*(4+5)).")
 
     try:
         return calc(ast.parse(texto, mode="eval"))
     except SyntaxError:
-        raise ToonsError("Expressão inválida (confira parênteses e operadores).") from None
+        raise LnuxError("Expressão inválida (confira parênteses e operadores).") from None
     except ZeroDivisionError:
-        raise ToonsError("Divisão por zero.") from None
+        raise LnuxError("Divisão por zero.") from None
     except ValueError as e:
         motivo = "fora do domínio da função" if "domain" in str(e) else str(e)
         if isinstance(e, statistics.StatisticsError):
             motivo = "faltam números para essa estatística"
-        raise ToonsError(f"Conta impossível ({motivo}).") from None
+        raise LnuxError(f"Conta impossível ({motivo}).") from None
     except OverflowError:
-        raise ToonsError("Resultado grande demais.") from None
+        raise LnuxError("Resultado grande demais.") from None
     except RecursionError:
-        raise ToonsError("Expressão aninhada demais.") from None
+        raise LnuxError("Expressão aninhada demais.") from None
 
 
 def calc_formatar(v) -> str:
@@ -19214,11 +20448,11 @@ def _calc_converter(valor, modo: str) -> str:
             fracao = Fraction(valor).limit_denominator(10**6)
             return str(fracao) + ("" if float(fracao) == valor else " (aproximada)")
     except (OverflowError, ValueError):
-        raise ToonsError("Esse número não vira fração.") from None
+        raise LnuxError("Esse número não vira fração.") from None
     if isinstance(valor, float) and valor.is_integer():
         valor = int(valor)
     if not isinstance(valor, int):
-        raise ToonsError("Só números inteiros podem ser mostrados em outra base.")
+        raise LnuxError("Só números inteiros podem ser mostrados em outra base.")
     return {"hex": hex, "bin": bin, "oct": oct}[modo](valor)
 
 
@@ -19240,7 +20474,7 @@ Exemplos:    sqrt(2)pi    sin(30)    2^10    10!/3!    log(1000)    media(7, 8.5
 
 @submenu
 def menu_calculadora():
-    # sem terminal interativo (ou com TOONS_NUMEROS=1) não há setas: usa o modo digitado
+    # sem terminal interativo (ou com LNUX_NUMEROS=1) não há setas: usa o modo digitado
     if setas_ativas():
         _calculadora_botoes()
     else:
@@ -19285,7 +20519,7 @@ def _calculadora_texto():
             else:
                 try:
                     print(f"  {VERD}={RST} {NEG}{_calc_converter(variaveis['ans'], comando)}{RST}")
-                except ToonsError as e:
+                except LnuxError as e:
                     erro(str(e))
         elif comando in ("limpar", "clear", "cls"):
             variaveis.clear()
@@ -19301,9 +20535,9 @@ def _calculadora_texto():
             try:
                 if atribuicao and (atribuicao.group(1) in CALC_RESERVADOS
                                    or atribuicao.group(1).lower() in _calc_funcoes(graus)):
-                    raise ToonsError(f"'{atribuicao.group(1)}' é reservado; escolha outro nome.")
+                    raise LnuxError(f"'{atribuicao.group(1)}' é reservado; escolha outro nome.")
                 valor = calc_avaliar(expressao, variaveis, graus)
-            except ToonsError as e:
+            except LnuxError as e:
                 erro(str(e))
                 continue
             variaveis["ans"] = valor
@@ -19403,7 +20637,7 @@ def _calculadora_botoes():
         nonlocal linha_resultado, tipo_resultado
         linha_resultado, tipo_resultado = "", ""
         if conta and not calculou:
-            with contextlib.suppress(ToonsError):
+            with contextlib.suppress(LnuxError):
                 linha_resultado = calc_formatar(calc_avaliar(fechada(conta), variaveis, graus))
                 tipo_resultado = "previa"
 
@@ -19418,7 +20652,7 @@ def _calculadora_botoes():
             texto = fechada(conta)
             try:
                 valor = calc_avaliar(texto, variaveis, graus)
-            except ToonsError as e:
+            except LnuxError as e:
                 linha_resultado, tipo_resultado = str(e), "erro"
                 return True
             variaveis["ans"] = valor
@@ -19432,7 +20666,7 @@ def _calculadora_botoes():
                 return True
             try:
                 linha_resultado, tipo_resultado = _calc_converter(variaveis["ans"], acao[1:]), "final"
-            except ToonsError as e:
+            except LnuxError as e:
                 linha_resultado, tipo_resultado = str(e), "erro"
             return True
         if acao == "#hist":
@@ -19578,8 +20812,8 @@ DIAS_SEMANA = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "dom
 
 
 def pasta_saida(*sub: str) -> Path:
-    """Onde salvar o que a pessoa vai querer abrir: Downloads/Termux-Toons (ou ~/.termux_toons/saida)."""
-    base = DOWNLOADS / "Termux-Toons" if DOWNLOADS.exists() else DATA_DIR / "saida"
+    """Onde salvar o que a pessoa vai querer abrir: Downloads/LNUX (ou ~/.lnux/saida)."""
+    base = DOWNLOADS / "LNUX" if DOWNLOADS.exists() else DATA_DIR / "saida"
     pasta = base.joinpath(*sub)
     pasta.mkdir(parents=True, exist_ok=True)
     return pasta
@@ -19592,7 +20826,7 @@ def _abridor(url: str):
 
 def pedir_bytes(url: str, dados: bytes | None = None, cabecalhos: dict | None = None, timeout: float = 30,
                 metodo: str | None = None) -> bytes:
-    """Faz uma requisição HTTP e devolve o corpo. Erros viram ToonsError com uma mensagem legível."""
+    """Faz uma requisição HTTP e devolve o corpo. Erros viram LnuxError com uma mensagem legível."""
     req = urllib.request.Request(url, data=dados, method=metodo,
                                  headers={"User-Agent": USER_AGENT, **(cabecalhos or {})})
     host = urllib.parse.urlsplit(url).netloc
@@ -19601,9 +20835,9 @@ def pedir_bytes(url: str, dados: bytes | None = None, cabecalhos: dict | None = 
             return r.read()
     except urllib.error.HTTPError as e:
         detalhe = e.read()[:300].decode("utf-8", errors="replace").strip()
-        raise ToonsError(f"HTTP {e.code} em {host}" + (f": {detalhe}" if detalhe else "")) from None
+        raise LnuxError(f"HTTP {e.code} em {host}" + (f": {detalhe}" if detalhe else "")) from None
     except (OSError, ValueError) as e:
-        raise ToonsError(f"Sem resposta de {host} ({getattr(e, 'reason', e)}). Está com internet?") from None
+        raise LnuxError(f"Sem resposta de {host} ({getattr(e, 'reason', e)}). Está com internet?") from None
 
 
 def pedir_json(url: str, dados=None, cabecalhos: dict | None = None, timeout: float = 30,
@@ -19615,7 +20849,7 @@ def pedir_json(url: str, dados=None, cabecalhos: dict | None = None, timeout: fl
     try:
         return json.loads(bruto.decode("utf-8", errors="replace") or "null")
     except ValueError:
-        raise ToonsError(f"Resposta inesperada de {urllib.parse.urlsplit(url).netloc}.") from None
+        raise LnuxError(f"Resposta inesperada de {urllib.parse.urlsplit(url).netloc}.") from None
 
 
 def url_com(base: str, **params) -> str:
@@ -19662,7 +20896,7 @@ def copiar_texto(texto: str, avisar: bool = True) -> bool:
     """Copia para a área de transferência do Android (Termux:API)."""
     try:
         _tapi(["termux-clipboard-set"], 10, entrada=texto, json_saida=False)
-    except ToonsError as e:
+    except LnuxError as e:
         aviso(f"Não consegui copiar ({e}).")
         return False
     if avisar:
@@ -19691,16 +20925,19 @@ def notificar_seguro(titulo_n: str, texto: str, **extra) -> None:
     """Notificação que nunca derruba quem chamou (fora do Termux só imprime)."""
     try:
         notificar(titulo_n, texto, **extra)
-    except ToonsError as e:
+    except LnuxError as e:
         log(f"Notificação falhou: {e}")
 
 
 def _pastas_de_arquivos() -> list:
     """(pasta, profundidade) onde os arquivos da pessoa costumam estar."""
-    s = HOME / "storage"
-    pastas = [(s / "downloads", 3), (s / "dcim", 3), (s / "pictures", 3), (s / "music", 3), (s / "movies", 3),
-              (s / "shared" / "Documents", 3), (s / "shared", 2), (HOME, 1)]
-    return [(p, n) for p, n in pastas if p.exists()]
+    u = pasta_usuario  # no Termux, ~/storage/...; nas distros, as pastas XDG (Downloads, Imagens...)
+    pastas = [(u("downloads"), 3), (u("dcim"), 3), (u("pictures"), 3), (u("music"), 3), (u("movies"), 3),
+              (u("shared", "Documents"), 3), (u("shared"), 2), (HOME, 1)]
+    profundidade = {}  # no Linux várias viram a mesma pasta (dcim e pictures = Imagens): fica a primeira
+    for pasta, n in pastas:
+        profundidade.setdefault(pasta, n)
+    return [(p, n) for p, n in profundidade.items() if p.exists()]
 
 
 def listar_arquivos(extensoes: tuple = (), pastas: list | None = None, limite: int = 200) -> list:
@@ -19749,7 +20986,7 @@ def escolher_arquivo(msg: str, extensoes: tuple = (), pastas: list | None = None
         return arquivos[i]
     caminho = Path(os.path.expanduser(perguntar("Caminho do arquivo").strip().strip("'\"")))
     if not caminho.is_file():
-        raise ToonsError(f"Arquivo não encontrado: {caminho}")
+        raise LnuxError(f"Arquivo não encontrado: {caminho}")
     return caminho
 
 
@@ -19757,7 +20994,7 @@ def escolher_arquivos(msg: str, extensoes: tuple = (), pastas: list | None = Non
     """Vários arquivos de uma vez (Espaço marca)."""
     arquivos = listar_arquivos(extensoes, pastas)
     if not arquivos:
-        raise ToonsError(f"Nenhum arquivo {'/'.join(extensoes)} encontrado nas pastas comuns.")
+        raise LnuxError(f"Nenhum arquivo {'/'.join(extensoes)} encontrado nas pastas comuns.")
     return [arquivos[i] for i in escolher_varios(msg, [_rotulo_arquivo(a) for a in arquivos])]
 
 
@@ -19810,7 +21047,7 @@ class TelaCheia:
 
     def __enter__(self):
         if not setas_ativas():
-            raise ToonsError("Isto precisa de um terminal interativo (abra pelo Termux).")
+            raise LnuxError("Isto precisa de um terminal interativo (abra pelo Termux).")
         self.fd = sys.stdin.fileno()
         self.antigo = termios.tcgetattr(self.fd)
         sys.stdout.write("\033[?1049h\033[?25l")
@@ -19886,7 +21123,7 @@ def parse_duracao(texto: str, unidade_padrao: str = "m") -> int:
         return int(float(t.replace(",", ".")) * {"s": 1, "m": 60, "h": 3600}[unidade_padrao])
     padrao = r"(\d+(?:[.,]\d+)?)(horas?|h|minutos?|mins?|m|segundos?|seg|s)"
     if not t or not re.fullmatch(f"(?:{padrao})+", t):
-        raise ToonsError("Não entendi o tempo. Exemplos: 25 (minutos), 90s, 1h30m, 10:00.")
+        raise LnuxError("Não entendi o tempo. Exemplos: 25 (minutos), 90s, 1h30m, 10:00.")
     total = 0.0
     for numero, unidade in re.findall(padrao, t):
         total += float(numero.replace(",", ".")) * {"h": 3600, "m": 60, "s": 1}[unidade[0]]
@@ -19999,7 +21236,7 @@ def menu_notas():
             elif i == 3:
                 try:
                     falar(f"{nota['titulo']}. {nota['corpo']}")
-                except ToonsError as e:
+                except LnuxError as e:
                     erro(str(e))
                     pausar()
             elif i == 4:
@@ -20092,7 +21329,7 @@ def parse_quando(texto: str, agora: datetime | None = None) -> datetime:
             try:
                 dia = date(ano, int(m.group(2)), int(m.group(1)))
             except ValueError:
-                raise ToonsError("Data inválida.") from None
+                raise LnuxError("Data inválida.") from None
             if not m.group(3) and dia < agora.date():
                 dia = dia.replace(year=ano + 1)  # '05/01' digitado em dezembro é do ano que vem
             t = t[m.end():]
@@ -20101,12 +21338,12 @@ def parse_quando(texto: str, agora: datetime | None = None) -> datetime:
     if t:
         m = re.fullmatch(r"(\d{1,2})(?:[:h](\d{2})?)?(?:min)?", t)
         if not m:
-            raise ToonsError("Não entendi. Exemplos: 18:30 · 7h · amanhã 7h · 25/12 08:00 · 10min · em 2 horas")
+            raise LnuxError("Não entendi. Exemplos: 18:30 · 7h · amanhã 7h · 25/12 08:00 · 10min · em 2 horas")
         hora, minuto = int(m.group(1)), int(m.group(2) or 0)
         if hora > 23 or minuto > 59:
-            raise ToonsError("Hora inválida.")
+            raise LnuxError("Hora inválida.")
     if dia is None and hora is None:
-        raise ToonsError("Diga quando: 18:30, amanhã 7h, 25/12 08:00, 10min...")
+        raise LnuxError("Diga quando: 18:30, amanhã 7h, 25/12 08:00, 10min...")
     if hora is None:
         hora, minuto = 9, 0
     quando = datetime.combine(dia or agora.date(), datetime.min.time()).replace(hour=hora, minute=minuto)
@@ -20154,18 +21391,18 @@ def disparar_lembrete(lem: dict, atrasado: bool = False) -> None:
     log(f"{'Alarme' if lem.get('alarme') else 'Lembrete'}: {texto}")
     titulo_n = "⏰ Alarme" if lem.get("alarme") else "🔔 Lembrete"
     if tem("termux-notification"):
-        with contextlib.suppress(ToonsError):
+        with contextlib.suppress(LnuxError):
             _tapi(["termux-notification", "--title", titulo_n, "--content", texto, "--id", f"lembrete{lem['id']}",
                    "--sound", "--priority", "high", "--vibrate", "500,300,500,300,500"], 15, json_saida=False)
     else:
         print(f"[{titulo_n}] {texto}")
     if lem.get("alarme") and not atrasado:
         for _ in range(6):
-            with contextlib.suppress(ToonsError):
+            with contextlib.suppress(LnuxError):
                 vibrar(700)
             time.sleep(1.2)
     if (lem.get("falar") or lem.get("alarme")) and not atrasado:
-        with contextlib.suppress(ToonsError):
+        with contextlib.suppress(LnuxError):
             falar(lem["texto"])
 
 
@@ -20239,7 +21476,7 @@ def menu_lembretes():
             ok(f"{len(ids)} apagado(s).")
 
     def testar():
-        disparar_lembrete({"id": "teste", "texto": "Teste de alarme do Termux-Toons", "alarme": True})
+        disparar_lembrete({"id": "teste", "texto": "Teste de alarme do LNUX", "alarme": True})
 
     menu("⏰ Lembretes e alarmes", [
         ("Novo lembrete", lambda: novo(False)),
@@ -20268,7 +21505,7 @@ def _tela_relogio(nome: str, tempo_txt: str, extras: list, dica: str, destaque: 
 
 def _avisar_fim(titulo_n: str, texto: str) -> None:
     notificar_seguro(titulo_n, texto, som=True)
-    with contextlib.suppress(ToonsError):
+    with contextlib.suppress(LnuxError):
         vibrar(1000)
     sys.stdout.write("\a")
 
@@ -20301,7 +21538,7 @@ def temporizador(segundos: int | None = None) -> None:
     if segundos is None:
         segundos = parse_duracao(perguntar("Quanto tempo? (5 = 5 min · 90s · 1h30m · 10:00)", "5"))
     if segundos <= 0:
-        raise ToonsError("O tempo precisa ser maior que zero.")
+        raise LnuxError("O tempo precisa ser maior que zero.")
     with TelaCheia():
         fim, restante, pausado = time.monotonic() + segundos, float(segundos), False
         while True:
@@ -20433,12 +21670,12 @@ def parse_data(texto: str, hoje: date | None = None) -> date:
         return hoje + timedelta(days=1)
     m = re.fullmatch(r"(\d{1,2})/(\d{1,2})(?:/(\d{2,4}))?", t)
     if not m:
-        raise ToonsError("Data inválida. Use dd/mm ou dd/mm/aaaa.")
+        raise LnuxError("Data inválida. Use dd/mm ou dd/mm/aaaa.")
     ano = int(m.group(3)) if m.group(3) else hoje.year
     try:
         return date(ano + (2000 if ano < 100 else 0), int(m.group(2)), int(m.group(1)))
     except ValueError:
-        raise ToonsError("Data inválida.") from None
+        raise LnuxError("Data inválida.") from None
 
 
 def adicionar_evento(dia: date | None = None) -> None:
@@ -20450,7 +21687,7 @@ def adicionar_evento(dia: date | None = None) -> None:
     if hora:
         m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?", hora)
         if not m or int(m.group(1)) > 23 or int(m.group(2) or 0) > 59:
-            raise ToonsError("Hora inválida.")
+            raise LnuxError("Hora inválida.")
         hora = f"{int(m.group(1)):02d}:{m.group(2) or '00'}"
     agenda = ler_json(AGENDA_FILE, {})
     agenda.setdefault(dia.isoformat(), []).append({"hora": hora, "texto": texto})
@@ -20545,7 +21782,7 @@ def calendario() -> None:
                 with tela.normal():
                     try:
                         adicionar_evento(sel)
-                    except ToonsError as e:
+                    except LnuxError as e:
                         erro(str(e))
                         pausar()
             elif tecla in ("d", "backspace"):
@@ -20655,10 +21892,10 @@ def cotacoes(renovar: bool = False) -> dict:
     try:
         dados = pedir_json("https://open.er-api.com/v6/latest/BRL", timeout=20)
         if dados.get("result") != "success":
-            raise ToonsError(f"Serviço de câmbio respondeu: {dados.get('error-type', 'erro')}")
+            raise LnuxError(f"Serviço de câmbio respondeu: {dados.get('error-type', 'erro')}")
         cache = {"quando": time.time(), "taxas": dados["rates"], "fonte": dados.get("time_last_update_utc", "")}
         gravar_json(CAMBIO_FILE, cache)
-    except ToonsError:
+    except LnuxError:
         if not cache.get("taxas"):
             raise
         aviso(f"Sem internet: usando a cotação salva em {datetime.fromtimestamp(cache['quando']):%d/%m %H:%M}.")
@@ -20667,7 +21904,7 @@ def cotacoes(renovar: bool = False) -> dict:
 
 def converter_moeda(valor: float, de: str, para: str, taxas: dict) -> float:
     if de not in taxas or para not in taxas:
-        raise ToonsError(f"Moeda sem cotação: {de if de not in taxas else para}")
+        raise LnuxError(f"Moeda sem cotação: {de if de not in taxas else para}")
     return valor / taxas[de] * taxas[para]
 
 
@@ -20701,7 +21938,7 @@ def menu_conversor():
                 return siglas[k]
             sigla = perguntar("Sigla da moeda (ex.: COP, PEN, KRW)").upper()
             if sigla not in dados["taxas"]:
-                raise ToonsError(f"Sem cotação para '{sigla}'.")
+                raise LnuxError(f"Sem cotação para '{sigla}'.")
             return sigla
 
         de = pegar("Converter de", 2)
@@ -20794,7 +22031,7 @@ def menu_gastos():
         texto = perguntar("Mês (mm/aaaa)", f"{date.today():%m/%Y}")
         m = re.fullmatch(r"(\d{1,2})/(\d{4})", texto.strip())
         if not m or not 1 <= int(m.group(1)) <= 12:
-            raise ToonsError("Use o formato mm/aaaa.")
+            raise LnuxError("Use o formato mm/aaaa.")
         return int(m.group(2)), int(m.group(1))
 
     def resumo():
@@ -20928,12 +22165,12 @@ def cofre_abrir(senha: str) -> tuple:
     from cryptography.fernet import Fernet, InvalidToken
     dados = ler_json(COFRE_FILE, None)
     if not dados:
-        raise ToonsError("O cofre ainda não foi criado.")
+        raise LnuxError("O cofre ainda não foi criado.")
     meta = {k: dados[k] for k in ("versao", "kdf", "sal")}
     try:
         entradas = json.loads(Fernet(_cofre_chave(senha, meta)).decrypt(dados["dados"].encode()))
     except InvalidToken:
-        raise ToonsError("Senha mestra errada.") from None
+        raise LnuxError("Senha mestra errada.") from None
     return entradas, meta
 
 
@@ -20977,9 +22214,9 @@ def menu_senhas():
             aviso("Se você esquecer a senha mestra, NÃO há como recuperar as senhas guardadas.")
             senha = getpass.getpass("Nova senha mestra: ")
             if len(senha) < 8:
-                raise ToonsError("Use pelo menos 8 caracteres na senha mestra.")
+                raise LnuxError("Use pelo menos 8 caracteres na senha mestra.")
             if getpass.getpass("Repita a senha mestra: ") != senha:
-                raise ToonsError("As senhas não conferem.")
+                raise LnuxError("As senhas não conferem.")
             cofre_salvar([], senha)
             ok("Cofre criado.")
         else:
@@ -21081,7 +22318,7 @@ def menu_senhas():
         def trocar_mestra():
             nova = getpass.getpass("Nova senha mestra: ")
             if len(nova) < 8 or getpass.getpass("Repita: ") != nova:
-                raise ToonsError("Senha curta (mínimo 8) ou não confere.")
+                raise LnuxError("Senha curta (mínimo 8) ou não confere.")
             estado["senha"] = nova
             estado["meta"] = cofre_salvar(entradas, nova)  # sal novo junto com a senha nova
             ok("Senha mestra trocada.")
@@ -21152,9 +22389,9 @@ def _local_do_tempo(perguntar_sempre: bool = False) -> dict:
     local = c.get("tempo_local") or {}
     if local and not perguntar_sempre:
         return local
-    i = escolher("Onde?", ["Minha localização (GPS/rede)", "Buscar uma cidade"])
+    i = escolher("Onde?", ["Minha localização (GPS/rede)", "Buscar uma cidade"]) if tem_recurso("termux_api") else 1
     if i is None:
-        raise ToonsError("Cancelado.")
+        raise LnuxError("Cancelado.")
     if i == 0:
         info("Pegando a localização...")
         loc = localizacao("network")
@@ -21162,10 +22399,10 @@ def _local_do_tempo(perguntar_sempre: bool = False) -> dict:
     else:
         achadas = buscar_cidade(perguntar("Cidade"))
         if not achadas:
-            raise ToonsError("Cidade não encontrada.")
+            raise LnuxError("Cidade não encontrada.")
         k = escolher("Qual?", [a["nome"] for a in achadas])
         if k is None:
-            raise ToonsError("Cancelado.")
+            raise LnuxError("Cancelado.")
         local = achadas[k]
     c["tempo_local"] = local
     salvar_cfg()
@@ -21287,7 +22524,7 @@ def mostrar_qr(conteudo: str, nome_arquivo: str = "qrcode", salvar: bool = True)
 
 
 def salvar_qr(conteudo: str, nome_arquivo: str = "qrcode") -> Path | None:
-    """Grava o QR code como imagem .png em Download/Termux-Toons/QR codes."""
+    """Grava o QR code como imagem .png em Download/LNUX/QR codes."""
     destino = pasta_saida("QR codes") / f"{_slug(nome_arquivo)}_{datetime.now():%H%M%S}.png"
     rodar(["qrencode", "-o", str(destino), "-s", "10", "-m", "3"], entrada=conteudo, mostrar=False)
     if destino.exists():
@@ -21322,12 +22559,12 @@ def menu_qr():
         if i == 0:
             chave = re.sub(r"\D", "", chave)
             if len(chave) not in (11, 14):
-                raise ToonsError("CPF tem 11 dígitos e CNPJ 14.")
+                raise LnuxError("CPF tem 11 dígitos e CNPJ 14.")
         elif i == 1:
             digitos = re.sub(r"\D", "", chave)
             chave = "+" + (digitos if digitos.startswith("55") and len(digitos) > 11 else "55" + digitos)
         elif i == 2 and "@" not in chave:
-            raise ToonsError("E-mail inválido.")
+            raise LnuxError("E-mail inválido.")
         nome = perguntar("Nome de quem recebe")
         cidade = perguntar("Cidade de quem recebe")
         valor_txt = perguntar("Valor em R$ (Enter = quem paga digita)", "")
@@ -21363,7 +22600,7 @@ def menu_qr():
         proc = rodar(["zbarimg", "-q", "--raw", str(arq)], capturar=True, timeout=60, mostrar=False)
         conteudo = (proc.stdout or "").strip()
         if not conteudo:
-            raise ToonsError("Nenhum QR code encontrado (tente uma foto mais nítida e de perto).")
+            raise LnuxError("Nenhum QR code encontrado (tente uma foto mais nítida e de perto).")
         print(f"\n{NEG}Conteúdo:{RST}\n{conteudo}\n")
         acoes = ["Copiar", "Abrir o link"] if re.match(r"https?://", conteudo) else ["Copiar"]
         j = escolher("O que fazer?", acoes + ["Nada"])
@@ -21394,13 +22631,13 @@ def traduzir(texto: str, destino: str = "en", origem: str = "auto") -> tuple:
                                    tl=destino, dt="t", q=texto), timeout=20)
         traducao = "".join(parte[0] for parte in dados[0] if parte and parte[0])
         return traducao, dados[2] if len(dados) > 2 and isinstance(dados[2], str) else origem
-    except (ToonsError, TypeError, IndexError):
+    except (LnuxError, TypeError, IndexError):
         de = origem if origem != "auto" else ("en" if destino.startswith("pt") else "pt")
         dados = pedir_json(url_com("https://api.mymemory.translated.net/get", q=texto[:500],
                                    langpair=f"{de}|{destino}"), timeout=20)
         traducao = (dados.get("responseData") or {}).get("translatedText")
         if not traducao:
-            raise ToonsError("Não consegui traduzir agora.") from None
+            raise LnuxError("Não consegui traduzir agora.") from None
         return traducao, de
 
 
@@ -21423,7 +22660,7 @@ def dicionario_pt(palavra: str) -> list:
 def dicionario_en(palavra: str) -> list:
     try:
         dados = pedir_json(f"https://api.dictionaryapi.dev/api/v2/entries/en/{urllib.parse.quote(palavra.lower())}")
-    except ToonsError:
+    except LnuxError:
         return []
     saida = []
     for entrada in dados if isinstance(dados, list) else []:
@@ -21452,7 +22689,7 @@ def menu_tradutor():
             print(f"  {DIM}[{IDIOMAS.get(origem, origem)} → {IDIOMAS.get(destino_atual(), destino_atual())}]{RST} "
                   f"{NEG}{VERD}{traducao}{RST}")
             if c.get("tradutor_falar"):
-                with contextlib.suppress(ToonsError):
+                with contextlib.suppress(LnuxError):
                     falar_em(traducao, destino_atual())
 
     def trocar_idioma():
@@ -21467,7 +22704,7 @@ def menu_tradutor():
     def traduzir_area():
         texto = _tapi(["termux-clipboard-get"], 10, json_saida=False)
         if not texto:
-            raise ToonsError("A área de transferência está vazia.")
+            raise LnuxError("A área de transferência está vazia.")
         traducao, origem = traduzir(texto, destino_atual())
         print(f"{DIM}{texto[:300]}{RST}\n\n{NEG}{VERD}{traducao}{RST}")
         if confirmar("Copiar a tradução?", True):
@@ -21583,7 +22820,7 @@ def rodar_bateria() -> None:
         c = recarregar_cfg()
         try:
             b = registrar_bateria()
-        except ToonsError as e:
+        except LnuxError as e:
             log(f"Não consegui ler a bateria: {e}")
             time.sleep(300)
             continue
@@ -21771,7 +23008,7 @@ def menu_uso_celular():
         info("Lendo as estatísticas de uso pelo ADB...")
         uso = parse_tempo_de_tela(adb_shell("dumpsys usagestats", timeout=120), periodo)
         if not uso:
-            raise ToonsError("O Android não devolveu o tempo de uso (versão diferente ou sem permissão).")
+            raise LnuxError("O Android não devolveu o tempo de uso (versão diferente ou sem permissão).")
         total = sum(s for _, s, _ in uso)
         print(f"\n  Total: {NEG}{fmt_relogio(total)}{RST} {DIM}({'hoje' if periodo == 'daily' else 'esta semana'}){RST}\n")
         maior = uso[0][1]
@@ -21789,7 +23026,7 @@ def menu_uso_celular():
         info("Lendo o uso de dados pelo ADB (pode levar alguns segundos)...")
         uso = parse_netstats(adb_shell("dumpsys netstats detail", timeout=180), desde)
         if not uso:
-            raise ToonsError("O Android não devolveu o uso de dados por app (versão diferente ou sem permissão).")
+            raise LnuxError("O Android não devolveu o uso de dados por app (versão diferente ou sem permissão).")
         nomes = mapa_uids(adb_shell("pm list packages -U"))
         nomes.update({0: "root (sistema)", 1000: "Android (sistema)", 1013: "mídia", -5: "tethering (roteador)"})
         linhas = sorted(((nomes.get(uid, f"uid {uid}"), v) for uid, v in uso.items()),
@@ -21807,7 +23044,7 @@ def menu_uso_celular():
         ("Tempo de tela hoje", lambda: tempo_de_tela("daily")),
         ("Tempo de tela na semana", lambda: tempo_de_tela("weekly")),
         ("Internet gasta por app (móvel e Wi-Fi)", dados_por_app),
-    ], cabecalho=lambda: print(f"{DIM}Precisa do ADB conectado (🔌 Depuração sem fio, em Celular e sistema).{RST}"))
+    ], cabecalho=lambda: print(f"{DIM}Precisa do ADB conectado ({DICA_ADB()}).{RST}"))
 
 
 # ── Gerenciador de apps (ADB) ────────────────────────────────────────
@@ -21912,7 +23149,7 @@ def menu_apps():
         ("Apps do sistema", lambda: listar("-s", "Apps do sistema")),
         ("Apps desativados (para reativar)", lambda: listar("-d", "Apps desativados")),
         ("Reinstalar app removido", reinstalar),
-    ], cabecalho=lambda: print(f"{DIM}Precisa do ADB conectado (🔌 Depuração sem fio, em Celular e sistema).{RST}"))
+    ], cabecalho=lambda: print(f"{DIM}Precisa do ADB conectado ({DICA_ADB()}).{RST}"))
 
 
 # ── Resolução da tela (root ou ADB) ──────────────────────────────────
@@ -21921,7 +23158,7 @@ def menu_apps():
 # app sozinho muda no Android 12+ pelas mudanças de compatibilidade DOWNSCALED/DOWNSCALE_xx (qualquer app,
 # mas alguns celulares só deixam em apps de teste) ou, no Android 13+, pelo modo de jogo (só jogos).
 # Toda mudança volta sozinha se não for confirmada em TEMPO_CONFIRMAR segundos: um vigia em outro processo
-# desfaz mesmo que o Termux-Toons feche ou a tela fique impossível de usar.
+# desfaz mesmo que o LNUX feche ou a tela fique impossível de usar.
 
 RESOLUCAO_FILE = DATA_DIR / "resolucao_pendente.json"
 TEMPO_CONFIRMAR = 60
@@ -21936,7 +23173,7 @@ def acesso_shell_android() -> tuple:
         info("Precisa de root ou da depuração sem fio (ADB pelo Wi-Fi), que dá ao Termux a permissão de 'shell'. "
              "Ligue a 'Depuração por Wi-Fi' nas Opções do desenvolvedor, se estiver desligada.")
         if not adb_conectar():
-            raise ToonsError("Sem conexão. Primeira vez? Use 'Depuração sem fio → Parear este celular' e volte aqui.")
+            raise LnuxError("Sem conexão. Primeira vez? Use 'Depuração sem fio → Parear este celular' e volte aqui.")
         modo = "adb"
     return modo, (adb_alvo() if modo == "adb" else None)
 
@@ -21955,7 +23192,7 @@ def tela_android(modo: str, serial: str | None) -> dict:
     fisica = re.search(r"Physical size:\s*(\d+)x(\d+)", tamanho)
     dpi_fisica = re.search(r"Physical density:\s*(\d+)", densidade)
     if not fisica or not dpi_fisica:
-        raise ToonsError(f"O Android não informou a tela: {(tamanho or densidade)[:200] or 'sem resposta'}")
+        raise LnuxError(f"O Android não informou a tela: {(tamanho or densidade)[:200] or 'sem resposta'}")
     atual = re.search(r"Override size:\s*(\d+)x(\d+)", tamanho) or fisica
     dpi_atual = re.search(r"Override density:\s*(\d+)", densidade) or dpi_fisica
     return {"fisica": (int(fisica[1]), int(fisica[2])), "atual": (int(atual[1]), int(atual[2])),
@@ -21976,9 +23213,9 @@ def desfazer_resolucao(vigia: str | None = None) -> bool:
     if not estado:
         return False
     codigo, texto = shell_android(estado["desfazer"], estado["modo"], estado.get("serial"))
-    if codigo != 0:  # fica anotada: 'toons resolucao' ou a próxima mudança pelo menu tentam de novo
+    if codigo != 0:  # fica anotada: 'lnux resolucao' ou a próxima mudança pelo menu tentam de novo
         aviso(f"Não consegui desfazer ({estado['descricao']}): {texto[-200:] or f'código {codigo}'}. "
-              "Rode: toons resolucao")
+              "Rode: lnux resolucao")
         return False
     RESOLUCAO_FILE.unlink(missing_ok=True)
     if vigia:
@@ -22005,7 +23242,7 @@ def mudar_com_prazo(descricao: str, tentativas: list, desfazer: str, modo: str, 
             if codigo == 0 and not _RECUSA_ANDROID.search(texto):
                 break
         else:
-            raise ToonsError(f"O Android não deixou: {texto[-300:] or f'código {codigo}'}")
+            raise LnuxError(f"O Android não deixou: {texto[-300:] or f'código {codigo}'}")
         ok(f"Mudou: {descricao}.")
         if depois:
             depois()
@@ -22061,7 +23298,7 @@ def resolucao_original(modo: str | None = None, serial: str | None = None) -> No
     densidade = "wm density reset" if abs(dpi - tela["dpi_fisica"]) <= 2 else f"wm density {dpi}"
     codigo, texto = shell_android(f"wm size reset; {densidade}", modo, serial)
     if codigo != 0:
-        raise ToonsError(f"O Android não deixou: {texto[-300:] or f'código {codigo}'}")
+        raise LnuxError(f"O Android não deixou: {texto[-300:] or f'código {codigo}'}")
     ok(f"Tela de volta a {tela['fisica'][0]}×{tela['fisica'][1]}.")
 
 
@@ -22098,7 +23335,7 @@ def mudar_resolucao_app() -> None:
     modo, serial = acesso_shell_android()
     sdk = _sdk_android(modo, serial)
     if sdk < 31:
-        raise ToonsError("Mudar a resolução de um app só existe no Android 12 ou mais novo. "
+        raise LnuxError("Mudar a resolução de um app só existe no Android 12 ou mais novo. "
                          "Use 'Diminuir a resolução da tela inteira'.")
     pacote = _escolher_app_android(modo, serial)
     if not pacote:
@@ -22154,7 +23391,7 @@ EXT_IMAGEM = (".jpg", ".jpeg", ".png", ".webp", ".heic", ".bmp", ".gif")
 
 
 def _pasta_fotos() -> Path:
-    for p in (HOME / "storage" / "dcim" / "Camera", HOME / "storage" / "dcim", HOME / "storage" / "pictures"):
+    for p in (pasta_usuario("dcim", "Camera"), pasta_usuario("dcim"), pasta_usuario("pictures")):
         if p.exists():
             return p
     return HOME
@@ -22217,15 +23454,15 @@ def menu_fotos():
                                aviso_extra="O Pillow lê e grava as imagens.")
 
     def trocar_pasta():
-        opcoes = [p for p in (HOME / "storage" / "dcim" / "Camera", HOME / "storage" / "dcim",
-                              HOME / "storage" / "pictures", HOME / "storage" / "downloads",
-                              HOME / "storage" / "shared" / "Pictures" / "Screenshots") if p.exists()]
+        opcoes = [p for p in dict.fromkeys((pasta_usuario("dcim", "Camera"), pasta_usuario("dcim"),
+                                            pasta_usuario("pictures"), pasta_usuario("downloads"),
+                                            *_pastas_de_print())) if p.exists()]
         i = escolher("Pasta das fotos", [str(p) for p in opcoes] + ["Digitar outra..."])
         if i is None:
             return
         pasta = opcoes[i] if i < len(opcoes) else Path(os.path.expanduser(perguntar("Pasta")))
         if not pasta.is_dir():
-            raise ToonsError("Pasta não encontrada.")
+            raise LnuxError("Pasta não encontrada.")
         estado["pasta"] = pasta
 
     def organizar():
@@ -22234,7 +23471,7 @@ def menu_fotos():
             info("Nenhuma foto nessa pasta.")
             return
         mover = escolher("Como organizar?", [
-            "Copiar para Downloads/Termux-Toons/Fotos por data (as originais ficam onde estão)",
+            "Copiar para Downloads/LNUX/Fotos por data (as originais ficam onde estão)",
             f"Mover para subpastas ano/mês dentro de {estado['pasta'].name}"]) == 1
         if precisa_pillow() is False:
             aviso("Sem o Pillow: uso a data do arquivo em vez da data da foto.")
@@ -22369,10 +23606,10 @@ def _saida_convertida(origem: Path, extensao: str, sufixo: str = "") -> Path:
 
 def _ffmpeg(*args) -> None:
     if not garantir_cmd("ffmpeg"):
-        raise ToonsError("O ffmpeg é necessário.")
+        raise LnuxError("O ffmpeg é necessário.")
     proc = rodar(["ffmpeg", "-hide_banner", "-loglevel", "error", "-stats", "-y", *map(str, args)], mostrar=False)
     if proc.returncode != 0:
-        raise ToonsError("O ffmpeg não conseguiu converter esse arquivo.")
+        raise LnuxError("O ffmpeg não conseguiu converter esse arquivo.")
 
 
 @submenu
@@ -22449,7 +23686,7 @@ def menu_conversor_arquivos():
             return
         lista = escolher_arquivos("Quais PDFs juntar? (Espaço marca; a ordem é a da lista)", (".pdf",))
         if len(lista) < 2:
-            raise ToonsError("Marque pelo menos dois PDFs.")
+            raise LnuxError("Marque pelo menos dois PDFs.")
         destino = _saida_convertida(lista[0], ".pdf", "_juntado")
         rodar(["qpdf", "--empty", "--pages", *map(str, lista), "--", str(destino)], check=True, capturar=True)
         ok(f"PDF juntado: {destino}")
@@ -22508,13 +23745,36 @@ def menu_conversor_arquivos():
         rodar(["pdftotext", "-layout", str(arq), str(destino)], check=True)
         ok(f"Texto salvo: {destino}")
 
+    def documento_pdf_linux(arq: Path):
+        programa = next((p for p in ("soffice", "libreoffice") if tem(p)), None)
+        if not programa:
+            aviso("O LibreOffice não está instalado (uns 500 MB).")
+            if not confirmar("Instalar agora?", True) or not instalar_pkg("libreoffice"):
+                return
+            programa = next((p for p in ("soffice", "libreoffice") if tem(p)), None)
+            if not programa:
+                return
+        tmp = Path(tempfile.mkdtemp(prefix="lnux_doc_"))
+        info("Convertendo com o LibreOffice (a primeira vez demora)...")
+        rodar([programa, "--headless", "--convert-to", "pdf", "--outdir", str(tmp), str(arq)], timeout=900)
+        pdf = tmp / (arq.stem + ".pdf")
+        if not pdf.exists():
+            raise LnuxError("O LibreOffice não gerou o PDF.")
+        destino = _saida_convertida(arq, ".pdf")
+        shutil.move(str(pdf), destino)
+        shutil.rmtree(tmp, ignore_errors=True)
+        ok(f"PDF salvo: {destino}")
+
     def documento_pdf():
         arq = escolher_arquivo("Qual documento?", EXT_DOC)
         if not arq:
             return
+        if not sistema().termux:
+            documento_pdf_linux(arq)
+            return
         distros = distros_instaladas()
         if not distros:
-            raise ToonsError("Converter Word/Excel/PowerPoint em PDF usa o LibreOffice, que roda numa distro Linux. "
+            raise LnuxError("Converter Word/Excel/PowerPoint em PDF usa o LibreOffice, que roda numa distro Linux. "
                              "Instale uma (Debian é a mais leve) no menu 🐧 Linux de verdade e tente de novo.")
         distro = distros[0] if len(distros) == 1 else distros[escolher("Qual distro?", distros) or 0]
         tem_office = rodar(["proot-distro", "login", distro, "--", "sh", "-c", "command -v soffice"],
@@ -22526,15 +23786,15 @@ def menu_conversor_arquivos():
             rodar(["proot-distro", "login", distro, "--", "sh", "-c",
                    "(apt-get update && apt-get install -y libreoffice-writer libreoffice-calc libreoffice-impress) || "
                    "(pacman -Sy --noconfirm libreoffice-fresh) || (apk add libreoffice) || (dnf install -y libreoffice)"])
-        tmp = Path(os.environ.get("TMPDIR", PREFIX + "/tmp" if PREFIX else "/tmp")) / "toons_doc"
+        tmp = Path(os.environ.get("TMPDIR", PREFIX + "/tmp" if PREFIX else "/tmp")) / "lnux_doc"
         tmp.mkdir(parents=True, exist_ok=True)
         shutil.copy2(arq, tmp / arq.name)
         info("Convertendo com o LibreOffice (a primeira vez demora)...")
         rodar(["proot-distro", "login", distro, "--shared-tmp", "--", "soffice", "--headless", "--convert-to", "pdf",
-               "--outdir", "/tmp/toons_doc", f"/tmp/toons_doc/{arq.name}"], timeout=900)
+               "--outdir", "/tmp/lnux_doc", f"/tmp/lnux_doc/{arq.name}"], timeout=900)
         pdf = tmp / (arq.stem + ".pdf")
         if not pdf.exists():
-            raise ToonsError("O LibreOffice não gerou o PDF.")
+            raise LnuxError("O LibreOffice não gerou o PDF.")
         destino = _saida_convertida(arq, ".pdf")
         shutil.move(str(pdf), destino)
         ok(f"PDF salvo: {destino}")
@@ -22552,7 +23812,8 @@ def menu_conversor_arquivos():
         ("📄 PDF: comprimir", pdf_comprimir),
         ("📄 PDF → imagens (PNG)", pdf_para_imagens),
         ("📄 PDF → texto", pdf_para_texto),
-        ("📄 Word/Excel/PowerPoint → PDF (LibreOffice na distro)", documento_pdf),
+        (por_sistema("📄 Word/Excel/PowerPoint → PDF (LibreOffice na distro)", "📄 Word/Excel/PowerPoint → PDF (LibreOffice)"),
+         documento_pdf),
     ])
 
 
@@ -22602,7 +23863,7 @@ def descrever_automacao(a: dict) -> str:
 def executar_acao(acao: dict) -> None:
     tipo = acao["tipo"]
     if tipo == "notificar":
-        notificar("Termux-Toons", acao["texto"], som=True)
+        notificar("LNUX", acao["texto"], som=True)
     elif tipo == "falar":
         falar(acao["texto"])
     elif tipo == "vibrar":
@@ -22616,7 +23877,7 @@ def executar_acao(acao: dict) -> None:
     elif tipo == "telegram":
         c = cfg()
         if not c.get("telegram_token") or not c.get("telegram_ids_permitidos"):
-            raise ToonsError("Configure o bot do Telegram primeiro (menu Bots).")
+            raise LnuxError("Configure o bot do Telegram primeiro (menu Bots).")
         for chat in c["telegram_ids_permitidos"]:
             tg_enviar_texto(c["telegram_token"], chat, acao["texto"])
     elif tipo == "tv":
@@ -22625,7 +23886,7 @@ def executar_acao(acao: dict) -> None:
         proc = rodar(acao["valor"], capturar=True, timeout=600, mostrar=False)
         log(f"comando terminou com código {proc.returncode}: {(proc.stdout or '')[-300:]}")
     else:
-        raise ToonsError(f"Ação desconhecida: {tipo}")
+        raise LnuxError(f"Ação desconhecida: {tipo}")
 
 
 def gatilhos_disparados(automacoes: list, anterior: dict, atual: dict, agora: datetime, ja_rodou: dict) -> list:
@@ -22676,13 +23937,13 @@ def _estado_do_celular(automacoes: list) -> dict:
     tipos = {a["gatilho"]["tipo"] for a in automacoes if a.get("ativo", True)}
     estado = {}
     if tipos & {"wifi_conectar", "wifi_desconectar"}:
-        with contextlib.suppress(ToonsError):
+        with contextlib.suppress(LnuxError):
             w = _tapi(["termux-wifi-connectioninfo"], 20)
             ssid = (w.get("ssid") or "").strip('"') if isinstance(w, dict) else ""
             conectado = isinstance(w, dict) and w.get("supplicant_state") == "COMPLETED"
             estado["ssid"] = ssid if conectado and ssid not in ("", "<unknown ssid>") else None
     if tipos & {"carregando", "descarregando", "bateria_abaixo", "bateria_acima"}:
-        with contextlib.suppress(ToonsError):
+        with contextlib.suppress(LnuxError):
             b = bateria()
             estado["pct"], estado["carregando"] = int(b.get("percentage", 0)), carregando(b)
     return estado
@@ -22723,7 +23984,7 @@ def menu_automacao():
             hora = perguntar("Hora (hh:mm)", "07:00").replace("h", ":")
             m = re.fullmatch(r"(\d{1,2}):?(\d{2})?", hora)
             if not m or int(m.group(1)) > 23:
-                raise ToonsError("Hora inválida.")
+                raise LnuxError("Hora inválida.")
             g["hora"] = f"{int(m.group(1)):02d}:{m.group(2) or '00'}"
             dias = escolher_varios("Em quais dias? (Espaço marca, a = todos)",
                                    [d.capitalize() for d in DIAS_SEMANA])
@@ -22732,7 +23993,7 @@ def menu_automacao():
             g["minutos"] = perguntar_int("A cada quantos minutos", 60, 1, 10080)
         elif tipo.startswith("wifi"):
             atual = ""
-            with contextlib.suppress(ToonsError, AttributeError):
+            with contextlib.suppress(LnuxError, AttributeError):
                 atual = (_tapi(["termux-wifi-connectioninfo"], 20).get("ssid") or "").strip('"')
             g["ssid"] = perguntar("Nome da rede (Enter = qualquer uma)", atual if atual != "<unknown ssid>" else "")
         elif tipo.startswith("bateria"):
@@ -22764,7 +24025,7 @@ def menu_automacao():
         elif tipo == "tv":
             tvs = _tvs()
             if not tvs:
-                raise ToonsError("Adicione a TV primeiro (📲 Celular e sistema → 📺 Controle da TV).")
+                raise LnuxError("Adicione a TV primeiro (📲 Celular e sistema → 📺 Controle da TV).")
             acoes = ["desligar", "ligar", "alternar", "mudo", "vol+", "vol-"]
             k = escolher("Fazer o quê com a TV?", [TV_TECLAS[t][0] for t in acoes])
             if k is None:
@@ -22839,7 +24100,7 @@ def menu_automacao():
 def iniciar_x11() -> None:
     """Sobe o servidor do Termux:X11 (display :0) e abre o app."""
     if not garantir_termux_x11():
-        raise ToonsError("O Termux:X11 é necessário (pacote termux-x11-nightly e o app Termux:X11).")
+        raise LnuxError("O Termux:X11 é necessário (pacote termux-x11-nightly e o app Termux:X11).")
     if not servico_ativo("x11") and not servico_ativo("desktop"):
         iniciar_servico("x11", "termux-x11 :0 -ac", com_log=False)
     rodar(["am", "start", "--user", "0", "-n", X11_APP], capturar=True, timeout=20, mostrar=False)
@@ -22865,7 +24126,7 @@ def _comando_no_celular(comando: str, saida_binaria: bool = False, timeout: floa
     cmd = ["su", "-c", comando] if tem_root() else ["adb", "-s", serial or adb_alvo(), "exec-out", comando]
     proc = subprocess.run(cmd, capture_output=True, timeout=timeout)
     if proc.returncode != 0:
-        raise ToonsError(f"'{comando.split()[0]}' falhou: {proc.stderr.decode(errors='replace').strip()[-200:]}")
+        raise LnuxError(f"'{comando.split()[0]}' falhou: {proc.stderr.decode(errors='replace').strip()[-200:]}")
     return proc.stdout if saida_binaria else proc.stdout.decode(errors="replace")
 
 
@@ -22873,12 +24134,12 @@ def quadro_da_tela(bruto: bytes, largura_max: int, qualidade: int) -> tuple:
     """(JPEG, largura e altura reais da tela) a partir da saída crua do 'screencap' (cabeçalho + pixels)."""
     from PIL import Image
     if len(bruto) < 16:
-        raise ToonsError("Captura vazia.")
+        raise LnuxError("Captura vazia.")
     largura, altura, formato = struct.unpack_from("<III", bruto)
     modo, bruto_modo, bpp = _FORMATOS_TELA.get(formato, ("RGBA", "RGBA", 4))
     cabecalho = len(bruto) - largura * altura * bpp  # 12 bytes (Android antigo) ou 16 (com o espaço de cor)
     if not largura or not altura or cabecalho not in (12, 16):
-        raise ToonsError(f"Formato de captura inesperado ({largura}x{altura}, formato {formato}).")
+        raise LnuxError(f"Formato de captura inesperado ({largura}x{altura}, formato {formato}).")
     img = Image.frombuffer(modo, (largura, altura), bruto[cabecalho:], "raw", bruto_modo, 0, 1).convert("RGB")
     if largura > largura_max:
         img = img.resize((largura_max, max(1, round(altura * largura_max / largura))))
@@ -22890,7 +24151,7 @@ def quadro_da_tela(bruto: bytes, largura_max: int, qualidade: int) -> tuple:
 def tamanho_png(dados: bytes) -> tuple:
     """Largura e altura de um PNG (bloco IHDR)."""
     if dados[:8] != b"\x89PNG\r\n\x1a\n":
-        raise ToonsError("A captura não veio em PNG.")
+        raise LnuxError("A captura não veio em PNG.")
     return struct.unpack(">II", dados[16:24])
 
 
@@ -22948,7 +24209,7 @@ def comando_de_controle(acao: dict, tamanho: tuple) -> str:
     As posições chegam de 0 a 1 (proporção da imagem) e viram pixels da tela de verdade."""
     largura, altura = tamanho
     if not largura or not altura:
-        raise ToonsError("Ainda não há imagem da tela.")
+        raise LnuxError("Ainda não há imagem da tela.")
 
     def px(valor, total) -> int:
         return max(0, min(total - 1, int(float(valor) * total)))
@@ -22965,9 +24226,9 @@ def comando_de_controle(acao: dict, tamanho: tuple) -> str:
     if tipo == "texto":
         texto = "".join(ch for ch in sem_acento(str(acao.get("texto", ""))) if 32 <= ord(ch) < 127)[:200]
         if not texto:
-            raise ToonsError("Texto vazio (o Android só aceita letras sem acento por aqui).")
+            raise LnuxError("Texto vazio (o Android só aceita letras sem acento por aqui).")
         return "input text " + shlex.quote(texto.replace(" ", "%s"))
-    raise ToonsError(f"Ação desconhecida: {tipo}")
+    raise LnuxError(f"Ação desconhecida: {tipo}")
 
 
 PAGINA_TELA = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
@@ -23051,7 +24312,7 @@ PAGINA_SEM_ACESSO = ("<!doctype html><meta charset='utf-8'><meta name='viewport'
 
 
 class _HandlerTela(BaseHTTPRequestHandler):
-    server_version = "TermuxToons"
+    server_version = "LNUX"
     transmissao: TransmissaoTela | None = None
     token = ""
     controle = False
@@ -23112,7 +24373,7 @@ class _HandlerTela(BaseHTTPRequestHandler):
             tamanho = int(self.headers.get("Content-Length") or 0)
             acao = json.loads(self.rfile.read(min(tamanho, 10_000)) or b"{}")
             self.executar(comando_de_controle(acao, self.transmissao.tamanho))
-        except (ToonsError, ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as e:
+        except (LnuxError, ValueError, KeyError, TypeError, OSError, subprocess.SubprocessError) as e:
             self._responder(400, str(e).encode())
             return
         self._responder(204)
@@ -23122,7 +24383,7 @@ def servir_tela(porta: int) -> None:
     """Servidor da transmissão de tela (roda dentro do tmux)."""
     c = cfg()
     if not c.get("tela_token"):
-        raise ToonsError("Crie a transmissão pelo menu primeiro (ela gera o link secreto).")
+        raise LnuxError("Crie a transmissão pelo menu primeiro (ela gera o link secreto).")
     _, largura, qualidade = TELA_QUALIDADES.get(c.get("tela_qualidade"), TELA_QUALIDADES["normal"])
     _HandlerTela.transmissao = TransmissaoTela(largura, qualidade)
     _HandlerTela.token, _HandlerTela.controle = c["tela_token"], bool(c.get("tela_controle"))
@@ -23171,7 +24432,7 @@ def iniciar_transmissao_tela() -> None:
     if not tem_root():
         try:
             adb_alvo()
-        except ToonsError as e:
+        except LnuxError as e:
             erro(str(e))
             info("Sem root, a tela é capturada pelo ADB ligado ao próprio celular: conecte em "
                  "📲 Celular e sistema → 🔌 Depuração sem fio e volte aqui.")
@@ -23197,7 +24458,7 @@ def iniciar_transmissao_tela() -> None:
         parar_servico("tela")  # reinicia para valer a qualidade e o controle escolhidos
         time.sleep(1)
     if not porta_livre(c["tela_porta"]):
-        raise ToonsError(f"A porta {c['tela_porta']} está em uso por outro programa.")
+        raise LnuxError(f"A porta {c['tela_porta']} está em uso por outro programa.")
     if not iniciar_servico("tela", cmd_self("tela", "--porta", str(c["tela_porta"])), reiniciar=True):
         return
     if j == 1:
@@ -23256,11 +24517,24 @@ def menu_espelhar():
         resultado = (adb("connect", f"{ip}:{porta}", timeout=30).stdout or "").strip()
         print(resultado)
         if "connected" not in resultado:
-            raise ToonsError("Não conectou. Confira o endereço e se os dois estão na mesma rede.")
+            raise LnuxError("Não conectou. Confira o endereço e se os dois estão na mesma rede.")
         iniciar_x11()
         info("Abrindo a tela do outro celular no Termux:X11. Para fechar, volte aqui e aperte Ctrl+C.")
         rodar("DISPLAY=:0 " + shlex.join(["scrcpy", "-s", f"{ip}:{porta}", "--max-size", "1280",
                                           "--video-bit-rate", "4M"]), mostrar=False)
+
+    def scrcpy_no_computador():
+        """No Linux: a tela do Android conectado (USB ou Wi-Fi) abre numa janela da área de trabalho."""
+        if not garantir_adb() or not garantir_cmd("scrcpy"):
+            return
+        if not adb_aparelhos():
+            info("Ligue o celular por USB (com a Depuração USB ligada) ou conecte pelo Wi-Fi em 📱 Android conectado.")
+            if not confirmar("Conectar pelo Wi-Fi agora?", True) or not adb_conectar():
+                return
+        if not _tem_tela():
+            raise LnuxError("O scrcpy precisa de uma área de trabalho (não há DISPLAY nem WAYLAND_DISPLAY).")
+        info("Abrindo a tela do celular numa janela. Para fechar, feche a janela ou aperte Ctrl+C aqui.")
+        rodar(["scrcpy", "-s", adb_alvo(), "--max-size", "1600"], mostrar=False)
 
     def num_pc():
         print("Para ver e controlar ESTE celular num computador (Windows, Mac ou Linux):\n"
@@ -23273,14 +24547,16 @@ def menu_espelhar():
             aviso("A porta 5555 fica aberta na rede até reiniciar o celular. Use só em redes de confiança.")
 
     menu("📲 Espelhar e transmitir a tela", [
-        ("🌍 Transmitir a tela por link (navegador; Wi-Fi ou internet)", iniciar_transmissao_tela),
-        (lambda: f"Transmissão: mostrar o link ({'no ar' if servico_ativo('tela') else 'parada'})", mostrar_links_tela),
+        ("🌍 Transmitir a tela por link (navegador; Wi-Fi ou internet)", so_em("android", iniciar_transmissao_tela)),
+        (lambda: f"Transmissão: mostrar o link ({'no ar' if servico_ativo('tela') else 'parada'})",
+         so_em("android", mostrar_links_tela)),
         (lambda: f"Transmissão: controle pelo navegador ({'permitido' if c.get('tela_controle') else 'bloqueado'})",
-         alternar_controle_tela),
-        ("Transmissão: gerar link novo (o antigo para de funcionar)", novo_link_tela),
-        ("Transmissão: parar (e fechar o túnel)", parar_transmissao_tela),
-        ("Ver e controlar OUTRO celular aqui (scrcpy + Termux:X11)", outro_celular),
-        ("Ver e controlar ESTE celular num PC (scrcpy, mesma rede)", num_pc),
+         so_em("android", alternar_controle_tela)),
+        ("Transmissão: gerar link novo (o antigo para de funcionar)", so_em("android", novo_link_tela)),
+        ("Transmissão: parar (e fechar o túnel)", so_em("android", parar_transmissao_tela)),
+        ("Ver e controlar OUTRO celular aqui (scrcpy + Termux:X11)", so_em("termux_x11", outro_celular)),
+        ("Ver e controlar ESTE celular num PC (scrcpy, mesma rede)", so_em("android", num_pc)),
+        ("Ver e controlar um Android conectado (scrcpy, USB ou Wi-Fi)", so_em("desktop", scrcpy_no_computador)),
     ])
 
 
@@ -23404,7 +24680,7 @@ def _padrao_ir(codigo: dict) -> tuple:
         for comando, fim in ((c & 0xFF, [1, 0]), (c & 0xFF ^ 0xFF, [0, 1])):
             padrao += _por_distancia((), _bits(a & 0x1F, 5) + _bits(comando, 8) + fim, 264, 792, 1848) + [43560]
         return 38000, padrao[:-1]
-    raise ToonsError(f"Protocolo de infravermelho não suportado: {codigo['protocolo']}")
+    raise LnuxError(f"Protocolo de infravermelho não suportado: {codigo['protocolo']}")
 
 
 def _rev8(valor: int) -> int:
@@ -23513,7 +24789,7 @@ def ir_disponivel() -> str:
         return "falta o pacote termux-api (pkg install termux-api) e o app Termux:API"
     try:
         faixas = _tapi(["termux-infrared-frequencies"], 20)
-    except ToonsError as e:
+    except LnuxError as e:
         return str(e)
     if isinstance(faixas, list) and faixas:
         return ""
@@ -23537,11 +24813,11 @@ def ir_transmitir(codigo: dict) -> None:
     if sum(padrao) > 1_950_000:
         padrao = _um_quadro(padrao)
     if not padrao or sum(padrao) > 1_950_000:
-        raise ToonsError("Código de infravermelho vazio ou longo demais (o Android manda no máximo 2 segundos).")
+        raise LnuxError("Código de infravermelho vazio ou longo demais (o Android manda no máximo 2 segundos).")
     resposta = _tapi(["termux-infrared-transmit", "-f", str(freq), ",".join(map(str, padrao))], 20,
                      json_saida=False)
     if resposta.strip():  # quando dá certo não aparece nada
-        raise ToonsError(f"O infravermelho não mandou o sinal: {resposta.strip()[:200]}")
+        raise LnuxError(f"O infravermelho não mandou o sinal: {resposta.strip()[:200]}")
 
 
 def _hex_le(texto: str) -> int:
@@ -23596,7 +24872,7 @@ def codigo_digitado(texto: str) -> dict:
     µs) ou de protocolo, com endereço e comando em hexadecimal ('NEC 04 08', 'Samsung32 07 02')."""
     palavras = texto.replace(",", " ").split()
     if not palavras:
-        raise ToonsError("Código vazio.")
+        raise LnuxError("Código vazio.")
     protocolos = {"NEC", "NECEXT", "NEC42", "PIONEER", "SAMSUNG32", "SIRC", "SIRC15", "SIRC20", "RC5", "RC5X", "RC6",
                   "KASEIKYO", "RCA", "SHARP"}
     try:
@@ -23619,7 +24895,7 @@ def codigo_digitado(texto: str) -> dict:
             raise ValueError
         _padrao_ir(codigo)
     except (ValueError, IndexError):
-        raise ToonsError("Não reconheci o código. Use Pronto (0000 006D ...), os tempos em µs (38000 9000,4500,...) "
+        raise LnuxError("Não reconheci o código. Use Pronto (0000 006D ...), os tempos em µs (38000 9000,4500,...) "
                          "ou protocolo, endereço e comando (NEC 04 08).") from None
     return codigo
 
@@ -23666,7 +24942,7 @@ def codigos_para_busca(categoria: str = "tv") -> list:
     def juntar(origem: str, codigo: dict, botoes: dict) -> None:
         try:
             freq, padrao = _padrao_ir(codigo)
-        except (ToonsError, ValueError, KeyError):
+        except (LnuxError, ValueError, KeyError):
             return  # protocolo que não sabemos montar
         if (freq, *padrao) not in vistos and sum(padrao) <= 1_950_000:
             vistos.add((freq, *padrao))
@@ -23706,7 +24982,7 @@ def _varrer_codigos(lista: list, inicio: int, alvo: str = "a TV") -> int | None:
             try:
                 ir_transmitir(lista[k][1])
                 falhas = 0
-            except ToonsError:
+            except LnuxError:
                 falhas += 1
                 if k == inicio or falhas >= 3:
                     print()
@@ -23767,7 +25043,7 @@ def desligar_tvs_por_perto() -> None:
     """Dispara, em sequência, o 'desligar' de centenas de TVs (estilo TV-B-Gone). Esc cancela."""
     problema = ir_disponivel()
     if problema:
-        raise ToonsError(f"Sem infravermelho: {problema}.")
+        raise LnuxError(f"Sem infravermelho: {problema}.")
     lista = codigos_para_busca("tv")
     print(f"{NEG}Vou mandar o sinal de desligar de {len(lista)} modelos de TV, um atrás do outro.{RST}\n"
           "Aponte o topo do celular para a(s) TV(s). Serve para desligar a TV de uma loja, academia ou sala de espera.")
@@ -23784,7 +25060,7 @@ def desligar_tvs_por_perto() -> None:
         for k, (origem, codigo, _) in enumerate(lista):
             print(f"\r\033[K  📴 {k + 1}/{len(lista)}  {DIM}{_cortar(origem, max(10, largura_tela() - 20))}{RST}",
                   end="", flush=True)
-            with contextlib.suppress(ToonsError):
+            with contextlib.suppress(LnuxError):
                 ir_transmitir(codigo)
                 enviados += 1
             if interativo and select.select([fd], [], [], 0.12)[0] and ler_tecla() == "esc":
@@ -23902,7 +25178,7 @@ def wake_on_lan(macs: list, ip: str | None = None) -> None:
         if len(limpo) == 12:
             pacotes.append(b"\xff" * 6 + bytes.fromhex(limpo) * 16)
     if not pacotes:
-        raise ToonsError("Não sei o endereço MAC da TV para ligá-la pela rede.")
+        raise LnuxError("Não sei o endereço MAC da TV para ligá-la pela rede.")
     destinos = {"255.255.255.255"}
     if ip and re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ip):
         destinos |= {ip.rsplit(".", 1)[0] + ".255", ip}  # o broadcast da rede de casa (/24) e a própria TV
@@ -23935,6 +25211,8 @@ def _macs_em(dados) -> list:
     return list(dict.fromkeys(achados))
 
 
+# nome com que o controle se apresenta às TVs Samsung/LG já pareadas: trocar faria a TV pedir
+# permissão de novo, então continua o nome antigo
 _NOME_NO_CONTROLE = base64.b64encode(b"Termux-Toons").decode()
 
 
@@ -23965,7 +25243,7 @@ def _samsung_conectar(tv: dict, espera: float = 8) -> _WebSocket:
                 if evento.get("event") == "ms.channel.connect":
                     break
                 if evento.get("event") == "ms.channel.unauthorized":
-                    raise ToonsError("A TV não permitiu. Aceite o pedido do Termux-Toons na tela da TV (ou libere em "
+                    raise LnuxError("A TV não permitiu. Aceite o pedido do LNUX na tela da TV (ou libere em "
                                      "Configurações → Geral → Gerenciador de dispositivos externos).")
         except OSError as e:
             ws.fechar()
@@ -23979,7 +25257,7 @@ def _samsung_conectar(tv: dict, espera: float = 8) -> _WebSocket:
             tv["token"] = token
             salvar_cfg()
         return ws
-    raise ToonsError(f"A TV Samsung não respondeu em {ip} ({'; '.join(erros)}). Ela está ligada e no mesmo Wi-Fi?")
+    raise LnuxError(f"A TV Samsung não respondeu em {ip} ({'; '.join(erros)}). Ela está ligada e no mesmo Wi-Fi?")
 
 
 _LG_PERMISSOES = [
@@ -24006,13 +25284,13 @@ class _TvLG:
             except OSError as e:
                 erros.append(str(e) or type(e).__name__)
         if self.ws is None:
-            raise ToonsError(f"A TV LG não respondeu em {tv['ip']} ({'; '.join(erros)}). Ela está ligada e no mesmo "
+            raise LnuxError(f"A TV LG não respondeu em {tv['ip']} ({'; '.join(erros)}). Ela está ligada e no mesmo "
                              "Wi-Fi?")
         try:
             self._registrar(espera)
         except OSError as e:
             self.fechar()
-            raise ToonsError(f"A TV LG fechou a conexão ({e or type(e).__name__}).") from None
+            raise LnuxError(f"A TV LG fechou a conexão ({e or type(e).__name__}).") from None
         except BaseException:
             self.fechar()
             raise
@@ -24044,7 +25322,7 @@ class _TvLG:
             try:
                 r = self._resposta("register_0", prazo - time.time())
             except TimeoutError:
-                raise ToonsError("A TV não confirmou. Aceite o pedido do Termux-Toons na tela da TV e tente de "
+                raise LnuxError("A TV não confirmou. Aceite o pedido do LNUX na tela da TV e tente de "
                                  "novo.") from None
             if r.get("type") == "registered":
                 chave = (r.get("payload") or {}).get("client-key")
@@ -24053,21 +25331,21 @@ class _TvLG:
                     salvar_cfg()
                 return
             if r.get("type") == "error":
-                raise ToonsError(f"A TV LG recusou: {r.get('error')}")
+                raise LnuxError(f"A TV LG recusou: {r.get('error')}")
             # 'response' com pairingType PROMPT: a TV está mostrando o pedido; continua esperando
 
     def pedir(self, uri: str, carga: dict | None = None) -> dict:
         self.n += 1
-        ident = f"toons_{self.n}"
+        ident = f"lnux_{self.n}"
         try:
             self.ws.enviar(json.dumps({"id": ident, "type": "request", "uri": f"ssap://{uri}", "payload": carga or {}}))
             r = self._resposta(ident, 8)
         except TimeoutError:
-            raise ToonsError("A TV LG não respondeu.") from None
+            raise LnuxError("A TV LG não respondeu.") from None
         except OSError as e:
-            raise ToonsError(f"A conexão com a TV LG caiu ({e or type(e).__name__}).") from None
+            raise LnuxError(f"A conexão com a TV LG caiu ({e or type(e).__name__}).") from None
         if r.get("type") == "error":
-            raise ToonsError(f"A TV LG respondeu: {r.get('error')}")
+            raise LnuxError(f"A TV LG respondeu: {r.get('error')}")
         return r.get("payload") or {}
 
     def botao(self, nome: str) -> None:
@@ -24075,7 +25353,7 @@ class _TvLG:
         if self.entrada is None:
             caminho = self.pedir("com.webos.service.networkinput/getPointerInputSocket").get("socketPath")
             if not caminho:
-                raise ToonsError("A TV LG não abriu o canal dos botões.")
+                raise LnuxError("A TV LG não abriu o canal dos botões.")
             self.entrada = _WebSocket(caminho, timeout=6)
         self.entrada.enviar(f"type:button\nname:{nome}\n\n")
 
@@ -24088,7 +25366,7 @@ class _TvLG:
 def _adb_tv(tv: dict, esperar_permissao: float = 0) -> str:
     """Conecta o adb à TV (Depuração por rede) e devolve o serial; na primeira vez a TV pergunta se permite."""
     if not garantir_adb():
-        raise ToonsError("Sem o adb (pacote android-tools).")
+        raise LnuxError("Sem o adb (pacote android-tools).")
     serial = tv["ip"] if ":" in tv["ip"] else f"{tv['ip']}:5555"
     prazo = time.time() + esperar_permissao
     while True:
@@ -24099,9 +25377,9 @@ def _adb_tv(tv: dict, esperar_permissao: float = 0) -> str:
         texto = " ".join(f"{p.stdout or ''} {p.stderr or ''}" for p in (conectar, estado)).strip()
         if time.time() >= prazo:
             if "unauthorized" in texto or "authenticate" in texto:
-                raise ToonsError("A TV ainda não permitiu: aceite 'Permitir depuração' na tela da TV (marque 'Sempre "
+                raise LnuxError("A TV ainda não permitiu: aceite 'Permitir depuração' na tela da TV (marque 'Sempre "
                                  "permitir deste computador').")
-            raise ToonsError(f"A TV não respondeu em {serial} ({texto[:160] or 'sem resposta'}). Ligue a 'Depuração "
+            raise LnuxError(f"A TV não respondeu em {serial} ({texto[:160] or 'sem resposta'}). Ligue a 'Depuração "
                              "USB' e a 'Depuração por rede (ADB)' nas Opções do desenvolvedor da TV.")
         time.sleep(2)
 
@@ -24247,14 +25525,14 @@ class ControleTV:
                 if acao != "alternar":
                     extra = " (pelo liga/desliga: o infravermelho não sabe se a TV estava ligada)"
             if codigo is None:
-                raise ToonsError(f"Não tenho o código do botão '{rotulo}' dessa TV.")
+                raise LnuxError(f"Não tenho o código do botão '{rotulo}' dessa TV.")
             ir_transmitir(codigo)
             return f"✔ {rotulo}{extra}"
         if acao in ENERGIA_TV:
             return self._energia(acao)
         nome = TV_TECLAS[acao][_COLUNA_TV[self.tv["tipo"]]]
         if nome is None:
-            raise ToonsError(f"Essa TV não tem o botão '{rotulo}' pelo Wi-Fi.")
+            raise LnuxError(f"Essa TV não tem o botão '{rotulo}' pelo Wi-Fi.")
         self._mandar(nome)
         return f"✔ {rotulo}"
 
@@ -24272,7 +25550,7 @@ class ControleTV:
                     self._ws.fechar()
                     self._ws = None
                     if tentativa:
-                        raise ToonsError("A conexão com a TV caiu.") from None
+                        raise LnuxError("A conexão com a TV caiu.") from None
         elif tipo == "lg":
             for tentativa in range(2):
                 if self._lg is None:
@@ -24284,16 +25562,16 @@ class ControleTV:
                     self._lg.fechar()
                     self._lg = None
                     if tentativa:
-                        raise ToonsError("A conexão com a TV caiu.") from None
+                        raise LnuxError("A conexão com a TV caiu.") from None
         elif tipo == "androidtv":
             self._serial = self._serial or _adb_tv(self.tv)
             proc = adb("shell", "input", "keyevent", nome, serial=self._serial, timeout=20)
             if proc.returncode != 0:
                 self._serial = None
-                raise ToonsError(f"A TV não recebeu a tecla: {(proc.stderr or proc.stdout or '').strip()[:160]}")
+                raise LnuxError(f"A TV não recebeu a tecla: {(proc.stderr or proc.stdout or '').strip()[:160]}")
         elif tipo == "roku":
             if _roku(ip, f"keypress/{nome}", apertar=True) is None:
-                raise ToonsError(f"A Roku TV não respondeu em {ip}. Ela está ligada e no mesmo Wi-Fi?")
+                raise LnuxError(f"A Roku TV não respondeu em {ip}. Ela está ligada e no mesmo Wi-Fi?")
 
     def _ligada(self) -> tuple:
         """(ligada: True/False/None se não dá para saber, responde pela rede: bool)."""
@@ -24310,17 +25588,17 @@ class ControleTV:
         if tipo == "lg":
             try:
                 self._lg = self._lg or _TvLG(self.tv, espera=6)
-            except ToonsError:
+            except LnuxError:
                 return False, False
             try:
                 estado = self._lg.pedir("com.webos.service.tvpower/power/getPowerState").get("state", "")
-            except (ToonsError, OSError):
+            except (LnuxError, OSError):
                 return True, True
             return estado not in ("Active Standby", "Suspend", "Power Off"), True
         if tipo == "androidtv":
             try:
                 self._serial = self._serial or _adb_tv(self.tv)
-            except ToonsError:
+            except LnuxError:
                 return False, False
             estado = re.search(r"mWakefulness=(\w+)", adb_shell("dumpsys power", serial=self._serial, timeout=20))
             return (estado.group(1) == "Awake" if estado else None), True
@@ -24345,7 +25623,7 @@ class ControleTV:
         if ligada:
             return "A TV já está ligada."
         if responde and tipo in ("samsung", "roku", "androidtv"):  # em espera, mas ainda na rede
-            with contextlib.suppress(ToonsError):
+            with contextlib.suppress(LnuxError):
                 self._mandar(TV_TECLAS["ligar"][coluna])
                 if tipo != "samsung":
                     return "✔ TV ligada"
@@ -24354,7 +25632,7 @@ class ControleTV:
             return "✔ Mandei o sinal para ligar pela rede (Wake-on-LAN)"
         if responde:
             return "✔ Mandei o sinal para ligar"
-        raise ToonsError("A TV não responde na rede e não sei o MAC dela para ligá-la pela rede. Ligue a opção "
+        raise LnuxError("A TV não responde na rede e não sei o MAC dela para ligá-la pela rede. Ligue a opção "
                          "'Ligar pela rede/pelo celular' na TV e adicione-a de novo.")
 
 
@@ -24365,11 +25643,11 @@ def _tvs() -> list:
 def tv_escolhida(nome: str | None = None) -> dict:
     tvs = _tvs()
     if not tvs:
-        raise ToonsError("Nenhuma TV configurada. Adicione em 📲 Celular e sistema → 📺 Controle da TV.")
+        raise LnuxError("Nenhuma TV configurada. Adicione em 📲 Celular e sistema → 📺 Controle da TV.")
     if nome:
         achada = next((tv for tv in tvs if tv["nome"].casefold() == nome.casefold()), None)
         if achada is None:
-            raise ToonsError(f"Não achei a TV '{nome}'. TVs: {', '.join(tv['nome'] for tv in tvs)}")
+            raise LnuxError(f"Não achei a TV '{nome}'. TVs: {', '.join(tv['nome'] for tv in tvs)}")
         return achada
     i = cfg().get("tv_atual", 0)
     return tvs[i] if isinstance(i, int) and 0 <= i < len(tvs) else tvs[0]
@@ -24461,7 +25739,7 @@ def _botao_tocado(alvos: list, x: int, y: int) -> str | None:
 def _painel_controle(titulo: str, subtitulo: str, layout: list, ativo, energia: set, dicas: list,
                      acionar, rotulo, atalhos: dict, volume: tuple | None) -> None:
     """Laço de um controle remoto na tela: toque nos botões, arraste (volume) ou use o teclado. `acionar(acao)` faz o
-    comando e devolve a mensagem (ou levanta ToonsError); `rotulo(acao)` dá o nome do botão."""
+    comando e devolve a mensagem (ou levanta LnuxError); `rotulo(acao)` dá o nome do botão."""
     if not setas_ativas():
         acoes = [a for fileira in layout for a, _ in fileira if a != "sair" and ativo(a)]
         while True:
@@ -24470,7 +25748,7 @@ def _painel_controle(titulo: str, subtitulo: str, layout: list, ativo, energia: 
                 return
             try:
                 ok(acionar(acoes[i]))
-            except ToonsError as e:
+            except LnuxError as e:
                 erro(str(e))
     fd = sys.stdin.fileno()
     antigo = termios.tcgetattr(fd)
@@ -24513,7 +25791,7 @@ def _painel_controle(titulo: str, subtitulo: str, layout: list, ativo, energia: 
                 for _ in range(vezes):
                     resultado = acionar(acao)
                 recado = f"{VERD}{resultado}{' ×' + str(vezes) if vezes > 1 else ''}{RST}"
-            except ToonsError as e:
+            except LnuxError as e:
                 recado = f"{VERM}✖ {e}{RST}"
     finally:
         _mouse(False)
@@ -24539,7 +25817,7 @@ def tela_controle_tv(tv: dict | None = None) -> None:
 def _nova_tv_ir() -> dict | None:
     problema = ir_disponivel()
     if problema:
-        raise ToonsError(f"Sem infravermelho: {problema}. Se a TV for Smart, adicione pelo Wi-Fi.")
+        raise LnuxError(f"Sem infravermelho: {problema}. Se a TV for Smart, adicione pelo Wi-Fi.")
     marcas = list(TV_MARCAS_IR)
     i = escolher("Qual a marca da TV?", marcas + ["🔎 Outra marca / não sei: busca automática (testa centenas)",
                                                   "📄 Importar um arquivo .ir ou colar um código"])
@@ -24583,7 +25861,7 @@ def _importar_codigos_ir(alvo: str = "a TV", desligar: str = "Power") -> dict | 
             for nome, codigo in codigos:
                 botoes.setdefault(nome, codigo)
         if not botoes:
-            raise ToonsError("Não achei códigos nesse arquivo.")
+            raise LnuxError("Não achei códigos nesse arquivo.")
         if _codigo_ir(botoes, desligar) is None:
             aviso(f"Esse arquivo não tem o botão de desligar ('{desligar}'); os outros botões funcionam.")
         ok(f"{len(botoes)} botões: {', '.join(list(botoes)[:15])}{'...' if len(botoes) > 15 else ''}")
@@ -24612,10 +25890,10 @@ def _parear_tv_wifi(tv: dict) -> None:
         info("Na TV vai aparecer um pedido de permissão: escolha 'Sim' / 'Aceitar'.")
         lg = _TvLG(tv, espera=60)
         try:
-            with contextlib.suppress(ToonsError, OSError):
+            with contextlib.suppress(LnuxError, OSError):
                 tv["macs"] = _macs_em(lg.pedir("com.webos.service.connectionmanager/getinfo"))
-            with contextlib.suppress(ToonsError, OSError):
-                lg.pedir("system.notifications/createToast", {"message": "Termux-Toons conectado ✓"})
+            with contextlib.suppress(LnuxError, OSError):
+                lg.pedir("system.notifications/createToast", {"message": "LNUX conectado ✓"})
         finally:
             lg.fechar()
     elif tipo == "androidtv":
@@ -24626,12 +25904,12 @@ def _parear_tv_wifi(tv: dict) -> None:
         pausar()
         info("Esperando a TV permitir (até 1 minuto)...")
         serial = _adb_tv(tv, esperar_permissao=60)
-        with contextlib.suppress(ToonsError):
+        with contextlib.suppress(LnuxError):
             tv["macs"] = _macs_android(serial, ip)
     elif tipo == "roku":
         dados = _roku_info(ip)
         if dados is None:
-            raise ToonsError(f"A Roku TV não respondeu em {ip}. Ela está ligada e no mesmo Wi-Fi?")
+            raise LnuxError(f"A Roku TV não respondeu em {ip}. Ela está ligada e no mesmo Wi-Fi?")
         tv["macs"] = [m for m in (dados.get("wifi-mac"), dados.get("ethernet-mac")) if m]
         tv.setdefault("modelo", dados.get("model-name", ""))
     if tv.get("macs"):
@@ -24654,7 +25932,7 @@ def _nova_tv_wifi() -> dict | None:
         if i == len(achadas):
             ip = perguntar("IP da TV (fica em Configurações → Rede → Status ou Informações da rede)").strip()
             if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", ip):
-                raise ToonsError("IP inválido (ex.: 192.168.0.20).")
+                raise LnuxError("IP inválido (ex.: 192.168.0.20).")
             tipos = list(TIPOS_TV)[1:]
             j = escolher("Que TV é essa?", [TIPOS_TV[t] for t in tipos])
             if j is None:
@@ -24666,14 +25944,22 @@ def _nova_tv_wifi() -> dict | None:
 
 
 def adicionar_tv() -> None:
+    if not tem_recurso("infravermelho"):  # computador: as Smart TVs pelo Wi-Fi
+        tv = _nova_tv_wifi()
+        if tv:
+            _guardar_tv(tv)
+        return
     i = escolher("Como o celular vai falar com a TV?", [
         "📡 Infravermelho do celular (qualquer TV, até as antigas; o celular precisa ter o emissor IR)",
         "📶 Wi-Fi (Smart TV: Samsung, LG, Android TV / Google TV, Roku)"])
     if i is None:
         return
     tv = _nova_tv_ir() if i == 0 else _nova_tv_wifi()
-    if not tv:
-        return
+    if tv:
+        _guardar_tv(tv)
+
+
+def _guardar_tv(tv: dict) -> None:
     tvs = _tvs()
     nome = perguntar("Nome dessa TV", "TV da sala" if not tvs else f"TV {len(tvs) + 1}").strip() or "TV"
     while any(t["nome"].casefold() == nome.casefold() for t in tvs):
@@ -24711,7 +25997,7 @@ def menu_tv():
 
     def trocar():
         if not tvs:
-            raise ToonsError("Nenhuma TV configurada ainda.")
+            raise LnuxError("Nenhuma TV configurada ainda.")
         i = escolher("Qual TV controlar?", [descrever_tv(tv) for tv in tvs], tvs.index(tv_escolhida()) + 1)
         if i is not None:
             c["tv_atual"] = i
@@ -24720,7 +26006,7 @@ def menu_tv():
 
     def editar():
         if not tvs:
-            raise ToonsError("Nenhuma TV configurada ainda.")
+            raise LnuxError("Nenhuma TV configurada ainda.")
         i = escolher("Qual TV?", [descrever_tv(tv) for tv in tvs])
         if i is None:
             return
@@ -24749,12 +26035,12 @@ def menu_tv():
     menu("📺 Controle da TV", [
         ("⏻ Ligar / desligar a TV", lambda: ok(tv_comando("alternar"))),
         ("🎮 Controle remoto (volume, canal, setas, OK)", tela_controle_tv),
-        ("➕ Adicionar uma TV (infravermelho ou Wi-Fi)", adicionar_tv),
+        (por_sistema("➕ Adicionar uma TV (infravermelho ou Wi-Fi)", "➕ Adicionar uma Smart TV (Wi-Fi)"), adicionar_tv),
         (lambda: f"🔀 Trocar de TV ({len(tvs)})", trocar),
         ("📝 Renomear ou apagar uma TV", editar),
-        ("📲 Atalho na tela inicial (Termux:Widget)", atalho_tv),
-        ("📴 Desligar TVs por perto (TV-B-Gone)", desligar_tvs_por_perto),
-        ("❓ Meu celular tem infravermelho?", checar_ir),
+        ("📲 Atalho na tela inicial (Termux:Widget)", so_em("termux", atalho_tv)),
+        ("📴 Desligar TVs por perto (TV-B-Gone)", so_em("infravermelho", desligar_tvs_por_perto)),
+        ("❓ Meu celular tem infravermelho?", so_em("infravermelho", checar_ir)),
     ], cabecalho=cabecalho)
 
 
@@ -24811,12 +26097,12 @@ def _aparelhos() -> list:
 def aparelho_escolhido(nome: str | None = None) -> dict:
     aps = _aparelhos()
     if not aps:
-        raise ToonsError("Nenhum aparelho configurado. Adicione em 📲 Celular e sistema → 🎛️ Controle de outros "
+        raise LnuxError("Nenhum aparelho configurado. Adicione em 📲 Celular e sistema → 🎛️ Controle de outros "
                          "aparelhos.")
     if nome:
         achado = next((a for a in aps if a["nome"].casefold() == nome.casefold()), None)
         if achado is None:
-            raise ToonsError(f"Não achei '{nome}'. Aparelhos: {', '.join(a['nome'] for a in aps)}")
+            raise LnuxError(f"Não achei '{nome}'. Aparelhos: {', '.join(a['nome'] for a in aps)}")
         return achado
     i = cfg().get("aparelho_atual", 0)
     return aps[i] if isinstance(i, int) and 0 <= i < len(aps) else aps[0]
@@ -24853,7 +26139,7 @@ def aparelho_comando(acao: str, nome: str | None = None) -> str:
     ap = aparelho_escolhido(nome)
     codigo = _codigo_ir(ap.get("codigos", {}), acao)
     if codigo is None:
-        raise ToonsError(f"O aparelho '{ap['nome']}' não tem o botão '{acao}'.")
+        raise LnuxError(f"O aparelho '{ap['nome']}' não tem o botão '{acao}'.")
     ir_transmitir(codigo)
     return f"✔ {acao} ({ap['nome']})"
 
@@ -24875,7 +26161,7 @@ def tela_controle_aparelho(ap: dict | None = None) -> None:
     def acionar(acao: str) -> str:
         codigo = _codigo_ir(botoes, acao)
         if codigo is None:
-            raise ToonsError(f"Esse aparelho não tem o botão '{rotular(acao)}'.")
+            raise LnuxError(f"Esse aparelho não tem o botão '{rotular(acao)}'.")
         ir_transmitir(codigo)
         return f"✔ {rotular(acao)}"
 
@@ -24903,7 +26189,7 @@ def _modelos_do_arquivo(arquivo: str) -> list:
 def _novo_aparelho_ir(categoria: str) -> dict | None:
     problema = ir_disponivel()
     if problema:
-        raise ToonsError(f"Sem infravermelho: {problema}.")
+        raise LnuxError(f"Sem infravermelho: {problema}.")
     cat, conf = _CATEGORIAS_IR[categoria], APARELHOS[categoria]
     desligar, alvo = cat["desligar"], conf["alvo"]
     info("Preparando a lista de modelos (na primeira vez baixa a biblioteca universal)...")
@@ -24967,7 +26253,7 @@ def adicionar_aparelho() -> None:
     salvar_cfg()
     ok(f"Pronto! {descrever_aparelho(aps[-1])}")
     info("Use '🎮 Controle remoto'. Dá para pôr um atalho na tela inicial (Termux:Widget) e usar no terminal "
-         "(toons aparelho ...).")
+         "(lnux aparelho ...).")
 
 
 def atalho_aparelho(ap: dict) -> None:
@@ -24998,7 +26284,7 @@ def menu_aparelhos():
 
     def trocar():
         if not aps:
-            raise ToonsError("Nenhum aparelho configurado ainda.")
+            raise LnuxError("Nenhum aparelho configurado ainda.")
         i = escolher("Qual aparelho controlar?", [descrever_aparelho(a) for a in aps],
                      aps.index(aparelho_escolhido()) + 1)
         if i is not None:
@@ -25008,7 +26294,7 @@ def menu_aparelhos():
 
     def editar():
         if not aps:
-            raise ToonsError("Nenhum aparelho configurado ainda.")
+            raise LnuxError("Nenhum aparelho configurado ainda.")
         i = escolher("Qual aparelho?", [descrever_aparelho(a) for a in aps])
         if i is None:
             return
@@ -25025,7 +26311,7 @@ def menu_aparelhos():
 
     def atalho():
         if not aps:
-            raise ToonsError("Nenhum aparelho configurado ainda.")
+            raise LnuxError("Nenhum aparelho configurado ainda.")
         atalho_aparelho(aparelho_escolhido())
 
     menu("📡 Controle de outros aparelhos (som, projetor, ar)", [
@@ -25039,21 +26325,27 @@ def menu_aparelhos():
 
 @submenu
 def menu_celular():
-    menu("📲 Celular e sistema", [
-        ("🔌 Depuração sem fio (ADB pelo Wi-Fi, sem root)", menu_adb),
-        ("📱 Termux:API (sensores, SMS, câmera, localização...)", menu_termux_api),
+    menu("📲 Celular e sistema" if sistema().android else "🖥️ Computador e Android conectado", [
+        # no Linux, o mesmo adb controla um Android ligado por USB ou pelo Wi-Fi (parear e conectar funcionam igual)
+        (por_sistema("🔌 Depuração sem fio (ADB pelo Wi-Fi, sem root)", "📱 Android conectado (ADB por USB ou Wi-Fi)"),
+         so_em("adb", menu_adb)),
+        (por_sistema("📱 Termux:API (sensores, SMS, câmera, localização...)",
+                     "🖥️ Recursos do computador (notificação, webcam, área de transferência, volume)"), menu_termux_api),
         ("📊 Painel do sistema ao vivo (CPU, RAM, bateria, serviços)", dashboard),
-        ("🔋 Saúde da bateria (histórico e alertas de 80%)", menu_bateria),
-        ("📊 Uso de dados e tempo de tela (ADB)", menu_uso_celular),
-        ("📦 Gerenciador de apps (ADB, sem root)", menu_apps),
-        ("🖥️ Resolução da tela (inteira ou de um app)", menu_resolucao),
+        ("🔋 Saúde da bateria (histórico e alertas de 80%)", so_em("bateria", menu_bateria)),
+        (por_sistema("📊 Uso de dados e tempo de tela (ADB)", "📊 Uso de dados e tempo de tela do Android (ADB)"),
+         so_em("adb", menu_uso_celular)),
+        (por_sistema("📦 Gerenciador de apps (ADB, sem root)", "📦 Apps do Android conectado (ADB)"), so_em("adb", menu_apps)),
+        ("🖥️ Resolução da tela (inteira ou de um app)", so_em("android", menu_resolucao)),
         ("📸 Organizador de fotos", menu_fotos),
         ("🔁 Conversor de arquivos (imagem, vídeo, áudio, PDF)", menu_conversor_arquivos),
         ("🤖 Automação por eventos (Wi-Fi, carregador, horário)", menu_automacao),
-        ("📲 Espelhar e transmitir a tela (scrcpy ou link pela internet)", menu_espelhar),
-        ("📺 Controle da TV (infravermelho do celular ou Wi-Fi)", menu_tv),
-        ("📡 Controle de outros aparelhos (som, projetor, ar)", menu_aparelhos),
-        ("📶 Modem: comandos AT (chamadas, SMS, sinal, APN; precisa de root)", menu_modem),
+        (por_sistema("📲 Espelhar e transmitir a tela (scrcpy ou link pela internet)",
+                     "📲 Ver e controlar a tela do Android conectado (scrcpy)"), menu_espelhar),
+        (lambda: "📺 Controle da TV (infravermelho do celular ou Wi-Fi)" if tem_recurso("infravermelho")
+         else "📺 Controle da Smart TV (Wi-Fi: Samsung, LG, Android TV, Roku)", menu_tv),
+        ("📡 Controle de outros aparelhos (som, projetor, ar)", so_em("infravermelho", menu_aparelhos)),
+        ("📶 Modem: comandos AT (chamadas, SMS, sinal, APN; precisa de root)", so_em("android", menu_modem)),
     ])
 
 
@@ -25106,7 +26398,7 @@ def html_para_texto(pagina: str) -> str:
 def _email_cfg() -> dict:
     e = cfg().get("email") or {}
     if not e.get("endereco") or not e.get("senha"):
-        raise ToonsError("Configure a conta de e-mail primeiro.")
+        raise LnuxError("Configure a conta de e-mail primeiro.")
     return e
 
 
@@ -25117,10 +26409,10 @@ def conectar_imap():
         conexao = imaplib.IMAP4_SSL(e["imap"], 993, timeout=30)
         conexao.login(e["endereco"], e["senha"])
     except imaplib.IMAP4.error as falha:
-        raise ToonsError(f"O servidor recusou o login ({falha}). No Gmail use uma 'senha de app' "
+        raise LnuxError(f"O servidor recusou o login ({falha}). No Gmail use uma 'senha de app' "
                          "(myaccount.google.com/apppasswords).") from None
     except OSError as falha:
-        raise ToonsError(f"Sem conexão com {e['imap']} ({falha}).") from None
+        raise LnuxError(f"Sem conexão com {e['imap']} ({falha}).") from None
     return conexao
 
 
@@ -25132,7 +26424,7 @@ def listar_emails(criterio: str = "ALL", n: int = 25, caixa: str = "INBOX") -> l
         conexao.select(caixa, readonly=True)
         status, dados = conexao.uid("SEARCH", None, criterio)
         if status != "OK":
-            raise ToonsError(f"Busca recusada pelo servidor: {dados}")
+            raise LnuxError(f"Busca recusada pelo servidor: {dados}")
         uids = dados[0].split()[-n:]
         if not uids:
             return []
@@ -25163,7 +26455,7 @@ def baixar_email(uid: str, marcar_lido: bool = True, caixa: str = "INBOX"):
         status, dados = conexao.uid("FETCH", uid, "(BODY.PEEK[])")
         bruto = next((p[1] for p in dados if isinstance(p, tuple)), None)
         if status != "OK" or bruto is None:
-            raise ToonsError("Não consegui baixar esse e-mail.")
+            raise LnuxError("Não consegui baixar esse e-mail.")
         if marcar_lido:
             conexao.uid("STORE", uid, "+FLAGS", "(\\Seen)")
         return email.message_from_bytes(bruto, policy=email.policy.default)
@@ -25223,9 +26515,9 @@ def enviar_email(para: str, assunto: str, corpo: str, anexos=(), responder_a=Non
             servidor.login(e["endereco"], e["senha"])
             servidor.send_message(msg)
     except smtplib.SMTPAuthenticationError:
-        raise ToonsError("Login recusado para enviar. No Gmail use uma 'senha de app'.") from None
+        raise LnuxError("Login recusado para enviar. No Gmail use uma 'senha de app'.") from None
     except (smtplib.SMTPException, OSError) as falha:
-        raise ToonsError(f"Falha ao enviar: {falha}") from None
+        raise LnuxError(f"Falha ao enviar: {falha}") from None
 
 
 @submenu
@@ -25235,7 +26527,7 @@ def menu_email():
     def configurar():
         endereco = perguntar("Seu e-mail", (c.get("email") or {}).get("endereco"))
         if "@" not in endereco:
-            raise ToonsError("E-mail inválido.")
+            raise LnuxError("E-mail inválido.")
         dominio = endereco.split("@", 1)[1].lower()
         imap, smtp, porta = EMAIL_PROVEDORES.get(dominio, ("", "", 465))
         if not imap:
@@ -25253,7 +26545,7 @@ def menu_email():
         salvar_cfg()
         info("Testando o login...")
         conectar_imap().logout()
-        ok("Conta configurada (a senha fica só neste celular, em ~/.termux_toons/config.json).")
+        ok("Conta configurada (a senha fica só neste celular, em ~/.lnux/config.json).")
 
     def caixa(criterio: str = "ALL", rotulo_caixa: str = "Caixa de entrada"):
         info("Buscando e-mails...")
@@ -25299,7 +26591,7 @@ def menu_email():
                     (pasta / nome).write_bytes(a.get_payload(decode=True) or b"")
                 ok(f"{len(anexos)} anexo(s) salvos em {pasta}" if anexos else "Este e-mail não tem anexos.")
             elif j == 2:
-                with contextlib.suppress(ToonsError):
+                with contextlib.suppress(LnuxError):
                     falar(f"{item['assunto']}. {texto[:3000]}")
             elif j == 3 and confirmar("Apagar este e-mail?", False):
                 apagar_email(item["uid"])
@@ -25311,7 +26603,7 @@ def menu_email():
     def escrever():
         para = perguntar("Para (e-mail)")
         if "@" not in para:
-            raise ToonsError("E-mail inválido.")
+            raise LnuxError("E-mail inválido.")
         assunto = perguntar("Assunto")
         corpo = editar_texto("", ".txt")
         if not corpo:
@@ -25369,7 +26661,7 @@ def ler_feed_completo(dados: bytes) -> list:
     try:
         raiz = ET.fromstring(dados)
     except ET.ParseError as e:
-        raise ToonsError(f"Feed inválido: {e}") from None
+        raise LnuxError(f"Feed inválido: {e}") from None
 
     def nome(el):
         return el.tag.split("}")[-1]
@@ -25410,7 +26702,7 @@ def texto_da_materia(url: str) -> str:
     import html as html_mod
     codigo, pagina = baixar_pagina(url)
     if codigo >= 400:
-        raise ToonsError(f"A página respondeu HTTP {codigo}.")
+        raise LnuxError(f"A página respondeu HTTP {codigo}.")
     paragrafos = []
     for bruto in re.findall(r"(?is)<p\b[^>]*>(.*?)</p>", re.sub(r"(?is)<(script|style)\b.*?</\1>", " ", pagina)):
         texto = " ".join(html_mod.unescape(re.sub(r"(?s)<[^>]+>", " ", bruto)).split())
@@ -25451,7 +26743,7 @@ def menu_noticias():
                 abrir_link(item["link"])
             elif i == 2:
                 info("Lendo em voz alta (Ctrl+C interrompe)...")
-                with contextlib.suppress(ToonsError, KeyboardInterrupt):
+                with contextlib.suppress(LnuxError, KeyboardInterrupt):
                     texto = texto_da_materia(item["link"])
                     for pedaco in fatiar(f"{item['titulo']}.\n{texto}", 3000):
                         falar(pedaco)
@@ -25472,7 +26764,7 @@ def menu_noticias():
         for f in fontes:
             try:
                 itens += [(f["nome"], it) for it in baixar_feed(f["url"])[:30]]
-            except ToonsError as e:
+            except LnuxError as e:
                 aviso(f"{f['nome']}: {e}")
         if not itens:
             info("Nenhuma notícia carregada.")
@@ -25512,7 +26804,7 @@ def menu_noticias():
     def adicionar_fonte():
         url = perguntar("Endereço do feed RSS/Atom (ex.: https://site.com/feed/)")
         if not url.startswith(("http://", "https://")):
-            raise ToonsError("O endereço precisa começar com http:// ou https://")
+            raise LnuxError("O endereço precisa começar com http:// ou https://")
         itens = baixar_feed(url)
         ok(f"Feed válido: {len(itens)} notícias.")
         c["feeds"].append({"nome": perguntar("Nome da fonte", urllib.parse.urlsplit(url).netloc), "url": url})
@@ -25536,16 +26828,16 @@ def menu_noticias():
 
 def aria2(metodo: str, *params):
     """Chama o aria2 rodando em segundo plano (JSON-RPC em 127.0.0.1:6800)."""
-    corpo = {"jsonrpc": "2.0", "id": "toons", "method": f"aria2.{metodo}",
+    corpo = {"jsonrpc": "2.0", "id": "lnux", "method": f"aria2.{metodo}",
              "params": [f"token:{cfg().get('aria2_segredo', '')}", *params]}
     try:
         resposta = pedir_json("http://127.0.0.1:6800/jsonrpc", corpo, timeout=15)
-    except ToonsError as e:
+    except LnuxError as e:
         if "HTTP" not in str(e):
-            raise ToonsError("O gerenciador de downloads não está rodando (inicie o serviço).") from None
+            raise LnuxError("O gerenciador de downloads não está rodando (inicie o serviço).") from None
         raise
     if resposta.get("error"):
-        raise ToonsError(f"aria2: {resposta['error'].get('message')}")
+        raise LnuxError(f"aria2: {resposta['error'].get('message')}")
     return resposta.get("result")
 
 
@@ -25572,7 +26864,7 @@ def _garantir_aria2() -> None:
     if not servico_ativo("downloads"):
         info("Iniciando o gerenciador de downloads em segundo plano...")
         if not iniciar_aria2():
-            raise ToonsError("O aria2 não iniciou.")
+            raise LnuxError("O aria2 não iniciou.")
         time.sleep(1.5)
 
 
@@ -25616,7 +26908,7 @@ def menu_downloads():
         if not alvo:
             return
         if not re.match(r"(https?|ftp)://|magnet:\?", alvo):
-            raise ToonsError("Isso não parece um link de download.")
+            raise LnuxError("Isso não parece um link de download.")
         _garantir_aria2()
         opcoes = {}
         nome = perguntar("Salvar com outro nome? (Enter = nome original)", "")
@@ -25666,7 +26958,7 @@ def menu_downloads():
                 try:
                     lista = todos_downloads()
                     status = aria2("getGlobalStat")
-                except ToonsError as e:
+                except LnuxError as e:
                     desenhar([str(e), "", "Aperte uma tecla"])
                     ler_tecla()
                     return
@@ -25762,12 +27054,13 @@ class SalaChat:
         try:
             self.servidor.bind(("0.0.0.0", CHAT_PORTA))
         except OSError:
-            raise ToonsError(f"A porta {CHAT_PORTA} está ocupada (já tem uma sala aberta?).") from None
+            raise LnuxError(f"A porta {CHAT_PORTA} está ocupada (já tem uma sala aberta?).") from None
         self.servidor.listen()
         threading.Thread(target=self._aceitar, daemon=True).start()
         threading.Thread(target=self._anunciar, daemon=True).start()
 
     def _anunciar(self) -> None:
+        # "toons-chat" é o protocolo do chat: com o mesmo nome, o LNUX conversa com quem ainda usa o Termux-Toons
         aviso_udp = json.dumps({"app": "toons-chat", "sala": self.nome_sala, "porta": CHAT_PORTA,
                                 "senha": bool(self.senha)}).encode()
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -25943,7 +27236,7 @@ def menu_chat():
         ("Entrar numa sala", entrar),
         (lambda: f"Meu nome no chat: {c.get('chat_nome') or '(definir)'}",
          lambda: (c.pop("chat_nome", None), meu_nome())),
-    ], cabecalho=lambda: print(f"{DIM}Funciona entre celulares com o Termux-Toons no mesmo Wi-Fi (ou roteador do "
+    ], cabecalho=lambda: print(f"{DIM}Funciona entre celulares com o LNUX no mesmo Wi-Fi (ou roteador do "
                                f"celular), sem internet.{RST}"))
 
 
@@ -25952,7 +27245,7 @@ def menu_chat():
 def _url_digitada(texto: str) -> str:
     texto = texto.strip()
     if not texto:
-        raise ToonsError("Digite um endereço.")
+        raise LnuxError("Digite um endereço.")
     if re.match(r"[a-z]+://", texto):
         return texto
     if "." in texto and " " not in texto:
@@ -26023,19 +27316,19 @@ def _guardar_link(tipo: str, url: str, original: str) -> None:
 
 def encurtar_link(url: str) -> str:
     for base in ("https://is.gd/create.php", "https://v.gd/create.php"):
-        with contextlib.suppress(ToonsError):
+        with contextlib.suppress(LnuxError):
             curto = pedir_bytes(url_com(base, format="simple", url=url), timeout=20).decode().strip()
             if curto.startswith("http"):
                 return curto
     curto = pedir_bytes(url_com("https://tinyurl.com/api-create.php", url=url), timeout=20).decode().strip()
     if not curto.startswith("http"):
-        raise ToonsError(f"Não consegui encurtar: {curto[:100]}")
+        raise LnuxError(f"Não consegui encurtar: {curto[:100]}")
     return curto
 
 
 def colar_texto_online(texto: str) -> str:
     """Publica um texto e devolve o link (paste.rs; dpaste.com se falhar)."""
-    with contextlib.suppress(ToonsError):
+    with contextlib.suppress(LnuxError):
         link = pedir_bytes("https://paste.rs/", texto.encode(), {"Content-Type": "text/plain; charset=utf-8"},
                            timeout=30, metodo="POST").decode().strip()
         if link.startswith("http"):
@@ -26044,7 +27337,7 @@ def colar_texto_online(texto: str) -> str:
     link = pedir_bytes("https://dpaste.com/api/v2/", corpo, {"Content-Type": "application/x-www-form-urlencoded"},
                        timeout=30, metodo="POST").decode().strip()
     if not link.startswith("http"):
-        raise ToonsError("Não consegui publicar o texto agora.")
+        raise LnuxError("Não consegui publicar o texto agora.")
     return link
 
 
@@ -26052,13 +27345,13 @@ def enviar_arquivo_online(caminho: Path, tempo: str | None = "24h") -> str:
     """Publica um arquivo: temporário no Litterbox (1h a 72h) ou permanente no Catbox."""
     limite = (1024 if tempo else 200) * 1024 * 1024
     if caminho.stat().st_size > limite:
-        raise ToonsError(f"Arquivo grande demais (máximo {bytes_humanos(limite)}).")
+        raise LnuxError(f"Arquivo grande demais (máximo {bytes_humanos(limite)}).")
     campos = {"reqtype": "fileupload", **({"time": tempo} if tempo else {})}
     corpo, tipo = _multipart(campos, {"fileToUpload": caminho})
     url = "https://litterbox.catbox.moe/resources/internals/api.php" if tempo else "https://catbox.moe/user/api.php"
     link = pedir_bytes(url, corpo, {"Content-Type": tipo}, timeout=600, metodo="POST").decode().strip()
     if not link.startswith("http"):
-        raise ToonsError(f"O envio falhou: {link[:200]}")
+        raise LnuxError(f"O envio falhou: {link[:200]}")
     return link
 
 
@@ -26091,7 +27384,7 @@ def menu_links():
             arq = escolher_arquivo("Qual arquivo?", (".txt", ".md", ".py", ".sh", ".json", ".log", ".csv"))
             texto = arq.read_text("utf-8", errors="replace") if arq else ""
         if not texto.strip():
-            raise ToonsError("Texto vazio.")
+            raise LnuxError("Texto vazio.")
         aviso("O texto fica público para quem tiver o link.")
         if confirmar("Publicar?", True):
             depois("texto", colar_texto_online(texto), texto[:80])
@@ -26199,7 +27492,7 @@ def _chave(provedor: str) -> str:
         info(f"Você precisa de uma chave de API do {IA_PROVEDORES[provedor]} ({onde}).")
         chave = getpass.getpass("Cole a chave (fica só neste celular): ").strip()
         if not chave:
-            raise ToonsError("Sem chave não dá para usar esse provedor.")
+            raise LnuxError("Sem chave não dá para usar esse provedor.")
         ia["chaves"][provedor] = chave
         salvar_cfg()
     return chave
@@ -26219,7 +27512,7 @@ def _imagem_base64(caminho: Path) -> tuple:
                 img.save(buffer, "JPEG", quality=85)
                 dados, tipo = buffer.getvalue(), "image/jpeg"
     if len(dados) > 4_500_000:
-        raise ToonsError("Imagem grande demais (instale o Pillow para ela ser reduzida automaticamente).")
+        raise LnuxError("Imagem grande demais (instale o Pillow para ela ser reduzida automaticamente).")
     return tipo, base64.b64encode(dados).decode()
 
 
@@ -26257,19 +27550,19 @@ def _responder_claude(historico: list, mostrar) -> dict:
     except anthropic.AuthenticationError:
         ia["chaves"].pop("claude", None)
         salvar_cfg()
-        raise ToonsError("Chave da API recusada: confira e cole de novo.") from None
+        raise LnuxError("Chave da API recusada: confira e cole de novo.") from None
     except anthropic.PermissionDeniedError as e:
-        raise ToonsError(f"Sua chave não tem acesso a isso: {e.message}") from None
+        raise LnuxError(f"Sua chave não tem acesso a isso: {e.message}") from None
     except anthropic.NotFoundError:
-        raise ToonsError(f"Modelo '{modelo}' não encontrado. Escolha outro em Configurar.") from None
+        raise LnuxError(f"Modelo '{modelo}' não encontrado. Escolha outro em Configurar.") from None
     except anthropic.RateLimitError:
-        raise ToonsError("Limite de uso atingido. Espere um pouco e tente de novo.") from None
+        raise LnuxError("Limite de uso atingido. Espere um pouco e tente de novo.") from None
     except anthropic.BadRequestError as e:
-        raise ToonsError(f"Pedido recusado pela API: {e.message}") from None
+        raise LnuxError(f"Pedido recusado pela API: {e.message}") from None
     except anthropic.APIStatusError as e:
-        raise ToonsError(f"Erro da API ({e.status_code}): {e.message}") from None
+        raise LnuxError(f"Erro da API ({e.status_code}): {e.message}") from None
     except anthropic.APIConnectionError:
-        raise ToonsError("Sem conexão com a API da Anthropic. Está com internet?") from None
+        raise LnuxError("Sem conexão com a API da Anthropic. Está com internet?") from None
     texto = "".join(b.text for b in final.content if b.type == "text")
     if final.stop_reason == "refusal":
         texto += "\n[O modelo recusou este pedido.]"
@@ -26288,20 +27581,20 @@ def _ler_sse(resposta):
             yield linha[5:].strip()
 
 
-def _erro_http(e: urllib.error.HTTPError) -> ToonsError:
+def _erro_http(e: urllib.error.HTTPError) -> LnuxError:
     try:
         dados = json.loads(e.read().decode())
         detalhe = (dados.get("error") or {}).get("message") or str(dados)[:200]
     except (ValueError, AttributeError):
         detalhe = ""
-    return ToonsError(f"A API respondeu HTTP {e.code}: {detalhe}")
+    return LnuxError(f"A API respondeu HTTP {e.code}: {detalhe}")
 
 
 def _responder_openai(historico: list, mostrar) -> dict:
     ia = ia_config()
     modelo = ia["modelos"].get("openai")
     if not modelo:
-        raise ToonsError("Escolha um modelo do ChatGPT em Configurar → Modelo.")
+        raise LnuxError("Escolha um modelo do ChatGPT em Configurar → Modelo.")
     mensagens = [{"role": "system", "content": ia["sistema"]}]
     for m in historico:
         conteudo = m["texto"]
@@ -26328,7 +27621,7 @@ def _responder_openai(historico: list, mostrar) -> dict:
     except urllib.error.HTTPError as e:
         raise _erro_http(e) from None
     except OSError as e:
-        raise ToonsError(f"Sem conexão com a OpenAI ({e}).") from None
+        raise LnuxError(f"Sem conexão com a OpenAI ({e}).") from None
     return {"role": "assistant", "texto": "".join(partes)}
 
 
@@ -26336,7 +27629,7 @@ def _responder_gemini(historico: list, mostrar) -> dict:
     ia = ia_config()
     modelo = ia["modelos"].get("gemini")
     if not modelo:
-        raise ToonsError("Escolha um modelo do Gemini em Configurar → Modelo.")
+        raise LnuxError("Escolha um modelo do Gemini em Configurar → Modelo.")
     conteudos = []
     for m in historico:
         partes_msg = [{"text": m["texto"]}]
@@ -26360,7 +27653,7 @@ def _responder_gemini(historico: list, mostrar) -> dict:
     except urllib.error.HTTPError as e:
         raise _erro_http(e) from None
     except OSError as e:
-        raise ToonsError(f"Sem conexão com o Google ({e}).") from None
+        raise LnuxError(f"Sem conexão com o Google ({e}).") from None
     return {"role": "assistant", "texto": "".join(partes)}
 
 
@@ -26368,7 +27661,7 @@ def ia_responder(historico: list, mostrar=None) -> dict:
     """Manda a conversa para o provedor escolhido e devolve a resposta (mostrando o texto enquanto chega)."""
     provedor = ia_config()["provedor"]
     if provedor == "claude" and not garantir_anthropic():
-        raise ToonsError("O SDK da Anthropic é necessário para usar o Claude.")
+        raise LnuxError("O SDK da Anthropic é necessário para usar o Claude.")
     estado = {"primeiro": True}
 
     def exibir(pedaco: str):
@@ -26398,7 +27691,7 @@ def ia_listar_modelos(provedor: str) -> list:
         try:
             return [m.id for m in anthropic.Anthropic(api_key=_chave("claude")).models.list()]
         except anthropic.APIError as e:
-            raise ToonsError(f"Não consegui listar os modelos: {e}") from None
+            raise LnuxError(f"Não consegui listar os modelos: {e}") from None
     if provedor == "openai":
         dados = pedir_json("https://api.openai.com/v1/models", cabecalhos={"Authorization": f"Bearer {_chave('openai')}"})
         return sorted((m["id"] for m in dados.get("data", []) if re.match(r"(gpt|o\d|chatgpt)", m["id"])), reverse=True)
@@ -26450,7 +27743,7 @@ def conversa_ia(primeira: str | None = None, imagem: Path | None = None) -> None
         print(f"{CIANO}ia>{RST} ", end="")
         try:
             resposta = ia_responder(historico)
-        except ToonsError as e:
+        except LnuxError as e:
             erro(str(e))
             historico.pop()
             continue
@@ -26480,7 +27773,7 @@ def texto_de_arquivo(caminho: Path) -> str:
     sufixo = caminho.suffix.lower()
     if sufixo == ".pdf":
         if not garantir_cmd("pdftotext", "poppler"):
-            raise ToonsError("O pdftotext (pacote poppler) é necessário para ler PDF.")
+            raise LnuxError("O pdftotext (pacote poppler) é necessário para ler PDF.")
         proc = rodar(["pdftotext", "-layout", str(caminho), "-"], capturar=True, timeout=300, mostrar=False)
         return proc.stdout or ""
     if sufixo == ".epub":
@@ -26519,12 +27812,12 @@ def modelo_whisper() -> Path:
 def transcrever_audio(arquivo: Path, idioma: str = "pt") -> str:
     binario = whisper_bin()
     if not binario:
-        raise ToonsError("O whisper.cpp ainda não foi compilado (use 'Instalar o whisper' neste menu).")
+        raise LnuxError("O whisper.cpp ainda não foi compilado (use 'Instalar o whisper' neste menu).")
     modelo = modelo_whisper()
     if not modelo.exists():
-        raise ToonsError(f"Baixe o modelo '{modelo.stem}' primeiro (opção 'Baixar modelo de voz').")
+        raise LnuxError(f"Baixe o modelo '{modelo.stem}' primeiro (opção 'Baixar modelo de voz').")
     if not garantir_cmd("ffmpeg"):
-        raise ToonsError("O ffmpeg é necessário para preparar o áudio.")
+        raise LnuxError("O ffmpeg é necessário para preparar o áudio.")
     tmp = DATA_DIR / "tmp"
     tmp.mkdir(parents=True, exist_ok=True)
     wav, base_saida = tmp / "voz16k.wav", tmp / "transcricao"
@@ -26535,7 +27828,7 @@ def transcrever_audio(arquivo: Path, idioma: str = "pt") -> str:
            "-t", str(min(4, os.cpu_count() or 4)), "-np"], capturar=True, timeout=3600)
     resultado = base_saida.with_suffix(".txt")
     if not resultado.exists():
-        raise ToonsError("O whisper não gerou a transcrição.")
+        raise LnuxError("O whisper não gerou a transcrição.")
     texto = " ".join(resultado.read_text("utf-8", errors="replace").split())
     resultado.unlink(missing_ok=True)
     return texto
@@ -26565,7 +27858,7 @@ def _depois_do_texto(texto: str, titulo_nota: str) -> None:
             traducao, _ = traduzir(texto, cfg().get("tradutor_destino", "en"))
             print(f"\n{VERD}{traducao}{RST}\n")
         elif i == 3:
-            with contextlib.suppress(ToonsError):
+            with contextlib.suppress(LnuxError):
                 falar(texto[:3500])
         elif i == 4:
             pergunta = perguntar("O que você quer saber? (Enter = resumir)", "Resuma e explique este texto.")
@@ -26602,7 +27895,7 @@ def menu_voz():
 
     def ditar():
         if not tem("termux-microphone-record"):
-            raise ToonsError("Precisa do Termux:API (pkg install termux-api + app Termux:API).")
+            raise LnuxError("Precisa do Termux:API (pkg install termux-api + app Termux:API).")
         arq = DATA_DIR / "tmp" / "ditado.m4a"
         arq.parent.mkdir(parents=True, exist_ok=True)
         arq.unlink(missing_ok=True)
@@ -26613,7 +27906,7 @@ def menu_voz():
             _tapi(["termux-microphone-record", "-q"], 20, json_saida=False)
         time.sleep(1)
         if not arq.exists() or arq.stat().st_size == 0:
-            raise ToonsError("Nada foi gravado (o Termux:API tem permissão de microfone?).")
+            raise LnuxError("Nada foi gravado (o Termux:API tem permissão de microfone?).")
         _depois_do_texto(transcrever_audio(arq), f"Ditado {datetime.now():%d/%m %H:%M}")
 
     def falar_texto():
@@ -26622,14 +27915,14 @@ def menu_voz():
             falar(texto)
 
     def configurar_voz():
-        with contextlib.suppress(ToonsError):
+        with contextlib.suppress(LnuxError):
             motores = _tapi(["termux-tts-engines"], 15)
             if isinstance(motores, list) and motores:
                 print("Motores de voz instalados: " + ", ".join(m.get("label", m.get("name", "?")) for m in motores))
         c["tts_idioma"] = perguntar("Idioma da voz (pt, en, es...; Enter = do sistema)", c.get("tts_idioma", ""))
         c["tts_velocidade"] = perguntar_float("Velocidade (1 = normal, 1.5 = mais rápido)", c.get("tts_velocidade", 1.0))
         salvar_cfg()
-        with contextlib.suppress(ToonsError):
+        with contextlib.suppress(LnuxError):
             falar("Assim fica a minha voz.")
 
     pronto = lambda: "pronto" if whisper_bin() and modelo_whisper().exists() else "não instalado"  # noqa: E731
@@ -26640,7 +27933,7 @@ def menu_voz():
         ("Configurar a voz (idioma e velocidade)", configurar_voz),
         (lambda: f"Instalar o whisper ({pronto()})", instalar),
         (lambda: f"Baixar/trocar modelo de voz ({c.get('whisper_modelo', 'base')})", baixar_modelo),
-    ], cabecalho=lambda: print(f"{DIM}A transcrição roda no próprio celular (whisper.cpp): nada vai para a "
+    ], cabecalho=lambda: print(f"{DIM}A transcrição roda neste aparelho (whisper.cpp): nada vai para a "
                                f"internet.{RST}"))
 
 
@@ -26665,13 +27958,12 @@ def garantir_tesseract(idiomas=("por", "eng")) -> bool:
 def ocr(imagem: Path, idiomas: str = "por+eng") -> str:
     proc = rodar(["tesseract", str(imagem), "stdout", "-l", idiomas], capturar=True, timeout=300, mostrar=False)
     if proc.returncode != 0:
-        raise ToonsError(f"O tesseract falhou: {(proc.stderr or '').strip()[-200:]}")
+        raise LnuxError(f"O tesseract falhou: {(proc.stderr or '').strip()[-200:]}")
     return re.sub(r"\n{3,}", "\n\n", proc.stdout or "").strip()
 
 
 def ultimo_print() -> Path | None:
-    s = HOME / "storage" / "shared"
-    pastas = [(p, 1) for p in (s / "Pictures" / "Screenshots", s / "DCIM" / "Screenshots") if p.exists()]
+    pastas = [(p, 1) for p in _pastas_de_print() if p.exists()]
     prints = listar_arquivos(EXT_IMAGEM, pastas, limite=1) if pastas else []
     return prints[0] if prints else None
 
@@ -26686,7 +27978,7 @@ def menu_ocr():
         elif origem == "print":
             arq = ultimo_print()
             if not arq:
-                raise ToonsError("Não achei prints (pasta Screenshots).")
+                raise LnuxError("Não achei prints (pasta Screenshots).")
             info(f"Usando o print mais recente: {arq.name}")
         else:
             arq = escolher_arquivo("Qual imagem?", EXT_IMAGEM)
@@ -26695,7 +27987,7 @@ def menu_ocr():
         info("Lendo o texto da imagem...")
         texto = ocr(arq)
         if not texto:
-            raise ToonsError("Não achei texto na imagem (tente uma foto mais nítida, reta e bem iluminada).")
+            raise LnuxError("Não achei texto na imagem (tente uma foto mais nítida, reta e bem iluminada).")
         _depois_do_texto(texto, f"Texto de {arq.name}")
 
     menu("🔍 Ler texto de imagens (OCR)", [
@@ -26708,7 +28000,7 @@ def menu_ocr():
 
 # ── Traduzir a tela ──────────────────────────────────────────────────
 # Pega a tela, lê o texto com o OCR (tesseract) e traduz. Jeitos de pegar a tela: esperar a pessoa tirar um
-# print com os botões do celular (não precisa de nada especial; o Termux-Toons pode ficar em segundo plano ou
+# print com os botões do celular (não precisa de nada especial; o LNUX pode ficar em segundo plano ou
 # no Termux:Float), capturar direto pelo ADB ou root (screencap) depois de uns segundos para trocar de app, ou
 # usar o último print. A tradução aparece aqui e numa notificação, para ler sem sair do app que está na tela.
 
@@ -26718,12 +28010,16 @@ IDIOMAS_TELA = {  # código do tesseract: nome (o idioma do texto que está na t
     "ara": "Árabe", "hin": "Hindi", "tur": "Turco", "por": "Português",
 }
 DESTINOS_TELA = {"pt": "Português", "en": "Inglês", "es": "Espanhol", "fr": "Francês", "it": "Italiano"}
-NOTIFICACAO_TRADUCAO = "toons-traducao"
+NOTIFICACAO_TRADUCAO = "lnux-traducao"
 
 
 def _pastas_de_print() -> list:
-    s = HOME / "storage" / "shared"
-    return [s / "Pictures" / "Screenshots", s / "DCIM" / "Screenshots", s / "Screenshots"]
+    """Onde os prints de tela costumam cair (no Linux, a pasta de capturas do perfil e a de Imagens)."""
+    s = pasta_usuario("shared")
+    pastas = [s / "Pictures" / "Screenshots", s / "DCIM" / "Screenshots", s / "Screenshots"]
+    if not sistema().termux:
+        pastas = [sistema().caminho("capturas_de_tela"), sistema().caminho("imagens"), *pastas]
+    return list(dict.fromkeys(pastas))
 
 
 def esperar_print(desde: float) -> Path:
@@ -26748,11 +28044,11 @@ def esperar_print(desde: float) -> Path:
 
 def capturar_tela(modo: str, serial: str | None) -> Path:
     """Tira um print pelo ADB ou root (screencap) para a pasta Download e devolve o arquivo."""
-    nome = ".toons-tela.png"  # com ponto: a galeria não mostra
+    nome = ".lnux-tela.png"  # com ponto: a galeria não mostra
     codigo, texto = shell_android(f"screencap -p /sdcard/Download/{nome}", modo, serial)
     arquivo = pasta_download() / nome
     if codigo != 0 or not arquivo.exists():
-        raise ToonsError(f"Não consegui capturar a tela: {texto[-200:] or f'código {codigo}'}")
+        raise LnuxError(f"Não consegui capturar a tela: {texto[-200:] or f'código {codigo}'}")
     return arquivo
 
 
@@ -26783,7 +28079,7 @@ def traduzir_imagem(imagem: Path, notificar_tambem: bool = True) -> str | None:
         return None
     try:
         traducao, _ = traduzir(texto[:4500], destino)
-    except ToonsError as e:  # sem internet: mostra o que leu e segue (no modo contínuo, espera o próximo)
+    except LnuxError as e:  # sem internet: mostra o que leu e segue (no modo contínuo, espera o próximo)
         print(f"\n{texto}\n")
         aviso(f"Li o texto, mas não consegui traduzir: {e}")
         return None
@@ -26803,7 +28099,7 @@ def traduzir_tela(modo: str) -> None:
     if modo == "ultimo":
         arquivo = ultimo_print()
         if not arquivo:
-            raise ToonsError("Não achei prints (pastas Screenshots).")
+            raise LnuxError("Não achei prints (pastas Screenshots).")
     elif modo == "captura":
         acesso = acesso_shell_android()
         segundos = c.get("tela_espera", 5)
@@ -26813,7 +28109,7 @@ def traduzir_tela(modo: str) -> None:
             time.sleep(1)
         print()
         arquivo = capturar_tela(*acesso)
-        with contextlib.suppress(ToonsError):
+        with contextlib.suppress(LnuxError):
             vibrar(80)
         try:
             traducao = traduzir_imagem(arquivo)
@@ -26848,7 +28144,7 @@ def _depois_da_traducao(traducao: str | None) -> None:
     if i == 0:
         copiar_texto(traducao)
     elif i == 1:
-        with contextlib.suppress(ToonsError):
+        with contextlib.suppress(LnuxError):
             falar_em(traducao[:3500], cfg().get("tela_destino", "pt"))
 
 
@@ -26874,12 +28170,14 @@ def menu_traduzir_tela():
     menu("🌐 Traduzir a tela", [
         ("📸 Esperar eu tirar um print (botões do celular)", lambda: traduzir_tela("print")),
         ("🔁 Modo contínuo: traduzir cada print novo", lambda: traduzir_tela("continuo")),
-        ("📱 Capturar a tela direto (ADB ou root)", lambda: traduzir_tela("captura")),
+        ("📱 Capturar a tela direto (ADB ou root)", so_em("android", lambda: traduzir_tela("captura"))),
         ("🖼️ Traduzir o último print", lambda: traduzir_tela("ultimo")),
         (lambda: f"Idioma do texto na tela: {IDIOMAS_TELA.get(c.get('tela_idioma', 'eng'))}", idioma_da_tela),
         (lambda: f"Traduzir para: {DESTINOS_TELA.get(c.get('tela_destino', 'pt'))}", traduzir_para),
     ], cabecalho=lambda: print(f"{DIM}Tire um print com os botões do celular e a tradução chega aqui e numa "
-                               f"notificação, sem precisar voltar ao Termux.{RST}"))
+                               f"notificação, sem precisar voltar ao Termux.{RST}" if sistema().android else
+                               f"{DIM}Tire um print (tecla Print Screen): o LNUX vê o arquivo novo em "
+                               f"{_pastas_de_print()[0]} e traduz.{RST}"))
 
 
 # ── Remover o fundo (deixar só a pessoa) ─────────────────────────────
@@ -27004,7 +28302,7 @@ def remover_fundo_foto() -> None:
     try:
         imagem = ImageOps.exif_transpose(Image.open(arquivo)).convert("RGB")
     except OSError as e:
-        raise ToonsError(f"Não consegui abrir a imagem: {e}") from None
+        raise LnuxError(f"Não consegui abrir a imagem: {e}") from None
     info("Procurando a pessoa...")
     mascara = recortador.mascara(imagem)
     if mascara.mean() < 0.01:
@@ -27032,7 +28330,7 @@ def _medidas_video(arquivo: Path) -> tuple:
         fluxo = dados["streams"][0]
         largura, altura = int(fluxo["width"]), int(fluxo["height"])
     except (ValueError, KeyError, IndexError):
-        raise ToonsError("Não achei a imagem desse vídeo.") from None
+        raise LnuxError("Não achei a imagem desse vídeo.") from None
     giro = next((abs(int(d.get("rotation", 0))) for d in fluxo.get("side_data_list") or [] if "rotation" in d), 0)
     if giro in (90, 270):  # o ffmpeg desvira o vídeo gravado em pé ao decodificar
         largura, altura = altura, largura
@@ -27095,7 +28393,7 @@ def remover_fundo_video() -> None:
         if not terminou or escritor.returncode != 0 or feitos == 0:
             parcial.unlink(missing_ok=True)
     if escritor.returncode != 0 or feitos == 0:
-        raise ToonsError("O ffmpeg não conseguiu montar o vídeo.")
+        raise LnuxError("O ffmpeg não conseguiu montar o vídeo.")
     parcial.replace(destino)
     ok(f"Pronto em {fmt_relogio(time.time() - inicio)}: {destino}")
     if transparente:
@@ -27118,8 +28416,8 @@ def menu_remover_fundo():
         ("🎬 Vídeo", remover_fundo_video),
         (lambda: f"Trocar o modelo ({MODELOS_RECORTE.get(c.get('recorte_modelo'), ('nenhum ainda',))[0]})",
          trocar_modelo),
-    ], cabecalho=lambda: print(f"{DIM}Roda no próprio celular: a foto ou o vídeo não vão para a internet. "
-                               f"O resultado fica em Download/Termux-Toons/Sem fundo.{RST}"))
+    ], cabecalho=lambda: print(f"{DIM}Roda neste aparelho: a foto ou o vídeo não vão para a internet. "
+                               f"O resultado fica em Download/LNUX/Sem fundo.{RST}"))
 
 
 @submenu
@@ -27178,7 +28476,7 @@ def menu_ia():
         else:
             texto = texto_da_materia(_url_digitada(perguntar("Endereço")))
         if not texto.strip():
-            raise ToonsError("Nada para resumir.")
+            raise LnuxError("Nada para resumir.")
         conversa_ia(f"Resuma o texto abaixo em tópicos curtos e diga os pontos principais.\n\n---\n{texto[:400000]}")
 
     def sobre_foto():
@@ -28199,7 +29497,7 @@ def ler_epub(caminho: Path) -> tuple:
                     if texto.strip():
                         capitulos.append(texto)
     except (zipfile.BadZipFile, KeyError, StopIteration, ET.ParseError) as e:
-        raise ToonsError(f"EPUB inválido: {e}") from None
+        raise LnuxError(f"EPUB inválido: {e}") from None
     return titulo_l.strip(), capitulos
 
 
@@ -28260,7 +29558,7 @@ def ler_texto(titulo_l: str, texto: str, chave: str | None = None) -> None:
                     try:
                         if pagina:
                             falar(pagina)
-                    except ToonsError as e:
+                    except LnuxError as e:
                         desenhar([str(e), "Aperte uma tecla"])
                         ler_tecla()
                         break
@@ -28288,7 +29586,7 @@ def abrir_livro(caminho: Path) -> None:
     else:
         texto, titulo_l = texto_de_arquivo(caminho), caminho.stem
     if not texto.strip():
-        raise ToonsError("Não achei texto nesse arquivo (PDF escaneado? use o OCR).")
+        raise LnuxError("Não achei texto nesse arquivo (PDF escaneado? use o OCR).")
     ler_texto(titulo_l, texto, chave=str(caminho.resolve()))
 
 
@@ -28373,9 +29671,9 @@ def radio_api(caminho: str, **params):
     for servidor in RADIO_SERVIDORES:
         try:
             return pedir_json(url_com(f"{servidor}/json/{caminho}", **params), timeout=20) or []
-        except ToonsError as e:
+        except LnuxError as e:
             ultimo_erro = e
-    raise ultimo_erro or ToonsError("Rádios indisponíveis agora.")
+    raise ultimo_erro or LnuxError("Rádios indisponíveis agora.")
 
 
 def buscar_radios(**filtros) -> list:
@@ -28394,7 +29692,7 @@ def tocar_radios(radios: list, inicio: int = 0) -> None:
     """Toca a lista de estações a partir de `inicio`: no player, próxima e anterior trocam de rádio."""
     radios = [r for r in radios if r.get("url_resolved") or r.get("url")]
     if not radios:
-        raise ToonsError("Nenhuma rádio com endereço para tocar.")
+        raise LnuxError("Nenhuma rádio com endereço para tocar.")
     inicio = min(max(0, inicio), len(radios) - 1)
     lista = DATA_DIR / "radio_atual.m3u"
     lista.parent.mkdir(parents=True, exist_ok=True)
@@ -28483,7 +29781,7 @@ def menu_radio():
     def surpresa():
         radios = buscar_radios(order="random", limit=30)
         if not radios:
-            raise ToonsError("Nenhuma rádio agora.")
+            raise LnuxError("Nenhuma rádio agora.")
         r = radios[0]
         info(f"Sorteada: {bandeira(r.get('countrycode'))} {r.get('name', '').strip()} "
              f"({PAISES_PT.get(str(r.get('countrycode')).upper()) or r.get('country') or '?'})")
@@ -28666,6 +29964,8 @@ def imagem_em_blocos(caminho: Path, largura: int) -> list:
 # monoespaçada (todas as letras da mesma largura), senão colunas e menus ficam tortos.
 
 FONTE_TERMUX = HOME / ".termux" / "font.ttf"
+# cópias guardadas antes da primeira troca ("*.antes-do-toons", do tempo do Termux-Toons): o nome fica igual
+# para quem já tem a cópia conseguir voltar ao original
 FONTE_ANTES = FONTE_TERMUX.with_name("font.ttf.antes-do-toons")
 EXT_FONTE = (".ttf", ".otf")
 
@@ -28755,13 +30055,13 @@ def trocar_fonte_terminal() -> None:
     else:
         arquivo = Path(os.path.expanduser(perguntar("Caminho da fonte").strip().strip("'\"")))
         if not arquivo.is_file():
-            raise ToonsError(f"Arquivo não encontrado: {arquivo}")
+            raise LnuxError(f"Arquivo não encontrado: {arquivo}")
         membro = None
         if arquivo.suffix.lower() == ".zip":
             with zipfile.ZipFile(arquivo) as z:
                 dentro = [m for m in sorted(z.namelist()) if m.lower().endswith(EXT_FONTE)]
             if not dentro:
-                raise ToonsError("Esse .zip não tem nenhuma fonte .ttf ou .otf.")
+                raise LnuxError("Esse .zip não tem nenhuma fonte .ttf ou .otf.")
             j = escolher("Qual fonte do .zip?", [Path(m).name for m in dentro])
             if j is None:
                 return
@@ -28773,17 +30073,17 @@ def trocar_fonte_terminal() -> None:
         else:
             dados = arquivo.read_bytes()
     except (OSError, zipfile.BadZipFile, KeyError) as e:
-        raise ToonsError(f"Não consegui ler a fonte: {e}") from None
+        raise LnuxError(f"Não consegui ler a fonte: {e}") from None
     nome, mono = info_fonte(dados)
     if nome is None:
-        raise ToonsError("Esse arquivo não é uma fonte TTF/OTF que o Termux consiga usar.")
+        raise LnuxError("Esse arquivo não é uma fonte TTF/OTF que o Termux consiga usar.")
     print(f"  Fonte: {NEG}{nome}{RST} · {'monoespaçada ✔' if mono else f'{AMAR}não é monoespaçada{RST}'}")
     if not mono:
         aviso("No terminal as letras dela ficam desalinhadas (colunas e menus tortos). Prefira uma com 'Mono' no nome.")
         if not confirmar("Usar mesmo assim?", False):
             return
     anterior = FONTE_TERMUX.read_bytes() if FONTE_TERMUX.exists() else None
-    if anterior is not None and not FONTE_ANTES.exists():  # guarda a fonte que a pessoa tinha antes do Toons
+    if anterior is not None and not FONTE_ANTES.exists():  # guarda a fonte que a pessoa tinha antes do LNUX
         FONTE_ANTES.write_bytes(anterior)
     _gravar_fonte(dados)
     if not IS_TERMUX or not tem("termux-reload-settings"):
@@ -28803,7 +30103,7 @@ def trocar_fonte_terminal() -> None:
 def fonte_original_terminal() -> None:
     if FONTE_ANTES.exists():
         _gravar_fonte(FONTE_ANTES.read_bytes())
-        ok("Voltou à fonte que você usava antes do Termux-Toons.")
+        ok("Voltou à fonte que você usava antes do LNUX.")
     else:
         _gravar_fonte(None)
         ok("Voltou à fonte padrão do Termux.")
@@ -28824,7 +30124,7 @@ def menu_arte():
         arte = figlet(texto, fontes[i])
         colorido = confirmar("Colorir com arco-íris?", True)
         print(arco_iris(arte) if colorido else arte)
-        j = escolher("E agora?", ["Copiar", "Salvar em arquivo", "Usar como banner do Termux-Toons", "Nada"])
+        j = escolher("E agora?", ["Copiar", "Salvar em arquivo", "Usar como banner do LNUX", "Nada"])
         if j == 0:
             copiar_texto(arte)
         elif j == 1:
@@ -28881,7 +30181,7 @@ def menu_aparencia():
                 arq.unlink(missing_ok=True)
         else:
             fundo, frente, cores = TEMAS_TERMUX[nomes[i]]
-            arq.write_text(f"# Tema {nomes[i]} (Termux-Toons)\nbackground={fundo}\nforeground={frente}\n"
+            arq.write_text(f"# Tema {nomes[i]} (LNUX)\nbackground={fundo}\nforeground={frente}\n"
                            f"cursor={frente}\n" + "".join(f"color{k}={cor}\n" for k, cor in enumerate(cores)), "utf-8")
         if tem("termux-reload-settings"):
             rodar(["termux-reload-settings"], capturar=True, timeout=20)
@@ -28908,12 +30208,14 @@ def menu_aparencia():
             shutil.copy2(backup, motd)
         ok("Pronto: abra uma nova sessão do Termux para ver.")
 
+    # tema, fonte e boas-vindas mexem nos arquivos do app Termux (~/.termux e $PREFIX/etc/motd); no Linux,
+    # o tema e a fonte são do programa de terminal (GNOME Terminal, Konsole...), nas configurações dele
     menu("🎨 Aparência do terminal", [
-        ("Tema de cores do Termux (Dracula, Nord...)", tema),
-        ("🔤 Fonte do terminal (uma fonte baixada no celular)", trocar_fonte_terminal),
-        ("Fonte do terminal: voltar à original", fonte_original_terminal),
-        ("Mensagem de boas-vindas do Termux", boas_vindas),
-        ("Banner do Termux-Toons: voltar ao original",
+        ("Tema de cores do Termux (Dracula, Nord...)", so_em("tema_termux", tema)),
+        ("🔤 Fonte do terminal (uma fonte baixada no celular)", so_em("tema_termux", trocar_fonte_terminal)),
+        ("Fonte do terminal: voltar à original", so_em("tema_termux", fonte_original_terminal)),
+        ("Mensagem de boas-vindas do Termux", so_em("termux", boas_vindas)),
+        ("Banner do LNUX: voltar ao original",
          lambda: (c.update(banner_texto=""), salvar_cfg(), ok("Banner original de volta."))),
     ], cabecalho=lambda: print(f"{DIM}Para um banner novo: 🎮 Diversão → 🎨 Arte ASCII → Texto em letras grandes "
                                f"→ Usar como banner.{RST}"))
@@ -29385,7 +30687,7 @@ def menu_editar_trote():
     def editar_cor():
         cor = perguntar("Cor do pisca-pisca (hex, ex.: #b10000)", c.get("trote_cor", "#b10000")).strip()
         if not re.fullmatch(r"#[0-9a-fA-F]{6}", cor):
-            raise ToonsError("Use um hex de 6 dígitos, como #b10000.")
+            raise LnuxError("Use um hex de 6 dígitos, como #b10000.")
         c["trote_cor"] = cor
         salvar("Cor salva.")
 
@@ -29461,7 +30763,7 @@ def menu_trote():
         for texto in preparar_trote():
             aviso(texto)
         if not porta_livre(porta, espera=3):
-            raise ToonsError(f"A porta {porta} já está em uso. Troque 'trote_porta' em Configurações.")
+            raise LnuxError(f"A porta {porta} já está em uso. Troque 'trote_porta' em Configurações.")
         if not iniciar_servico("trote", cmd_self("trote", "--porta", str(porta)), reiniciar=True):
             return
         if not servico_ativo("tunel-trote") and confirmar("Liberar o link para a internet (fora do seu Wi-Fi)?", True):
@@ -29543,7 +30845,7 @@ def rodar_sql(conexao, sql: str) -> tuple:
         conexao.commit()
         return [], [], cursor.rowcount
     except sqlite3.Error as e:
-        raise ToonsError(f"SQL: {e}") from None
+        raise LnuxError(f"SQL: {e}") from None
 
 
 def ver_tabela_paginada(nome: str, colunas: list, linhas: list) -> None:
@@ -29568,6 +30870,55 @@ def ver_tabela_paginada(nome: str, colunas: list, linhas: list) -> None:
             if tecla in ("esc", "q"):
                 return
             pagina += 1 if tecla in ("dir", "baixo", "pgdn", " ") else -1 if tecla in ("esq", "cima", "pgup") else 0
+
+
+def como_usuario(usuario: str, cmd: list) -> list | None:
+    """O comando rodando como outro usuário do sistema (ex.: 'postgres'), com sudo -u/doas -u (ou runuser, como root)."""
+    if getattr(os, "geteuid", lambda: 1)() == 0:
+        return ["runuser", "-u", usuario, "--", *cmd]
+    for prefixo in sistema().dados.get("elevar") or []:
+        if prefixo and shutil.which(prefixo[0]):
+            return [prefixo[0], "-u", usuario, *cmd]
+    return None
+
+
+def banco_no_sistema(chave: str) -> None:
+    """MariaDB ou PostgreSQL nas distros: o serviço do sistema (systemd ou OpenRC, pelo perfil). O PostgreSQL
+    ganha um usuário com o seu nome, para o psql funcionar sem sudo; o MariaDB abre o console pelo sudo."""
+    nome = "MariaDB (MySQL)" if chave == "mariadb" else "PostgreSQL"
+    console = "mariadb" if chave == "mariadb" else "psql"
+    if not tem(console):
+        if not confirmar(f"O {nome} não está instalado. Instalar agora?", True) or not instalar_pkg(chave):
+            return
+    usuario = getpass.getuser()
+    opcoes = ["Ligar o servidor (e ao iniciar o computador)", "Abrir o console SQL", "Desligar o servidor", "Status"]
+    if chave == "postgresql":
+        opcoes.insert(2, "Criar um banco")
+    i = escolher(nome, opcoes)
+    if i is None:
+        return
+    acao = opcoes[i]
+    if acao.startswith("Ligar"):
+        if not (servico_do_sistema(chave, "ligar_no_boot") and servico_do_sistema(chave, "iniciar")):
+            return
+        if chave == "postgresql":
+            for passo in (["createuser", "-s", usuario], ["createdb", "-O", usuario, usuario]):
+                cmd = como_usuario("postgres", passo)
+                if cmd:
+                    rodar(cmd, capturar=True)  # se já existir, tudo bem
+            info(f"Conecte em localhost:5432 com o usuário '{usuario}' (é só rodar: psql).")
+        else:
+            info("Conecte em localhost:3306. O console abre como o administrador do banco (sudo mariadb).")
+    elif acao.startswith("Abrir"):
+        cmd = (como_root(["mariadb"]) if chave == "mariadb" else ["psql", perguntar("Banco", usuario)])
+        if cmd:
+            rodar(cmd, mostrar=False)
+    elif acao.startswith("Criar"):
+        rodar(["createdb", perguntar("Nome do banco")])
+    elif acao.startswith("Desligar"):
+        servico_do_sistema(chave, "parar")
+    else:
+        servico_do_sistema(chave, "status")
 
 
 @submenu
@@ -29618,7 +30969,7 @@ def menu_banco_de_dados():
                 dialeto = csv.excel
             linhas = list(csv.reader(io.StringIO(texto), dialeto))
             if len(linhas) < 2:
-                raise ToonsError("O CSV precisa de um cabeçalho e pelo menos uma linha.")
+                raise LnuxError("O CSV precisa de um cabeçalho e pelo menos uma linha.")
             colunas = [re.sub(r"\W+", "_", sem_acento(c).strip().lower()).strip("_") or f"coluna{k}"
                        for k, c in enumerate(linhas[0], 1)]
             nome = re.sub(r"\W+", "_", sem_acento(perguntar("Nome da tabela", arq.stem)).lower()).strip("_")
@@ -29680,6 +31031,9 @@ SELECT cidade, COUNT(*) FROM clientes GROUP BY cidade;{RST}""")
                 abrir_banco(arq)
 
     def mariadb():
+        if not sistema().termux:
+            banco_no_sistema("mariadb")
+            return
         if not garantir_cmd("mariadbd-safe", "mariadb") and not tem("mysqld_safe"):
             return
         dados = Path(PREFIX or "/usr") / "var" / "lib" / "mysql"
@@ -29699,6 +31053,9 @@ SELECT cidade, COUNT(*) FROM clientes GROUP BY cidade;{RST}""")
             status_servico("mariadb")
 
     def postgres():
+        if not sistema().termux:
+            banco_no_sistema("postgresql")
+            return
         if not garantir_cmd("postgres", "postgresql"):
             return
         dados = Path(PREFIX or "/usr") / "var" / "lib" / "postgresql"
@@ -29734,7 +31091,7 @@ SELECT cidade, COUNT(*) FROM clientes GROUP BY cidade;{RST}""")
 def repos_locais() -> list:
     """Pastas com repositório git em ~, ~/projetos e ~/storage/shared (até 2 níveis)."""
     achados = []
-    for base in (HOME, HOME / "projetos", HOME / "storage" / "shared"):
+    for base in dict.fromkeys((HOME, HOME / "projetos", pasta_usuario("shared"))):
         if not base.exists():
             continue
         for pasta in [base] + [p for p in base.iterdir() if p.is_dir() and not p.name.startswith(".")]:
@@ -29815,7 +31172,7 @@ def menu_github():
             return None
         pasta = repos[i] if i < len(repos) else Path(os.path.expanduser(perguntar("Pasta")))
         if not pasta.is_dir():
-            raise ToonsError("Pasta não encontrada.")
+            raise LnuxError("Pasta não encontrada.")
         return pasta
 
     def commit_push():
@@ -29877,10 +31234,10 @@ def crontab_atual() -> str:
 
 
 def tarefas_agendadas(texto: str) -> list:
-    """[(id, nome, expressão, comando)] das tarefas criadas pelo Termux-Toons no crontab."""
+    """[(id, nome, expressão, comando)] das tarefas criadas pelo LNUX no crontab."""
     tarefas, linhas = [], texto.splitlines()
     for i, linha in enumerate(linhas[:-1]):
-        m = re.match(r"# toons:(\w+) (.*)", linha)
+        m = re.match(r"# (?:lnux|toons):(\w+) (.*)", linha)  # 'toons:' = criada pelo Termux-Toons
         if m:
             partes = linhas[i + 1].split(None, 5)
             if len(partes) == 6:
@@ -29894,7 +31251,7 @@ def gravar_crontab(texto: str) -> None:
         texto = caminho + "\n" + texto
     proc = rodar(["crontab", "-"], entrada=texto.rstrip("\n") + "\n", capturar=True, timeout=20, mostrar=False)
     if proc.returncode != 0:
-        raise ToonsError(f"O crontab recusou: {(proc.stderr or '').strip()}")
+        raise LnuxError(f"O crontab recusou: {(proc.stderr or '').strip()}")
 
 
 def descrever_cron(expressao: str) -> str:
@@ -29925,7 +31282,8 @@ def menu_agendador():
         if not garantir_cron():
             return
         modelos = [("Otimização rápida (limpa caches)", cmd_self("limpar")),
-                   ("Atualizar Termux, pacotes e o Termux-Toons", cmd_self("atualizar")),
+                   (por_sistema("Atualizar Termux, pacotes e o LNUX", "Atualizar o sistema, pacotes e o LNUX")(),
+                    cmd_self("atualizar")),
                    ("Backup da pasta do Termux em Downloads (.tar.gz)",
                     f"tar -czf {shlex.quote(str(pasta_saida('Backups')))}/termux-$(date +%Y%m%d).tar.gz "
                     f"-C {shlex.quote(str(HOME))} --exclude=./storage ."),
@@ -29946,7 +31304,7 @@ def menu_agendador():
             hora = perguntar("Horário (hh:mm)", "03:00").replace("h", ":")
             m = re.fullmatch(r"(\d{1,2}):?(\d{2})?", hora)
             if not m or int(m.group(1)) > 23:
-                raise ToonsError("Horário inválido.")
+                raise LnuxError("Horário inválido.")
             h, mi = int(m.group(1)), int(m.group(2) or 0)
         if f == 0:
             expressao = f"*/{perguntar_int('A cada quantos minutos', 30, 1, 59)} * * * *"
@@ -29964,13 +31322,13 @@ def menu_agendador():
         else:
             expressao = perguntar("Expressão (minuto hora dia mês dia-da-semana)", "0 3 * * *")
             if len(expressao.split()) != 5:
-                raise ToonsError("A expressão tem 5 campos.")
+                raise LnuxError("A expressão tem 5 campos.")
         ident = uuid.uuid4().hex[:6]
         nome = perguntar("Nome da tarefa", modelos[i][0] if modelos[i][1] else comando[:30])
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         log_arq = shlex.quote(str(LOG_DIR / f"cron-{ident}.log"))
         linha = f"{expressao} ({comando}) >> {log_arq} 2>&1".replace("%", "\\%")  # no cron, % vira quebra de linha
-        gravar_crontab(crontab_atual().rstrip("\n") + f"\n# toons:{ident} {nome}\n{linha}\n")
+        gravar_crontab(crontab_atual().rstrip("\n") + f"\n# lnux:{ident} {nome}\n{linha}\n")
         ok(f"Agendado: {nome} ({descrever_cron(expressao)}).")
         if not servico_ativo("cron") and confirmar("O agendador (crond) está parado. Iniciar agora?", True):
             iniciar_servico("cron", "crond -n", reiniciar=True)
@@ -29978,7 +31336,7 @@ def menu_agendador():
     def listar():
         tarefas = tarefas_agendadas(crontab_atual())
         if not tarefas:
-            info("Nenhuma tarefa agendada pelo Termux-Toons.")
+            info("Nenhuma tarefa agendada pelo LNUX.")
         for _, nome, expressao, comando in tarefas:
             print(f"  {CIANO}•{RST} {NEG}{nome}{RST} · {descrever_cron(expressao)}\n    {DIM}{comando[:90]}{RST}")
         print(f"\nAgendador: {'RODANDO' if servico_ativo('cron') else 'PARADO (nada roda!)'}")
@@ -29999,7 +31357,7 @@ def menu_agendador():
                 if pular:
                     pular -= 1
                     continue
-                if linha.startswith(f"# toons:{t[0]} "):
+                if linha.startswith((f"# lnux:{t[0]} ", f"# toons:{t[0]} ")):
                     pular = 1
                     continue
                 saida_linhas.append(linha)
@@ -30024,10 +31382,14 @@ def menu_agendador():
         ("Ver o log de uma tarefa", ver_log_tarefa),
         ("Remover tarefa", remover),
         ("Editar o crontab à mão", lambda: garantir_cron() and rodar(["crontab", "-e"], mostrar=False)),
-        *itens_servico("cron", "Agendador (crond)", lambda: garantir_cron() and
-                       iniciar_servico("cron", "crond -n", reiniciar=True)),
+        *so_em_itens("termux", itens_servico("cron", "Agendador (crond)", lambda: garantir_cron() and
+                                             iniciar_servico("cron", "crond -n", reiniciar=True))),
+        ("Ligar o agendador do sistema (cron, e ao iniciar o computador)",
+         so_em("servicos_sistema", lambda: garantir_cron() and servico_do_sistema("cron", "ligar_no_boot")
+               and servico_do_sistema("cron", "iniciar"))),
     ], cabecalho=lambda: print(f"{DIM}O Android pode pausar o Termux: as tarefas rodam enquanto o agendador "
-                               f"estiver ativo (ele segura o wake-lock).{RST}"))
+                               f"estiver ativo (ele segura o wake-lock).{RST}" if sistema().termux else
+                               f"{DIM}As tarefas rodam pelo cron do sistema: ligue o agendador uma vez.{RST}"))
 
 
 # ── Servidores: Minecraft, Jellyfin, Navidrome ───────────────────────
@@ -30038,7 +31400,7 @@ def instalar_minecraft() -> None:
     versao = perguntar("Versão do Minecraft", manifesto["latest"]["release"])
     entrada = next((v for v in manifesto["versions"] if v["id"] == versao), None)
     if not entrada:
-        raise ToonsError(f"Versão '{versao}' não encontrada.")
+        raise LnuxError(f"Versão '{versao}' não encontrada.")
     detalhes = pedir_json(entrada["url"])
     java = int(detalhes.get("javaVersion", {}).get("majorVersion", 21))
     versao_java = re.search(r'version "(\d+)', (rodar(["java", "-version"], capturar=True, timeout=30).stderr or "")
@@ -30051,7 +31413,7 @@ def instalar_minecraft() -> None:
     baixar_arquivo(detalhes["downloads"]["server"]["url"], MINECRAFT_DIR / "server.jar")
     print("\nPara rodar o servidor é preciso aceitar a EULA do Minecraft: https://aka.ms/MinecraftEULA")
     if not confirmar("Você aceita a EULA?", False):
-        raise ToonsError("Sem aceitar a EULA o servidor não inicia.")
+        raise LnuxError("Sem aceitar a EULA o servidor não inicia.")
     (MINECRAFT_DIR / "eula.txt").write_text("eula=true\n", "utf-8")
     propriedades = MINECRAFT_DIR / "server.properties"
     if not propriedades.exists():
@@ -30079,7 +31441,8 @@ def parar_minecraft() -> None:
         info("O servidor não está rodando.")
         return
     info("Salvando o mundo e desligando...")
-    rodar(["tmux", "send-keys", "-t", "=" + sessao("minecraft"), "stop", "Enter"], capturar=True)
+    rodar(["tmux", "send-keys", "-t", "=" + (_sessao_existente("minecraft") or sessao("minecraft")), "stop", "Enter"],
+          capturar=True)
     for _ in range(40):
         time.sleep(1)
         if not servico_ativo("minecraft"):
@@ -30121,12 +31484,14 @@ def menu_servidores():
         (lambda: f"⛏️ Minecraft: memória ({c.get('minecraft_memoria', '1G')})",
          lambda: (c.update(minecraft_memoria=perguntar("Memória máxima (ex.: 1G, 1536M, 2G)",
                                                        c.get("minecraft_memoria", "1G")).upper()), salvar_cfg())),
-        ("🎬 Jellyfin: seus filmes e séries no navegador e na TV (porta 8096)", jellyfin),
-        ("🎬 Jellyfin: parar", lambda: parar_servico("jellyfin")),
-        ("🎵 Navidrome: sua música em qualquer app (porta 4533)", navidrome),
-        ("🎵 Navidrome: parar", lambda: parar_servico("navidrome")),
+        ("🎬 Jellyfin: seus filmes e séries no navegador e na TV (porta 8096)", so_em("pacote:jellyfin-server", jellyfin)),
+        ("🎬 Jellyfin: parar", so_em("pacote:jellyfin-server", lambda: parar_servico("jellyfin"))),
+        ("🎵 Navidrome: sua música em qualquer app (porta 4533)", so_em("pacote:navidrome", navidrome)),
+        ("🎵 Navidrome: parar", so_em("pacote:navidrome", lambda: parar_servico("navidrome"))),
     ], cabecalho=lambda: print(f"{DIM}Os servidores ficam no ar enquanto o Termux roda. Deixe o celular na tomada e "
-                               f"sem otimização de bateria para o Termux.{RST}"))
+                               f"sem otimização de bateria para o Termux.{RST}" if sistema().termux else
+                               f"{DIM}Os servidores rodam em segundo plano (tmux) enquanto o computador estiver "
+                               f"ligado.{RST}"))
 
 
 @submenu
@@ -30212,7 +31577,7 @@ _MD_PERGUNTOU_GUARDAR = False
 
 
 def meus_dados() -> dict:
-    """O que a pessoa preencheu: fica na memória e, se ela pediu, em ~/.termux_toons/meus_dados.json."""
+    """O que a pessoa preencheu: fica na memória e, se ela pediu, em ~/.lnux/meus_dados.json."""
     global _MEUS_DADOS
     if _MEUS_DADOS is None:
         lido = ler_json(MEUS_DADOS_FILE, {})
@@ -30318,20 +31683,20 @@ def _estados_trf(regiao: int) -> str:
 
 
 def _md_validar(chave: str, valor: str) -> str:
-    """Arruma o que foi digitado (formato, maiúsculas...); ToonsError com o motivo se não der."""
+    """Arruma o que foi digitado (formato, maiúsculas...); LnuxError com o motivo se não der."""
     valor = " ".join(valor.split())
     if chave == "nome":
         if len(valor) < 3 or not re.search(r"[^\W\d_]", valor):
-            raise ToonsError("Digite o nome completo.")
+            raise LnuxError("Digite o nome completo.")
         if " " not in valor:
             aviso("Com o nome completo (nome e sobrenomes) as buscas acham bem menos homônimos.")
     elif chave == "cpf":
         if not cpf_valido(valor):
-            raise ToonsError("CPF inválido: os dígitos verificadores não conferem. Confira os 11 números.")
+            raise LnuxError("CPF inválido: os dígitos verificadores não conferem. Confira os 11 números.")
         return cpf_formatado(valor)
     elif chave == "cnpj":
         if not cnpj_valido(valor):
-            raise ToonsError("CNPJ inválido: os dígitos verificadores não conferem.")
+            raise LnuxError("CNPJ inválido: os dígitos verificadores não conferem.")
         return cnpj_formatado(valor)
     elif chave == "uf":
         sigla = valor.upper()
@@ -30339,20 +31704,20 @@ def _md_validar(chave: str, valor: str) -> str:
             sigla = next((s for s, (nome, _) in UFS.items() if sem_acento(nome).lower() == sem_acento(valor).lower()),
                          "")
         if not sigla:
-            raise ToonsError("Digite a sigla do estado (ex.: SP, RJ, MG).")
+            raise LnuxError("Digite a sigla do estado (ex.: SP, RJ, MG).")
         return sigla
     elif chave == "email":
         if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", valor):
-            raise ToonsError("E-mail inválido (ex.: nome@gmail.com).")
+            raise LnuxError("E-mail inválido (ex.: nome@gmail.com).")
         return valor.lower()
     elif chave == "telefone":
         if not _telefone_digitos(valor):
-            raise ToonsError("Digite o celular com DDD (ex.: 19 98765-4321).")
+            raise LnuxError("Digite o celular com DDD (ex.: 19 98765-4321).")
         return _telefone_variantes(valor)[0]
     elif chave == "usuario":
         valor = valor.split("?")[0].rstrip("/").rsplit("/", 1)[-1].lstrip("@")  # aceita o link do perfil
         if not re.fullmatch(r"[A-Za-z0-9._]{1,30}", valor):
-            raise ToonsError("Use só letras, números, ponto e _ (ex.: maria.souza).")
+            raise LnuxError("Use só letras, números, ponto e _ (ex.: maria.souza).")
     return valor
 
 
@@ -30366,7 +31731,7 @@ def _md_perguntar(campo: tuple, atual: str | None) -> str:
             return ""
         try:
             return _md_validar(chave, resp)
-        except ToonsError as e:
+        except LnuxError as e:
             erro(str(e))
 
 
@@ -30383,7 +31748,7 @@ def _md_guardar() -> None:
         gravar_json(MEUS_DADOS_FILE, meus_dados(), privado=True)
         ok(f"Guardado em {MEUS_DADOS_FILE}. Para apagar: 🗑️ Apagar meus dados deste celular.")
     else:
-        info("Os dados ficam só até você fechar o Termux-Toons.")
+        info("Os dados ficam só até você fechar o LNUX.")
 
 
 def _md_exigir(*chaves: str) -> dict | None:
@@ -30425,8 +31790,8 @@ def editar_meus_dados() -> None:
 
 
 def _md_pasta_relatorios() -> Path:
-    """Downloads/Termux-Toons/Meus dados (sem criar a pasta)."""
-    return (DOWNLOADS / "Termux-Toons" if DOWNLOADS.exists() else DATA_DIR / "saida") / "Meus dados"
+    """Downloads/LNUX/Meus dados (sem criar a pasta)."""
+    return (DOWNLOADS / "LNUX" if DOWNLOADS.exists() else DATA_DIR / "saida") / "Meus dados"
 
 
 def apagar_meus_dados() -> None:
@@ -30772,13 +32137,13 @@ def resultado_cnpj(cnpj: str) -> dict:
     """Dados públicos do CNPJ pela BrasilAPI (que repassa os dados abertos da Receita)."""
     try:
         e = pedir_json(f"https://brasilapi.com.br/api/cnpj/v1/{cnpj_limpo(cnpj)}", timeout=30)
-    except ToonsError as erro_api:
+    except LnuxError as erro_api:
         if "HTTP 404" in str(erro_api):
-            raise ToonsError("CNPJ não encontrado nos dados abertos da Receita (se é novo, pode demorar a "
+            raise LnuxError("CNPJ não encontrado nos dados abertos da Receita (se é novo, pode demorar a "
                              "aparecer).") from None
         raise
     if not isinstance(e, dict):
-        raise ToonsError("Resposta inesperada da BrasilAPI.")
+        raise LnuxError("Resposta inesperada da BrasilAPI.")
     endereco = ", ".join(p for p in (f"{e.get('descricao_tipo_de_logradouro') or ''} {e.get('logradouro') or ''} "
                                      f"{e.get('numero') or ''}".strip(), e.get("complemento"), e.get("bairro"),
                                      "/".join(x for x in (e.get("municipio"), e.get("uf")) if x),
@@ -30818,9 +32183,9 @@ def resultado_transparencia(cpf: str, chave: str) -> dict:
     try:
         dados = pedir_json(url_com(URL_TRANSPARENCIA_API, cpf=_so_digitos(cpf)),
                            cabecalhos={"chave-api-dados": chave}, timeout=40)
-    except ToonsError as e:
+    except LnuxError as e:
         if re.search(r"HTTP 40[13]", str(e)):
-            raise ToonsError("O Portal recusou a chave da API: confira em 🏛️ → 🔑 Chave da API.") from None
+            raise LnuxError("O Portal recusou a chave da API: confira em 🏛️ → 🔑 Chave da API.") from None
         raise
     if isinstance(dados, list):
         dados = dados[0] if dados else {}
@@ -30853,7 +32218,7 @@ def transparencia_meu_cpf() -> None:
 def configurar_chave_transparencia() -> None:
     c = cfg()
     print(f"{DIM}A API do Portal da Transparência é grátis: cadastre o seu e-mail e a chave chega por e-mail. "
-          f"Ela fica só neste celular, na configuração do Termux-Toons.{RST}")
+          f"Ela fica só neste celular, na configuração do LNUX.{RST}")
     if c.get("transparencia_chave"):
         info(f"Chave atual: {mascarar(c['transparencia_chave'])}")
     opcoes = ["Colar ou digitar a chave", "Abrir a página de cadastro (grátis)"]
@@ -30882,7 +32247,7 @@ def resultado_diarios(nome: str, quantos: int = 10) -> dict:
     dados = pedir_json(url_com(URL_QUERIDO_DIARIO_API, querystring=_aspas(nome), excerpt_size=250,
                                number_of_excerpts=1, size=quantos), timeout=45)
     if not isinstance(dados, dict):
-        raise ToonsError("Resposta inesperada do Querido Diário.")
+        raise LnuxError("Resposta inesperada do Querido Diário.")
     total = dados.get("total_gazettes") or 0
     itens = []
     for g in dados.get("gazettes") or []:
@@ -31034,12 +32399,12 @@ dt {{ color:var(--suave); }} dd {{ margin:0; overflow-wrap:anywhere; }}
 .rodape {{ font-size:.85rem; margin:20px 0; }}
 </style></head><body><main>
 <h1>👤 Meus dados na internet</h1>
-<p class="quem">{quem}<br>Gerado pelo Termux-Toons em {datetime.now():%d/%m/%Y às %H:%M}.
+<p class="quem">{quem}<br>Gerado pelo LNUX em {datetime.now():%d/%m/%Y às %H:%M}.
 Toque nos links: eles abrem os sites oficiais e as buscas prontas.</p>
 {"<h2>Consultas feitas agora</h2>" + "".join(blocos) if blocos else ""}
 {"".join(grupos)}
 <p class="rodape">{"Com " + esc(", ".join(faltam)) + " preenchidos o relatório traz mais buscas. " if faltam else ""}
-Este arquivo tem os seus dados: apague quando não precisar mais (Termux-Toons → 👤 Meus dados na internet →
+Este arquivo tem os seus dados: apague quando não precisar mais (LNUX → 👤 Meus dados na internet →
 🗑️ Apagar).</p>
 </main></body></html>
 """
@@ -31070,7 +32435,7 @@ def verificar_meus_dados() -> None:
         info(f"Consultando {nome}...")
         try:
             resultados.append(consulta())
-        except ToonsError as e:
+        except LnuxError as e:
             aviso(str(e))
             continue
         _md_mostrar(resultados[-1])
@@ -31089,7 +32454,7 @@ def verificar_meus_dados() -> None:
 def _md_cabecalho() -> None:
     d = meus_dados()
     print(f"{DIM}O que está público sobre você: órgãos oficiais, tribunais, Diário Oficial, Google e redes. "
-          f"Os links abrem no navegador e os seus dados ficam só no celular.{RST}")
+          f"Os links abrem no navegador e os seus dados ficam só neste aparelho.{RST}")
     if d.get("nome"):
         partes = [d["nome"], cpf_mascarado(d["cpf"]) if d.get("cpf") else "",
                   "/".join(x for x in (d.get("cidade"), d.get("uf")) if x)]
@@ -31141,7 +32506,7 @@ def menu_config():
     def editar_json():
         editor = os.environ.get("EDITOR") or next((e for e in ("nvim", "nano", "vi") if tem(e)), None)
         if not editor:
-            raise ToonsError("Nenhum editor encontrado (pkg install nano).")
+            raise LnuxError("Nenhum editor encontrado (pkg install nano).")
         salvar_cfg()
         rodar([editor, CONFIG_FILE])
         novo = ler_json(CONFIG_FILE, {})
@@ -31191,36 +32556,48 @@ MODULOS_OPCIONAIS = [("rich", "dashboard"), ("flask", "servidor web"), ("fastapi
 
 
 def diagnostico() -> None:
-    print(f"Termux-Toons {VERSION} · Python {platform.python_version()} · "
-          f"{'Termux ' + os.environ.get('TERMUX_VERSION', '') if IS_TERMUX else 'fora do Termux'}")
-    print(f"Armazenamento (~/storage): {'ok' if (HOME / 'storage').exists() else 'sem acesso (termux-setup-storage)'}")
+    print(f"LNUX {VERSION} · Python {platform.python_version()} · {sistema().nome}"
+          f"{' ' + os.environ.get('TERMUX_VERSION', '') if IS_TERMUX else ''}")
+    if sistema().termux:
+        print(f"Armazenamento (~/storage): {'ok' if (HOME / 'storage').exists() else 'sem acesso (termux-setup-storage)'}")
+    else:
+        print(f"Downloads: {DOWNLOADS}")
     print(f"\n{NEG}Programas{RST}")
+    instalar = " ".join(sistema().comando("instalar") or ["(instale à mão)"])
     for cmd, pacote, uso in FERRAMENTAS:
+        nomes = sistema().pacote(pacote)
+        if nomes is None:
+            continue  # não existe nesta distro (ex.: termux-api fora do Termux)
         marca = f"{VERD}✔{RST}" if tem(cmd) else f"{VERM}✖{RST}"
-        print(f"  {marca} {cmd:<22} {DIM}{uso} · pkg install {pacote}{RST}")
+        print(f"  {marca} {cmd:<22} {DIM}{uso} · {instalar} {' '.join(nomes)}{RST}")
     marca = f"{VERD}✔{RST}" if llama_bin("llama-cli") else f"{VERM}✖{RST}"
     print(f"  {marca} {'llama-cli':<22} {DIM}LLM · compile pelo menu{RST}")
     print(f"\n{NEG}Módulos Python opcionais{RST}")
     for mod, uso in MODULOS_OPCIONAIS:
         print(f"  {VERD + '✔' if modulo_existe(mod) else VERM + '✖'}{RST} {mod:<22} {DIM}{uso}{RST}")
-    if tem("termux-battery-status"):
+    if sistema().termux and tem("termux-battery-status"):
         try:
             bateria()
             ok("App Termux:API respondendo.")
-        except ToonsError as e:
+        except LnuxError as e:
             aviso(str(e))
     print(f"\nServiços ativos: {', '.join(servicos_ativos()) or 'nenhum'}")
 
 
 def instalar_essenciais() -> None:
-    if not IS_TERMUX:
-        aviso("Fora do Termux: instale python3, tmux e git pelo gerenciador do seu sistema.")
+    """Os programas básicos do LNUX, com a lista e os nomes do perfil do sistema em uso."""
+    perfil = sistema()
+    essenciais = perfil.pacotes.get("essenciais") or []
+    if not essenciais or not perfil.comando("instalar"):
+        aviso(f"{perfil.nome}: instale python3, tmux, git e curl pelo gerenciador do seu sistema.")
         return
-    rodar(["pkg", "update", "-y"])
-    instalar_pkg("python", "tmux", "termux-api", "git", "curl", "nano")
+    if perfil.comando("atualizar_indice"):
+        rodar_pacotes("atualizar_indice")
+    instalar_pkg(*essenciais)
     garantir_storage()
     instalar_pip("rich")
-    info("Instale também o app Termux:API (F-Droid) para sensores, SMS, câmera etc.")
+    if perfil.termux:
+        info("Instale também o app Termux:API (F-Droid) para sensores, SMS, câmera etc.")
     ok("Essenciais instalados.")
 
 
@@ -31251,10 +32628,14 @@ def menu_sistema():
     """Junta as três categorias de manutenção que ficavam soltas no menu principal
     (🔄 Atualização, 🧹 Otimização e limpeza, ⚙️ Configurações e diagnóstico)."""
     menu("⚙️ Sistema e manutenção", [
-        ("🔄 Atualização (Termux, pip, repositórios, Termux-Toons)", menu_atualizar),
+        (lambda: f"🐧 Trocar o sistema (agora: {sistema().nome})", menu_trocar_sistema),
+        ("ℹ️ O que o LNUX sabe deste sistema (perfil, pastas, recursos)", mostrar_sistema),
+        (por_sistema("🔄 Atualização (Termux, pip, repositórios, LNUX)", "🔄 Atualização (sistema, pip, repositórios, LNUX)"),
+         menu_atualizar),
         ("🧹 Otimização e limpeza (caches, arquivos grandes e duplicados)", menu_otimizacao),
         ("📦 Instalar dependências (essenciais, música, vídeos)", instalar_dependencias),
-        ("🎨 Aparência do terminal (tema, fonte, boas-vindas, banner)", menu_aparencia),
+        (lambda: "🎨 Aparência do terminal (tema, fonte, boas-vindas, banner)" if tem_recurso("tema_termux")
+         else "🎨 Aparência (banner do menu; o tema e a fonte ficam no seu programa de terminal)", menu_aparencia),
         ("⚙️ Configurações e diagnóstico", menu_config),
     ])
 
@@ -31264,9 +32645,9 @@ def menu_sistema():
 # ════════════════════════════════════════════════════════════════════
 
 BANNER = [
-    "╔╦╗╔═╗╦═╗╔╦╗╦ ╦═╗ ╦  ╔╦╗╔═╗╔═╗╔╗╔╔═╗",
-    " ║ ║╣ ╠╦╝║║║║ ║╔╩╦╝   ║ ║ ║║ ║║║║╚═╗",
-    " ╩ ╚═╝╩╚═╩ ╩╚═╝╩ ╚═   ╩ ╚═╝╚═╝╝╚╝╚═╝",
+    "╦   ╔╗╔ ╦ ╦ ═╗ ╦",
+    "║   ║║║ ║ ║ ╔╩╦╝",
+    "╩═╝ ╝╚╝ ╚═╝ ╩ ╚═",
 ]
 
 
@@ -31279,14 +32660,13 @@ def cabecalho() -> None:
         if c.get("banner_texto") and tem("figlet") else BANNER
     largura = max(map(_largura, banner), default=0)
     if largura > largura_tela():  # tela estreita demais para o desenho: só o nome
-        banner = ["T E R M U X · T O O N S"]
+        banner = ["L  N  U  X"]
         largura = _largura(banner[0])
     for i, linha in enumerate(banner):
         cor = GRADIENTE_BANNER[i * (len(GRADIENTE_BANNER) - 1) // max(1, len(banner) - 1)]
         # todas as linhas com a mesma largura: centralizadas pelo menu, o desenho não entorta
         print(f"{_c(f'38;5;{cor}')}{linha}{' ' * (largura - _largura(linha))}{RST}")
-    ambiente = "Termux" if IS_TERMUX else "fora do Termux"
-    print(f"{DIM}v{VERSION} · {ambiente} · serviços: {', '.join(servicos_ativos()) or 'nenhum'}{RST}")
+    print(f"{DIM}v{VERSION} · {sistema().nome} · serviços: {', '.join(servicos_ativos()) or 'nenhum'}{RST}")
     tocando = titulo_tocando()
     if tocando:
         print(f"{CIANO}♪ {tocando}{RST}")
@@ -31462,7 +32842,7 @@ def menu_busca():
         return
     consulta = sem_acento(termo).lower().strip()
     pontuados = ((_pontua_busca(consulta, f"{sem_acento(rotulo).lower()} {termos}"), rotulo, func)
-                 for rotulo, termos, func in _indice_busca())
+                 for rotulo, termos, func in _indice_busca() if disponivel(func))
     achados = sorted((e for e in pontuados if e[0] >= 0.6), key=lambda e: e[0], reverse=True)[:12]
     if not achados:
         info(f"Nada parecido com '{termo}'. Tente outra palavra (ex.: 'jogo', 'foto', 'pdf', 'rede').")
@@ -31481,13 +32861,15 @@ def menu_principal() -> None:
         ("🤖 Bots Telegram / Discord 24h", menu_bots),
         ("🔎 Scraping e monitoramento", menu_monitor),
         ("🛡️ Rede e segurança", menu_rede),
-        ("🐧 Linux de verdade", menu_proot),
+        ("🐧 Linux de verdade", so_em("proot_distro", menu_proot)),
+        # nas distros, o equivalente do proot-distro: outras distros em contêineres (Distrobox + Podman)
+        ("🐧 Outras distros em contêineres (Distrobox)", so_em("distrobox", menu_distrobox)),
         ("🗄️ Arquivos e backup", menu_arquivos),
         ("🎵 Música, rádio e podcasts", menu_musica),
         ("🎬 Vídeos", menu_videos),
         ("📺 Compartilhar filme por link", menu_midia),
         ("🧰 Utilitários (calculadora, notas, senhas...)", menu_utilitarios),
-        ("📲 Celular e sistema", menu_celular),
+        (por_sistema("📲 Celular e sistema", "🖥️ Computador e Android conectado"), menu_celular),
         ("🌐 Internet", menu_internet),
         ("👤 Meus dados na internet", menu_meus_dados),
         ("✨ Inteligência artificial", menu_ia),
@@ -31499,8 +32881,9 @@ def menu_principal() -> None:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
-        prog="termux_toons.py",
-        description="Termux-Toons: canivete suíço para o Termux. Sem argumentos abre o menu.")
+        prog="lnux.py",
+        description="LNUX: canivete suíço para o terminal, no Termux (Android) e nas distros Linux. "
+                    "Sem argumentos abre o menu.")
     sub = parser.add_subparsers(dest="comando", metavar="COMANDO")
     p = sub.add_parser("serve", help="sobe o servidor web/API em primeiro plano")
     p.add_argument("--framework", choices=list(DEPENDENCIAS_WEB))
@@ -31576,14 +32959,19 @@ def main(argv=None) -> int:
     p.add_argument("nome", help="nome do aparelho configurado no menu")
     p.add_argument("acao", nargs="?", default="controle", help="botão (Power, Off, Vol_up...) ou 'controle'")
     sub.add_parser("tvbgone", help="desliga as TVs por perto (estilo TV-B-Gone)")
-    sub.add_parser("atualizar", help="atualiza Termux, pacotes Python, distros e o Termux-Toons")
+    sub.add_parser("atualizar", help="atualiza Termux, pacotes Python, distros e o LNUX")
     sub.add_parser("limpar", help="otimização rápida: limpa caches e temporários com segurança")
     sub.add_parser("doctor", help="diagnóstico do ambiente")
+    p = sub.add_parser("sistema", help="mostra ou troca o sistema (perfil de distro) que o LNUX usa")
+    p.add_argument("perfil", nargs="?", help="id do perfil (termux, debian, arch, fedora, alpine, opensuse, outro)")
+    p.add_argument("--listar", action="store_true", help="lista os perfis disponíveis")
     p = sub.add_parser("resolucao", help="desfaz a última mudança de resolução ou volta a tela à de fábrica")
     p.add_argument("--vigiar", metavar="ID", help=argparse.SUPPRESS)  # o vigia que desfaz sem confirmação
     args = parser.parse_args(argv)
 
     try:
+        # perfil do sistema: o salvo; na primeira vez o menu pergunta (os serviços usam o detectado)
+        preparar_sistema(interativo=args.comando is None)
         if args.comando is None:
             menu_principal()
             print("Até mais! 👋")
@@ -31619,7 +33007,7 @@ def main(argv=None) -> int:
         elif args.comando == "video":
             falhas = sum(not baixar_video(alvo, args.formato, args.qualidade) for alvo in args.alvos)
             if falhas:
-                raise ToonsError(f"{falhas} download(s) falharam.")
+                raise LnuxError(f"{falhas} download(s) falharam.")
         elif args.comando == SERVICO_PROXY:
             servir_proxy(args.porta or cfg()["proxy_porta"])
         elif args.comando == SERVICO_NAVEGADOR:
@@ -31642,7 +33030,7 @@ def main(argv=None) -> int:
             else:
                 distro = args.distro or next(iter(distros_instaladas()), None)
                 if not distro:
-                    raise ToonsError("Nenhuma distro instalada (use o menu Linux de verdade).")
+                    raise LnuxError("Nenhuma distro instalada (use o menu Linux de verdade).")
                 if not iniciar_desktop(distro):
                     return 1
         elif args.comando == "arquivos":
@@ -31677,7 +33065,7 @@ def main(argv=None) -> int:
                 try:
                     mpv = Mpv(timeout=2)
                 except OSError:
-                    raise ToonsError("Nada tocando agora.") from None
+                    raise LnuxError("Nada tocando agora.") from None
                 mpv(*{"pausar": ["cycle", "pause"], "proxima": ["playlist-next"],
                       "anterior": ["playlist-prev"]}[args.acao])
                 mpv.fechar()
@@ -31687,7 +33075,7 @@ def main(argv=None) -> int:
             else:
                 try:
                     print(tv_comando(args.acao, args.tv))
-                except ToonsError as e:
+                except LnuxError as e:
                     if not sys.stdout.isatty():  # atalho da tela inicial (sem terminal): avisa numa notificação
                         notificar_seguro("📺 TV", f"✖ {e}")
                     raise
@@ -31697,7 +33085,7 @@ def main(argv=None) -> int:
             else:
                 try:
                     print(aparelho_comando(args.acao, args.nome))
-                except ToonsError as e:
+                except LnuxError as e:
                     if not sys.stdout.isatty():
                         notificar_seguro("🎛️ Aparelho", f"✖ {e}")
                     raise
@@ -31709,6 +33097,19 @@ def main(argv=None) -> int:
             atualizar_tudo()
         elif args.comando == "doctor":
             diagnostico()
+        elif args.comando == "sistema":
+            if args.listar:
+                for perfil in perfis().values():
+                    print(f"{perfil.id:<10} {perfil.nome:<20} {DIM}{perfil.descricao}{RST}")
+            elif args.perfil:
+                if args.perfil not in perfis():
+                    raise LnuxError(f"Perfil '{args.perfil}' não existe. Use: {', '.join(perfis())}")
+                cfg()["sistema"] = args.perfil
+                salvar_cfg()
+                aplicar_sistema(perfis()[args.perfil])
+                ok(f"Sistema: {sistema().nome}.")
+            else:
+                mostrar_sistema()
         elif args.comando == "resolucao":
             if args.vigiar:
                 desfazer_resolucao(args.vigiar)
@@ -31716,7 +33117,7 @@ def main(argv=None) -> int:
                 ok("Mudança de resolução sem confirmação desfeita.")
             else:
                 resolucao_original()
-    except (ToonsError, BasicErro) as e:
+    except (LnuxError, BasicErro) as e:
         erro(str(e))
         return 1
     except KeyboardInterrupt:
