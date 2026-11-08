@@ -6189,7 +6189,7 @@ def _reescrever_tag(tag: str, nome: str, base: str, ligar) -> str:
 
 def _script_do_navegador(com_barra: bool, completo: bool = False) -> str:
     return (f'<script src="/_tt/nav.js?v={NAV_JS_VERSAO}" data-barra="{1 if com_barra else 0}"'
-            f'{' data-completo="1"' if completo else ""}></script>')
+            + (' data-completo="1"' if completo else "") + '></script>')  # sem aspas iguais dentro da f-string: o Python 3.11 não aceita
 
 
 def _reescrever_html(pagina: str, base_url: str, ligar=_proxiar, com_barra: bool = True,

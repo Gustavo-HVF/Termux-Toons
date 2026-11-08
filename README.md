@@ -710,6 +710,7 @@ python3 tests/verificar_menus.py --arvore   # também mostra a árvore inteira, 
 python3 tests/verificar_perfis.py           # confere os perfis de distros/ contra o que o código usa
 python3 tests/testar_menus_por_sistema.py   # abre todos os menus em cada sistema, sem executar nenhuma ação
 python3 tests/testar_mensagens_secretas.py  # codificar e decodificar de cada técnica de 🕵️ Mensagens secretas
+python3 tests/verificar_compatibilidade.py  # o código continua abrindo no Python 3.9 (Debian 12 usa o 3.11, Ubuntu 22.04 o 3.10)
 ```
 
 Uma opção que só funciona em alguns sistemas se marca com `so_em("recurso", função)` (ex.:
