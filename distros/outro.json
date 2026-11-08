@@ -60,6 +60,7 @@
       "openjdk-21": null,
       "openssh": null,
       "openssl": null,
+      "openssl-tool": null,
       "p7zip": null,
       "pip": null,
       "podman": null,
