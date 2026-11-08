@@ -50,6 +50,8 @@ Reúne em um único menu (cada categoria tem subcategorias; 🔍 Buscar acha qua
   17. Sistema e manutenção: atualização, otimização e limpeza, instalar dependências, aparência do
       terminal (tema, fonte, banner, zsh com Oh My Zsh ou Starship), explorar o espaço (estilo ncdu),
       serviços e logs do sistema (systemd/OpenRC) e configurações/diagnóstico
+  18. Apps Web: editores que abrem no navegador (Vídeo, Som, Efeitos...), do repositório LNUX-APPs, com a
+      ponte local para as pastas do aparelho e o ffmpeg
 
 O verificador tests/verificar_menus.py confere se não há opções duplicadas, menus soltos ou entradas da
 busca apontando para o lugar errado (rode antes de cada commit).
@@ -58,6 +60,7 @@ Uso:
     python lnux.py            # menu interativo
     python lnux.py sistema    # o sistema em uso (perfil, pastas, recursos); 'sistema arch' troca
     python lnux.py ficha      # a ficha do sistema (estilo neofetch)
+    python lnux.py apps som   # abre um dos Apps Web no navegador (liga o servidor e a ponte)
     python lnux.py --help     # subcomandos (também usados pelo tmux)
 
 Só precisa da biblioteca padrão do Python para abrir; o resto (flask, rich,
@@ -35916,6 +35919,305 @@ def menu_telas_de_descanso():
 
 
 # ════════════════════════════════════════════════════════════════════
+#  29. Apps Web (LNUX-APPs: editores que abrem no navegador)
+# ════════════════════════════════════════════════════════════════════
+#
+# O LNUX-APPs é outro repositório: apps só em HTML/CSS/JS (Vídeo, Som, Efeitos...) e um servidor em Python
+# (servidor/lnux_apps.py) que entrega os apps e faz a "ponte local" (pastas do aparelho, ffmpeg, bateria...).
+# Aqui o LNUX baixa o repositório, liga o servidor como um serviço (tmux) e abre cada app no navegador já com
+# a chave da ponte no endereço (#token=...). A lista de apps vem do apps.json do próprio repositório, então
+# um app novo lá aparece aqui sem mexer no LNUX.
+
+LNUX_APPS_REPO = "https://github.com/Gustavo-HVF/LNUX-APPs"
+LNUX_APPS_DIR = DATA_DIR / "lnux-apps"
+LNUX_APPS_DADOS = HOME / ".lnux-apps"  # onde o servidor guarda a chave e os temporários (o padrão dele)
+LNUX_APPS_PORTA = 8095
+SERVICO_APPS = "apps-web"
+
+
+def lnux_apps_servidor() -> Path:
+    return LNUX_APPS_DIR / "servidor" / "lnux_apps.py"
+
+
+def lnux_apps_instalado() -> bool:
+    return lnux_apps_servidor().is_file()
+
+
+def lnux_apps_catalogo() -> list:
+    """Os apps do apps.json (vazio se o LNUX-APPs não estiver baixado)."""
+    try:
+        dados = json.loads((LNUX_APPS_DIR / "apps.json").read_text("utf-8"))
+        return [a for a in dados.get("apps", []) if isinstance(a, dict) and a.get("id") and a.get("caminho")]
+    except (OSError, ValueError):
+        return []
+
+
+def lnux_apps_baixar(atualizar: bool = False) -> bool:
+    """Clona (ou atualiza) o LNUX-APPs em ~/.lnux/lnux-apps."""
+    if not garantir_cmd("git"):
+        return False
+    if (LNUX_APPS_DIR / ".git").is_dir():
+        if not atualizar:
+            return True
+        info("Atualizando o LNUX-APPs...")
+        r = rodar(["git", "-C", str(LNUX_APPS_DIR), "pull", "--ff-only"], capturar=True, timeout=180, mostrar=False)
+        if r.returncode != 0:
+            raise LnuxError("Não deu para atualizar o LNUX-APPs: " + ((r.stderr or r.stdout or "").strip().splitlines() or ["erro do git"])[-1]
+                            + f"\nSe você mexeu nos arquivos de {LNUX_APPS_DIR}, apague a pasta e baixe de novo.")
+        ok("LNUX-APPs atualizado." if "Already up to date" not in (r.stdout or "") else "O LNUX-APPs já estava na versão mais nova.")
+        return True
+    if LNUX_APPS_DIR.exists() and any(LNUX_APPS_DIR.iterdir()):
+        raise LnuxError(f"A pasta {LNUX_APPS_DIR} já existe e não é um clone do git. Apague ou renomeie e tente de novo.")
+    info(f"Baixando o LNUX-APPs ({LNUX_APPS_REPO})...")
+    r = rodar(["git", "clone", "--depth", "1", LNUX_APPS_REPO, str(LNUX_APPS_DIR)], capturar=True, timeout=600, mostrar=False)
+    if r.returncode != 0:
+        raise LnuxError("Não deu para baixar o LNUX-APPs: " + ((r.stderr or "").strip().splitlines() or ["sem resposta"])[-1])
+    ok(f"LNUX-APPs baixado em {LNUX_APPS_DIR}.")
+    return True
+
+
+def garantir_lnux_apps() -> bool:
+    """O LNUX-APPs baixado e com os apps dentro (se a pasta já existe sem eles, tenta atualizar)."""
+    if lnux_apps_instalado():
+        return True
+    if (LNUX_APPS_DIR / ".git").is_dir():
+        lnux_apps_baixar(atualizar=True)
+    else:
+        info("Os Apps Web ficam num repositório à parte, o LNUX-APPs (uns poucos MB).")
+        if not confirmar("Baixar agora?", True):
+            return False
+        lnux_apps_baixar()
+    if not lnux_apps_instalado():
+        raise LnuxError("O LNUX-APPs foi baixado, mas a versão publicada ainda não tem os apps (o repositório está "
+                        "começando). Tente '🔄 Atualizar os Apps Web' daqui a pouco.")
+    return True
+
+
+def lnux_apps_config() -> dict:
+    """~/.lnux-apps/ponte.json (chave, pastas liberadas, comandos). Cria pelo próprio servidor se faltar."""
+    arquivo = LNUX_APPS_DADOS / "ponte.json"
+    if not arquivo.exists() and lnux_apps_instalado():
+        rodar([sys.executable, str(lnux_apps_servidor()), "--mostrar-token"], capturar=True, timeout=30, mostrar=False)
+    try:
+        return json.loads(arquivo.read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def lnux_apps_salvar_config(config: dict) -> None:
+    arquivo = LNUX_APPS_DADOS / "ponte.json"
+    LNUX_APPS_DADOS.mkdir(parents=True, exist_ok=True)
+    temporario = arquivo.with_suffix(".tmp")
+    temporario.write_text(json.dumps(config, ensure_ascii=False, indent=2), "utf-8")
+    os.chmod(temporario, 0o600)
+    os.replace(temporario, arquivo)
+
+
+def lnux_apps_estado(porta: int, token: str = "") -> dict | None:
+    """O que o servidor da porta responde em /api/estado: None se não há servidor do LNUX-APPs ali."""
+    pedido = urllib.request.Request(f"http://127.0.0.1:{porta}/api/estado", headers={"X-Ponte-Token": token} if token else {})
+    try:
+        with urllib.request.urlopen(pedido, timeout=3) as r:
+            dados = json.loads(r.read() or b"{}")
+            return dados if "ponte" in dados else None
+    except urllib.error.HTTPError as e:
+        if e.code == 401:  # é o nosso servidor, com a ponte, mas com outra chave
+            return {"ponte": True, "chave_diferente": True}
+        return None
+    except (OSError, ValueError):
+        return None
+
+
+def garantir_servidor_apps(com_ponte: bool, na_rede: bool = False) -> int | None:
+    """Liga o servidor do LNUX-APPs (se preciso) e devolve a porta. Com a ponte quando o app precisa dela."""
+    if not garantir_lnux_apps():
+        return None
+    c = cfg()
+    porta = int(c.get("apps_porta", LNUX_APPS_PORTA))
+    token = lnux_apps_config().get("token", "")
+    estado = lnux_apps_estado(porta, token)
+    rodando_na_rede = c.get("apps_na_rede_ativo", False)
+    if estado and not estado.get("chave_diferente") and (estado.get("ponte") or not com_ponte) and (rodando_na_rede or not na_rede):
+        return porta
+    if servico_ativo(SERVICO_APPS):
+        info("Reiniciando o servidor dos Apps Web" + (" para a rede..." if na_rede else " com a ponte..." if com_ponte else "..."))
+        parar_servico(SERVICO_APPS)
+        porta_livre(porta, espera=5)
+    elif not porta_livre(porta):
+        aviso(f"A porta {porta} está ocupada por outro programa.")
+        porta = perguntar_int("Outra porta para os Apps Web", porta + 1, 1024, 65535)
+        c["apps_porta"] = porta
+        salvar_cfg()
+    argumentos = ["--porta", str(porta)]
+    if not com_ponte:
+        argumentos.append("--sem-ponte")
+    if na_rede:
+        argumentos += ["--endereco", "0.0.0.0"]
+    c["apps_na_rede_ativo"] = na_rede
+    salvar_cfg()
+    comando = "PYTHONUNBUFFERED=1 " + shlex.join([sys.executable, str(lnux_apps_servidor()), *argumentos])
+    if not iniciar_servico(SERVICO_APPS, comando, wake_lock=True):
+        return None
+    for _ in range(40):
+        if lnux_apps_estado(porta, token):
+            return porta
+        time.sleep(0.25)
+    erro("O servidor dos Apps Web não respondeu. Veja o log em Apps Web › Servidor: status e log.")
+    return None
+
+
+def abrir_app_web(app: dict | None = None) -> None:
+    """Abre um app (ou a página inicial) no navegador, ligando o servidor e, se o app usa, a ponte."""
+    usa_ponte = cfg().get("apps_ponte", "sempre")
+    precisa = app is None or app.get("ponte") == "necessaria" or (usa_ponte == "sempre" and app.get("ponte") != "nao")
+    porta = garantir_servidor_apps(precisa)
+    if not porta:
+        return
+    token = lnux_apps_config().get("token", "")
+    caminho = app["caminho"] if app else ""
+    url = f"http://127.0.0.1:{porta}/{caminho}" + (f"#token={token}" if precisa and token else "")
+    abrir_link(url)
+    nome = app["nome"] if app else "a página inicial dos Apps Web"
+    ok(f"Abrindo {nome} no navegador.")
+    info(f"Endereço: http://127.0.0.1:{porta}/{caminho}" + ("  (com a chave da ponte)" if precisa else ""))
+    if sistema().termux:
+        info("O servidor fica ligado em segundo plano; para desligar: Apps Web › Servidor: parar.")
+
+
+def apps_web_na_rede() -> None:
+    """Liga o servidor para a rede toda e mostra o link (com a chave) e o QR code para outro aparelho."""
+    aviso("Assim, qualquer aparelho na mesma rede Wi-Fi que tiver o link abre os apps E usa a ponte "
+          "(as pastas liberadas e o ffmpeg deste aparelho). Use só em redes suas.")
+    if not confirmar("Ligar os Apps Web para a rede?", False):
+        return
+    porta = garantir_servidor_apps(True, na_rede=True)
+    if not porta:
+        return
+    token = lnux_apps_config().get("token", "")
+    url = f"http://{ip_local()}:{porta}/#token={token}"
+    ok("Abra no outro aparelho (mesma rede):")
+    print(f"  {NEG}{url}{RST}")
+    mostrar_qr(url, "apps-web", salvar=False)
+    info("Para voltar a ser só deste aparelho: Apps Web › Servidor: parar (e abra um app de novo).")
+
+
+@submenu
+def apps_web_pastas() -> None:
+    """Pastas liberadas para a ponte, rodar comandos e a chave."""
+    if not garantir_lnux_apps():
+        return
+    config = lnux_apps_config()
+    raizes = list(config.get("raizes", []))
+
+    def acrescentar():
+        pasta = os.path.expanduser(perguntar("Pasta para liberar (caminho completo)", str(HOME)))
+        if not Path(pasta).is_dir():
+            raise LnuxError(f"A pasta {pasta} não existe.")
+        if pasta not in raizes:
+            raizes.append(pasta)
+        salvar()
+
+    def tirar():
+        if not raizes:
+            info("Não há pastas extras liberadas (a pasta pessoal e o armazenamento do celular sempre valem).")
+            return
+        i = escolher("Tirar qual?", raizes)
+        if i is not None:
+            raizes.pop(i)
+            salvar()
+
+    def comandos():
+        if not config.get("comandos"):
+            aviso("Com isso ligado, os apps podem rodar programas neste aparelho (o editor de código usa para o terminal).")
+            if not confirmar("Deixar os apps rodarem comandos?", False):
+                return
+        config["comandos"] = not config.get("comandos")
+        salvar()
+
+    def nova_chave():
+        if not confirmar("Trocar a chave da ponte? Links antigos (e abas já abertas) deixam de funcionar.", False):
+            return
+        config["token"] = secrets.token_urlsafe(24)
+        salvar()
+
+    def salvar():
+        config["raizes"] = raizes
+        lnux_apps_salvar_config(config)
+        ok("Salvo.")
+        if servico_ativo(SERVICO_APPS):
+            parar_servico(SERVICO_APPS)
+            info("O servidor foi desligado; ele liga de novo, com a mudança, ao abrir um app.")
+
+    def cabecalho():
+        print(f"  Sempre liberadas: a pasta pessoal ({HOME})" + (" e o armazenamento interno do celular" if sistema().termux else ""))
+        print(f"  Extras: {', '.join(raizes) if raizes else '(nenhuma)'}")
+        print(f"  Rodar comandos: {'LIGADO' if config.get('comandos') else 'desligado'}")
+        print(f"  Ponte: {'sempre que o app usa' if cfg().get('apps_ponte', 'sempre') == 'sempre' else 'só nos apps que precisam'}\n")
+
+    def alternar_ponte():
+        c = cfg()
+        c["apps_ponte"] = "precisa" if c.get("apps_ponte", "sempre") == "sempre" else "sempre"
+        salvar_cfg()
+        ok("Agora a ponte liga " + ("sempre que o app usa." if c["apps_ponte"] == "sempre" else "só nos apps que não funcionam sem ela."))
+
+    menu("⚙️ Ponte dos Apps Web", [
+        ("Liberar mais uma pasta", acrescentar),
+        ("Tirar uma pasta liberada", tirar),
+        ("Ligar/desligar: rodar comandos", comandos),
+        ("Ligar a ponte sempre / só quando o app precisa", alternar_ponte),
+        ("Trocar a chave da ponte", nova_chave),
+    ], cabecalho=cabecalho)
+
+
+def explicar_apps_web() -> None:
+    print(textwrap.dedent(f"""
+        {NEG}Apps Web{RST}: editores que abrem no navegador (do celular ou do computador), feitos só com HTML,
+        CSS e JavaScript, no repositório LNUX-APPs ({LNUX_APPS_REPO}).
+
+        Funcionam sozinhos no navegador. Com a {NEG}ponte local{RST} (que o LNUX liga sozinho), também abrem e
+        salvam direto nas pastas do aparelho, usam o ffmpeg para exportar em MP4, MP3, GIF... e leem bateria,
+        área de transferência e notificações.
+
+        A ponte só escuta neste aparelho e exige uma chave, que vai no endereço quando o LNUX abre o app.
+        Ela só mexe na pasta pessoal (e, no celular, no armazenamento interno), mais as pastas que você liberar.
+
+        Tema (claro, escuro, sépia, oceano, alto contraste) e layout ficam no botão ◐ de cada app, e o projeto
+        fica guardado no navegador: fechar a aba não perde nada.
+    """).strip("\n"))
+
+
+@submenu
+def menu_apps_web():
+    apps = [a for a in lnux_apps_catalogo() if a.get("estado") == "pronto"]
+    icones = {"video": "🎬", "efeito": "✨", "onda": "🎚️", "comando": "💻", "play": "▶", "texto": "💬", "camadas": "🗣️",
+              "arquivo": "📄", "layout": "📊", "tela": "🖥️", "imagem": "🖼️", "estrela": "⭐", "cor": "🎨",
+              "particulas": "🎞️", "forma": "📐", "ia": "🤖"}
+    itens = [("🏠 Página inicial (todos os apps)", lambda: abrir_app_web(None))]
+    itens += [(f"{icones.get(a.get('icone'), '🧩')} {a['nome']}: {a.get('descricao', '')}", (lambda app=a: abrir_app_web(app))) for a in apps]
+    if not apps:
+        itens.append(("⬇️ Baixar o LNUX-APPs (Vídeo, Som, Efeitos...)", lambda: lnux_apps_baixar()))
+    itens += [
+        ("🔄 Atualizar os Apps Web (baixar os apps novos)", lambda: lnux_apps_baixar(atualizar=True)),
+        ("📡 Abrir em outro aparelho da rede (QR code)", apps_web_na_rede),
+        *itens_servico(SERVICO_APPS, "Servidor", lambda: garantir_servidor_apps(cfg().get("apps_ponte", "sempre") == "sempre")),
+        ("⚙️ Ponte: pastas liberadas, comandos e chave", apps_web_pastas),
+        ("ℹ️ Como funciona", explicar_apps_web),
+    ]
+
+    def cabecalho():
+        if not lnux_apps_instalado():
+            print(f"{DIM}O LNUX-APPs ainda não foi baixado: escolha um app ou 'Baixar'.{RST}")
+        else:
+            prontos = len(apps)
+            planejados = sum(1 for a in lnux_apps_catalogo() if a.get("estado") != "pronto")
+            ligado = servico_ativo(SERVICO_APPS)
+            print(f"{DIM}{prontos} apps prontos · {planejados} a caminho · servidor {'ligado' if ligado else 'desligado'}"
+                  f" · ffmpeg {'sim' if tem('ffmpeg') else 'não (instale para exportar MP4/MP3)'}{RST}")
+
+    menu("🧩 Apps Web", itens, cabecalho=cabecalho)
+
+
+# ════════════════════════════════════════════════════════════════════
 #  Configurações e diagnóstico
 # ════════════════════════════════════════════════════════════════════
 
@@ -36198,6 +36500,8 @@ def _indice_busca() -> list:
         ("💹 Criptomoedas e bolsa", "cripto bitcoin ethereum bolsa acoes ibovespa cotacao investimento dolar",
          menu_cotacoes),
         ("🌌 Telas de descanso", "tela descanso matrix canos pipes aquario peixe screensaver", menu_telas_de_descanso),
+        ("🧩 Apps Web (vídeo, som e efeitos no navegador)", "apps web navegador editor video filme som audio estudio gravar mixar "
+         "efeitos animacao titulo motion lnux-apps ponte filmcraft soundcraft effectcraft", menu_apps_web),
         ("📲 Celular e sistema", "celular sistema android adb bateria apps fotos", menu_celular),
         ("🔌 Depuração sem fio (ADB)", "adb depuracao wifi wireless android shell signal 9 pareamento", menu_adb),
         ("📖 Comandos do ADB (com descrição)", "comandos adb lista ajuda pm am dpm shell screencap screenrecord "
@@ -36345,6 +36649,7 @@ def menu_principal() -> None:
         ("🕵️ Mensagens secretas (esconder, cifrar e códigos)", menu_mensagens_secretas),
         (por_sistema("📲 Celular e sistema", "🖥️ Computador e Android conectado"), menu_celular),
         ("🌐 Internet", menu_internet),
+        ("🧩 Apps Web (vídeo, som e efeitos no navegador)", menu_apps_web),
         ("👤 Meus dados na internet", menu_meus_dados),
         ("✨ Inteligência artificial", menu_ia),
         ("🎮 Diversão e aprendizado", menu_diversao),
@@ -36440,6 +36745,8 @@ def main(argv=None) -> int:
     p.add_argument("pasta")
     p.add_argument("--porta", type=int, default=8090)
     sub.add_parser("ficha", help="ficha do sistema (estilo neofetch)")
+    p = sub.add_parser("apps", help="abre os Apps Web no navegador (liga o servidor e a ponte)")
+    p.add_argument("app", nargs="?", help="id do app (video, som, efeitos...); sem nada, a página inicial")
     p = sub.add_parser("sistema", help="mostra ou troca o sistema (perfil de distro) que o LNUX usa")
     p.add_argument("perfil", nargs="?", help="id do perfil (termux, debian, arch, fedora, alpine, opensuse, outro)")
     p.add_argument("--listar", action="store_true", help="lista os perfis disponíveis")
@@ -36579,6 +36886,14 @@ def main(argv=None) -> int:
             servir_pasta(args.pasta, args.porta)
         elif args.comando == "ficha":
             ficha_do_sistema()
+        elif args.comando == "apps":
+            app = None
+            if args.app:
+                app = next((a for a in lnux_apps_catalogo() if a["id"] == args.app), None)
+                if not app:
+                    raise LnuxError(f"App desconhecido: {args.app}. Os que existem: "
+                                    f"{', '.join(a['id'] for a in lnux_apps_catalogo() if a.get('estado') == 'pronto') or '(baixe o LNUX-APPs antes)'}")
+            abrir_app_web(app)
         elif args.comando == "sistema":
             if args.listar:
                 for perfil in perfis().values():
