@@ -38,7 +38,7 @@ PASTA_PERFIS = RAIZ / "distros"
 GENERICAS = {
     "parar_servico", "status_servico", "abrir_sessao", "rodar", "info", "ok", "instalar_pkg", "mostrar_dados",
     "_explicar", "_abrir_link_android", "_testar_aparelho", "_usar_rede_privada", "usar_saida_no_proxy",
-    "abrir_tunel", "abrir_link", "servico_do_sistema", "pronto",
+    "abrir_tunel", "abrir_link", "servico_do_sistema", "pronto", "_explicar_tecnica",
 }
 
 # Funções que abrem um menu mas são chamadas de outro jeito (dinâmico), não por um item de menu.
@@ -185,6 +185,21 @@ def montar_arvore(leitor: Leitor):
             rot = Leitor.rotulo(rot_no)
             alvo_no, req_item = Leitor.desembrulhar(alvo_no)
             requisitos = herdados + req_lista + req_item
+            # ferramenta("Título", explicação, codificar, decodificar, extras=...): um grupo com "Como funciona",
+            # codificar e decodificar (as técnicas de 🕵️ Mensagens secretas)
+            if isinstance(alvo_no, ast.Call) and isinstance(alvo_no.func, ast.Name) and alvo_no.func.id == "ferramenta":
+                titulo_f = Leitor.rotulo(alvo_no.args[0])
+                no = No(prof, caminho, rot, f"grupo «{titulo_f}»", requisitos, pai)
+                nos.append(no)
+                if pai:
+                    pai.filhos.append(no)
+                extras = next((k.value for k in alvo_no.keywords if k.arg == "extras"), ast.Tuple(elts=[]))
+                itens_f = [(ast.Constant("ℹ️ Como funciona"), ast.Name("_explicar_tecnica"), ()),
+                           (ast.Constant("🔒 Codificar"), alvo_no.args[2], ()),
+                           (ast.Constant("🔓 Decodificar"), alvo_no.args[3], ())]
+                visitar_itens(titulo_f, itens_f + leitor.itens_da_lista(extras, funcao), funcao_dona,
+                              caminho + (titulo_f,), prof + 1, no, requisitos)
+                continue
             # grupo("Título", [...]) dentro do menu: um submenu sem função própria
             if isinstance(alvo_no, ast.Call) and isinstance(alvo_no.func, ast.Name) and alvo_no.func.id == "grupo":
                 titulo_grupo = Leitor.rotulo(alvo_no.args[0])
@@ -308,6 +323,15 @@ def main(argv: list) -> int:
         if nome in visitados or nome in ABERTAS_DE_OUTRO_JEITO or not leitor.menus_da_funcao(nome):
             continue
         problemas.append(f"SOLTO: '{nome}' tem um menu, mas nenhuma opção o abre")
+
+    # 3a. duas funções de módulo com o mesmo nome: a de baixo substitui a de cima sem aviso
+    contagem = collections.Counter(n.name for n in leitor.arvore_ast.body if isinstance(n, (ast.FunctionDef,
+                                                                                           ast.AsyncFunctionDef)))
+    for nome, vezes in sorted(contagem.items()):
+        if vezes > 1:
+            linhas = [str(n.lineno) for n in leitor.arvore_ast.body if isinstance(n, ast.FunctionDef) and n.name == nome]
+            problemas.append(f"NOME REPETIDO: a função '{nome}' é definida {vezes} vezes (linhas {', '.join(linhas)}); "
+                             f"a última substitui as outras")
 
     # 3b. função que abre um menu precisa de @submenu (sem ele, ao voltar a tela pede "Pressione Enter")
     ajudantes = {"menu_principal", "grupo", "_menu_ponte_publica", "_menu_categoria_adb", "_md_menu_grupo"}

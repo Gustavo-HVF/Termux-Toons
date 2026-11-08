@@ -26,6 +26,8 @@ Reúne em um único menu (cada categoria tem subcategorias; 🔍 Buscar acha qua
       troca de trilha de áudio e conversão na hora (servidor de vídeo + túnel)
   10. Utilitários: calculadora científica, notas, lista de afazeres, lembretes/alarmes, cronômetro/Pomodoro,
       agenda, conversor, gastos, senhas, previsão do tempo, QR code (Wi-Fi, PIX) e tradutor
+      + Mensagens secretas: esteganografia (foto, áudio, texto invisível, arquivo dentro de foto), AES-256 com
+      senha, OpenSSL, Vernam, cifras clássicas, sistemas numéricos, alfabetos próprios, Morse, Braille e Base64
   11. Celular e sistema: depuração sem fio (ADB), Termux:API, painel do sistema, bateria, uso de dados e
       apps, resolução da tela, fotos, conversor de arquivos, automação por eventos, espelhamento e
       transmissão da tela, controle da TV e de outros aparelhos por infravermelho, modem (comandos AT)
@@ -62,6 +64,7 @@ import asyncio
 import atexit
 import base64
 import calendar
+import collections
 import contextlib
 import copy
 import csv
@@ -32481,6 +32484,1359 @@ def menu_meus_dados():
 
 
 # ════════════════════════════════════════════════════════════════════
+#  27. Mensagens secretas: esconder, cifrar e codificar
+# ════════════════════════════════════════════════════════════════════
+# Três ideias diferentes, que dá para combinar:
+#   • esconder (esteganografia): a mensagem vai dentro de outra coisa (uma foto, um áudio, um texto) e quem
+#     olha não percebe que ela existe;
+#   • cifrar (criptografia): a mensagem fica à vista, mas embaralhada; só quem tem a senha ou a chave lê;
+#   • codificar: escrever de outro jeito (binário, Morse, Braille, um alfabeto inventado). Não protege nada:
+#     quem conhece o código lê.
+# As funções de cada técnica não falam com a tela (recebem e devolvem texto ou bytes) e são testadas em
+# tests/testar_mensagens_secretas.py. Os menus ficam no fim da seção.
+
+LETRAS = string.ascii_lowercase
+PASTA_SECRETAS = "Mensagens secretas"  # dentro de Download/LNUX
+
+
+# ── cifras clássicas ─────────────────────────────────────────────────
+
+def _desloca_letra(c: str, n: int) -> str:
+    """Anda n casas no alfabeto (a..z e A..Z; o resto, inclusive letras acentuadas, fica igual)."""
+    if "a" <= c <= "z":
+        return chr((ord(c) - 97 + n) % 26 + 97)
+    if "A" <= c <= "Z":
+        return chr((ord(c) - 65 + n) % 26 + 65)
+    return c
+
+
+def cifra_cesar(texto: str, deslocamento: int) -> str:
+    """César: cada letra anda `deslocamento` casas (com 3, a→d, b→e...). Decifrar é andar para trás."""
+    return "".join(_desloca_letra(c, deslocamento) for c in texto)
+
+
+# frequência das letras no português (%), para achar o deslocamento de um César sem saber a chave
+FREQUENCIA_PT = {"a": 14.63, "b": 1.04, "c": 3.88, "d": 4.99, "e": 12.57, "f": 1.02, "g": 1.30, "h": 1.28,
+                 "i": 6.18, "j": 0.40, "k": 0.02, "l": 2.78, "m": 4.74, "n": 5.05, "o": 10.73, "p": 2.52,
+                 "q": 1.20, "r": 6.53, "s": 7.81, "t": 4.34, "u": 4.63, "v": 1.67, "w": 0.01, "x": 0.21,
+                 "y": 0.01, "z": 0.47}
+
+
+def _distancia_do_portugues(texto: str) -> float:
+    """Qui-quadrado entre as letras do texto e as do português: quanto menor, mais parece português."""
+    letras = [c for c in texto.lower() if c in LETRAS]
+    if not letras:
+        return float("inf")
+    contagem = collections.Counter(letras)
+    total = len(letras)
+    return sum((contagem.get(l, 0) - total * f / 100) ** 2 / (total * f / 100) for l, f in FREQUENCIA_PT.items())
+
+
+def cesar_quebrar(texto: str, quantos: int = 5) -> list:
+    """[(deslocamento, texto decifrado)] das tentativas que mais parecem português, a melhor primeiro."""
+    tentativas = [(k, cifra_cesar(texto, -k)) for k in range(26)]
+    return sorted(tentativas, key=lambda t: _distancia_do_portugues(t[1]))[:quantos]
+
+
+def rot47(texto: str) -> str:
+    """ROT47: gira os 94 caracteres visíveis do ASCII (de ! a ~) em 47. Aplicar de novo desfaz."""
+    return "".join(chr(33 + (ord(c) - 33 + 47) % 94) if 33 <= ord(c) <= 126 else c for c in texto)
+
+
+def atbash(texto: str) -> str:
+    """Atbash: o alfabeto ao contrário (a↔z, b↔y, c↔x...). Aplicar de novo desfaz."""
+    def troca(c: str) -> str:
+        if "a" <= c <= "z":
+            return chr(ord("a") + ord("z") - ord(c))
+        if "A" <= c <= "Z":
+            return chr(ord("A") + ord("Z") - ord(c))
+        return c
+    return "".join(map(troca, texto))
+
+
+def cifra_vigenere(texto: str, chave: str, decifrar: bool = False) -> str:
+    """Vigenère: um César diferente para cada letra, dado pelas letras da chave (a=0, b=1...), em ciclo."""
+    deslocamentos = [ord(c) - 97 for c in sem_acento(chave).lower() if c in LETRAS]
+    if not deslocamentos:
+        raise LnuxError("A chave precisa ter pelo menos uma letra.")
+    saida, i = [], 0
+    for c in texto:
+        if c.isascii() and c.isalpha():
+            n = deslocamentos[i % len(deslocamentos)]
+            saida.append(_desloca_letra(c, -n if decifrar else n))
+            i += 1
+        else:
+            saida.append(c)
+    return "".join(saida)
+
+
+def alfabeto_com_palavra(chave: str) -> str:
+    """O alfabeto começando pelas letras da palavra-chave, sem repetir, e depois as que faltam."""
+    return "".join(dict.fromkeys([c for c in sem_acento(chave).lower() if c in LETRAS] + list(LETRAS)))
+
+
+def cifra_substituicao(texto: str, chave: str, decifrar: bool = False) -> str:
+    """Substituição com palavra-chave: a vira a 1ª letra do alfabeto da chave, b a 2ª, e assim por diante."""
+    cifrado = alfabeto_com_palavra(chave)
+    de, para = (cifrado, LETRAS) if decifrar else (LETRAS, cifrado)
+    return texto.translate(str.maketrans(de + de.upper(), para + para.upper()))
+
+
+def _trilho_de_cada_posicao(tamanho: int, trilhos: int) -> list:
+    """Em que trilho cai cada letra do zigue-zague (0, 1, 2, 1, 0, 1, 2...)."""
+    if trilhos < 2:
+        return [0] * tamanho
+    ciclo = 2 * (trilhos - 1)
+    return [min(i % ciclo, ciclo - i % ciclo) for i in range(tamanho)]
+
+
+def cerca_codificar(texto: str, trilhos: int) -> str:
+    """Cerca de trilhos: escreve em zigue-zague em N linhas e lê uma linha depois da outra."""
+    trilho = _trilho_de_cada_posicao(len(texto), trilhos)
+    return "".join(c for t in range(trilhos) for c, tt in zip(texto, trilho) if tt == t)
+
+
+def cerca_decodificar(texto: str, trilhos: int) -> str:
+    trilho = _trilho_de_cada_posicao(len(texto), trilhos)
+    ordem_de_leitura = sorted(range(len(texto)), key=lambda i: (trilho[i], i))
+    saida = [""] * len(texto)
+    for c, posicao in zip(texto, ordem_de_leitura):
+        saida[posicao] = c
+    return "".join(saida)
+
+
+QUADRADO_POLIBIO = "abcdefghiklmnopqrstuvwxyz"  # 5x5: o j divide a casa com o i
+
+
+def polibio_codificar(texto: str) -> str:
+    """Quadrado de Políbio: cada letra vira linha e coluna numa grade 5x5 (a=11, b=12... z=55)."""
+    palavras = []
+    for palavra in sem_acento(texto).lower().split():
+        numeros = []
+        for c in palavra.replace("j", "i"):
+            if c in QUADRADO_POLIBIO:
+                i = QUADRADO_POLIBIO.index(c)
+                numeros.append(f"{i // 5 + 1}{i % 5 + 1}")
+        if numeros:
+            palavras.append(" ".join(numeros))
+    return " / ".join(palavras)
+
+
+def polibio_decodificar(texto: str) -> str:
+    palavras = ["".join(QUADRADO_POLIBIO[(int(par[0]) - 1) * 5 + int(par[1]) - 1]
+                        for par in re.findall(r"[1-5][1-5]", palavra)) for palavra in texto.split("/")]
+    return " ".join(p for p in palavras if p)
+
+
+def bacon_codificar(texto: str) -> str:
+    """Cifra de Bacon: cada letra vira 5 sinais de dois tipos, A e B (a=AAAAA, b=AAAAB...)."""
+    palavras = []
+    for palavra in sem_acento(texto).lower().split():
+        letras = [format(LETRAS.index(c), "05b").translate(str.maketrans("01", "AB")) for c in palavra if c in LETRAS]
+        if letras:
+            palavras.append(" ".join(letras))
+    return " / ".join(palavras)
+
+
+def bacon_decodificar(texto: str) -> str:
+    palavras = []
+    for palavra in texto.upper().split("/"):
+        bits = re.sub(r"[^AB]", "", palavra).translate(str.maketrans("AB", "01"))
+        palavras.append("".join(LETRAS[int(bits[i:i + 5], 2)] for i in range(0, len(bits) - 4, 5)
+                                if int(bits[i:i + 5], 2) < 26))
+    return " ".join(p for p in palavras if p)
+
+
+def a1z26_codificar(texto: str) -> str:
+    """A1Z26: cada letra vira a posição dela no alfabeto (a=1... z=26), com hífen entre as letras."""
+    palavras = ["-".join(str(LETRAS.index(c) + 1) for c in palavra if c in LETRAS)
+                for palavra in sem_acento(texto).lower().split()]
+    return " ".join(p for p in palavras if p)
+
+
+def a1z26_decodificar(texto: str) -> str:
+    palavras = ["".join(LETRAS[int(n) - 1] for n in re.findall(r"\d+", palavra) if 1 <= int(n) <= 26)
+                for palavra in texto.split()]
+    return " ".join(p for p in palavras if p)
+
+
+# ── outros códigos: Morse, Braille, Base64... ────────────────────────
+
+MORSE = {
+    "a": ".-", "b": "-...", "c": "-.-.", "d": "-..", "e": ".", "f": "..-.", "g": "--.", "h": "....", "i": "..",
+    "j": ".---", "k": "-.-", "l": ".-..", "m": "--", "n": "-.", "o": "---", "p": ".--.", "q": "--.-", "r": ".-.",
+    "s": "...", "t": "-", "u": "..-", "v": "...-", "w": ".--", "x": "-..-", "y": "-.--", "z": "--..",
+    "0": "-----", "1": ".----", "2": "..---", "3": "...--", "4": "....-", "5": ".....", "6": "-....",
+    "7": "--...", "8": "---..", "9": "----.", ".": ".-.-.-", ",": "--..--", "?": "..--..", "!": "-.-.--",
+    "'": ".----.", '"': ".-..-.", "/": "-..-.", "(": "-.--.", ")": "-.--.-", "&": ".-...", ":": "---...",
+    ";": "-.-.-.", "=": "-...-", "+": ".-.-.", "-": "-....-", "$": "...-..-", "@": ".--.-.",
+}
+
+
+def morse_codificar(texto: str) -> str:
+    """Código Morse: cada letra vira pontos e traços; espaço entre letras e ' / ' entre palavras."""
+    palavras = [" ".join(MORSE[c] for c in palavra if c in MORSE) for palavra in sem_acento(texto).lower().split()]
+    return " / ".join(p for p in palavras if p)
+
+
+def morse_decodificar(texto: str) -> str:
+    inverso = {v: k for k, v in MORSE.items()}
+    for parecido, certo in (("·", "."), ("•", "."), ("—", "-"), ("–", "-"), ("_", "-")):
+        texto = texto.replace(parecido, certo)
+    palavras = ["".join(inverso.get(sinal, "?") for sinal in palavra.split())
+                for palavra in re.split(r"\s*/\s*|\s{3,}", texto.strip())]
+    return " ".join(p for p in palavras if p)
+
+
+def morse_som(texto_morse: str, destino: Path, frequencia: int = 650, unidade: float = 0.08) -> Path:
+    """Grava o Morse como som (.wav): ponto = 1 unidade, traço = 3, pausa entre letras = 3, entre palavras = 7."""
+    import wave
+    taxa = 22050
+
+    def tom(duracao: float) -> bytes:
+        n = int(taxa * duracao)
+        rampa = max(1, int(taxa * 0.005))  # 5 ms de entrada e saída, para não estalar
+        return b"".join(struct.pack("<h", int(16000 * min(1, i / rampa, (n - i) / rampa)
+                                              * math.sin(2 * math.pi * frequencia * i / taxa))) for i in range(n))
+
+    def silencio(duracao: float) -> bytes:
+        return b"\x00\x00" * int(taxa * duracao)
+
+    partes = []
+    for palavra in re.split(r"\s*/\s*", texto_morse.strip()):
+        for letra in palavra.split():
+            for sinal in letra:
+                partes += [tom(unidade if sinal == "." else 3 * unidade), silencio(unidade)]
+            partes.append(silencio(2 * unidade))
+        partes.append(silencio(4 * unidade))
+    with wave.open(str(destino), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(taxa)
+        w.writeframes(b"".join(partes))
+    return destino
+
+
+# Braille (Grafia Braille para a Língua Portuguesa): letras, acentos, números com ⠼ e maiúsculas com ⠨
+BRAILLE = dict(zip("abcdefghijklmnopqrstuvwxyz", "⠁⠃⠉⠙⠑⠋⠛⠓⠊⠚⠅⠇⠍⠝⠕⠏⠟⠗⠎⠞⠥⠧⠺⠭⠽⠵"))
+BRAILLE.update({"á": "⠷", "à": "⠫", "â": "⠡", "ã": "⠜", "é": "⠿", "ê": "⠣", "í": "⠌", "ó": "⠬", "ô": "⠹",
+                "õ": "⠪", "ú": "⠾", "ü": "⠳", "ç": "⠯", ",": "⠂", ";": "⠆", ":": "⠒", ".": "⠄", "?": "⠢",
+                "!": "⠖", "-": "⠤", " ": " "})
+BRAILLE_NUMEROS = dict(zip("1234567890", "⠁⠃⠉⠙⠑⠋⠛⠓⠊⠚"))
+SINAL_NUMERO, SINAL_MAIUSCULA = "⠼", "⠨"
+
+
+def braille_codificar(texto: str) -> str:
+    """Braille: cada letra vira uma cela de 6 pontos. Números levam ⠼ antes; maiúsculas, ⠨."""
+    saida, em_numero = [], False
+    for c in texto:
+        if c in BRAILLE_NUMEROS:
+            if not em_numero:
+                saida.append(SINAL_NUMERO)
+                em_numero = True
+            saida.append(BRAILLE_NUMEROS[c])
+            continue
+        em_numero = False
+        if c.lower() in BRAILLE:
+            saida.append((SINAL_MAIUSCULA if c != c.lower() else "") + BRAILLE[c.lower()])
+        else:
+            saida.append(c)
+    return "".join(saida)
+
+
+def braille_decodificar(texto: str) -> str:
+    letras = {v: k for k, v in BRAILLE.items()}
+    numeros = {v: k for k, v in BRAILLE_NUMEROS.items()}
+    saida, em_numero, maiuscula = [], False, False
+    for c in texto:
+        if c == SINAL_NUMERO:
+            em_numero = True
+        elif c == SINAL_MAIUSCULA:
+            maiuscula = True
+        elif em_numero and c in numeros:
+            saida.append(numeros[c])
+        else:
+            em_numero = False
+            letra = letras.get(c, c)
+            saida.append(letra.upper() if maiuscula else letra)
+            maiuscula = False
+    return "".join(saida)
+
+
+def base64_codificar(texto: str) -> str:
+    return base64.b64encode(texto.encode("utf-8")).decode()
+
+
+def base64_decodificar(texto: str) -> str:
+    """Aceita o Base64 comum e o de links (com - e _), com ou sem os '=' do fim."""
+    limpo = re.sub(r"\s+", "", texto).replace("-", "+").replace("_", "/").rstrip("=")
+    try:
+        dados = base64.b64decode(limpo + "=" * (-len(limpo) % 4), validate=True)
+        if not dados:
+            raise ValueError("vazio")
+        return dados.decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        raise LnuxError("Isso não é um Base64 de um texto.") from None
+
+
+def base32_codificar(texto: str) -> str:
+    return base64.b32encode(texto.encode("utf-8")).decode()
+
+
+def base32_decodificar(texto: str) -> str:
+    limpo = re.sub(r"\s+", "", texto).upper()
+    try:
+        return base64.b32decode(limpo + "=" * (-len(limpo) % 8)).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        raise LnuxError("Isso não é um Base32 de um texto.") from None
+
+
+# ── sistemas numéricos ───────────────────────────────────────────────
+
+BASES = {"binário": 2, "octal": 8, "decimal": 10, "hexadecimal": 16}
+_DIGITOS = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def ler_numero_na_base(texto: str, base: int) -> int:
+    """Lê um número na base dada; aceita espaços, '_', sinal e os prefixos 0b, 0o e 0x."""
+    limpo = re.sub(r"[\s_]", "", texto).lower()
+    negativo = limpo.startswith("-")
+    limpo = limpo.lstrip("+-")
+    for prefixo, b in (("0b", 2), ("0o", 8), ("0x", 16)):
+        if limpo.startswith(prefixo) and base == b:
+            limpo = limpo[2:]
+    if not limpo:
+        raise LnuxError("Digite um número.")
+    try:
+        valor = int(limpo, base)
+    except ValueError:
+        raise LnuxError(f"'{texto.strip()}' não é um número válido na base {base}.") from None
+    return -valor if negativo else valor
+
+
+def numero_na_base(valor: int, base: int) -> str:
+    """O número escrito na base (2 a 36), com as letras de a a z para os dígitos acima de 9."""
+    if not 2 <= base <= 36:
+        raise LnuxError("A base vai de 2 a 36.")
+    if valor == 0:
+        return "0"
+    digitos, n = [], abs(valor)
+    while n:
+        n, resto = divmod(n, base)
+        digitos.append(_DIGITOS[resto])
+    return ("-" if valor < 0 else "") + "".join(reversed(digitos))
+
+
+def texto_para_base(texto: str, base: int) -> str:
+    """Cada byte do texto (UTF-8) escrito na base: binário com 8 dígitos, octal com 3, hexa com 2."""
+    largura = {2: 8, 8: 3, 16: 2}.get(base, 0)
+    return " ".join(numero_na_base(b, base).zfill(largura) for b in texto.encode("utf-8"))
+
+
+def base_para_texto(texto: str, base: int) -> str:
+    partes = texto.split()
+    if len(partes) == 1 and base in (2, 16):  # tudo junto: corta de 8 em 8 (binário) ou de 2 em 2 (hexa)
+        passo = 8 if base == 2 else 2
+        bloco = re.sub(r"^0[bx]", "", partes[0].lower())
+        partes = [bloco[i:i + passo] for i in range(0, len(bloco), passo)]
+    try:
+        dados = bytes(ler_numero_na_base(p, base) for p in partes)
+        return dados.decode("utf-8")
+    except (ValueError, UnicodeDecodeError, LnuxError):
+        raise LnuxError(f"Esses números (base {base}) não formam um texto.") from None
+
+
+# ── criptografia moderna ─────────────────────────────────────────────
+
+PREFIXO_AES = "LNUX-AES1:"          # texto: prefixo + base64(sal 16 + nonce 12 + cifrado com a etiqueta)
+MAGICO_ARQUIVO_AES = b"LNUXAES1"   # arquivo: estes 8 bytes + sal + nonce + cifrado
+
+
+def chave_da_senha(senha: str, sal: bytes) -> bytes:
+    """Chave de 256 bits a partir da senha, com scrypt (lento de propósito: atrapalha quem tenta adivinhar)."""
+    if not senha:
+        raise LnuxError("A senha não pode ficar vazia.")
+    return hashlib.scrypt(senha.encode("utf-8"), salt=sal, n=2 ** 15, r=8, p=1, maxmem=64 * 1024 * 1024, dklen=32)
+
+
+def _aesgcm():
+    if not garantir_modulo("cryptography", pkg_nome="python-cryptography",
+                           aviso_extra="O AES usa a biblioteca 'cryptography' (a mesma do cofre de senhas)."):
+        raise LnuxError("Sem a biblioteca 'cryptography' não dá para usar o AES.")
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    return AESGCM
+
+
+def aes_cifrar_bytes(dados: bytes, senha: str) -> bytes:
+    """AES-256-GCM: cifra e assina (quem mexer em um byte é descoberto). Sal e nonce novos a cada vez."""
+    sal, nonce = secrets.token_bytes(16), secrets.token_bytes(12)
+    return sal + nonce + _aesgcm()(chave_da_senha(senha, sal)).encrypt(nonce, dados, MAGICO_ARQUIVO_AES)
+
+
+def aes_decifrar_bytes(pacote: bytes, senha: str) -> bytes:
+    if len(pacote) < 16 + 12 + 16:
+        raise LnuxError("Isso não é uma mensagem cifrada pelo LNUX (curta demais).")
+    sal, nonce, cifrado = pacote[:16], pacote[16:28], pacote[28:]
+    AESGCM = _aesgcm()
+    from cryptography.exceptions import InvalidTag
+    try:
+        return AESGCM(chave_da_senha(senha, sal)).decrypt(nonce, cifrado, MAGICO_ARQUIVO_AES)
+    except InvalidTag:
+        raise LnuxError("Senha errada (ou a mensagem foi alterada).") from None
+
+
+def aes_cifrar_texto(texto: str, senha: str) -> str:
+    return PREFIXO_AES + base64.b64encode(aes_cifrar_bytes(texto.encode("utf-8"), senha)).decode()
+
+
+def aes_decifrar_texto(texto: str, senha: str) -> str:
+    limpo = re.sub(r"\s+", "", texto)
+    if limpo.startswith(PREFIXO_AES):
+        limpo = limpo[len(PREFIXO_AES):]
+    try:
+        pacote = base64.b64decode(limpo, validate=True)
+    except ValueError:
+        raise LnuxError(f"Isso não é uma mensagem cifrada pelo LNUX (começa com {PREFIXO_AES}).") from None
+    return aes_decifrar_bytes(pacote, senha).decode("utf-8")
+
+
+def aes_cifrar_arquivo(origem: Path, senha: str, destino: Path | None = None) -> Path:
+    destino = destino or origem.with_name(origem.name + ".lnuxcripto")
+    destino.write_bytes(MAGICO_ARQUIVO_AES + aes_cifrar_bytes(origem.read_bytes(), senha))
+    return destino
+
+
+def aes_decifrar_arquivo(origem: Path, senha: str, destino: Path | None = None) -> Path:
+    dados = origem.read_bytes()
+    if not dados.startswith(MAGICO_ARQUIVO_AES):
+        raise LnuxError("Esse arquivo não foi cifrado pelo LNUX.")
+    claro = aes_decifrar_bytes(dados[len(MAGICO_ARQUIVO_AES):], senha)
+    if destino is None:
+        nome = origem.name[:-len(".lnuxcripto")] if origem.name.endswith(".lnuxcripto") else origem.name + ".aberto"
+        destino = origem.with_name(nome)
+        if destino.exists():
+            destino = destino.with_name(f"{destino.stem} (decifrado){destino.suffix}")
+    destino.write_bytes(claro)
+    return destino
+
+
+def _openssl(argumentos: list, entrada: str, senha: str) -> str:
+    """Roda o 'openssl enc' com a senha numa variável de ambiente (não aparece na lista de processos)."""
+    if not garantir_cmd("openssl", "openssl-tool"):
+        raise LnuxError("Precisa do comando openssl.")
+    try:
+        proc = subprocess.run(["openssl", "enc", "-aes-256-cbc", "-pbkdf2", "-iter", "600000", "-a", "-A",
+                               "-pass", "env:LNUX_SENHA", *argumentos], input=entrada.encode("utf-8"),
+                              capture_output=True, timeout=120, env={**os.environ, "LNUX_SENHA": senha})
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise LnuxError(f"O openssl falhou: {e}") from None
+    if proc.returncode != 0:
+        raise LnuxError("Senha errada ou texto que não é do openssl." if "-d" in argumentos else
+                        f"O openssl falhou: {proc.stderr.decode(errors='replace').strip()[:200]}")
+    try:
+        return proc.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        raise LnuxError("A senha não é essa (o resultado não é um texto).") from None
+
+
+def openssl_cifrar(texto: str, senha: str) -> str:
+    """AES-256-CBC + PBKDF2 do OpenSSL: abre em qualquer computador com o comando openssl."""
+    if not senha:
+        raise LnuxError("A senha não pode ficar vazia.")
+    return _openssl(["-salt"], texto, senha).strip()
+
+
+def openssl_decifrar(texto: str, senha: str) -> str:
+    return _openssl(["-d"], re.sub(r"\s+", "", texto) + "\n", senha)
+
+
+def vernam_cifrar(texto: str) -> tuple:
+    """Bloco de uso único (Vernam): soma cada byte com um byte aleatório da chave (XOR).
+    Devolve (mensagem cifrada, chave), as duas em Base64."""
+    dados = texto.encode("utf-8")
+    chave = secrets.token_bytes(len(dados))
+    cifrado = bytes(a ^ b for a, b in zip(dados, chave))
+    return base64.b64encode(cifrado).decode(), base64.b64encode(chave).decode()
+
+
+def vernam_decifrar(cifrado_b64: str, chave_b64: str) -> str:
+    try:
+        cifrado = base64.b64decode(re.sub(r"\s+", "", cifrado_b64))
+        chave = base64.b64decode(re.sub(r"\s+", "", chave_b64))
+    except ValueError:
+        raise LnuxError("A mensagem e a chave precisam estar em Base64.") from None
+    if len(chave) < len(cifrado):
+        raise LnuxError("A chave é menor que a mensagem: não é a chave desta mensagem.")
+    try:
+        return bytes(a ^ b for a, b in zip(cifrado, chave)).decode("utf-8")
+    except UnicodeDecodeError:
+        raise LnuxError("Essa chave não abre esta mensagem.") from None
+
+
+# ── esteganografia ───────────────────────────────────────────────────
+# O que vai escondido é sempre um "pacote": LNX + 1 byte (0 = texto puro, 1 = cifrado com senha) + 4 bytes do
+# tamanho + a mensagem. Assim, ao revelar, dá para saber se há mesmo algo ali e se precisa da senha.
+
+MAGICO_ESCONDIDO = b"LNX"
+CABECALHO_ESCONDIDO = len(MAGICO_ESCONDIDO) + 1 + 4
+
+
+def embalar(dados: bytes, cifrado: bool = False) -> bytes:
+    return MAGICO_ESCONDIDO + bytes([1 if cifrado else 0]) + len(dados).to_bytes(4, "big") + dados
+
+
+def _ler_cabecalho(cabecalho: bytes) -> tuple:
+    """(cifrado?, tamanho) do pacote, ou erro se não houver nada escondido."""
+    if not cabecalho.startswith(MAGICO_ESCONDIDO):
+        raise LnuxError("Não há mensagem escondida aqui (ou o arquivo foi recomprimido e ela se perdeu).")
+    return cabecalho[3] == 1, int.from_bytes(cabecalho[4:8], "big")
+
+
+def _bits_dos_bytes(dados: bytes):
+    for byte in dados:
+        for i in range(7, -1, -1):
+            yield (byte >> i) & 1
+
+
+def _bytes_dos_bits(bits) -> bytes:
+    bits = list(bits)
+    return bytes(int("".join(map(str, bits[i:i + 8])), 2) for i in range(0, len(bits) - 7, 8))
+
+
+def imagem_capacidade(largura: int, altura: int) -> int:
+    """Quantos bytes cabem numa imagem: 1 bit em cada canal de cor (R, G e B) de cada pixel."""
+    return largura * altura * 3 // 8 - CABECALHO_ESCONDIDO
+
+
+def imagem_esconder(origem: Path, dados: bytes, destino: Path, cifrado: bool = False) -> Path:
+    """Esconde nos bits menos significativos das cores (LSB). A foto continua igual a olho nu.
+    Salva em PNG: o JPEG e o WhatsApp recomprimem a imagem e apagariam a mensagem."""
+    if not garantir_modulo("PIL", pip_nome="pillow", pkg_nome="python-pillow"):
+        raise LnuxError("Precisa do Pillow para mexer nas imagens.")
+    from PIL import Image
+    img = Image.open(origem)
+    img = img.convert("RGBA" if "A" in img.getbands() or img.mode == "P" else "RGB")
+    pacote = embalar(dados, cifrado)
+    if len(pacote) * 8 > img.width * img.height * 3:
+        raise LnuxError(f"A mensagem não cabe: esta imagem guarda até {imagem_capacidade(img.width, img.height)} bytes.")
+    pixels, largura = img.load(), img.width
+    for k, bit in enumerate(_bits_dos_bytes(pacote)):
+        posicao, canal = divmod(k, 3)
+        xy = (posicao % largura, posicao // largura)
+        cor = list(pixels[xy])
+        cor[canal] = (cor[canal] & ~1) | bit
+        pixels[xy] = tuple(cor)
+    img.save(destino, "PNG")
+    return destino
+
+
+def imagem_revelar(origem: Path) -> tuple:
+    """(mensagem em bytes, cifrada?) escondida por imagem_esconder."""
+    if not garantir_modulo("PIL", pip_nome="pillow", pkg_nome="python-pillow"):
+        raise LnuxError("Precisa do Pillow para mexer nas imagens.")
+    from PIL import Image
+    img = Image.open(origem).convert("RGB")
+    pixels, largura, total = img.load(), img.width, img.width * img.height * 3
+
+    def ler(inicio_bit: int, n_bytes: int) -> bytes:
+        if inicio_bit + n_bytes * 8 > total:
+            raise LnuxError("Não há mensagem escondida aqui (o tamanho anotado não cabe na imagem).")
+        bits = []
+        for k in range(inicio_bit, inicio_bit + n_bytes * 8):
+            posicao, canal = divmod(k, 3)
+            bits.append(pixels[posicao % largura, posicao // largura][canal] & 1)
+        return _bytes_dos_bits(bits)
+
+    cifrado, tamanho = _ler_cabecalho(ler(0, CABECALHO_ESCONDIDO))
+    return ler(CABECALHO_ESCONDIDO * 8, tamanho), cifrado
+
+
+def audio_esconder(origem: Path, dados: bytes, destino: Path, cifrado: bool = False) -> Path:
+    """Esconde no bit menos significativo de cada amostra de um WAV de 16 bits (um chiado que ninguém ouve)."""
+    import wave
+    with wave.open(str(origem)) as w:
+        parametros, quadros = w.getparams(), bytearray(w.readframes(w.getnframes()))
+    if parametros.sampwidth != 2:
+        raise LnuxError("Use um WAV de 16 bits (as outras extensões o LNUX converte antes com o ffmpeg).")
+    pacote = embalar(dados, cifrado)
+    if len(pacote) * 8 > len(quadros) // 2:
+        raise LnuxError(f"A mensagem não cabe: este áudio guarda até {len(quadros) // 16 - CABECALHO_ESCONDIDO} bytes.")
+    for k, bit in enumerate(_bits_dos_bytes(pacote)):
+        quadros[2 * k] = (quadros[2 * k] & 0xFE) | bit  # o byte baixo de cada amostra (little-endian)
+    with wave.open(str(destino), "wb") as w:
+        w.setparams(parametros)
+        w.writeframes(bytes(quadros))
+    return destino
+
+
+def audio_revelar(origem: Path) -> tuple:
+    import wave
+    with wave.open(str(origem)) as w:
+        if w.getsampwidth() != 2:
+            raise LnuxError("Este WAV não é de 16 bits: não foi o LNUX que escondeu algo nele.")
+        quadros = w.readframes(w.getnframes())
+
+    def ler(inicio: int, n_bytes: int) -> bytes:
+        if (inicio + n_bytes * 8) * 2 > len(quadros):
+            raise LnuxError("Não há mensagem escondida aqui (o tamanho anotado não cabe no áudio).")
+        return _bytes_dos_bits(quadros[2 * k] & 1 for k in range(inicio, inicio + n_bytes * 8))
+
+    cifrado, tamanho = _ler_cabecalho(ler(0, CABECALHO_ESCONDIDO))
+    return ler(CABECALHO_ESCONDIDO * 8, tamanho), cifrado
+
+
+# Texto invisível: caracteres de largura zero (o ZERO WIDTH SPACE é o 0, o ZERO WIDTH NON-JOINER é o 1),
+# entre duas marcas WORD JOINER, logo depois da primeira letra de um texto qualquer.
+INVISIVEL_0, INVISIVEL_1, INVISIVEL_MARCA = "​", "‌", "⁠"
+
+
+def invisivel_esconder(capa: str, dados: bytes, cifrado: bool = False) -> str:
+    oculto = INVISIVEL_MARCA + "".join(INVISIVEL_1 if b else INVISIVEL_0 for b in _bits_dos_bytes(embalar(dados, cifrado))) \
+        + INVISIVEL_MARCA
+    return capa[:1] + oculto + capa[1:]
+
+
+def invisivel_revelar(texto: str) -> tuple:
+    m = re.search(f"{INVISIVEL_MARCA}([{INVISIVEL_0}{INVISIVEL_1}]+){INVISIVEL_MARCA}", texto)
+    if not m:
+        raise LnuxError("Não achei texto invisível aqui (alguns apps apagam esses caracteres ao enviar).")
+    pacote = _bytes_dos_bits(1 if c == INVISIVEL_1 else 0 for c in m.group(1))
+    cifrado, tamanho = _ler_cabecalho(pacote[:CABECALHO_ESCONDIDO])
+    return pacote[CABECALHO_ESCONDIDO:CABECALHO_ESCONDIDO + tamanho], cifrado
+
+
+def tirar_invisiveis(texto: str) -> str:
+    return re.sub(f"[{INVISIVEL_0}{INVISIVEL_1}{INVISIVEL_MARCA}]", "", texto)
+
+
+# Arquivo dentro de uma imagem: o arquivo vai grudado no fim da foto, depois de onde ela termina. Os
+# visualizadores param de ler no fim da imagem, então a foto abre normal; o LNUX acha o anexo pelo rodapé.
+MAGICO_ANEXO = b"LNUXANEXO1"
+
+
+def anexar_arquivo(imagem: Path, arquivo: Path, destino: Path, senha: str | None = None) -> Path:
+    conteudo = arquivo.read_bytes()
+    if senha:
+        conteudo = aes_cifrar_bytes(conteudo, senha)
+    nome = arquivo.name.encode("utf-8")[:500]
+    rodape = MAGICO_ANEXO + bytes([1 if senha else 0]) + len(nome).to_bytes(2, "big") + nome + \
+        len(conteudo).to_bytes(8, "big")
+    destino.write_bytes(imagem.read_bytes() + conteudo + rodape + len(rodape).to_bytes(2, "big"))
+    return destino
+
+
+def extrair_anexo(imagem: Path) -> tuple:
+    """(nome do arquivo, conteúdo, cifrado?) do que anexar_arquivo grudou na imagem."""
+    dados = imagem.read_bytes()
+    if len(dados) < 2:
+        raise LnuxError("Arquivo vazio.")
+    tamanho_rodape = int.from_bytes(dados[-2:], "big")
+    rodape = dados[-2 - tamanho_rodape:-2]
+    if not rodape.startswith(MAGICO_ANEXO):
+        raise LnuxError("Esta imagem não tem um arquivo escondido pelo LNUX.")
+    p = len(MAGICO_ANEXO)
+    cifrado, n_nome = rodape[p] == 1, int.from_bytes(rodape[p + 1:p + 3], "big")
+    nome = rodape[p + 3:p + 3 + n_nome].decode("utf-8", errors="replace")
+    tamanho = int.from_bytes(rodape[p + 3 + n_nome:p + 11 + n_nome], "big")
+    fim = len(dados) - 2 - tamanho_rodape
+    return nome, dados[fim - tamanho:fim], cifrado
+
+
+# ── alfabetos próprios ───────────────────────────────────────────────
+
+ALFABETOS_FILE = DATA_DIR / "alfabetos.json"
+CARACTERES_DO_ALFABETO = list(LETRAS) + list("0123456789")
+PREFIXO_ALFABETO = "lnux-alfabeto:"
+# conjuntos para gerar um alfabeto de uma vez (só caracteres de um código cada, para não confundir na volta)
+CONJUNTOS_DE_SIMBOLOS = {
+    "Emojis": "🍎🍌🍒🍇🍉🍓🍑🍍🥝🥥🥑🍆🥕🌽🥒🥦🍄🥜🌰🍞🧀🍗🍔🍟🍕🌭🌮🍿🍩🍪🎂🍫🍬🍭🍯🥐",
+    "Runas (Futhark antigo)": "ᚠᚢᚦᚨᚱᚲᚷᚹᚺᚾᛁᛃᛇᛈᛉᛊᛏᛒᛖᛗᛚᛜᛞᛟᚪᚫᚣᛡᛠᛣᚸᛢᛥᛦᛧᛨ",
+    "Grego e copta": "αβγδεζηθικλμνξοπρστυφχψωϐϑϒϕϖϗϘϙϚϛϜϝ",
+    "Símbolos": "★☆✦✧✪✫✬✭✮✯✰♠♣♥♦♤♧♡♢☀☁☂☃☄☾☽♪♫♬⚑⚐✿❀❁❃❋",
+    "Setas": "←↑→↓↔↕↖↗↘↙↚↛↜↝↞↟↠↡↢↣↤↥↦↧↨↩↪↫↬↭↮↯↰↱↲↳",
+}
+
+
+def validar_alfabeto(mapa: dict) -> None:
+    """Um alfabeto precisa poder ser lido de volta: símbolos não vazios, sem espaço, sem repetir e sem que um
+    seja o começo de outro (senão 'ab' poderia ser lido como 'a' + 'b')."""
+    simbolos = [s for s in mapa.values() if s]
+    if not simbolos:
+        raise LnuxError("O alfabeto não tem nenhum símbolo.")
+    if any(re.search(r"\s", s) for s in simbolos):
+        raise LnuxError("Os símbolos não podem ter espaço.")
+    repetidos = sorted({s for s in simbolos if simbolos.count(s) > 1})
+    if repetidos:
+        raise LnuxError(f"Símbolo repetido em mais de uma letra: {' '.join(repetidos)}")
+    for a in simbolos:
+        for b in simbolos:
+            if a != b and b.startswith(a):
+                raise LnuxError(f"'{a}' é o começo de '{b}': na hora de ler, não daria para saber qual é.")
+    soltos = [s for s in simbolos if len(s) == 1 and s.isascii() and s not in mapa and s.isalnum()]
+    if soltos:
+        raise LnuxError(f"Estes símbolos são letras ou números que o alfabeto não troca: {' '.join(soltos)}")
+
+
+def alfabeto_gerado(simbolos: str, embaralhar: bool = False) -> dict:
+    """Letras e números (nessa ordem) recebendo os símbolos do conjunto; os que sobrarem ficam iguais."""
+    lista = list(dict.fromkeys(simbolos))
+    if embaralhar:
+        secrets.SystemRandom().shuffle(lista)
+    return dict(zip(CARACTERES_DO_ALFABETO, lista))
+
+
+def alfabeto_codificar(texto: str, mapa: dict) -> str:
+    saida = []
+    for c in texto:
+        chave = c.lower() if c.lower() in mapa else sem_acento(c.lower())
+        saida.append(mapa.get(chave, c))
+    return "".join(saida)
+
+
+def alfabeto_decodificar(texto: str, mapa: dict) -> str:
+    inverso = {v: k for k, v in mapa.items() if v}
+    simbolos = sorted(inverso, key=len, reverse=True)  # o mais longo primeiro
+    saida, i = [], 0
+    while i < len(texto):
+        for s in simbolos:
+            if texto.startswith(s, i):
+                saida.append(inverso[s])
+                i += len(s)
+                break
+        else:
+            saida.append(texto[i])
+            i += 1
+    return "".join(saida)
+
+
+def alfabeto_para_texto(nome: str, mapa: dict) -> str:
+    """O alfabeto num texto só, para mandar a quem vai ler as mensagens."""
+    dados = json.dumps({"nome": nome, "mapa": mapa}, ensure_ascii=False, separators=(",", ":"))
+    return PREFIXO_ALFABETO + base64.urlsafe_b64encode(dados.encode("utf-8")).decode()
+
+
+def alfabeto_de_texto(texto: str) -> tuple:
+    limpo = re.sub(r"\s+", "", texto)
+    if not limpo.startswith(PREFIXO_ALFABETO):
+        raise LnuxError(f"Cole o texto inteiro, que começa com {PREFIXO_ALFABETO}")
+    try:
+        corpo = limpo[len(PREFIXO_ALFABETO):]
+        dados = json.loads(base64.urlsafe_b64decode(corpo + "=" * (-len(corpo) % 4)).decode("utf-8"))
+        nome, mapa = str(dados["nome"]), {str(k): str(v) for k, v in dados["mapa"].items()}
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise LnuxError("Esse texto de alfabeto está incompleto ou foi alterado.") from None
+    validar_alfabeto(mapa)
+    return nome, mapa
+
+
+def alfabetos() -> dict:
+    return ler_json(ALFABETOS_FILE, {})
+
+
+# ── telas ────────────────────────────────────────────────────────────
+
+def _texto_de_entrada(msg: str = "Mensagem") -> str:
+    """Uma linha digitada; com Enter vazio, várias linhas, o que está copiado ou um arquivo de texto."""
+    texto = perguntar(f"{msg} (Enter vazio: várias linhas, colar ou arquivo)")
+    if texto:
+        return texto
+    i = escolher("De onde vem o texto?", ["📝 Digitar várias linhas", "📋 Colar o que está copiado",
+                                         "📄 Ler de um arquivo de texto"])
+    if i == 0:
+        texto = ler_linhas(msg)
+    elif i == 1:
+        texto = _tapi(["termux-clipboard-get"], 10, json_saida=False)
+    elif i == 2:
+        arq = escolher_arquivo("Qual arquivo?", (".txt", ".md", ".csv", ".json", ".html"))
+        texto = arq.read_text("utf-8", errors="replace") if arq else ""
+    if not texto:
+        raise LnuxError("Nenhum texto.")
+    return texto
+
+
+def _senha(confirmar_digitando: bool = False, opcional: bool = False) -> str:
+    """Pede a senha sem mostrar na tela (duas vezes ao cifrar, para não errar)."""
+    rotulo = "Senha (Enter vazio = sem senha)" if opcional else "Senha"
+    senha = getpass.getpass(f"{rotulo}: ")
+    if not senha:
+        if opcional:
+            return ""
+        raise LnuxError("A senha não pode ficar vazia.")
+    if confirmar_digitando and getpass.getpass("Repita a senha: ") != senha:
+        raise LnuxError("As senhas não são iguais.")
+    if confirmar_digitando and len(senha) < 8:
+        aviso("Senha curta: com menos de 8 caracteres, quem tiver a mensagem pode adivinhar.")
+    return senha
+
+
+def _mostrar_resultado(texto: str, nome: str = "mensagem") -> None:
+    """Mostra o resultado e oferece copiar, salvar num arquivo ou mostrar como QR code."""
+    print(f"\n{NEG}Resultado:{RST}\n{VERD}{texto}{RST}\n{DIM}{len(texto)} caracteres{RST}")
+    while True:
+        i = escolher("E agora?", ["📋 Copiar", "💾 Salvar num arquivo (.txt)", "🔳 Mostrar como QR code", "✔ Pronto"])
+        if i == 0:
+            copiar_texto(texto)
+        elif i == 1:
+            destino = pasta_saida(PASTA_SECRETAS) / f"{_slug(nome)}-{datetime.now():%Y%m%d-%H%M%S}.txt"
+            destino.write_text(texto + "\n", "utf-8")
+            ok(f"Salvo: {destino}")
+        elif i == 2:
+            if len(texto.encode("utf-8")) > 2000:
+                aviso("Grande demais para um QR code (até uns 2000 caracteres). Salve num arquivo.")
+            else:
+                mostrar_qr(texto, _slug(nome))
+        else:
+            return
+
+
+def _texto_revelado(dados: bytes, cifrado: bool) -> str:
+    """O texto que saiu de um esconderijo, decifrando com a senha se ele foi escondido com uma."""
+    if cifrado:
+        info("Esta mensagem foi escondida com senha.")
+        dados = aes_decifrar_bytes(dados, _senha())
+    try:
+        return dados.decode("utf-8")
+    except UnicodeDecodeError:
+        raise LnuxError("O que estava escondido não é um texto.") from None
+
+
+def _bytes_para_esconder() -> tuple:
+    """(bytes, cifrado?) da mensagem a esconder, cifrada com AES se a pessoa der uma senha."""
+    texto = _texto_de_entrada("Mensagem a esconder")
+    senha = _senha(confirmar_digitando=False, opcional=True)
+    if senha:
+        return aes_cifrar_bytes(texto.encode("utf-8"), senha), True
+    return texto.encode("utf-8"), False
+
+
+def _explicar_tecnica(nome: str, explicacao: str) -> None:
+    titulo(nome)
+    for paragrafo in explicacao.split("\n"):
+        print(textwrap.fill(paragrafo, min(largura_tela(), 90) - 2, initial_indent="  ", subsequent_indent="  "))
+        print()
+
+
+def ferramenta(nome: str, explicacao: str, codificar, decodificar, extras: tuple = (),
+               rotulos: tuple = ("🔒 Codificar", "🔓 Decodificar")):
+    """Submenu padrão de uma técnica: como funciona, codificar e decodificar (e extras, como quebrar o César).
+    O verificador de menus (tests/verificar_menus.py) lê ferramenta(...) como um submenu."""
+    resumo = explicacao.split("\n")[0]
+    return grupo(nome, [("ℹ️ Como funciona", lambda: _explicar_tecnica(nome, explicacao)),
+                        (rotulos[0], codificar), (rotulos[1], decodificar), *extras],
+                 cabecalho=lambda: print(f"{DIM}{textwrap.shorten(resumo, 160)}{RST}"))
+
+
+def _cifra_de_texto(funcao, pedir=None, nome: str = "mensagem"):
+    """Ação de menu: pede o texto (e a chave, se `pedir`), aplica `funcao(texto[, chave])` e mostra."""
+    def acao():
+        texto = _texto_de_entrada()
+        resultado = funcao(texto, pedir()) if pedir else funcao(texto)
+        _mostrar_resultado(resultado, nome)
+    return acao
+
+
+def _tirar_acentos_se_quiser(texto: str) -> str:
+    """As cifras clássicas só mexem em a–z: oferece tirar os acentos (ç→c, ã→a) para essas letras também mudarem."""
+    if sem_acento(texto) != texto and confirmar("O texto tem acentos, que estas cifras não mudam. Tirar os "
+                                               "acentos (ç→c, ã→a) antes?", True):
+        return sem_acento(texto)
+    return texto
+
+
+def _classica(funcao, pedir=None, nome: str = "mensagem"):
+    """Como _cifra_de_texto, oferecendo tirar os acentos antes de cifrar."""
+    def acao():
+        texto = _tirar_acentos_se_quiser(_texto_de_entrada())
+        _mostrar_resultado(funcao(texto, pedir()) if pedir else funcao(texto), nome)
+    return acao
+
+
+@submenu
+def menu_cifras_classicas():
+    pedir_deslocamento = lambda: perguntar_int("Deslocamento (quantas casas)", 3, -25, 25)  # noqa: E731
+    pedir_chave = lambda: perguntar("Palavra-chave").strip() or "lnux"  # noqa: E731
+    pedir_trilhos = lambda: perguntar_int("Quantos trilhos (linhas)", 3, 2, 20)  # noqa: E731
+
+    def quebrar_cesar():
+        texto = _texto_de_entrada("Mensagem cifrada com César")
+        print(f"\n{NEG}Os deslocamentos que mais parecem português:{RST}")
+        tentativas = cesar_quebrar(texto)
+        for k, decifrado in tentativas:
+            print(f"  {CIANO}{k:>2}{RST}  {textwrap.shorten(decifrado, max(20, largura_tela() - 8))}")
+        i = escolher("Qual ficou certo?", [f"Deslocamento {k}" for k, _ in tentativas])
+        if i is not None:
+            _mostrar_resultado(tentativas[i][1], "cesar-decifrado")
+
+    menu("📜 Cifras clássicas", [
+        ("🏛️ César (cada letra anda N casas)", ferramenta(
+            "🏛️ Cifra de César",
+            "Cada letra anda um número fixo de casas no alfabeto: com 3, a vira d, b vira e e z volta para c. "
+            "Júlio César usava assim nas cartas.\nÉ fácil de quebrar: só existem 25 deslocamentos possíveis. "
+            "A opção 'Descobrir sem a chave' testa todos e mostra os que mais parecem português.",
+            _classica(lambda t, k: cifra_cesar(t, k), pedir_deslocamento, "cesar"),
+            _classica(lambda t, k: cifra_cesar(t, -k), pedir_deslocamento, "cesar"),
+            extras=(("🔎 Descobrir sem a chave (testa os 25 deslocamentos)", quebrar_cesar),))),
+        ("🔄 ROT13 (César de 13 casas)", ferramenta(
+            "🔄 ROT13",
+            "Um César de 13 casas. Como o alfabeto tem 26 letras, aplicar duas vezes volta ao original: codificar "
+            "e decodificar são a mesma coisa.\nÉ usado para esconder spoilers e respostas de charadas, não para "
+            "proteger segredos.",
+            _classica(lambda t: cifra_cesar(t, 13)), _classica(lambda t: cifra_cesar(t, 13)))),
+        ("🔁 ROT47 (letras, números e símbolos)", ferramenta(
+            "🔁 ROT47",
+            "Como o ROT13, mas gira os 94 caracteres visíveis do teclado (letras, números e símbolos) em 47 casas. "
+            "Aplicar de novo desfaz.",
+            _cifra_de_texto(rot47), _cifra_de_texto(rot47))),
+        ("🔃 Atbash (alfabeto ao contrário)", ferramenta(
+            "🔃 Atbash",
+            "Troca cada letra pela do lado oposto do alfabeto: a↔z, b↔y, c↔x. Vem do hebraico antigo. Aplicar de "
+            "novo desfaz.",
+            _classica(atbash), _classica(atbash))),
+        ("🗝️ Vigenère (César com palavra-chave)", ferramenta(
+            "🗝️ Cifra de Vigenère",
+            "Um César diferente para cada letra, dado pela palavra-chave repetida: com a chave 'sol', a 1ª letra anda "
+            "18 casas (s), a 2ª anda 14 (o), a 3ª anda 11 (l), e começa de novo.\nResistiu por três séculos e ficou "
+            "conhecida como 'a cifra indecifrável'. Hoje é quebrada com estatística quando a mensagem é longa.",
+            _classica(lambda t, k: cifra_vigenere(t, k), pedir_chave, "vigenere"),
+            _classica(lambda t, k: cifra_vigenere(t, k, decifrar=True), pedir_chave, "vigenere"))),
+        ("🔀 Substituição com palavra-chave", ferramenta(
+            "🔀 Substituição com palavra-chave",
+            "Monta um alfabeto novo começando pelas letras da palavra-chave (sem repetir) e seguindo com as que "
+            "faltam; cada letra da mensagem vira a letra da mesma posição nesse alfabeto. Com a chave 'lnux': "
+            "a→l, b→n, c→u, d→x, e→a...",
+            _classica(lambda t, k: cifra_substituicao(t, k), pedir_chave, "substituicao"),
+            _classica(lambda t, k: cifra_substituicao(t, k, decifrar=True), pedir_chave, "substituicao"))),
+        ("🚧 Cerca de trilhos (zigue-zague)", ferramenta(
+            "🚧 Cerca de trilhos",
+            "Escreve a mensagem em zigue-zague em algumas linhas (os trilhos) e lê uma linha depois da outra. As "
+            "letras não mudam, só a ordem: é uma cifra de transposição. Para decodificar, use o mesmo número de "
+            "trilhos.",
+            _cifra_de_texto(cerca_codificar, pedir_trilhos, "cerca"),
+            _cifra_de_texto(cerca_decodificar, pedir_trilhos, "cerca"))),
+        ("🔲 Quadrado de Políbio (letras viram números)", ferramenta(
+            "🔲 Quadrado de Políbio",
+            "As letras ficam numa grade 5x5 e cada uma vira o número da linha e da coluna: a=11, b=12, f=21... "
+            "O i e o j dividem a mesma casa (ao decodificar, o j volta como i). Dava para mandar com tochas ou "
+            "batidas.",
+            _cifra_de_texto(polibio_codificar), _cifra_de_texto(polibio_decodificar))),
+        ("🥓 Cifra de Bacon (A e B)", ferramenta(
+            "🥓 Cifra de Bacon",
+            "Cada letra vira um grupo de 5 sinais de dois tipos, A e B (a=AAAAA, b=AAAAB...). Francis Bacon criou "
+            "para esconder mensagens em textos comuns, usando dois tipos de letra no lugar do A e do B.",
+            _cifra_de_texto(bacon_codificar), _cifra_de_texto(bacon_decodificar))),
+        ("🔢 A1Z26 (a=1, b=2... z=26)", ferramenta(
+            "🔢 A1Z26",
+            "Cada letra vira a posição dela no alfabeto: a=1, b=2, z=26. Hífen entre as letras e espaço entre as "
+            "palavras. Muito usada em caças ao tesouro e em jogos.",
+            _cifra_de_texto(a1z26_codificar), _cifra_de_texto(a1z26_decodificar))),
+    ], cabecalho=lambda: print(f"{DIM}Cifras antigas: boas para brincar e aprender. Para um segredo de verdade, use "
+                               f"🔒 Criptografia moderna.{RST}"))
+
+
+@submenu
+def menu_codigos():
+    def som_morse():
+        texto = _texto_de_entrada("Mensagem")
+        codigo = morse_codificar(texto) if re.search(r"[a-zA-Z0-9]", texto) else texto
+        destino = morse_som(codigo, pasta_saida(PASTA_SECRETAS) / f"morse-{datetime.now():%Y%m%d-%H%M%S}.wav")
+        ok(f"Som do Morse salvo: {destino}")
+        if confirmar("Ouvir agora?", True):
+            abrir_arquivo(destino)
+
+    menu("📡 Códigos: Morse, Braille, Base64...", [
+        ("📡 Código Morse", ferramenta(
+            "📡 Código Morse",
+            "Cada letra vira uma sequência de pontos (curtos) e traços (longos), feita para o telégrafo: dá para "
+            "mandar com som, luz ou batidas. Espaço entre as letras e ' / ' entre as palavras.\nNão é segredo: o "
+            "código é público. A opção do som grava um .wav com os bipes.",
+            _cifra_de_texto(morse_codificar, nome="morse"), _cifra_de_texto(morse_decodificar, nome="morse"),
+            extras=(("🔊 Gerar o som (bipes em .wav)", som_morse),))),
+        ("⠿ Braille", ferramenta(
+            "⠿ Braille",
+            "A escrita das pessoas cegas: cada letra é uma cela com até 6 pontos em relevo. Aqui, com os acentos do "
+            "português; os números levam o sinal ⠼ antes e as maiúsculas, o ⠨. Não é segredo: o código é público.",
+            _cifra_de_texto(braille_codificar, nome="braille"), _cifra_de_texto(braille_decodificar, nome="braille"))),
+        ("🧬 Base64", ferramenta(
+            "🧬 Base64",
+            "Escreve qualquer texto (ou arquivo) só com letras, números, + e /. É usado para mandar dados por e-mail e "
+            "na web. Não protege nada: qualquer um decodifica. Serve para 'disfarçar' ou para passar o texto por "
+            "lugares que estragariam acentos e símbolos.",
+            _cifra_de_texto(base64_codificar, nome="base64"), _cifra_de_texto(base64_decodificar, nome="base64"))),
+        ("🧬 Base32", ferramenta(
+            "🧬 Base32",
+            "Como o Base64, mas só com letras maiúsculas e os números 2 a 7: não confunde 0 com O nem 1 com l, bom para "
+            "ditar ou digitar. É o formato das chaves dos apps autenticadores.",
+            _cifra_de_texto(base32_codificar, nome="base32"), _cifra_de_texto(base32_decodificar, nome="base32"))),
+    ])
+
+
+@submenu
+def menu_sistemas_numericos():
+    def mostrar_em_todas(valor: int, extra: int | None = None) -> None:
+        print()
+        for nome, b in BASES.items():
+            print(f"  {CIANO}{nome:<12}{RST} {numero_na_base(valor, b)}")
+        if extra and extra not in BASES.values():
+            print(f"  {CIANO}{'base ' + str(extra):<12}{RST} {numero_na_base(valor, extra)}")
+
+    def decimal_para_bases():
+        valor = ler_numero_na_base(perguntar("Número em decimal (ex.: 255)"), 10)
+        outra = perguntar_int("Mostrar também numa base de 2 a 36 (Enter = só as quatro)", 16, 2, 36)
+        mostrar_em_todas(valor, outra)
+
+    def base_para_decimal():
+        nomes = list(BASES) + ["outra base (2 a 36)"]
+        i = escolher("O número está em", nomes, "1")
+        if i is None:
+            return
+        base = BASES[nomes[i]] if i < len(BASES) else perguntar_int("Qual base", 36, 2, 36)
+        valor = ler_numero_na_base(perguntar(f"Número na base {base} (ex.: {numero_na_base(255, base)})"), base)
+        print(f"\n  {NEG}Em decimal: {valor}{RST}")
+        mostrar_em_todas(valor, base)
+
+    def texto_base(nome: str, base: int):
+        return ferramenta(
+            f"🔢 Texto ↔ {nome}",
+            f"O computador guarda cada letra como um número (pelo padrão UTF-8: 'A' é 65, 'a' é 97, letras com "
+            f"acento usam dois números). Aqui cada um desses números aparece em {nome}"
+            + {2: " (8 dígitos: 'A' = 01000001)", 8: " (3 dígitos: 'A' = 101)", 10: " ('A' = 65)",
+               16: " (2 dígitos: 'A' = 41)"}[base] + ".\nPara decodificar, os números podem vir separados por espaço"
+            + (" ou tudo junto." if base in (2, 16) else "."),
+            _cifra_de_texto(lambda t: texto_para_base(t, base), nome=f"texto-{nome}"),
+            _cifra_de_texto(lambda t: base_para_texto(t, base), nome=f"texto-{nome}"))
+
+    menu("🔢 Sistemas numéricos", [
+        ("🧮 Converter um número (binário, octal, decimal, hexadecimal...)", ferramenta(
+            "🧮 Converter um número",
+            "O mesmo número escrito em bases diferentes: em binário (base 2) só há 0 e 1; em octal, de 0 a 7; em "
+            "decimal, de 0 a 9; em hexadecimal, de 0 a 9 e de a a f (a=10... f=15). Ex.: 255 = 11111111 = 377 = ff.\n"
+            "Codificar: de um número decimal para as outras bases. Decodificar: de um número em qualquer base "
+            "(2 a 36) para o decimal.",
+            decimal_para_bases, base_para_decimal, rotulos=("🔒 Codificar: decimal → binário, octal, hexa...",
+                                                            "🔓 Decodificar: binário, octal, hexa... → decimal"))),
+        *[(f"🔤 Texto ↔ {nome}", texto_base(nome, b)) for nome, b in BASES.items()],
+    ])
+
+
+@submenu
+def menu_criptografia():
+    def cifrar_texto():
+        texto = _texto_de_entrada("Mensagem")
+        _mostrar_resultado(aes_cifrar_texto(texto, _senha(confirmar_digitando=True)), "aes")
+
+    def decifrar_texto():
+        texto = _texto_de_entrada("Mensagem cifrada (começa com LNUX-AES1:)")
+        _mostrar_resultado(aes_decifrar_texto(texto, _senha()), "aes-decifrado")
+
+    def cifrar_arquivo():
+        arq = escolher_arquivo("Qual arquivo cifrar?")
+        if arq:
+            destino = aes_cifrar_arquivo(arq, _senha(confirmar_digitando=True))
+            ok(f"Cifrado: {destino}")
+            if confirmar(f"Apagar o original ({arq.name})? Só faça isso se tiver certeza de que não vai esquecer a "
+                         "senha.", False):
+                arq.unlink()
+                ok("Original apagado.")
+
+    def decifrar_arquivo():
+        arq = escolher_arquivo("Qual arquivo decifrar?", (".lnuxcripto",))
+        if arq:
+            ok(f"Decifrado: {aes_decifrar_arquivo(arq, _senha())}")
+
+    def openssl_codificar():
+        texto = _texto_de_entrada("Mensagem")
+        _mostrar_resultado(openssl_cifrar(texto, _senha(confirmar_digitando=True)), "openssl")
+        info("Para abrir em outro computador: echo 'TEXTO' | openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -a -A")
+
+    def openssl_decodificar():
+        texto = _texto_de_entrada("Mensagem do openssl (Base64)")
+        _mostrar_resultado(openssl_decifrar(texto, _senha()), "openssl-decifrado")
+
+    def vernam_codificar():
+        cifrado, chave = vernam_cifrar(_texto_de_entrada("Mensagem"))
+        print(f"\n{NEG}Chave (mande por OUTRO caminho e use uma vez só):{RST}\n{AMAR}{chave}{RST}")
+        if confirmar("Copiar a chave agora?", False):
+            copiar_texto(chave)
+        _mostrar_resultado(cifrado, "vernam")
+
+    def vernam_decodificar():
+        cifrado = _texto_de_entrada("Mensagem cifrada (Base64)")
+        chave = _texto_de_entrada("Chave (Base64)")
+        _mostrar_resultado(vernam_decifrar(cifrado, chave), "vernam-decifrado")
+
+    menu("🔒 Criptografia moderna (com senha)", [
+        ("🔒 AES-256 com senha (texto)", ferramenta(
+            "🔒 AES-256 com senha",
+            "O AES é a cifra usada por bancos, governos e pelo WhatsApp. Aqui no modo GCM, que também acusa se alguém "
+            "mexeu na mensagem. A chave de 256 bits sai da sua senha pelo scrypt, que é lento de propósito para "
+            "atrapalhar quem tenta adivinhar.\nA segurança está na senha: use uma longa (uma frase, por exemplo) e "
+            "combine com a pessoa por outro caminho. Sem a senha, nem o LNUX abre.",
+            cifrar_texto, decifrar_texto, rotulos=("🔒 Cifrar (codificar)", "🔓 Decifrar (decodificar)"))),
+        ("📁 AES-256 com senha (arquivo: foto, PDF, qualquer um)", ferramenta(
+            "📁 AES-256 para arquivos",
+            "O mesmo AES-256-GCM, para um arquivo inteiro: gera um .lnuxcripto ao lado do original. Para abrir, "
+            "'Decifrar' e a mesma senha.",
+            cifrar_arquivo, decifrar_arquivo, rotulos=("🔒 Cifrar um arquivo", "🔓 Decifrar um arquivo"))),
+        ("🧰 Compatível com o OpenSSL (abre em qualquer computador)", ferramenta(
+            "🧰 Compatível com o OpenSSL",
+            "AES-256-CBC com PBKDF2 (600 mil rodadas), no formato do comando openssl, que existe em quase todo Linux, "
+            "Mac e no Git do Windows: quem recebe abre sem o LNUX, com "
+            "'openssl enc -d -aes-256-cbc -pbkdf2 -iter 600000 -a -A'.",
+            openssl_codificar, openssl_decodificar, rotulos=("🔒 Cifrar (codificar)", "🔓 Decifrar (decodificar)"))),
+        ("🎲 Bloco de uso único (cifra de Vernam)", ferramenta(
+            "🎲 Bloco de uso único (Vernam)",
+            "Cada byte da mensagem é misturado (XOR) com um byte aleatório da chave, que é do mesmo tamanho da "
+            "mensagem. É a única cifra comprovadamente impossível de quebrar, se a chave for aleatória, só a pessoa "
+            "tiver uma cópia e ela for usada UMA vez só.\nA dificuldade é entregar a chave: ela é tão grande quanto a "
+            "mensagem e precisa ir por outro caminho.",
+            vernam_codificar, vernam_decodificar, rotulos=("🔒 Cifrar (gera a chave)", "🔓 Decifrar (com a chave)"))),
+    ])
+
+
+@submenu
+def menu_esteganografia():
+    def salvar_como(origem: Path, sufixo: str, extensao: str) -> Path:
+        """Ao lado do original (ou em Download/LNUX/Mensagens secretas), sem sobrescrever nada."""
+        pasta = origem.parent if os.access(origem.parent, os.W_OK) else pasta_saida(PASTA_SECRETAS)
+        destino, n = pasta / f"{origem.stem}{sufixo}{extensao}", 2
+        while destino.exists():
+            destino, n = pasta / f"{origem.stem}{sufixo} ({n}){extensao}", n + 1
+        return destino
+
+    def imagem_esconder_tela():
+        arq = escolher_arquivo("Em qual foto esconder?", EXT_IMAGEM)
+        if not arq:
+            return
+        dados, cifrado = _bytes_para_esconder()
+        destino = imagem_esconder(arq, dados, salvar_como(arq, "_secreta", ".png"), cifrado)
+        ok(f"Pronto: {destino}")
+        aviso("Mande como ARQUIVO (documento): enviada como foto, o WhatsApp e outros apps recomprimem a imagem e "
+              "a mensagem some.")
+
+    def imagem_revelar_tela():
+        arq = escolher_arquivo("Qual foto?", (".png", ".bmp", ".tif", ".tiff", ".webp"))
+        if arq:
+            _mostrar_resultado(_texto_revelado(*imagem_revelar(arq)), "revelado")
+
+    def invisivel_esconder_tela():
+        capa = perguntar("Texto que todo mundo vai ver (ex.: 'Bom dia!')", "Bom dia!")
+        dados, cifrado = _bytes_para_esconder()
+        _mostrar_resultado(invisivel_esconder(capa, dados, cifrado), "texto-com-segredo")
+        info("Copie e mande: a mensagem vai junto, invisível. Alguns apps apagam esses caracteres; teste antes.")
+
+    def invisivel_revelar_tela():
+        texto = _texto_de_entrada("Texto recebido (cole com Enter vazio → 'Colar o que está copiado')")
+        _mostrar_resultado(_texto_revelado(*invisivel_revelar(texto)), "revelado")
+        if confirmar("Ver também o texto sem os caracteres invisíveis?", False):
+            print(tirar_invisiveis(texto))
+
+    def wav_de(arq: Path) -> Path:
+        """O áudio em WAV de 16 bits (converte com o ffmpeg o que não for)."""
+        if arq.suffix.lower() == ".wav":
+            return arq
+        if not garantir_cmd("ffmpeg"):
+            raise LnuxError("Para usar um áudio que não é WAV, precisa do ffmpeg.")
+        destino = Path(tempfile.mkdtemp(prefix="lnux_audio_")) / (arq.stem + ".wav")
+        rodar(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(arq), "-acodec", "pcm_s16le",
+               str(destino)], check=True, capturar=True)
+        return destino
+
+    def audio_esconder_tela():
+        arq = escolher_arquivo("Em qual áudio esconder? (WAV, MP3, OGG, M4A...)", EXT_AUDIO + (".wav",))
+        if not arq:
+            return
+        dados, cifrado = _bytes_para_esconder()
+        destino = audio_esconder(wav_de(arq), dados, salvar_como(arq, "_secreto", ".wav"), cifrado)
+        ok(f"Pronto: {destino}")
+        aviso("Mande o .wav como ARQUIVO: converter para MP3 ou mandar como áudio do WhatsApp apaga a mensagem.")
+
+    def audio_revelar_tela():
+        arq = escolher_arquivo("Qual áudio (.wav)?", (".wav",))
+        if arq:
+            _mostrar_resultado(_texto_revelado(*audio_revelar(arq)), "revelado")
+
+    def anexo_esconder_tela():
+        foto = escolher_arquivo("Qual foto vai por fora?", EXT_IMAGEM)
+        if not foto:
+            return
+        arq = escolher_arquivo("Qual arquivo esconder dentro dela?")
+        if not arq:
+            return
+        senha = _senha(opcional=True)
+        destino = anexar_arquivo(foto, arq, salvar_como(foto, "_com_anexo", foto.suffix), senha or None)
+        ok(f"Pronto: {destino} ({bytes_humanos(destino.stat().st_size)}). Abre como uma foto normal.")
+        aviso("Mande como ARQUIVO (documento): enviada como foto, o app recomprime e o anexo se perde.")
+
+    def anexo_revelar_tela():
+        foto = escolher_arquivo("Qual foto?", EXT_IMAGEM)
+        if not foto:
+            return
+        nome, conteudo, cifrado = extrair_anexo(foto)
+        if cifrado:
+            info("O arquivo foi escondido com senha.")
+            conteudo = aes_decifrar_bytes(conteudo, _senha())
+        destino = pasta_saida(PASTA_SECRETAS) / Path(nome).name
+        if destino.exists():
+            destino = destino.with_name(f"{destino.stem} ({datetime.now():%H%M%S}){destino.suffix}")
+        destino.write_bytes(conteudo)
+        ok(f"Arquivo escondido: {destino} ({bytes_humanos(len(conteudo))})")
+
+    senha_opcional = ("\nSe você der uma senha ao esconder, a mensagem é cifrada com AES-256 antes: mesmo quem "
+                      "souber onde procurar não consegue ler sem a senha.")
+    menu("🖼️ Esteganografia: esconder a mensagem", [
+        ("🖼️ Texto dentro de uma foto (PNG)", ferramenta(
+            "🖼️ Texto dentro de uma foto",
+            "Cada pixel tem três números de cor (vermelho, verde e azul) de 0 a 255. O LNUX troca só o último bit de "
+            "cada um (um 200 vira 201, por exemplo): a diferença é invisível, e esses bits guardam a mensagem. Uma "
+            "foto de celular guarda milhões de caracteres.\nO resultado sai em PNG, porque o JPEG apagaria esses bits. "
+            "Mande como arquivo, não como foto." + senha_opcional,
+            imagem_esconder_tela, imagem_revelar_tela, rotulos=("🔒 Esconder (codificar)", "🔓 Revelar (decodificar)"))),
+        ("👻 Texto invisível dentro de outro texto", ferramenta(
+            "👻 Texto invisível",
+            "O Unicode tem caracteres de largura zero, que não aparecem na tela. O LNUX escreve a mensagem em binário "
+            "com dois deles (um é o 0, o outro é o 1) e põe tudo depois da primeira letra de um texto qualquer, como "
+            "'Bom dia!'. Quem lê vê só o 'Bom dia!'.\nFunciona em mensagens, e-mails e redes sociais, mas alguns apps "
+            "apagam esses caracteres: teste antes." + senha_opcional,
+            invisivel_esconder_tela, invisivel_revelar_tela,
+            rotulos=("🔒 Esconder (codificar)", "🔓 Revelar (decodificar)"))),
+        ("🎵 Texto dentro de um áudio (WAV)", ferramenta(
+            "🎵 Texto dentro de um áudio",
+            "Um áudio WAV é uma lista de números (amostras), milhares por segundo. O LNUX troca o último bit de cada "
+            "uma: vira um chiado baixíssimo, que ninguém ouve, e guarda a mensagem. Qualquer áudio serve (MP3, OGG...): "
+            "ele é convertido para WAV antes.\nO resultado precisa continuar WAV: converter para MP3 apaga a "
+            "mensagem." + senha_opcional,
+            audio_esconder_tela, audio_revelar_tela, rotulos=("🔒 Esconder (codificar)", "🔓 Revelar (decodificar)"))),
+        ("📎 Arquivo escondido dentro de uma foto", ferramenta(
+            "📎 Arquivo dentro de uma foto",
+            "O arquivo (um PDF, um ZIP, outro vídeo...) vai grudado no fim da foto, depois de onde ela termina. Os "
+            "visualizadores param de ler no fim da imagem, então a foto abre normal; o LNUX acha o anexo pelo "
+            "rodapé que deixa no fim. Cabe um arquivo de qualquer tamanho, mas a foto fica maior." + senha_opcional,
+            anexo_esconder_tela, anexo_revelar_tela, rotulos=("🔒 Esconder (codificar)", "🔓 Revelar (decodificar)"))),
+    ], cabecalho=lambda: print(f"{DIM}Esconder: a mensagem vai dentro de outra coisa e ninguém percebe que ela "
+                               f"existe.{RST}"))
+
+
+@submenu
+def menu_alfabetos():
+    def escolher_alfabeto(msg: str = "Qual alfabeto?") -> tuple:
+        todos = alfabetos()
+        if not todos:
+            raise LnuxError("Nenhum alfabeto ainda: crie um em '➕ Criar um alfabeto'.")
+        nomes = list(todos)
+        i = escolher(msg, [f"{n}  {DIM}{''.join(list(todos[n].values())[:8])}…{RST}" for n in nomes])
+        if i is None:
+            raise LnuxError("Cancelado.")
+        return nomes[i], todos[nomes[i]]
+
+    def guardar(nome: str, mapa: dict) -> None:
+        validar_alfabeto(mapa)
+        todos = alfabetos()
+        if nome in todos and not confirmar(f"Já existe um alfabeto '{nome}'. Trocar?", False):
+            raise LnuxError("Nada mudou.")
+        todos[nome] = mapa
+        gravar_json(ALFABETOS_FILE, todos)
+        ok(f"Alfabeto '{nome}' guardado: {len(mapa)} símbolos.")
+        print("  " + "  ".join(f"{c}={s}" for c, s in list(mapa.items())[:12]) + ("  …" if len(mapa) > 12 else ""))
+
+    def criar():
+        i = escolher("Como criar?", ["✨ Gerar de um conjunto (emojis, runas, grego, símbolos, setas)",
+                                    "✍️ Escolher um símbolo para cada letra e número"])
+        if i is None:
+            return
+        nome = perguntar("Nome do alfabeto", "meu alfabeto").strip() or "meu alfabeto"
+        if i == 0:
+            conjuntos = list(CONJUNTOS_DE_SIMBOLOS)
+            j = escolher("Qual conjunto?", [f"{n}  {CONJUNTOS_DE_SIMBOLOS[n][:12]}" for n in conjuntos])
+            if j is None:
+                return
+            embaralhar = confirmar("Embaralhar? (cada letra pega um símbolo aleatório: só quem tiver o seu "
+                                   "alfabeto lê)", True)
+            mapa = alfabeto_gerado(CONJUNTOS_DE_SIMBOLOS[conjuntos[j]], embaralhar)
+        else:
+            info("Digite o símbolo de cada letra e número (emoji, desenho, letra de outro alfabeto, uma palavra...). "
+                 "Enter vazio deixa o caractere como está.")
+            mapa = {}
+            for c in CARACTERES_DO_ALFABETO:
+                simbolo = perguntar(f"  {c} →").strip()
+                if simbolo:
+                    mapa[c] = simbolo
+        guardar(nome, mapa)
+
+    def codificar():
+        nome, mapa = escolher_alfabeto()
+        _mostrar_resultado(alfabeto_codificar(_texto_de_entrada(), mapa), f"alfabeto-{nome}")
+
+    def decodificar():
+        nome, mapa = escolher_alfabeto()
+        _mostrar_resultado(alfabeto_decodificar(_texto_de_entrada("Mensagem no alfabeto"), mapa), "decodificado")
+
+    def ver():
+        nome, mapa = escolher_alfabeto()
+        titulo(f"🔣 {nome}")
+        for i in range(0, len(CARACTERES_DO_ALFABETO), 9):
+            print("  " + "   ".join(f"{c} {mapa.get(c, '·')}" for c in CARACTERES_DO_ALFABETO[i:i + 9]))
+
+    def compartilhar():
+        nome, mapa = escolher_alfabeto("Qual alfabeto mandar?")
+        info("Quem receber este texto usa '📥 Receber um alfabeto' no LNUX dele para ler as suas mensagens.")
+        _mostrar_resultado(alfabeto_para_texto(nome, mapa), f"alfabeto-{nome}")
+
+    def receber():
+        nome, mapa = alfabeto_de_texto(_texto_de_entrada(f"Texto do alfabeto ({PREFIXO_ALFABETO}...)"))
+        guardar(perguntar("Guardar com o nome", nome).strip() or nome, mapa)
+
+    def apagar():
+        nome, _ = escolher_alfabeto("Apagar qual?")
+        if confirmar(f"Apagar o alfabeto '{nome}'? As mensagens escritas nele não poderão mais ser lidas aqui.", False):
+            todos = alfabetos()
+            todos.pop(nome, None)
+            gravar_json(ALFABETOS_FILE, todos)
+            ok("Apagado.")
+
+    explicacao = ("Você inventa um símbolo para cada letra e número (emojis, runas, desenhos, letras de outro "
+                  "alfabeto ou até palavras) e escreve com ele. Para alguém ler, mande o alfabeto antes, por outro "
+                  "caminho, com '📤 Mandar um alfabeto'.\nÉ uma cifra de substituição: com uma mensagem longa, dá para "
+                  "quebrar contando os símbolos mais usados (no português, os mais comuns são a, e, o, s). Maiúsculas "
+                  "voltam como minúsculas e os acentos se perdem (ç vira c).")
+    menu("🔣 Alfabetos próprios", [
+        ("ℹ️ Como funciona", lambda: _explicar_tecnica("🔣 Alfabetos próprios", explicacao)),
+        ("➕ Criar um alfabeto", criar),
+        ("🔒 Codificar com um alfabeto", codificar),
+        ("🔓 Decodificar com um alfabeto", decodificar),
+        (lambda: f"👀 Ver um alfabeto ({len(alfabetos())} guardado(s))", ver),
+        ("📤 Mandar um alfabeto (para alguém ler as suas mensagens)", compartilhar),
+        ("📥 Receber um alfabeto que alguém mandou", receber),
+        ("🗑️ Apagar um alfabeto", apagar),
+    ], cabecalho=lambda: print(f"{DIM}Um código só seu: cada letra vira o símbolo que você escolher.{RST}"))
+
+
+def explicar_mensagens_secretas() -> None:
+    _explicar_tecnica("🕵️ Esconder, cifrar ou codificar?", (
+        "Esconder (esteganografia): a mensagem vai dentro de outra coisa (uma foto, um áudio, um texto qualquer) e "
+        "ninguém percebe que ela existe. Proteção: ninguém sabe que há algo ali.\n"
+        "Cifrar (criptografia): a mensagem fica à vista, mas embaralhada, e só quem tem a senha ou a chave lê. "
+        "Proteção: a matemática. As cifras clássicas (César, Vigenère) são de brincadeira; o AES-256 é o que se usa "
+        "de verdade.\n"
+        "Codificar: escrever de outro jeito (binário, Morse, Braille, Base64, um alfabeto inventado). Não protege: "
+        "quem conhece o código lê.\n"
+        "Dá para combinar: cifrar com senha e depois esconder numa foto. Nas opções de esconder, é só dar uma senha."))
+
+
+@submenu
+def menu_mensagens_secretas():
+    menu("🕵️ Mensagens secretas", [
+        ("ℹ️ Esconder, cifrar ou codificar? (qual usar)", explicar_mensagens_secretas),
+        ("🖼️ Esteganografia: esconder em foto, áudio ou texto", menu_esteganografia),
+        ("🔒 Criptografia moderna com senha (AES-256, OpenSSL, Vernam)", menu_criptografia),
+        ("📜 Cifras clássicas (César, Vigenère, Atbash, ROT13...)", menu_cifras_classicas),
+        ("🔢 Sistemas numéricos (binário, octal, decimal, hexadecimal)", menu_sistemas_numericos),
+        ("🔣 Alfabetos próprios (invente o seu código)", menu_alfabetos),
+        ("📡 Códigos: Morse, Braille, Base64 e Base32", menu_codigos),
+    ], cabecalho=lambda: print(f"{DIM}Cada técnica tem 'Como funciona', codificar e decodificar. O que sai fica em "
+                               f"Download/LNUX/{PASTA_SECRETAS}.{RST}"))
+
+
+# ════════════════════════════════════════════════════════════════════
 #  Configurações e diagnóstico
 # ════════════════════════════════════════════════════════════════════
 
@@ -32725,6 +34081,18 @@ def _indice_busca() -> list:
         ("🌦️ Previsão do tempo", "tempo clima previsao chuva temperatura meteorologia", menu_tempo),
         ("🔳 QR code", "qr qrcode codigo ler gerar escanear", menu_qr),
         ("🌍 Tradutor", "traduzir traducao tradutor idioma lingua", menu_tradutor),
+        ("🕵️ Mensagens secretas", "mensagem secreta segredo esconder codigo cifra cifrar criptografar criptografia "
+                                  "decifrar espiao", menu_mensagens_secretas),
+        ("🖼️ Esteganografia: esconder em foto, áudio ou texto", "esteganografia esconder escondida foto imagem png "
+                                                              "audio wav invisivel zero largura anexo", menu_esteganografia),
+        ("🔒 Criptografia com senha (AES-256)", "aes criptografar cifrar senha arquivo openssl vernam uso unico",
+         menu_criptografia),
+        ("📜 Cifras clássicas (César, Vigenère...)", "cesar vigenere atbash rot13 rot47 substituicao cerca trilhos "
+                                                    "polibio bacon a1z26", menu_cifras_classicas),
+        ("🔢 Sistemas numéricos (binário, hexadecimal...)", "binario octal decimal hexadecimal hexa base conversao "
+                                                           "numero bits", menu_sistemas_numericos),
+        ("🔣 Alfabetos próprios", "alfabeto proprio simbolos emoji runas inventar codigo", menu_alfabetos),
+        ("📡 Código Morse, Braille e Base64", "morse braille base64 base32 codigo pontos tracos", menu_codigos),
         ("📲 Celular e sistema", "celular sistema android adb bateria apps fotos", menu_celular),
         ("🔌 Depuração sem fio (ADB)", "adb depuracao wifi wireless android shell signal 9 pareamento", menu_adb),
         ("📖 Comandos do ADB (com descrição)", "comandos adb lista ajuda pm am dpm shell screencap screenrecord "
@@ -32869,6 +34237,7 @@ def menu_principal() -> None:
         ("🎬 Vídeos", menu_videos),
         ("📺 Compartilhar filme por link", menu_midia),
         ("🧰 Utilitários (calculadora, notas, senhas...)", menu_utilitarios),
+        ("🕵️ Mensagens secretas (esconder, cifrar e códigos)", menu_mensagens_secretas),
         (por_sistema("📲 Celular e sistema", "🖥️ Computador e Android conectado"), menu_celular),
         ("🌐 Internet", menu_internet),
         ("👤 Meus dados na internet", menu_meus_dados),

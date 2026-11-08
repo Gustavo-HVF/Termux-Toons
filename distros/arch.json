@@ -63,6 +63,7 @@
       "openjdk-21": "jre21-openjdk-headless",
       "openssh": "openssh",
       "openssl": "openssl",
+      "openssl-tool": "openssl",
       "p7zip": "7zip",
       "pip": "python-pip",
       "podman": "podman",
