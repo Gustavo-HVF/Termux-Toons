@@ -15,22 +15,27 @@ Reúne em um único menu (cada categoria tem subcategorias; 🔍 Buscar acha qua
    3. Scraping e monitoramento (preço, notícias/RSS, status de site, texto e mudança de página)
    4. Rede e segurança em equipamentos seus: diagnóstico (nmap, DNS, velocidade, Wi-Fi, tráfego), servidor
       SSH, WireGuard e pontes de conexão (proxy para o PC, túnel SSH, Tor, Smart DNS, links públicos com
-      Cloudflare/ngrok/localtunnel/serveo/pinggy, endereço fixo e redes privadas Tailscale/ZeroTier)
+      Cloudflare/ngrok/localtunnel/serveo/pinggy, endereço fixo e redes privadas Tailscale/ZeroTier),
+      ping com gráfico ao vivo e internet usada por cada programa (nethogs/bandwhich)
    5. Linux de verdade com proot-distro (Debian, Ubuntu, Arch...), com desktop no Termux:X11
    6. Arquivos e backup: gerenciador de arquivos (ADB ou root para Android/data), publicar site num link,
-      nuvem e sincronização (rclone, Syncthing), compartilhar na rede (HTTP, Samba) e backup
+      nuvem e sincronização (rclone, Syncthing), compartilhar na rede (pasta pelo navegador com envio e
+      senha, Samba), mandar arquivos com um código (croc) e backup
    7. Música, rádio e podcasts: ouvir, baixar, biblioteca e playlists; player com tela 'Tocando agora' e
-      notificação com botões; equalizador de 10 bandas; rádios do mundo todo com legenda automática
+      notificação com botões; equalizador de 10 bandas; rádios do mundo todo com legenda automática;
+      letra sincronizada da música que está tocando (LRCLIB)
    8. Vídeos do TikTok, YouTube e outros sites com yt-dlp; reduzir a resolução ou comprimir (4K → 1080p/720p)
    9. Compartilhar filmes por link: arquivo do celular ou qualquer link de vídeo, com player próprio,
       troca de trilha de áudio e conversão na hora (servidor de vídeo + túnel)
   10. Utilitários: calculadora científica, notas, lista de afazeres, lembretes/alarmes, cronômetro/Pomodoro,
-      agenda, conversor, gastos, senhas, previsão do tempo, QR code (Wi-Fi, PIX) e tradutor
+      agenda, conversor, gastos, senhas, códigos 2FA (TOTP), cotações de cripto e bolsa com gráfico,
+      previsão do tempo, QR code (Wi-Fi, PIX) e tradutor
       + Mensagens secretas: esteganografia (foto, áudio, texto invisível, arquivo dentro de foto), AES-256 com
       senha, OpenSSL, Vernam, cifras clássicas, sistemas numéricos, alfabetos próprios, Morse, Braille e Base64
-  11. Celular e sistema: depuração sem fio (ADB), Termux:API, painel do sistema, bateria, uso de dados e
-      apps, resolução da tela, fotos, conversor de arquivos, automação por eventos, espelhamento e
-      transmissão da tela, controle da TV e de outros aparelhos por infravermelho, modem (comandos AT)
+  11. Celular e sistema: ficha do sistema (estilo neofetch), processos ao vivo (estilo htop), depuração sem
+      fio (ADB), Termux:API, painel do sistema, bateria, uso de dados e apps, resolução da tela, fotos,
+      conversor de arquivos, automação por eventos, espelhamento e transmissão da tela, controle da TV e
+      de outros aparelhos por infravermelho, modem (comandos AT)
   12. Internet: e-mail, notícias, downloads (aria2), chat na rede local, navegador pelo celular (abre
       sites num link, pela conexão dele), Browsh/w3m e encurtador/pastebin
   13. Meus dados na internet: o que está público sobre você na Receita Federal, Portal da Transparência,
@@ -38,11 +43,13 @@ Reúne em um único menu (cada categoria tem subcategorias; 🔍 Buscar acha qua
   14. Inteligência artificial: Claude/ChatGPT/Gemini, LLMs locais (llama.cpp), voz (whisper.cpp), OCR,
       traduzir a tela e remover o fundo de fotos e vídeos
   15. Diversão e aprendizado: jogos (incluindo os retrô), cursos de Python/Bash/Git, BASIC, leitor de
-      livros, arte ASCII e trote
+      livros, arte ASCII, teste de digitação, telas de descanso (Matrix, canos, aquário) e trote
   16. Programação e servidores: ambiente de desenvolvimento, SQLite/MariaDB/PostgreSQL, GitHub, agendar
-      comandos (cron), Minecraft, Jellyfin e Navidrome
+      comandos (cron), cola de comandos (tldr), testar APIs HTTP, ver JSON/Markdown, gravar o terminal
+      (asciinema), contêineres Docker/Podman, Minecraft, Jellyfin e Navidrome
   17. Sistema e manutenção: atualização, otimização e limpeza, instalar dependências, aparência do
-      terminal (tema, fonte, banner) e configurações/diagnóstico
+      terminal (tema, fonte, banner, zsh com Oh My Zsh ou Starship), explorar o espaço (estilo ncdu),
+      serviços e logs do sistema (systemd/OpenRC) e configurações/diagnóstico
 
 O verificador tests/verificar_menus.py confere se não há opções duplicadas, menus soltos ou entradas da
 busca apontando para o lugar errado (rode antes de cada commit).
@@ -50,6 +57,7 @@ busca apontando para o lugar errado (rode antes de cada commit).
 Uso:
     python lnux.py            # menu interativo
     python lnux.py sistema    # o sistema em uso (perfil, pastas, recursos); 'sistema arch' troca
+    python lnux.py ficha      # a ficha do sistema (estilo neofetch)
     python lnux.py --help     # subcomandos (também usados pelo tmux)
 
 Só precisa da biblioteca padrão do Python para abrir; o resto (flask, rich,
@@ -1298,6 +1306,8 @@ INSTALACAO_MANUAL = {
     "rust-analyzer": "rustup component add rust-analyzer",
     "scrcpy": "https://github.com/Genymobile/scrcpy/blob/master/doc/linux.md",
     "python-onnxruntime": "pip install --user onnxruntime",
+    "starship": "curl -sS https://starship.rs/install.sh | sh",
+    "croc": "curl https://getcroc.schollz.com | bash",
 }
 
 # Perfis mínimos embutidos, para o LNUX abrir mesmo se a pasta distros/ não vier junto com o lnux.py.
@@ -6189,7 +6199,7 @@ def _reescrever_tag(tag: str, nome: str, base: str, ligar) -> str:
 
 def _script_do_navegador(com_barra: bool, completo: bool = False) -> str:
     return (f'<script src="/_tt/nav.js?v={NAV_JS_VERSAO}" data-barra="{1 if com_barra else 0}"'
-            f'{' data-completo="1"' if completo else ""}></script>')
+            + (' data-completo="1"' if completo else "") + '></script>')  # sem aspas iguais dentro da f-string: o Python 3.11 não aceita
 
 
 def _reescrever_html(pagina: str, base_url: str, ligar=_proxiar, com_barra: bool = True,
@@ -10444,6 +10454,8 @@ def menu_rede():
                 ("Teste de velocidade (Cloudflare)", velocidade),
                 ("Redes Wi-Fi próximas", wifi_proximas),
                 ("Análise de tráfego (tcpdump / .pcap)", trafego),
+                ("📈 Ping com gráfico (vários endereços ao vivo)", ping_com_grafico),
+                ("📶 Internet usada por cada programa (nethogs)", so_em("!android", rede_por_programa)),
             ])),
         (por_sistema("🔐 Servidor SSH (porta 8022)", "🔐 Servidor SSH (porta 22)"), grupo("🔐 Servidor SSH", [
             ("Instalar e definir senha", so_em("termux", ssh_configurar)),
@@ -12839,12 +12851,25 @@ def parar_site() -> None:
 @submenu
 def menu_arquivos():
     def http_iniciar():
+        c = cfg()
         pasta = os.path.expanduser(perguntar("Pasta a compartilhar", _pasta_compartilhada_padrao()))
+        if not Path(pasta).is_dir():
+            raise LnuxError(f"A pasta {pasta} não existe.")
         porta = perguntar_int("Porta", 8090, 1024, 65535)
-        aviso("Qualquer pessoa na mesma rede Wi-Fi poderá baixar os arquivos dessa pasta (sem senha).")
-        if iniciar_servico("http-arquivos", shlex.join([sys.executable, "-m", "http.server", str(porta),
-                                                        "--bind", "0.0.0.0", "--directory", pasta])):
-            info(f"Abra no navegador: http://{ip_local()}:{porta}")
+        c["pasta_envio"] = confirmar("Deixar quem abrir o link MANDAR arquivos para esta pasta?", False)
+        senha = perguntar("Senha para abrir (Enter = sem senha)", "") if confirmar("Pedir senha?", True) else ""
+        c["pasta_senha"] = senha
+        salvar_cfg()  # fica na configuração (permissão 600), e não na linha de comando, que outros veem
+        if not senha:
+            aviso("Sem senha: qualquer pessoa na mesma rede Wi-Fi poderá abrir" +
+                  (" e mandar arquivos." if c["pasta_envio"] else " e baixar os arquivos."))
+        if servico_ativo("http-arquivos"):
+            parar_servico("http-arquivos")
+        if iniciar_servico("http-arquivos", cmd_self("pasta", pasta, "--porta", str(porta))):
+            link = f"http://{ip_local()}:{porta}"
+            info(f"Abra no navegador: {link}" + (f"  (usuário: qualquer um · senha: {senha})" if senha else ""))
+            if confirmar("Mostrar o QR code do link?", True):
+                mostrar_qr(link, "pasta", salvar=False)
 
     def rclone_config():
         if garantir_cmd("rclone"):
@@ -13011,6 +13036,7 @@ def menu_arquivos():
             ("Limpar o registro de visitas", limpar_visitas_do_site),
             ("Tirar do ar", parar_site),
         ], cabecalho=dica_endereco_fixo)),
+        ("📦 Mandar arquivos para outro aparelho com um código (croc)", menu_croc),
         ("☁️ Nuvem e sincronização (rclone, Syncthing)", grupo("☁️ Nuvem e sincronização", [
             ("rclone: instalar e configurar nuvem (Drive, Dropbox, OneDrive...)", rclone_config),
             ("rclone: copiar/sincronizar pasta com a nuvem", rclone_copiar),
@@ -13020,7 +13046,8 @@ def menu_arquivos():
             ("Syncthing: parar", lambda: parar_servico("syncthing")),
         ])),
         ("📡 Compartilhar na rede (HTTP, Samba)", grupo("📡 Compartilhar na rede", [
-            *itens_servico("http-arquivos", "Compartilhar pasta via HTTP", http_iniciar),
+            *itens_servico("http-arquivos", "Compartilhar pasta (baixar e mandar arquivos pelo navegador)",
+                           http_iniciar),
             ("Samba (SMB): configurar e iniciar", samba),
             ("Samba (SMB): parar", lambda: parar_servico("samba")),
         ])),
@@ -14855,6 +14882,7 @@ def menu_musica():
         (lambda: f"🎚️ Equalizador ({nome_eq(equalizador()) if equalizador()['ligado'] else 'desligado'})",
          tela_equalizador),
         ("🔎 Descobrir a música de um arquivo (pelo som)", descobrir_musica),
+        ("🎤 Letra da música (sincronizada com o que está tocando)", letra_da_musica),
         ("▶  Ouvir (buscar, álbum, cantor ou banda, mix)", grupo("▶  Ouvir", [
             ("Buscar e tocar (streaming)", buscar_tocar),
             ("💿 Ouvir um álbum (buscar pelo nome)", ouvir_album),
@@ -18747,24 +18775,6 @@ def menu_otimizacao():
         rodar(["su", "-c", "sm fstrim"])
         ok("TRIM solicitado ao armazenamento.")
 
-    def espaco():
-        pasta = _escolher_pasta("Analisar qual pasta?")
-        if not pasta:
-            return
-        info(f"Somando {pasta} ...")
-        try:
-            filhos = list(pasta.iterdir())
-        except OSError as e:
-            raise LnuxError(f"Sem acesso a {pasta}: {e}") from None
-        tamanhos = sorted(((tamanho(f), f) for f in filhos), reverse=True)
-        total = sum(t for t, _ in tamanhos) or 1
-        print(f"\n{NEG}{pasta}{RST} — {bytes_humanos(total)}")
-        for t, f in tamanhos[:20]:
-            nome = f.name + ("/" if f.is_dir() and not f.is_symlink() else "")
-            print(f"  {_barra(t / total, 12)} {bytes_humanos(t):>9}  {nome}")
-        livre = shutil.disk_usage(pasta)
-        print(f"\nDisco: {bytes_humanos(livre.free)} livres de {bytes_humanos(livre.total)}")
-
     def grandes():
         pasta = _escolher_pasta()
         if not pasta:
@@ -18840,34 +18850,6 @@ def menu_otimizacao():
                     removidas += 1
             ok(f"{removidas} pasta(s) removida(s).")
 
-    def processos():
-        lista = []
-        for pid_dir in Path("/proc").iterdir():
-            if not pid_dir.name.isdigit() or int(pid_dir.name) == os.getpid():
-                continue
-            with contextlib.suppress(OSError, ValueError, IndexError):
-                campos = dict(linha.split(":", 1) for linha in (pid_dir / "status").read_text().splitlines()
-                              if ":" in linha)
-                rss = int(campos.get("VmRSS", "0 kB").split()[0]) * 1024
-                if rss:
-                    cmdline = (pid_dir / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
-                    lista.append((rss, int(pid_dir.name), cmdline.strip() or campos["Name"].strip()))
-        if not lista:
-            info("Nenhum processo visível (o Android só mostra os do próprio Termux).")
-            return
-        lista.sort(reverse=True)
-        print(f"{DIM}O Android só deixa ver os processos do próprio Termux.{RST}")
-        i = escolher("Escolha um para encerrar (Esc para só olhar)",
-                     [f"{bytes_humanos(rss):>9}  {pid:<6} {cmd[:60]}" for rss, pid, cmd in lista[:25]])
-        if i is not None:
-            rss, pid, cmd = lista[i]
-            if confirmar(f"Encerrar o processo {pid} ({cmd[:40]})?"):
-                try:
-                    os.kill(pid, 15)
-                    ok("Sinal de encerramento enviado.")
-                except OSError as e:
-                    erro(f"Não consegui encerrar: {e}")
-
     def parar_tudo():
         ativos = servicos_ativos()
         if not ativos:
@@ -18887,11 +18869,11 @@ def menu_otimizacao():
         ("Escolher o que limpar (mostra o tamanho de cada item)", escolher_limpeza),
         ("Limpar cache de TODOS os apps (root ou depuração sem fio)", so_em("android", cache_todos_apps)),
         ("Limpar o cache de pacotes da distro (com sudo)", so_em("!termux", limpar_pacotes_distro)),
-        ("Ver o que ocupa espaço", espaco),
+        ("💽 Explorar o espaço (pastas por tamanho: entrar, apagar, abrir)", explorar_espaco),
         ("Arquivos grandes", grandes),
         ("Arquivos duplicados", duplicados),
         ("Pastas vazias", pastas_vazias),
-        (por_sistema("Processos do Termux que mais usam RAM", "Processos que mais usam RAM"), processos),
+        # "Processos que mais usam RAM" virou ⚙️ Processos ao vivo, em 📲 Celular e sistema (ordena por memória com 'm')
         ("Parar todos os serviços do LNUX", parar_tudo),
         ("Otimizar apps — compilação em segundo plano (root)", so_em("android", otimizar_apps_root)),
         ("TRIM do armazenamento (root)", so_em("android", trim_root)),
@@ -22747,7 +22729,9 @@ def menu_utilitarios():
         ("📅 Calendário e agenda (feriados)", menu_agenda),
         ("💱 Conversor de unidades e moedas", menu_conversor),
         ("💰 Controle de gastos", menu_gastos),
+        ("💹 Criptomoedas e bolsa (cotações e gráficos)", menu_cotacoes),
         ("🔐 Gerenciador de senhas", menu_senhas),
+        ("🔑 Códigos de verificação 2FA (como o Google Authenticator)", menu_2fa),
         ("🌦️ Previsão do tempo", menu_tempo),
         ("🔳 QR code (Wi-Fi, PIX, ler)", menu_qr),
         ("🌍 Tradutor e dicionário", menu_tradutor),
@@ -26335,6 +26319,8 @@ def menu_celular():
         (por_sistema("📱 Termux:API (sensores, SMS, câmera, localização...)",
                      "🖥️ Recursos do computador (notificação, webcam, área de transferência, volume)"), menu_termux_api),
         ("📊 Painel do sistema ao vivo (CPU, RAM, bateria, serviços)", dashboard),
+        ("🖥️ Ficha do sistema (estilo neofetch: aparelho, CPU, memória, disco...)", ficha_do_sistema),
+        ("⚙️ Processos ao vivo (estilo htop: ordenar, procurar, encerrar)", monitor_processos),
         ("🔋 Saúde da bateria (histórico e alertas de 80%)", so_em("bateria", menu_bateria)),
         (por_sistema("📊 Uso de dados e tempo de tela (ADB)", "📊 Uso de dados e tempo de tela do Android (ADB)"),
          so_em("adb", menu_uso_celular)),
@@ -30218,6 +30204,7 @@ def menu_aparencia():
         ("🔤 Fonte do terminal (uma fonte baixada no celular)", so_em("tema_termux", trocar_fonte_terminal)),
         ("Fonte do terminal: voltar à original", so_em("tema_termux", fonte_original_terminal)),
         ("Mensagem de boas-vindas do Termux", so_em("termux", boas_vindas)),
+        ("🐚 Shell bonito (zsh com Oh My Zsh, ou o prompt Starship)", menu_shell_bonito),
         ("Banner do LNUX: voltar ao original",
          lambda: (c.update(banner_texto=""), salvar_cfg(), ok("Banner original de volta."))),
     ], cabecalho=lambda: print(f"{DIM}Para um banner novo: 🎮 Diversão → 🎨 Arte ASCII → Texto em letras grandes "
@@ -30800,6 +30787,8 @@ def menu_diversao():
         ("🎓 Aprender programação (Python, Bash, Git e BASIC retrô)", menu_aprender),
         ("📖 Leitor de livros (EPUB, PDF) e audiolivro", menu_livros),
         ("🎨 Arte ASCII (texto grande e imagem no terminal)", menu_arte),
+        ("⌨️ Teste de digitação (palavras por minuto, em português)", teste_de_digitacao),
+        ("🌌 Telas de descanso (Matrix, canos, aquário)", menu_telas_de_descanso),
         ("👻 Trote / pegadinha: link que dá um susto (screamer)", menu_trote),
     ])
 
@@ -31505,6 +31494,11 @@ def menu_programacao():
         ("⏲️ Agendar comandos (cron: limpeza, backup, comando seu)", menu_agendador),
         ("🖥️ Servidores (Minecraft, Jellyfin, Navidrome)", menu_servidores),
         ("💻 Ambiente de desenvolvimento (Neovim, compiladores)", menu_dev),
+        ("📚 Cola de comandos (tldr: exemplos de qualquer comando)", menu_tldr),
+        ("🔌 Testar uma API (HTTP: GET, POST, JSON colorido)", menu_testar_api),
+        ("🔍 Ver JSON e Markdown (navegar e ler formatado)", menu_ver_dados),
+        ("🎬 Gravar o terminal (asciinema)", menu_gravar_terminal),
+        ("🐳 Contêineres (Docker ou Podman)", so_em("!termux", menu_conteineres)),
     ])
 
 
@@ -33837,6 +33831,2091 @@ def menu_mensagens_secretas():
 
 
 # ════════════════════════════════════════════════════════════════════
+#  28. Ferramentas inspiradas nos programas de terminal mais usados do GitHub
+# ════════════════════════════════════════════════════════════════════
+# Cada uma lembra um programa famoso (fastfetch, htop, ncdu, Oh My Zsh, asciinema, tldr, croc, dufs,
+# gping, nethogs, HTTPie, fx/glow, lazydocker, systemctl, 2fa, sptlrx, ttyper, cointop, cmatrix), feita
+# aqui em Python com o que o LNUX já tem, ou chamando o próprio programa quando ele é a melhor escolha.
+# As partes que não falam com a tela são testadas em tests/testar_ferramentas_novas.py.
+
+BLOCOS_SPARK = "▁▂▃▄▅▆▇█"
+
+
+def sparkline(valores: list, largura: int | None = None) -> str:
+    """Minigráfico de uma linha (▁▂▃▅▇). None vira '✕' (ex.: um ping perdido)."""
+    valores = list(valores)[-largura:] if largura else list(valores)
+    numeros = [v for v in valores if v is not None]
+    if not numeros:
+        return "✕" * len(valores)
+    menor, maior = min(numeros), max(numeros)
+    faixa = (maior - menor) or 1
+    return "".join("✕" if v is None else BLOCOS_SPARK[min(7, int((v - menor) / faixa * 7.999))] for v in valores)
+
+
+def grafico_em_colunas(valores: list, largura: int, altura: int) -> list:
+    """Gráfico de várias linhas: uma coluna por ponto (reamostrado para a largura), em oitavos de linha."""
+    if not valores:
+        return []
+    passo = len(valores) / largura
+    pontos = [valores[min(len(valores) - 1, int(i * passo))] for i in range(min(largura, len(valores)))] \
+        if len(valores) > largura else list(valores)
+    menor, maior = min(pontos), max(pontos)
+    faixa = (maior - menor) or 1
+    alturas = [round((v - menor) / faixa * (altura * 8 - 1)) + 1 for v in pontos]  # em oitavos
+    linhas = []
+    for linha in range(altura - 1, -1, -1):
+        base = linha * 8
+        linhas.append("".join(" " if h <= base else "█" if h >= base + 8 else BLOCOS_SPARK[h - base - 1]
+                              for h in alturas))
+    return linhas
+
+
+# ── 1. Ficha do sistema (estilo fastfetch/neofetch) ─────────────────
+
+LOGO_TUX = [
+    "    .--.    ",
+    "   |o_o |   ",
+    "   |:_/ |   ",
+    "  //   \\ \\  ",
+    " (|     | ) ",
+    "/'\\_   _/`\\ ",
+    "\\___)=(___/ ",
+]
+LOGO_ANDROID = [
+    "  \\  ,--.  /  ",
+    "   ,'    `.   ",
+    "  /  o  o  \\  ",
+    " :__________: ",
+    " |  ______  | ",
+    " | |      | | ",
+    " |_|      |_| ",
+]
+CORES_DISTRO = {"termux": "32", "debian": "31", "arch": "36", "fedora": "34", "alpine": "34", "opensuse": "32"}
+
+
+def _ler_primeira(caminhos, padrao: str = "") -> str:
+    for caminho in caminhos:
+        with contextlib.suppress(OSError):
+            texto = Path(caminho).read_text(errors="replace").strip()
+            if texto:
+                return texto
+    return padrao
+
+
+def _getprop(nome: str) -> str:
+    return saida(["getprop", nome], timeout=5) if tem("getprop") else ""
+
+
+def _contar_pacotes() -> str:
+    """Quantos pacotes o sistema tem, do jeito rápido de cada gerenciador (sem chamar o gerenciador)."""
+    contagens = []
+    for nome, base, padrao in (("dpkg", Path(PREFIX or "/") / ("var/lib/dpkg/info" if PREFIX else "var/lib/dpkg/info"), "*.list"),
+                               ("pacman", Path("/var/lib/pacman/local"), "*"), ("flatpak", Path("/var/lib/flatpak/app"), "*")):
+        with contextlib.suppress(OSError):
+            n = sum(1 for _ in base.glob(padrao)) - (1 if nome == "pacman" else 0)  # o pacman tem o ALPM_DB_VERSION
+            if n > 0:
+                contagens.append(f"{n} ({nome})")
+    with contextlib.suppress(OSError):
+        n = Path("/lib/apk/db/installed").read_text(errors="replace").count("\nP:") + 1
+        if n > 1:
+            contagens.append(f"{n} (apk)")
+    if not contagens and tem("rpm"):
+        n = len(saida(["rpm", "-qa"], timeout=20).splitlines())
+        if n:
+            contagens.append(f"{n} (rpm)")
+    return ", ".join(contagens) or "?"
+
+
+def _tempo_ligado() -> str:
+    with contextlib.suppress(OSError, ValueError, IndexError):
+        segundos = int(float(Path("/proc/uptime").read_text().split()[0]))
+        dias, resto = divmod(segundos, 86400)
+        horas, resto = divmod(resto, 3600)
+        partes = [f"{dias} d"] * bool(dias) + [f"{horas} h"] * bool(horas) + [f"{resto // 60} min"]
+        return " ".join(partes)
+    return "?"
+
+
+def _memoria() -> tuple:
+    """(usada, total) em bytes, de /proc/meminfo."""
+    with contextlib.suppress(OSError, ValueError):
+        campos = {l.split(":")[0]: int(l.split()[1]) * 1024 for l in Path("/proc/meminfo").read_text().splitlines()
+                  if len(l.split()) >= 2}
+        total = campos.get("MemTotal", 0)
+        return total - campos.get("MemAvailable", campos.get("MemFree", 0)), total
+    return 0, 0
+
+
+def informacoes_do_sistema() -> list:
+    """[(rótulo, valor)] para a ficha do sistema."""
+    perfil = sistema()
+    if perfil.android:
+        nome_so = f"Android {_getprop('ro.build.version.release')} (Termux {os.environ.get('TERMUX_VERSION', '')})"
+        aparelho = " ".join(x for x in (_getprop("ro.product.manufacturer").capitalize(), _getprop("ro.product.model")) if x)
+    else:
+        nome_so = os_release().get("PRETTY_NAME") or platform.system()
+        aparelho = " ".join(dict.fromkeys(x for x in (
+            _ler_primeira(["/sys/devices/virtual/dmi/id/sys_vendor"]),
+            _ler_primeira(["/sys/devices/virtual/dmi/id/product_name", "/sys/firmware/devicetree/base/model"]))
+            if x and "filled" not in x.lower()))
+    cpu_info = _ler_primeira(["/proc/cpuinfo"])
+    m = re.search(r"^(?:model name|Hardware|Processor|cpu model)\s*:\s*(.+)$", cpu_info, re.M)
+    cpu = (m.group(1).strip() if m else platform.machine()) + f" ({os.cpu_count() or '?'} núcleos)"
+    usada, total = _memoria()
+    disco = shutil.disk_usage(HOME)
+    linhas = [
+        ("Sistema", nome_so), ("Aparelho", aparelho or "?"), ("Kernel", platform.release()),
+        ("Ligado há", _tempo_ligado()), ("Pacotes", _contar_pacotes()),
+        ("Shell", Path(os.environ.get("SHELL", "sh")).name), ("Terminal", os.environ.get("TERM_PROGRAM") or
+                                                                     os.environ.get("TERM", "?")),
+        ("CPU", cpu), ("Memória", f"{bytes_humanos(usada)} de {bytes_humanos(total)}" if total else "?"),
+        ("Disco (~)", f"{bytes_humanos(disco.used)} de {bytes_humanos(disco.total)} "
+                      f"({disco.used * 100 // max(1, disco.total)}%)"),
+    ]
+    if tem_recurso("bateria"):
+        with contextlib.suppress(LnuxError, OSError):
+            b = bateria()
+            linhas.append(("Bateria", f"{b.get('percentage', '?')}% ({str(b.get('status', '')).lower()})"))
+    linhas += [("IP local", ip_local()), ("Python", platform.python_version()), ("LNUX", f"{VERSION} · {perfil.nome}")]
+    return linhas
+
+
+def ficha_do_sistema() -> None:
+    perfil = sistema()
+    logo = LOGO_ANDROID if perfil.android else LOGO_TUX
+    cor = _c(CORES_DISTRO.get(perfil.id, "37") + ";1")
+    usuario = f"{getpass.getuser()}@{socket.gethostname()}"
+    info_linhas = [f"{cor}{usuario}{RST}", "─" * len(usuario)]
+    info_linhas += [f"{cor}{rotulo}{RST}: {valor}" for rotulo, valor in informacoes_do_sistema()]
+    info_linhas += ["", "".join(f"\033[4{i}m   " for i in range(8)) + RST if _COR else ""]
+    largura_logo = max(map(len, logo))
+    print()
+    for i in range(max(len(logo), len(info_linhas))):
+        parte_logo = logo[i] if i < len(logo) else ""
+        print(f"  {cor}{parte_logo:<{largura_logo}}{RST}  {info_linhas[i] if i < len(info_linhas) else ''}")
+    print()
+    if confirmar("Copiar a ficha (texto, sem cores)?", False):
+        copiar_texto("\n".join(f"{r}: {v}" for r, v in [("Usuário", usuario), *informacoes_do_sistema()]))
+
+
+# ── 2. Processos ao vivo (estilo htop/btop) ─────────────────────────
+
+def ler_processos() -> dict:
+    """{pid: {nome, comando, memoria (bytes), tiques (CPU usada até agora), usuario}} de /proc."""
+    processos = {}
+    for pasta in Path("/proc").iterdir():
+        if not pasta.name.isdigit():
+            continue
+        with contextlib.suppress(OSError, ValueError, IndexError):
+            stat = (pasta / "stat").read_text()
+            depois_do_nome = stat[stat.rindex(")") + 2:].split()  # o nome (2º campo) pode ter espaços
+            status = dict(l.split(":", 1) for l in (pasta / "status").read_text().splitlines() if ":" in l)
+            comando = (pasta / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+            processos[int(pasta.name)] = {
+                "nome": status.get("Name", "?").strip(), "comando": comando or f"[{status.get('Name', '?').strip()}]",
+                "memoria": int(status.get("VmRSS", "0 kB").split()[0]) * 1024,
+                "tiques": int(depois_do_nome[11]) + int(depois_do_nome[12]),  # utime + stime
+                "estado": depois_do_nome[0], "usuario": int(status.get("Uid", "0").split()[0]),
+            }
+    return processos
+
+
+def calcular_cpu(antes: dict, agora: dict, segundos: float) -> dict:
+    """{pid: % de CPU} entre duas leituras (100% = um núcleo inteiro, como no htop)."""
+    tiques_por_segundo = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+    return {pid: max(0.0, (p["tiques"] - antes[pid]["tiques"]) / tiques_por_segundo / max(segundos, 1e-6) * 100)
+            for pid, p in agora.items() if pid in antes}
+
+
+def monitor_processos() -> None:
+    if not setas_ativas():  # sem tela interativa: uma foto da lista
+        for pid, p in sorted(ler_processos().items(), key=lambda kv: -kv[1]["memoria"])[:20]:
+            print(f"  {pid:>7} {bytes_humanos(p['memoria']):>9}  {p['comando'][:60]}")
+        return
+    ordem, filtro, sel = "cpu", "", 0
+    antes, momento = ler_processos(), time.time()
+    cpu_total = _AmostradorCPU()
+    uso_cpu, total_cpu = {}, None
+    with TelaCheia() as tela:
+        while True:
+            agora = time.time()
+            if agora - momento >= 1.5 or not uso_cpu:
+                atuais = ler_processos()
+                uso_cpu, antes, momento = calcular_cpu(antes, atuais, agora - momento), atuais, agora
+                total_cpu = cpu_total.uso()
+            lista = [(pid, p) for pid, p in antes.items()
+                     if not filtro or filtro.lower() in p["comando"].lower() or filtro == str(pid)]
+            chave = {"cpu": lambda kv: -uso_cpu.get(kv[0], 0), "mem": lambda kv: -kv[1]["memoria"],
+                     "pid": lambda kv: kv[0]}[ordem]
+            lista.sort(key=chave)
+            colunas, altura = shutil.get_terminal_size((80, 24))
+            visiveis = max(3, altura - 6)
+            sel = max(0, min(sel, len(lista) - 1))
+            inicio = max(0, sel - visiveis + 1)
+            usada, total = _memoria()
+            linhas = [f"{NEG}📊 Processos{RST}  CPU {'?' if total_cpu is None else f'{total_cpu * 100:.0f}%'} · "
+                      f"memória {bytes_humanos(usada)}/{bytes_humanos(total)} · {len(lista)} processos"
+                      + (f" · filtro '{filtro}'" if filtro else ""),
+                      f"{DIM}{'O Android só mostra os processos do Termux. ' if sistema().android else ''}"
+                      f"↑↓ escolher · c/m/p ordenar por CPU, memória, PID · / filtrar · k encerrar · K forçar · q sair{RST}",
+                      f"{INV}{'PID':>7} {'CPU%':>6} {'MEMÓRIA':>9}  COMANDO{' ' * max(0, colunas - 34)}{RST}"]
+            for i, (pid, p) in enumerate(lista[inicio:inicio + visiveis], inicio):
+                texto = f"{pid:>7} {uso_cpu.get(pid, 0):>6.1f} {bytes_humanos(p['memoria']):>9}  {p['comando']}"
+                linhas.append(f"{DESTAQUE}{_cortar(texto, colunas)}{RST}" if i == sel else texto)
+            desenhar(linhas)
+            tecla = tecla_ou_nada(0.5)
+            if tecla in ("q", "esc", "Q"):
+                return
+            if tecla in ("cima", "baixo", "pgup", "pgdn", "home", "end"):
+                sel = _mover(tecla, sel, len(lista), visiveis)
+            elif tecla in ("c", "m", "p"):
+                ordem = {"c": "cpu", "m": "mem", "p": "pid"}[tecla]
+            elif tecla == "/":
+                with tela.normal():
+                    filtro = perguntar("Mostrar só os que têm (vazio = todos)").strip()
+                sel = 0
+            elif tecla in ("k", "K") and lista:
+                pid, p = lista[sel]
+                with tela.normal():
+                    if confirmar(f"{'Forçar o fim' if tecla == 'K' else 'Encerrar'} de {pid} ({p['comando'][:50]})?",
+                                 False):
+                        try:
+                            os.kill(pid, signal.SIGKILL if tecla == "K" else signal.SIGTERM)
+                            ok("Sinal enviado.")
+                        except PermissionError:
+                            cmd = como_root(["kill", "-9" if tecla == "K" else "-15", str(pid)])
+                            if cmd and confirmar("É de outro usuário. Tentar com root (sudo)?", False):
+                                rodar(cmd)
+                        except OSError as e:
+                            erro(f"Não consegui: {e}")
+                        time.sleep(1)
+
+
+# ── 3. Explorar o espaço em disco (estilo ncdu/gdu/dust) ─────────────
+
+def tamanhos_da_pasta(pasta: Path, cache: dict | None = None) -> list:
+    """[(tamanho, caminho, é pasta?)] do que tem dentro, do maior para o menor (sem seguir atalhos)."""
+    cache = {} if cache is None else cache
+    itens = []
+    with contextlib.suppress(OSError):
+        for entrada in os.scandir(pasta):
+            caminho = Path(entrada.path)
+            try:
+                eh_pasta = entrada.is_dir(follow_symlinks=False)
+                if eh_pasta:
+                    if caminho not in cache:
+                        cache[caminho] = tamanho(caminho)
+                    t = cache[caminho]
+                else:
+                    t = entrada.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+            itens.append((t, caminho, eh_pasta))
+    return sorted(itens, key=lambda x: -x[0])
+
+
+def explorar_espaco(inicio: Path | None = None) -> None:
+    """Navega pelas pastas ordenadas pelo tamanho: Enter entra, ← volta, d apaga, o abre."""
+    pasta = Path(inicio) if inicio else _escolher_pasta("Explorar qual pasta?")
+    if not pasta:
+        return
+    cache: dict = {}
+    if not setas_ativas():
+        info(f"Somando {pasta} ...")
+        for t, caminho, eh_pasta in tamanhos_da_pasta(pasta, cache)[:25]:
+            print(f"  {bytes_humanos(t):>9}  {caminho.name}{'/' if eh_pasta else ''}")
+        return
+    sel = 0
+    with TelaCheia() as tela:
+        while True:
+            desenhar([f"{NEG}💽 {pasta}{RST}", f"{DIM}Somando...{RST}"])
+            itens = tamanhos_da_pasta(pasta, cache)
+            total = sum(t for t, _, _ in itens) or 1
+            livre = shutil.disk_usage(pasta)
+            while True:
+                colunas, altura = shutil.get_terminal_size((80, 24))
+                visiveis = max(3, altura - 5)
+                sel = max(0, min(sel, len(itens) - 1))
+                inicio_lista = max(0, sel - visiveis + 1)
+                linhas = [f"{NEG}💽 {pasta}{RST}  {bytes_humanos(total)} · disco: {bytes_humanos(livre.free)} livres "
+                          f"de {bytes_humanos(livre.total)}",
+                          f"{DIM}↑↓ escolher · Enter entra · ← sobe · d apaga · o abre · q sai{RST}"]
+                if not itens:
+                    linhas.append("  (pasta vazia ou sem acesso)")
+                for i, (t, caminho, eh_pasta) in enumerate(itens[inicio_lista:inicio_lista + visiveis], inicio_lista):
+                    texto = f"{bytes_humanos(t):>9} {_barra(t / total, 10)} {caminho.name}{'/' if eh_pasta else ''}"
+                    linhas.append(f"{DESTAQUE}{_cortar(texto, colunas)}{RST}" if i == sel else texto)
+                desenhar(linhas)
+                tecla = ler_tecla()
+                if tecla in ("q", "esc"):
+                    return
+                if tecla in ("cima", "baixo", "pgup", "pgdn", "home", "end"):
+                    sel = _mover(tecla, sel, len(itens), visiveis)
+                elif tecla in ("enter", "dir") and itens and itens[sel][2]:
+                    pasta, sel = itens[sel][1], 0
+                    break
+                elif tecla in ("esq", "backspace") and pasta.parent != pasta:
+                    pasta, sel = pasta.parent, 0
+                    break
+                elif tecla == "o" and itens:
+                    abrir_arquivo(itens[sel][1])
+                elif tecla == "d" and itens:
+                    t, caminho, _ = itens[sel]
+                    with tela.normal():
+                        if confirmar(f"APAGAR {caminho} ({bytes_humanos(t)})? Não dá para desfazer.", False):
+                            liberado = apagar(caminho)
+                            for p in list(cache):  # as pastas de cima ficaram menores
+                                if p == caminho or caminho.is_relative_to(p) or p.is_relative_to(caminho):
+                                    cache.pop(p, None)
+                            ok(f"Liberado: {bytes_humanos(liberado)}")
+                            time.sleep(1)
+                    break
+
+
+# ── 4. Shell bonito (zsh + Oh My Zsh, ou Starship) ───────────────────
+
+MARCA_RC = "# LNUX:"  # as linhas que o LNUX põe no ~/.bashrc / ~/.zshrc levam esta marca, para desfazer depois
+TEMAS_OH_MY_ZSH = {"robbyrussell": "o padrão, simples e limpo", "agnoster": "blocos coloridos (precisa de Nerd Font)",
+                   "af-magic": "duas linhas, mostra o git", "bira": "duas linhas com usuário e hora",
+                   "ys": "estilo servidor, com hora", "fino": "minimalista, com seta"}
+PRESETS_STARSHIP = {"(sem preset: o padrão)": "", "plain-text-symbols": "só texto, funciona em qualquer fonte",
+                    "nerd-font-symbols": "ícones (precisa de Nerd Font)", "pastel-powerline": "blocos em tons pastel",
+                    "tokyo-night": "azul e roxo", "gruvbox-rainbow": "cores do Gruvbox", "bracketed-segments": "[entre colchetes]"}
+
+
+def _acrescentar_ao_rc(arquivo: Path, linhas: list, motivo: str) -> None:
+    """Acrescenta linhas ao fim de um arquivo de configuração do shell, marcadas com '# LNUX: motivo'."""
+    atual = arquivo.read_text("utf-8") if arquivo.exists() else ""
+    if f"{MARCA_RC} {motivo}" in atual:
+        return
+    bloco = "".join(f"{linha}  {MARCA_RC} {motivo}\n" for linha in linhas)
+    arquivo.write_text(atual + ("" if atual.endswith("\n") or not atual else "\n") + bloco, "utf-8")
+
+
+def _tirar_do_rc(arquivo: Path, motivo: str) -> bool:
+    if not arquivo.exists():
+        return False
+    linhas = arquivo.read_text("utf-8").splitlines(keepends=True)
+    novas = [l for l in linhas if f"{MARCA_RC} {motivo}" not in l]
+    if len(novas) != len(linhas):
+        arquivo.write_text("".join(novas), "utf-8")
+        return True
+    return False
+
+
+def _clonar_raso(url: str, destino: Path) -> bool:
+    if destino.exists():
+        return rodar(["git", "-C", str(destino), "pull", "--ff-only"], capturar=True).returncode == 0
+    return garantir_cmd("git") and rodar(["git", "clone", "--depth", "1", url, str(destino)]).returncode == 0
+
+
+@submenu
+def menu_shell_bonito():
+    zshrc, bashrc = HOME / ".zshrc", HOME / ".bashrc"
+
+    def oh_my_zsh():
+        if not garantir_cmd("zsh"):
+            return
+        base = HOME / ".oh-my-zsh"
+        if not _clonar_raso("https://github.com/ohmyzsh/ohmyzsh.git", base):
+            raise LnuxError("Não consegui baixar o Oh My Zsh.")
+        plugins = base / "custom" / "plugins"
+        for nome in ("zsh-autosuggestions", "zsh-syntax-highlighting"):
+            _clonar_raso(f"https://github.com/zsh-users/{nome}.git", plugins / nome)
+        temas = list(TEMAS_OH_MY_ZSH)
+        i = escolher("Tema", [f"{t} — {d}" for t, d in TEMAS_OH_MY_ZSH.items()])
+        tema = temas[i] if i is not None else "robbyrussell"
+        if zshrc.exists() and not (HOME / ".zshrc.antes-do-lnux").exists():
+            shutil.copy2(zshrc, HOME / ".zshrc.antes-do-lnux")
+        modelo = (base / "templates" / "zshrc.zsh-template").read_text("utf-8")
+        modelo = re.sub(r'^ZSH_THEME=".*"$', f'ZSH_THEME="{tema}"', modelo, flags=re.M)
+        modelo = re.sub(r"^plugins=\(.*\)$", "plugins=(git zsh-autosuggestions zsh-syntax-highlighting)", modelo, flags=re.M)
+        zshrc.write_text(modelo, "utf-8")
+        ok(f"Oh My Zsh instalado com o tema {tema}, sugestões enquanto digita e cores nos comandos.")
+        info("Abra com 'zsh', ou use 'Usar o zsh sempre' para ele abrir sozinho.")
+
+    def starship():
+        if not garantir_cmd("starship"):
+            return
+        presets = list(PRESETS_STARSHIP)
+        i = escolher("Visual", [f"{p} — {d}" if d else p for p, d in PRESETS_STARSHIP.items()])
+        if i:
+            pasta = HOME / ".config"
+            pasta.mkdir(exist_ok=True)
+            rodar(["starship", "preset", presets[i], "-o", str(pasta / "starship.toml")])
+        _acrescentar_ao_rc(bashrc, ['eval "$(starship init bash)"'], "starship")
+        if zshrc.exists() or tem("zsh"):
+            _acrescentar_ao_rc(zshrc, ['eval "$(starship init zsh)"'], "starship")
+        ok("Starship ligado no bash" + (" e no zsh" if tem("zsh") else "") + ". Abra um terminal novo para ver.")
+
+    def zsh_padrao():
+        if not garantir_cmd("zsh"):
+            return
+        alvo = "zsh" if sistema().termux else (shutil.which("zsh") or "/bin/zsh")
+        rodar(["chsh", "-s", alvo])
+        ok("Pronto: o zsh abre sozinho nas próximas sessões.")
+
+    def desfazer():
+        mudou = [_tirar_do_rc(bashrc, "starship"), _tirar_do_rc(zshrc, "starship")]
+        antes = HOME / ".zshrc.antes-do-lnux"
+        if antes.exists() and confirmar("Voltar o ~/.zshrc que você tinha antes do Oh My Zsh?", True):
+            shutil.copy2(antes, zshrc)
+            mudou.append(True)
+        if confirmar("Voltar ao bash como shell padrão?", False):
+            rodar(["chsh", "-s", "bash" if sistema().termux else (shutil.which("bash") or "/bin/bash")])
+        ok("Desfeito." if any(mudou) else "Nada do LNUX para desfazer nos arquivos do shell.")
+
+    menu("🐚 Shell bonito", [
+        ("Oh My Zsh: zsh com temas, sugestões enquanto digita e cores nos comandos", oh_my_zsh),
+        ("Starship: um prompt bonito e rápido (bash e zsh)", starship),
+        ("Usar o zsh sempre (shell padrão)", zsh_padrao),
+        ("Desfazer (tirar o Starship, voltar o .zshrc e o bash)", desfazer),
+    ], cabecalho=lambda: print(f"{DIM}Inspirado no Oh My Zsh (190 mil ⭐) e no Starship (61 mil ⭐). Alguns temas pedem "
+                               f"uma Nerd Font (⚙️ → 🎨 Aparência → Fonte do terminal).{RST}"))
+
+
+# ── 14. Serviços e logs do sistema (systemd ou OpenRC) ───────────────
+
+def parse_systemctl(texto: str) -> list:
+    """Linhas do 'systemctl list-units --plain --no-legend' → [{nome, carregado, ativo, estado, descricao}]."""
+    servicos = []
+    for linha in texto.splitlines():
+        partes = linha.lstrip("● ").split(None, 4)
+        if len(partes) >= 4 and partes[0].endswith(".service"):
+            servicos.append({"nome": partes[0], "carregado": partes[1], "ativo": partes[2], "estado": partes[3],
+                             "descricao": partes[4] if len(partes) > 4 else ""})
+    return servicos
+
+
+def parse_rc_status(texto: str) -> list:
+    """'rc-status --all' do OpenRC → [{nome, ativo, estado, descricao}]."""
+    servicos = []
+    for linha in texto.splitlines():
+        m = re.match(r"\s+(\S+)\s+\[\s*(\w+)\s*\]", linha)
+        if m:
+            estado = m.group(2).lower()
+            servicos.append({"nome": m.group(1), "carregado": "", "estado": estado, "descricao": "",
+                             "ativo": "active" if estado == "started" else "inactive"})
+    return servicos
+
+
+def _systemd() -> bool:
+    return bool(shutil.which("systemctl")) and Path("/run/systemd/system").is_dir()
+
+
+def listar_servicos() -> list:
+    if _systemd():
+        return parse_systemctl(saida(["systemctl", "list-units", "--type=service", "--all", "--no-pager",
+                                      "--no-legend", "--plain"], timeout=30))
+    if shutil.which("rc-status"):
+        return parse_rc_status(saida(["rc-status", "--all"], timeout=30))
+    raise LnuxError("Não achei o systemd nem o OpenRC neste sistema.")
+
+
+def _como_root_ou_eu(cmd: list) -> list:
+    return como_root(cmd) or cmd
+
+
+@submenu
+def menu_servicos_sistema():
+    def escolher_servico():
+        servicos = listar_servicos()
+        filtro = perguntar("Procurar (parte do nome; Enter = todos)").strip().lower()
+        if filtro:
+            servicos = [s for s in servicos if filtro in s["nome"].lower() or filtro in s["descricao"].lower()]
+        if not servicos:
+            raise LnuxError("Nenhum serviço com esse nome.")
+        marca = {"active": f"{VERD}●{RST}", "failed": f"{VERM}●{RST}"}
+        i = escolher(f"{len(servicos)} serviço(s)", [f"{marca.get(s['ativo'], DIM + '○' + RST)} {s['nome']:<34} "
+                                                     f"{DIM}{s['estado']} {s['descricao'][:40]}{RST}" for s in servicos])
+        if i is None:
+            raise LnuxError("Cancelado.")
+        return servicos[i]["nome"]
+
+    def acoes():
+        nome = escolher_servico()
+        systemd = _systemd()
+        opcoes = [("Status", ["systemctl", "status", "--no-pager", nome] if systemd else ["rc-service", nome, "status"]),
+                  ("Iniciar", ["systemctl", "start", nome] if systemd else ["rc-service", nome, "start"]),
+                  ("Parar", ["systemctl", "stop", nome] if systemd else ["rc-service", nome, "stop"]),
+                  ("Reiniciar", ["systemctl", "restart", nome] if systemd else ["rc-service", nome, "restart"]),
+                  ("Ligar ao iniciar o computador", ["systemctl", "enable", nome] if systemd
+                   else ["rc-update", "add", nome, "default"]),
+                  ("Não ligar ao iniciar o computador", ["systemctl", "disable", nome] if systemd
+                   else ["rc-update", "del", nome, "default"])]
+        if systemd:
+            opcoes += [("Ver os últimos logs", ["journalctl", "-u", nome, "-n", "150", "--no-pager"]),
+                       ("Acompanhar os logs ao vivo (Ctrl+C para sair)", ["journalctl", "-u", nome, "-f", "-n", "30"])]
+        i = escolher(nome, [r for r, _ in opcoes])
+        if i is not None:
+            cmd = opcoes[i][1]
+            rodar(cmd if i == 0 else _como_root_ou_eu(cmd), mostrar=i not in (0, 6, 7))
+
+    def falharam():
+        if _systemd():
+            rodar(["systemctl", "--failed", "--no-pager"], mostrar=False)
+        else:
+            rodar(["rc-status", "--crashed"], mostrar=False)
+
+    def logs_erros():
+        if _systemd():
+            rodar(_como_root_ou_eu(["journalctl", "-p", "err", "-b", "-n", "100", "--no-pager"]), mostrar=False)
+        else:
+            rodar(_como_root_ou_eu(["tail", "-n", "100", "/var/log/messages"]), mostrar=False)
+
+    def logs_ao_vivo():
+        info("Ctrl+C para sair.")
+        rodar(_como_root_ou_eu(["journalctl", "-f", "-n", "40"] if _systemd() else ["tail", "-f", "/var/log/messages"]),
+              mostrar=False)
+
+    menu("⚙️ Serviços e logs do sistema", [
+        ("Ver e controlar um serviço (status, iniciar, parar, ligar no boot, logs)", acoes),
+        ("Serviços que falharam", falharam),
+        ("Erros do sistema desde que ligou", logs_erros),
+        ("Logs do sistema ao vivo", logs_ao_vivo),
+    ], cabecalho=lambda: print(f"{DIM}{'systemd (systemctl e journalctl)' if _systemd() else 'OpenRC'} · mudar um "
+                               f"serviço pede a senha do sudo.{RST}"))
+
+
+# ── 7. Mandar arquivos com um código (croc) ──────────────────────────
+
+@submenu
+def menu_croc():
+    def pronto() -> bool:
+        return garantir_cmd("croc")
+
+    def mandar_arquivos():
+        if not pronto():
+            return
+        arquivos = escolher_arquivos("Quais arquivos mandar? (Espaço marca)")
+        if not arquivos:
+            return
+        info("O croc vai mostrar um CÓDIGO (três palavras e um número). Passe o código para a outra pessoa: ela "
+             "recebe no croc dela (ou no LNUX: 'Receber'). Deixe esta tela aberta até terminar.")
+        rodar(["croc", "send", *map(str, arquivos)], mostrar=False)
+
+    def mandar_texto():
+        if not pronto():
+            return
+        texto = perguntar("Texto a mandar")
+        if texto:
+            rodar(["croc", "send", "--text", texto], mostrar=False)
+
+    def receber():
+        if not pronto():
+            return
+        codigo = perguntar("Código que a outra pessoa passou (ex.: 7123-banana-cadeira-sol)").strip()
+        if not codigo:
+            return
+        pasta = pasta_para_salvar(DOWNLOADS) or HOME
+        info(f"Recebendo em {pasta} ...")
+        # o croc novo só aceita o código pela variável CROC_SECRET (na linha de comando ele ficaria visível)
+        try:
+            subprocess.run(["croc", "--yes", "--out", str(pasta)], env={**os.environ, "CROC_SECRET": codigo},
+                           timeout=None)
+        except KeyboardInterrupt:
+            aviso("Cancelado.")
+
+    menu("📦 Mandar arquivos com um código (croc)", [
+        ("📤 Mandar arquivos", mandar_arquivos),
+        ("💬 Mandar um texto", mandar_texto),
+        ("📥 Receber (com o código)", receber),
+        ("ℹ️ Como funciona", lambda: _explicar_tecnica("📦 croc", (
+            "Manda arquivos de um aparelho para outro, em qualquer rede (Wi-Fi diferente, 4G...), sem conta e sem "
+            "link: quem manda recebe um código de palavras, e quem recebe digita o mesmo código.\n"
+            "A conexão é cifrada de ponta a ponta com uma chave que sai do código (PAKE): o servidor do meio, que só "
+            "repassa os dados, não consegue ler. Funciona com o croc de qualquer computador (Windows, Mac, Linux)."))),
+    ], cabecalho=lambda: print(f"{DIM}Inspirado no croc (41 mil ⭐) e no magic-wormhole (23 mil ⭐).{RST}"))
+
+
+# ── 8. Pasta compartilhada com upload pelo navegador (estilo dufs/miniserve) ──
+
+PAGINA_PASTA = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>__TITULO__</title>
+<style>
+:root{--fundo:#f6f7f9;--cartao:#fff;--texto:#1d2330;--fraco:#6b7385;--borda:#dde1e8;--acento:#2563eb}
+@media (prefers-color-scheme:dark){:root{--fundo:#12151b;--cartao:#1b2029;--texto:#e7eaf0;--fraco:#97a0b3;--borda:#2b3240;--acento:#60a5fa}}
+body{margin:0;font:16px/1.45 system-ui,sans-serif;background:var(--fundo);color:var(--texto)}
+main{max-width:860px;margin:0 auto;padding:16px}
+h1{font-size:1.2rem;margin:.2rem 0 1rem;word-break:break-all}
+.caixa{background:var(--cartao);border:1px solid var(--borda);border-radius:12px;padding:12px;margin-bottom:14px}
+a{color:var(--acento);text-decoration:none}
+table{width:100%;border-collapse:collapse}
+td{padding:9px 6px;border-top:1px solid var(--borda);vertical-align:middle;word-break:break-word}
+td.n{white-space:nowrap;text-align:right;color:var(--fraco);font-size:.9rem}
+#envio{border:2px dashed var(--borda);border-radius:12px;padding:18px;text-align:center}
+#envio.sobre{border-color:var(--acento)}
+button{font:inherit;background:var(--acento);color:#fff;border:0;border-radius:8px;padding:9px 16px}
+progress{width:100%;height:10px}
+.fraco{color:var(--fraco);font-size:.9rem}
+</style></head><body><main>
+<h1>📂 __TITULO__</h1>
+__ENVIO__
+<div class="caixa"><table>__LINHAS__</table></div>
+<p class="fraco">Compartilhado pelo LNUX</p>
+</main>
+<script>
+const caixa = document.getElementById('envio');
+if (caixa) {
+  const entrada = document.getElementById('arquivos'), estado = document.getElementById('estado');
+  const mandar = async (lista) => {
+    for (const arq of lista) {
+      estado.innerHTML = 'Enviando ' + arq.name + '... <progress max="100" value="0" id="barra"></progress>';
+      await new Promise((ok, falha) => {
+        const x = new XMLHttpRequest();
+        x.open('PUT', location.pathname.replace(/\\/?$/, '/') + encodeURIComponent(arq.name));
+        x.upload.onprogress = e => { if (e.lengthComputable) document.getElementById('barra').value = e.loaded * 100 / e.total; };
+        x.onload = () => x.status < 300 ? ok() : falha(x.responseText);
+        x.onerror = () => falha('falhou a conexão');
+        x.send(arq);
+      }).catch(e => { estado.textContent = 'Erro: ' + e; throw e; });
+    }
+    estado.textContent = 'Pronto! ' + lista.length + ' arquivo(s) enviado(s).';
+    setTimeout(() => location.reload(), 900);
+  };
+  entrada.onchange = () => mandar([...entrada.files]);
+  ['dragover', 'dragenter'].forEach(t => caixa.addEventListener(t, e => { e.preventDefault(); caixa.classList.add('sobre'); }));
+  ['dragleave', 'drop'].forEach(t => caixa.addEventListener(t, () => caixa.classList.remove('sobre')));
+  caixa.addEventListener('drop', e => { e.preventDefault(); mandar([...e.dataTransfer.files]); });
+}
+</script></body></html>"""
+
+FORMULARIO_ENVIO = """<div class="caixa" id="envio"><p><b>Mandar arquivos para esta pasta</b></p>
+<input type="file" id="arquivos" multiple><p class="fraco">ou arraste os arquivos para cá</p><div id="estado"></div></div>"""
+
+
+def _caminho_na_pasta(raiz: Path, caminho_url: str) -> Path | None:
+    """O arquivo pedido, se ele estiver mesmo dentro da pasta compartilhada (sem '..' nem atalhos para fora)."""
+    relativo = urllib.parse.unquote(urllib.parse.urlsplit(caminho_url).path).lstrip("/")
+    if any(parte.startswith(".") for parte in Path(relativo).parts):
+        return None  # arquivos ocultos e '..' ficam de fora
+    alvo = Path(os.path.realpath(raiz / relativo))
+    raiz_real = Path(os.path.realpath(raiz))
+    return alvo if alvo == raiz_real or raiz_real in alvo.parents else None
+
+
+class ServidorDePasta(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, endereco, raiz: Path, permitir_envio: bool, senha: str = ""):
+        self.raiz, self.permitir_envio, self.senha = Path(raiz), permitir_envio, senha
+        super().__init__(endereco, ManipuladorDePasta)
+
+
+class ManipuladorDePasta(BaseHTTPRequestHandler):
+    server_version = f"LNUX/{VERSION}"
+
+    def log_message(self, formato, *args):
+        log(f"{self.client_address[0]} {formato % args}")
+
+    def _autorizado(self) -> bool:
+        if not self.server.senha:
+            return True
+        cabecalho = self.headers.get("Authorization", "")
+        if cabecalho.startswith("Basic "):
+            with contextlib.suppress(ValueError, UnicodeDecodeError):
+                _, _, senha = base64.b64decode(cabecalho[6:]).decode("utf-8").partition(":")
+                if hmac.compare_digest(senha.encode(), self.server.senha.encode()):
+                    return True
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="LNUX", charset="UTF-8"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
+
+    def _responder(self, codigo: int, corpo: bytes, tipo: str = "text/plain; charset=utf-8") -> None:
+        self.send_response(codigo)
+        self.send_header("Content-Type", tipo)
+        self.send_header("Content-Length", str(len(corpo)))
+        self.end_headers()
+        self.wfile.write(corpo)
+
+    def do_GET(self):  # noqa: N802
+        if not self._autorizado():
+            return
+        alvo = _caminho_na_pasta(self.server.raiz, self.path)
+        if alvo is None or not alvo.exists():
+            return self._responder(404, b"Nao encontrado.")
+        if alvo.is_dir():
+            if not self.path.split("?")[0].endswith("/"):
+                self.send_response(301)
+                self.send_header("Location", self.path.split("?")[0] + "/")
+                self.end_headers()
+                return
+            return self._responder(200, self._listagem(alvo).encode("utf-8"), "text/html; charset=utf-8")
+        self._mandar_arquivo(alvo)
+
+    def _listagem(self, pasta: Path) -> str:
+        linhas = [] if pasta == Path(os.path.realpath(self.server.raiz)) else ['<tr><td><a href="../">⬆️ ..</a></td><td></td></tr>']
+        with contextlib.suppress(OSError):
+            itens = sorted((p for p in pasta.iterdir() if not p.name.startswith(".")),
+                           key=lambda p: (not p.is_dir(), p.name.lower()))
+            for p in itens:
+                nome = html.escape(p.name)
+                link = urllib.parse.quote(p.name) + ("/" if p.is_dir() else "")
+                with contextlib.suppress(OSError):
+                    info_arq = "" if p.is_dir() else bytes_humanos(p.stat().st_size)
+                    linhas.append(f'<tr><td><a href="{link}">{"📁" if p.is_dir() else "📄"} {nome}</a></td>'
+                                  f'<td class="n">{info_arq}</td></tr>')
+        relativo = pasta.relative_to(Path(os.path.realpath(self.server.raiz)))
+        titulo_p = html.escape(f"{self.server.raiz.name}/{relativo}".rstrip("/."))
+        return (PAGINA_PASTA.replace("__TITULO__", titulo_p or "Pasta")
+                .replace("__ENVIO__", FORMULARIO_ENVIO if self.server.permitir_envio else "")
+                .replace("__LINHAS__", "".join(linhas) or '<tr><td class="fraco">(vazia)</td></tr>'))
+
+    def _mandar_arquivo(self, alvo: Path) -> None:
+        tamanho_arq = alvo.stat().st_size
+        inicio, fim = 0, tamanho_arq - 1
+        m = re.match(r"bytes=(\d*)-(\d*)$", self.headers.get("Range", ""))
+        if m and (m.group(1) or m.group(2)):  # pedaço do arquivo: vídeos e downloads que continuam
+            if m.group(1):
+                inicio, fim = int(m.group(1)), int(m.group(2) or fim)
+            else:
+                inicio = max(0, tamanho_arq - int(m.group(2)))
+            fim = min(fim, tamanho_arq - 1)
+            if inicio > fim:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{tamanho_arq}")
+                self.end_headers()
+                return
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {inicio}-{fim}/{tamanho_arq}")
+        else:
+            self.send_response(200)
+        tipo = mimetypes_guess(alvo.name)
+        self.send_header("Content-Type", tipo)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(fim - inicio + 1))
+        self.end_headers()
+        with open(alvo, "rb") as arq, contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            arq.seek(inicio)
+            falta = fim - inicio + 1
+            while falta > 0 and (bloco := arq.read(min(1 << 20, falta))):
+                self.wfile.write(bloco)
+                falta -= len(bloco)
+
+    def do_PUT(self):  # noqa: N802
+        if not self._autorizado():
+            return
+        if not self.server.permitir_envio:
+            return self._responder(403, "O envio de arquivos está desligado.".encode())
+        caminho = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
+        pasta_url, _, nome = caminho.rpartition("/")
+        nome = Path(nome).name
+        pasta = _caminho_na_pasta(self.server.raiz, pasta_url + "/")
+        if not nome or nome.startswith(".") or pasta is None or not pasta.is_dir():
+            return self._responder(400, "Nome ou pasta inválidos.".encode())
+        destino, n = pasta / nome, 2
+        while destino.exists():  # nunca sobrescreve: 'foto (2).jpg'
+            destino, n = pasta / f"{Path(nome).stem} ({n}){Path(nome).suffix}", n + 1
+        falta = int(self.headers.get("Content-Length") or 0)
+        parcial = destino.with_name(destino.name + ".enviando")
+        try:
+            with open(parcial, "wb") as arq:
+                while falta > 0 and (bloco := self.rfile.read(min(1 << 20, falta))):
+                    arq.write(bloco)
+                    falta -= len(bloco)
+            if falta:
+                raise ConnectionError("o envio parou no meio")
+            parcial.replace(destino)
+        except (OSError, ConnectionError) as e:
+            parcial.unlink(missing_ok=True)
+            return self._responder(500, f"Falhou: {e}".encode())
+        log(f"Recebido: {destino.name} ({bytes_humanos(destino.stat().st_size)})")
+        self._responder(201, destino.name.encode("utf-8"))
+
+
+def mimetypes_guess(nome: str) -> str:
+    import mimetypes
+    return mimetypes.guess_type(nome)[0] or "application/octet-stream"
+
+
+def servir_pasta(pasta: str, porta: int) -> None:
+    """O servidor da pasta compartilhada (roda no tmux; as opções ficam na configuração, com permissão 600)."""
+    c = cfg()
+    raiz = Path(os.path.expanduser(pasta))
+    if not raiz.is_dir():
+        raise LnuxError(f"A pasta {raiz} não existe.")
+    servidor = ServidorDePasta(("0.0.0.0", porta), raiz, bool(c.get("pasta_envio")), c.get("pasta_senha") or "")
+    log(f"Compartilhando {raiz} em http://{ip_local()}:{porta} "
+        f"({'com' if servidor.permitir_envio else 'sem'} envio, {'com' if servidor.senha else 'sem'} senha)")
+    servidor.serve_forever()
+
+
+# ── 9. Ping com gráfico (estilo gping) ───────────────────────────────
+
+def parse_ping(texto: str) -> float | None:
+    """O tempo (ms) da resposta de um 'ping -c 1', ou None se não respondeu."""
+    m = re.search(r"time[=<]\s*([\d.,]+)\s*ms", texto)
+    return float(m.group(1).replace(",", ".")) if m else None
+
+
+def medir_ping(host: str, espera: int = 2) -> float | None:
+    try:
+        proc = subprocess.run(["ping", "-c", "1", "-W", str(espera), host], capture_output=True, text=True,
+                              timeout=espera + 3)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return parse_ping(proc.stdout)
+
+
+def _ms(valor: float) -> str:
+    """Milissegundos: com uma casa abaixo de 10 ms (0,4 ms na rede de casa não é '0')."""
+    return f"{valor:.1f}" if valor < 10 else f"{valor:.0f}"
+
+
+def gateway_padrao() -> str | None:
+    m = re.search(r"default via (\S+)", saida(["ip", "route", "show", "default"], timeout=5))
+    return m.group(1) if m else None
+
+
+def ping_com_grafico() -> None:
+    if not garantir_cmd("ping", "iputils"):
+        raise LnuxError("Precisa do comando ping.")
+    padrao = ", ".join(h for h in (gateway_padrao(), "1.1.1.1", "google.com") if h)
+    hosts = [h.strip() for h in perguntar("Endereços (separados por vírgula)", padrao).split(",") if h.strip()][:6]
+    if not hosts:
+        return
+    historico = {h: collections.deque(maxlen=300) for h in hosts}
+    parar = threading.Event()
+
+    def medir(host: str):
+        while not parar.is_set():
+            inicio = time.time()
+            historico[host].append(medir_ping(host))
+            parar.wait(max(0.0, 1 - (time.time() - inicio)))
+
+    for h in hosts:
+        threading.Thread(target=medir, args=(h,), daemon=True).start()
+    if not setas_ativas():
+        time.sleep(5)
+        parar.set()
+        for h in hosts:
+            v = [x for x in historico[h] if x is not None]
+            print(f"  {h:<20} {sparkline(historico[h])}  " + (f"média {statistics.mean(v):.0f} ms" if v else "sem resposta"))
+        return
+    with TelaCheia():
+        try:
+            while True:
+                colunas, _ = shutil.get_terminal_size((80, 24))
+                largura = max(10, colunas - 4)
+                linhas = [f"{NEG}📈 Ping com gráfico{RST}  {DIM}uma medida por segundo · ✕ = sem resposta · q sai{RST}", ""]
+                for h in hosts:
+                    valores = list(historico[h])
+                    bons = [v for v in valores if v is not None]
+                    perda = (len(valores) - len(bons)) * 100 / len(valores) if valores else 0
+                    atual = f"{_ms(valores[-1])} ms" if valores and valores[-1] is not None else "—"
+                    resumo = (f"agora {atual} · mín {_ms(min(bons))} · média {_ms(statistics.mean(bons))} · máx "
+                              f"{_ms(max(bons))} ms · perda {perda:.0f}%") if bons else "esperando resposta..."
+                    cor = VERM if perda > 10 or (bons and statistics.mean(bons[-10:]) > 150) else VERD
+                    linhas += [f"{NEG}{h}{RST}  {DIM}{resumo}{RST}", f"  {cor}{sparkline(valores, largura)}{RST}", ""]
+                desenhar(linhas)
+                if tecla_ou_nada(1) in ("q", "esc", "Q"):
+                    return
+        finally:
+            parar.set()
+
+
+# ── 10. Internet usada por cada programa (estilo nethogs/bandwhich) ──
+
+def rede_por_programa() -> None:
+    """No Linux, o nethogs (ou o bandwhich, se estiver instalado) mostra quem está usando a rede agora."""
+    programa = "bandwhich" if tem("bandwhich") else "nethogs"
+    if programa == "nethogs" and not garantir_cmd("nethogs"):
+        return
+    cmd = como_root([programa])
+    if cmd is None:
+        raise LnuxError("Para ver a rede de cada programa é preciso ser root (sudo).")
+    info("Mostra, ao vivo, quanto cada programa está mandando e recebendo. Para sair: q (ou Ctrl+C).")
+    rodar(cmd, mostrar=False)
+
+
+# ── 5. Gravar o terminal (asciinema) ─────────────────────────────────
+
+PASTA_GRAVACOES = "Gravações do terminal"
+
+
+@submenu
+def menu_gravar_terminal():
+    def gravacoes() -> list:
+        pasta = pasta_saida(PASTA_GRAVACOES)
+        return sorted(pasta.glob("*.cast"), key=lambda p: -p.stat().st_mtime)
+
+    def escolher_gravacao(msg: str) -> Path | None:
+        lista = gravacoes()
+        if not lista:
+            info("Nenhuma gravação ainda.")
+            return None
+        i = escolher(msg, [f"{p.stem}  {DIM}{bytes_humanos(p.stat().st_size)} · "
+                           f"{datetime.fromtimestamp(p.stat().st_mtime):%d/%m %H:%M}{RST}" for p in lista])
+        return lista[i] if i is not None else None
+
+    def gravar():
+        if not garantir_cmd("asciinema"):
+            return
+        nome = _slug(perguntar("Nome da gravação", "minha-gravacao")) or "gravacao"
+        destino = pasta_saida(PASTA_GRAVACOES) / f"{nome}-{datetime.now():%Y%m%d-%H%M}.cast"
+        info("Gravando tudo o que aparecer no terminal. Para PARAR: digite exit (ou Ctrl+D).")
+        rodar(["asciinema", "rec", str(destino)], mostrar=False)
+        if destino.exists():
+            ok(f"Gravação salva: {destino}")
+
+    def assistir():
+        arq = escolher_gravacao("Qual gravação?")
+        if arq and garantir_cmd("asciinema"):
+            info("Espaço pausa · . avança quadro a quadro · Ctrl+C sai.")
+            rodar(["asciinema", "play", str(arq)], mostrar=False)
+
+    def enviar():
+        arq = escolher_gravacao("Qual gravação mandar para o asciinema.org?")
+        if arq and garantir_cmd("asciinema") and confirmar(
+                "A gravação fica pública no asciinema.org (quem tiver o link vê). Enviar?", False):
+            rodar(["asciinema", "upload", str(arq)], mostrar=False)
+
+    def apagar_gravacao():
+        arq = escolher_gravacao("Apagar qual?")
+        if arq and confirmar(f"Apagar {arq.name}?", False):
+            arq.unlink()
+            ok("Apagada.")
+
+    menu("🎬 Gravar o terminal (asciinema)", [
+        ("⏺ Gravar uma sessão", gravar),
+        (lambda: f"▶ Assistir uma gravação ({len(gravacoes())})", assistir),
+        ("🌍 Mandar para o asciinema.org (gera um link para compartilhar)", enviar),
+        ("🗑️ Apagar uma gravação", apagar_gravacao),
+    ], cabecalho=lambda: print(f"{DIM}Grava o texto do terminal (não é vídeo): fica leve e dá para copiar os comandos de "
+                               f"dentro da gravação. Inspirado no asciinema (18 mil ⭐).{RST}"))
+
+
+# ── 6. Cola de comandos (páginas do tldr) ────────────────────────────
+
+TLDR_PASTA = DATA_DIR / "tldr"
+TLDR_ZIP = "https://github.com/tldr-pages/tldr/releases/latest/download/tldr.zip"
+TLDR_CRU = "https://raw.githubusercontent.com/tldr-pages/tldr/main"
+TLDR_IDIOMAS = ("pages.pt_BR", "pages.pt_PT", "pages")  # português primeiro; o inglês tem todas
+
+
+def _tldr_plataformas() -> tuple:
+    return ("common", "android", "linux") if sistema().android else ("common", "linux")
+
+
+def tldr_atualizar() -> int:
+    """Baixa as páginas do tldr (português e inglês) para usar sem internet. Devolve quantas páginas ficaram."""
+    info("Baixando as páginas do tldr (uns 10 MB, só na primeira vez)...")
+    dados = pedir_bytes(TLDR_ZIP, timeout=120)
+    TLDR_PASTA.mkdir(parents=True, exist_ok=True)
+    total = 0
+    with zipfile.ZipFile(io.BytesIO(dados)) as z:
+        for nome in z.namelist():
+            partes = nome.split("/")
+            if len(partes) == 3 and partes[0] in TLDR_IDIOMAS and partes[1] in ("common", "linux", "android") \
+                    and nome.endswith(".md"):
+                destino = TLDR_PASTA.joinpath(*partes)
+                destino.parent.mkdir(parents=True, exist_ok=True)
+                destino.write_bytes(z.read(nome))
+                total += 1
+    (TLDR_PASTA / "atualizado").write_text(f"{datetime.now():%Y-%m-%d}\n")
+    return total
+
+
+def tldr_achar(comando: str, base: Path = TLDR_PASTA) -> Path | None:
+    nome = re.sub(r"\s+", "-", comando.strip().lower())
+    for idioma in TLDR_IDIOMAS:
+        for plataforma in _tldr_plataformas():
+            caminho = base / idioma / plataforma / f"{nome}.md"
+            if caminho.exists():
+                return caminho
+    return None
+
+
+def tldr_buscar_online(comando: str) -> str | None:
+    """Sem as páginas baixadas: busca só a página pedida no GitHub."""
+    nome = re.sub(r"\s+", "-", comando.strip().lower())
+    for idioma in TLDR_IDIOMAS:
+        for plataforma in _tldr_plataformas():
+            with contextlib.suppress(LnuxError):
+                return pedir_bytes(f"{TLDR_CRU}/{idioma}/{plataforma}/{urllib.parse.quote(nome)}.md", timeout=15).decode()
+    return None
+
+
+def tldr_nomes(base: Path = TLDR_PASTA) -> list:
+    return sorted({p.stem for p in base.glob("pages*/*/*.md")})
+
+
+def tldr_renderizar(texto: str) -> list:
+    """O Markdown do tldr em linhas coloridas: título, descrição, exemplos e comandos ({{argumentos}} em destaque)."""
+    linhas = []
+    for linha in texto.splitlines():
+        if linha.startswith("# "):
+            linhas += [f"{NEG}{CIANO}{linha[2:]}{RST}", ""]
+        elif linha.startswith("> "):
+            descricao = re.sub(r"`([^`]+)`", r"\1", re.sub(r"<(https?://[^>]+)>", r"\1", linha[2:]))
+            linhas.append(DIM + descricao + RST)
+        elif linha.startswith("- "):
+            exemplo = re.sub(r"`([^`]+)`", NEG + r"\1" + RST, linha[2:])
+            linhas += ["", f"{VERD}•{RST} " + exemplo]
+        elif linha.startswith("`") and linha.endswith("`"):
+            comando = re.sub(r"\{\{(.+?)\}\}", AMAR + r"\1" + RST + CIANO, linha[1:-1])
+            linhas.append(f"    {CIANO}{comando}{RST}")
+    return linhas
+
+
+@submenu
+def menu_tldr():
+    def procurar():
+        comando = perguntar("Qual comando? (ex.: tar, ffmpeg, git commit, find)").strip()
+        if not comando:
+            return
+        caminho = tldr_achar(comando)
+        texto = caminho.read_text("utf-8") if caminho else tldr_buscar_online(comando)
+        if texto:
+            print("\n".join(tldr_renderizar(texto)))
+            if caminho and "pages.pt" not in str(caminho):
+                print(f"\n{DIM}(Esta página ainda não tem tradução para o português.){RST}")
+            return
+        nomes = tldr_nomes()
+        parecidos = difflib.get_close_matches(comando.replace(" ", "-"), nomes, n=8, cutoff=0.6) or \
+            [n for n in nomes if comando.lower() in n][:8]
+        if not parecidos:
+            info("Não achei esse comando. Baixe as páginas ('Baixar ou atualizar') para procurar sem internet.")
+            return
+        i = escolher("Não achei esse. Será um destes?", parecidos)
+        if i is not None:
+            print("\n".join(tldr_renderizar(tldr_achar(parecidos[i]).read_text("utf-8"))))
+
+    def aleatorio():
+        nomes = tldr_nomes()
+        if not nomes:
+            raise LnuxError("Baixe as páginas primeiro ('Baixar ou atualizar as páginas').")
+        nome = random.choice(nomes)
+        print("\n".join(tldr_renderizar(tldr_achar(nome).read_text("utf-8"))))
+
+    def atualizar():
+        ok(f"{tldr_atualizar()} páginas prontas para usar sem internet.")
+
+    def resumo() -> str:
+        quando = (TLDR_PASTA / "atualizado").read_text().strip() if (TLDR_PASTA / "atualizado").exists() else ""
+        return f"baixadas em {quando}" if quando else "ainda não baixadas: busca na internet"
+
+    menu("📚 Cola de comandos (tldr)", [
+        ("🔎 Explicar um comando (com exemplos)", procurar),
+        ("🎲 Um comando aleatório (para aprender)", aleatorio),
+        (lambda: f"⬇️ Baixar ou atualizar as páginas ({resumo()})", atualizar),
+    ], cabecalho=lambda: print(f"{DIM}Exemplos práticos de milhares de comandos, em português quando há tradução. "
+                               f"Páginas do projeto tldr (64 mil ⭐, licença CC BY 4.0).{RST}"))
+
+
+# ── 11. Testar uma API (estilo HTTPie/Posting) ──────────────────────
+
+API_HISTORICO = DATA_DIR / "api_historico.json"
+METODOS_HTTP = ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"]
+
+
+def requisicao_http(metodo: str, url: str, cabecalhos: dict | None = None, corpo: bytes | None = None,
+                    timeout: float = 30) -> dict:
+    """Faz a requisição e devolve {status, motivo, cabecalhos, corpo, segundos}, inclusive em erro 4xx/5xx."""
+    if not re.match(r"https?://", url):
+        url = "http://" + url
+    pedido = urllib.request.Request(url, data=corpo, method=metodo.upper(),
+                                    headers={"User-Agent": f"LNUX/{VERSION}", **(cabecalhos or {})})
+    inicio = time.time()
+    try:
+        with _abridor(url).open(pedido, timeout=timeout) as r:
+            dados, status, motivo, resposta_cab = r.read(), r.status, r.reason, dict(r.headers.items())
+    except urllib.error.HTTPError as e:
+        dados, status, motivo, resposta_cab = e.read(), e.code, e.reason, dict(e.headers.items())
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise LnuxError(f"Não consegui falar com {url}: {getattr(e, 'reason', e)}") from None
+    return {"status": status, "motivo": str(motivo), "cabecalhos": resposta_cab, "corpo": dados,
+            "segundos": time.time() - inicio, "url": url}
+
+
+def colorir_json(texto: str) -> str:
+    """JSON já formatado com cores: chaves em ciano, textos em verde, números em amarelo, true/false/null em magenta."""
+    padrao = r'("(?:\\.|[^"\\])*")(\s*:)?|\b(true|false|null)\b|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)'
+
+    def cor(m: re.Match) -> str:
+        if m.group(1):
+            return f"{CIANO}{m.group(1)}{RST}{m.group(2)}" if m.group(2) else f"{VERD}{m.group(1)}{RST}"
+        if m.group(3):
+            return f"{MAG}{m.group(3)}{RST}"
+        return f"{AMAR}{m.group(4)}{RST}"
+
+    return re.sub(padrao, cor, texto)
+
+
+def como_curl(metodo: str, url: str, cabecalhos: dict, corpo: str) -> str:
+    """O mesmo pedido como comando curl, para repetir em qualquer terminal."""
+    partes = ["curl", "-i"] + (["-X", metodo] if metodo not in ("GET", "HEAD") or (metodo == "GET" and corpo) else []) \
+        + (["-I"] if metodo == "HEAD" else [])
+    for nome, valor in cabecalhos.items():
+        partes += ["-H", f"{nome}: {valor}"]
+    if corpo:
+        partes += ["--data", corpo]
+    return shlex.join(partes + [url])
+
+
+def mostrar_resposta(r: dict) -> None:
+    cor = VERD if r["status"] < 300 else AMAR if r["status"] < 400 else VERM
+    print(f"\n{cor}{NEG}{r['status']} {r['motivo']}{RST}  {DIM}{r['segundos'] * 1000:.0f} ms · "
+          f"{bytes_humanos(len(r['corpo']))}{RST}")
+    for nome, valor in r["cabecalhos"].items():
+        print(f"  {DIM}{nome}:{RST} {valor}")
+    tipo = r["cabecalhos"].get("Content-Type", r["cabecalhos"].get("content-type", ""))
+    texto = r["corpo"].decode("utf-8", errors="replace")
+    print()
+    if "json" in tipo or texto.lstrip()[:1] in ("{", "["):
+        with contextlib.suppress(ValueError):
+            texto = colorir_json(json.dumps(json.loads(texto), ensure_ascii=False, indent=2))
+    linhas = texto.splitlines()
+    print("\n".join(linhas[:200]) + (f"\n{DIM}… mais {len(linhas) - 200} linhas (salve para ver tudo){RST}"
+                                      if len(linhas) > 200 else ""))
+
+
+@submenu
+def menu_testar_api():
+    def historico() -> list:
+        return ler_json(API_HISTORICO, [])
+
+    def executar_pedido(pedido: dict) -> None:
+        corpo = pedido.get("corpo") or ""
+        r = requisicao_http(pedido["metodo"], pedido["url"], pedido.get("cabecalhos") or {},
+                            corpo.encode("utf-8") if corpo else None)
+        mostrar_resposta(r)
+        lista = [p for p in historico() if p != pedido][:29]
+        gravar_json(API_HISTORICO, [pedido, *lista])
+        i = escolher("E agora?", ["✔ Pronto", "💾 Salvar a resposta num arquivo", "📋 Copiar como comando curl"])
+        if i == 1:
+            destino = pasta_saida("API") / f"resposta-{datetime.now():%Y%m%d-%H%M%S}.txt"
+            destino.write_bytes(r["corpo"])
+            ok(f"Salvo: {destino}")
+        elif i == 2:
+            copiar_texto(como_curl(pedido["metodo"], r["url"], pedido.get("cabecalhos") or {}, corpo))
+
+    def novo():
+        i = escolher("Método", METODOS_HTTP)
+        if i is None:
+            return
+        metodo = METODOS_HTTP[i]
+        url = perguntar("Endereço (ex.: https://api.github.com/users/octocat)").strip()
+        if not url:
+            return
+        cabecalhos = {}
+        token = perguntar("Token (Authorization: Bearer ...; Enter = sem)").strip()
+        if token:
+            cabecalhos["Authorization"] = f"Bearer {token}"
+        for linha in ler_linhas("Outros cabeçalhos, um por linha, como 'Accept: application/json'").splitlines():
+            nome, _, valor = linha.partition(":")
+            if nome.strip() and valor.strip():
+                cabecalhos[nome.strip()] = valor.strip()
+        corpo = ""
+        if metodo in ("POST", "PUT", "PATCH"):
+            corpo = ler_linhas("Corpo (JSON ou texto)")
+            if corpo.strip()[:1] in ("{", "["):
+                try:
+                    json.loads(corpo)
+                    cabecalhos.setdefault("Content-Type", "application/json")
+                except ValueError:
+                    aviso("O corpo parece JSON, mas tem um erro: vai como texto.")
+        executar_pedido({"metodo": metodo, "url": url, "cabecalhos": cabecalhos, "corpo": corpo})
+
+    def repetir():
+        lista = historico()
+        if not lista:
+            info("Nenhum pedido ainda.")
+            return
+        i = escolher("Repetir qual?", [f"{p['metodo']:<6} {p['url']}" for p in lista])
+        if i is not None:
+            executar_pedido(lista[i])
+
+    menu("🔌 Testar uma API (HTTP)", [
+        ("➕ Novo pedido (GET, POST, PUT, PATCH, DELETE)", novo),
+        (lambda: f"🔁 Repetir um pedido ({len(historico())} no histórico)", repetir),
+        ("🗑️ Limpar o histórico", lambda: (API_HISTORICO.unlink(missing_ok=True), ok("Histórico limpo."))),
+    ], cabecalho=lambda: print(f"{DIM}Respostas JSON coloridas e o comando curl equivalente. Inspirado no HTTPie "
+                               f"(39 mil ⭐) e no Posting (13 mil ⭐).{RST}"))
+
+
+# ── 12. Ver JSON e Markdown (estilo fx/glow) ─────────────────────────
+
+def json_resumo(valor) -> str:
+    if isinstance(valor, dict):
+        return f"{{…}} {len(valor)} chave(s)"
+    if isinstance(valor, list):
+        return f"[…] {len(valor)} item(ns)"
+    texto = json.dumps(valor, ensure_ascii=False)
+    return texto if len(texto) <= 60 else texto[:57] + "…"
+
+
+def json_filhos(valor) -> list:
+    """[(rótulo, chave, filho)] de um objeto ou lista JSON."""
+    if isinstance(valor, dict):
+        return [(f"{k}: {json_resumo(v)}", k, v) for k, v in valor.items()]
+    if isinstance(valor, list):
+        return [(f"[{i}] {json_resumo(v)}", i, v) for i, v in enumerate(valor)]
+    return []
+
+
+def json_caminho(chaves: list) -> str:
+    """Caminho no estilo do jq: .dados[3].nome"""
+    return "".join(f"[{k}]" if isinstance(k, int) else
+                   (f".{k}" if re.fullmatch(r"[A-Za-z_]\w*", str(k)) else f'["{k}"]') for k in chaves) or "."
+
+
+def markdown_simples(texto: str) -> list:
+    """Markdown em linhas coloridas (sem o rich): títulos, listas, citações, código, **negrito** e links."""
+    linhas, em_codigo = [], False
+    for linha in texto.splitlines():
+        if linha.strip().startswith("```"):
+            em_codigo = not em_codigo
+            continue
+        if em_codigo:
+            linhas.append(f"  {CIANO}{linha}{RST}")
+            continue
+        linha = re.sub(r"\*\*(.+?)\*\*", NEG + r"\1" + RST, linha)
+        linha = re.sub(r"`([^`]+)`", CIANO + r"\1" + RST, linha)
+        linha = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1 " + DIM + r"(\2)" + RST, linha)
+        m = re.match(r"(#{1,6})\s+(.*)", linha)
+        if m:
+            nivel = len(m.group(1))
+            linhas += ["", f"{NEG}{MAG if nivel == 1 else CIANO}{m.group(2).upper() if nivel == 1 else m.group(2)}{RST}"]
+        elif re.match(r"\s*[-*+]\s+", linha):
+            linhas.append(re.sub(r"^(\s*)[-*+]\s+", r"\1• ", linha))
+        elif linha.startswith(">"):
+            linhas.append(f"{DIM}│ {linha.lstrip('> ')}{RST}")
+        else:
+            linhas.append(linha)
+    return linhas
+
+
+@submenu
+def menu_ver_dados():
+    def carregar_json():
+        i = escolher("De onde?", ["📄 Um arquivo .json", "📋 O que está copiado", "🌐 Um endereço da internet"])
+        if i == 0:
+            arq = escolher_arquivo("Qual arquivo?", (".json", ".geojson", ".jsonl"))
+            texto = arq.read_text("utf-8", errors="replace") if arq else ""
+        elif i == 1:
+            texto = _tapi(["termux-clipboard-get"], 10, json_saida=False)
+        elif i == 2:
+            texto = requisicao_http("GET", perguntar("Endereço"))["corpo"].decode("utf-8", errors="replace")
+        else:
+            return None
+        try:
+            return json.loads(texto)
+        except ValueError as e:
+            raise LnuxError(f"Isso não é um JSON válido: {e}") from None
+
+    def navegar_json():
+        raiz = carregar_json()
+        if raiz is None:
+            return
+        caminho: list = []
+        while True:
+            atual = raiz
+            for chave in caminho:
+                atual = atual[chave]
+            filhos = json_filhos(atual)
+            titulo(f"🔍 {json_caminho(caminho)}  ({json_resumo(atual)})")
+            if not filhos:
+                print(colorir_json(json.dumps(atual, ensure_ascii=False, indent=2)))
+            opcoes = [r for r, _, _ in filhos] + ["🖨 Mostrar tudo daqui (formatado)", "📋 Copiar este valor",
+                                                  "📋 Copiar o caminho (estilo jq)"]
+            i = escolher("Entrar em (Esc volta)", opcoes)
+            if i is None:
+                if not caminho:
+                    return
+                caminho.pop()
+            elif i < len(filhos):
+                if isinstance(filhos[i][2], (dict, list)):
+                    caminho.append(filhos[i][1])
+                else:
+                    print(colorir_json(json.dumps(filhos[i][2], ensure_ascii=False, indent=2)))
+                    pausar()
+            elif i == len(filhos):
+                print(colorir_json(json.dumps(atual, ensure_ascii=False, indent=2)))
+                pausar()
+            elif i == len(filhos) + 1:
+                copiar_texto(json.dumps(atual, ensure_ascii=False, indent=2))
+            else:
+                copiar_texto(json_caminho(caminho))
+
+    def ver_markdown():
+        pastas = [(DATA_DIR / "notas", 2), *_pastas_de_arquivos(), (SCRIPT.parent, 2)]
+        arq = escolher_arquivo("Qual arquivo Markdown?", (".md", ".markdown"), pastas)
+        if not arq:
+            return
+        texto = arq.read_text("utf-8", errors="replace")
+        if modulo_existe("rich"):
+            from rich.console import Console
+            from rich.markdown import Markdown
+            console = Console()
+            with console.pager(styles=True):
+                console.print(Markdown(texto))
+        else:
+            ler_texto(arq.name, "\n".join(markdown_simples(texto)))
+
+    menu("🔍 Ver JSON e Markdown", [
+        ("🧩 Navegar num JSON (arquivo, copiado ou da internet)", navegar_json),
+        ("📝 Ler um Markdown formatado (notas, READMEs)", ver_markdown),
+    ], cabecalho=lambda: print(f"{DIM}Inspirado no fx (21 mil ⭐) e no glow (28 mil ⭐).{RST}"))
+
+
+# ── 13. Contêineres (estilo lazydocker) ──────────────────────────────
+
+def motor_de_conteineres() -> str:
+    for programa in ("podman", "docker"):
+        if tem(programa):
+            return programa
+    if confirmar("Nem o Podman nem o Docker estão instalados. Instalar o Podman (sem precisar de root)?", True) \
+            and instalar_pkg("podman"):
+        return "podman"
+    raise LnuxError("Precisa do Podman ou do Docker.")
+
+
+def parse_lista_json(texto: str) -> list:
+    """A saída '--format json' do podman (uma lista) ou '{{json .}}' do docker (um objeto por linha)."""
+    texto = texto.strip()
+    if not texto:
+        return []
+    if texto.startswith("["):
+        return json.loads(texto)
+    return [json.loads(linha) for linha in texto.splitlines() if linha.strip().startswith("{")]
+
+
+def normalizar_conteiner(c: dict) -> dict:
+    """Os nomes dos campos mudam entre o docker e o podman: deixa num formato só."""
+    nomes = c.get("Names") or c.get("Name") or ""
+    nome = nomes[0] if isinstance(nomes, list) and nomes else str(nomes).lstrip("/")
+    estado = str(c.get("State") or "").lower()
+    return {"id": str(c.get("ID") or c.get("Id") or "")[:12], "nome": nome, "imagem": c.get("Image", ""),
+            "estado": estado, "status": c.get("Status", "") or estado, "rodando": estado == "running"}
+
+
+@submenu
+def menu_conteineres():
+    def docker(*args) -> list:
+        motor = motor_de_conteineres()
+        cmd = [motor, *args]
+        if motor == "docker" and not os.access("/var/run/docker.sock", os.W_OK):
+            cmd = como_root(cmd) or cmd  # sem estar no grupo docker, o docker precisa de sudo
+        return cmd
+
+    def listar(todos: bool = True) -> list:
+        motor = motor_de_conteineres()
+        formato = "json" if motor == "podman" else "{{json .}}"
+        proc = rodar(docker("ps", *(["-a"] if todos else []), "--format", formato), capturar=True, timeout=60)
+        if proc.returncode != 0:
+            raise LnuxError(proc.stderr.strip()[:300] or "O comando ps falhou.")
+        return [normalizar_conteiner(c) for c in parse_lista_json(proc.stdout)]
+
+    def conteiner():
+        lista = listar()
+        if not lista:
+            info("Nenhum contêiner. Crie com 'Baixar uma imagem' e depois 'Rodar uma imagem'.")
+            return
+        i = escolher("Contêiner", [f"{VERD + '●' if c['rodando'] else DIM + '○'}{RST} {c['nome']:<24} "
+                                   f"{DIM}{c['imagem'][:30]} · {c['status']}{RST}" for c in lista])
+        if i is None:
+            return
+        c = lista[i]
+        acoes = [("Ver os logs (últimas 200 linhas)", ["logs", "--tail", "200", c["nome"]]),
+                 ("Acompanhar os logs ao vivo (Ctrl+C sai)", ["logs", "-f", "--tail", "50", c["nome"]]),
+                 ("Abrir um terminal dentro dele", ["exec", "-it", c["nome"], "sh"]),
+                 ("Uso de CPU e memória", ["stats", "--no-stream", c["nome"]]),
+                 ("Parar" if c["rodando"] else "Iniciar", ["stop" if c["rodando"] else "start", c["nome"]]),
+                 ("Reiniciar", ["restart", c["nome"]]),
+                 ("Remover", ["rm", "-f", c["nome"]])]
+        j = escolher(c["nome"], [r for r, _ in acoes])
+        if j is not None and (acoes[j][0] != "Remover" or confirmar(f"Remover o contêiner {c['nome']}?", False)):
+            rodar(docker(*acoes[j][1]), mostrar=False)
+
+    def imagens():
+        rodar(docker("images"), mostrar=False)
+
+    def baixar():
+        imagem = perguntar("Imagem (ex.: nginx, postgres:16, docker.io/library/alpine)").strip()
+        if imagem:
+            rodar(docker("pull", imagem))
+
+    def rodar_imagem():
+        imagem = perguntar("Imagem (ex.: nginx)").strip()
+        if not imagem:
+            return
+        nome = perguntar("Nome do contêiner", re.sub(r"[^a-z0-9]+", "-", imagem.split("/")[-1].split(":")[0]))
+        portas = perguntar("Portas (ex.: 8080:80; Enter = nenhuma)").strip()
+        args = ["run", "-d", "--name", nome] + [x for p in portas.split() for x in ("-p", p)] + [imagem]
+        rodar(docker(*args))
+
+    def limpar_tudo():
+        if confirmar("Apagar contêineres parados, imagens sem uso e o cache de construção?", False):
+            rodar(docker("system", "prune", "-f"))
+
+    menu("🐳 Contêineres (Docker ou Podman)", [
+        ("📦 Contêineres (logs, terminal, parar, iniciar, remover)", conteiner),
+        ("🖼️ Imagens baixadas", imagens),
+        ("⬇️ Baixar uma imagem", baixar),
+        ("▶ Rodar uma imagem num contêiner novo", rodar_imagem),
+        ("🧹 Limpar o que não é usado", limpar_tudo),
+    ], cabecalho=lambda: print(f"{DIM}Usa o Podman (sem root) ou o Docker. Inspirado no lazydocker (53 mil ⭐).{RST}"))
+
+
+# ── 15. Códigos de verificação em duas etapas (TOTP, como o Google Authenticator) ──
+
+ARQUIVO_2FA = DATA_DIR / "2fa.lnuxcripto"
+
+
+def hotp(chave: bytes, contador: int, digitos: int = 6, algoritmo: str = "sha1") -> str:
+    """HOTP (RFC 4226): HMAC do contador, 'truncado' para N dígitos."""
+    mac = hmac.new(chave, contador.to_bytes(8, "big"), getattr(hashlib, algoritmo)).digest()
+    deslocamento = mac[-1] & 0x0F
+    numero = int.from_bytes(mac[deslocamento:deslocamento + 4], "big") & 0x7FFFFFFF
+    return str(numero % 10 ** digitos).zfill(digitos)
+
+
+def chave_base32(segredo: str) -> bytes:
+    limpo = re.sub(r"[\s-]", "", segredo).upper()
+    try:
+        return base64.b32decode(limpo + "=" * (-len(limpo) % 8))
+    except ValueError:
+        raise LnuxError("A chave precisa estar em Base32 (letras A–Z e números 2–7).") from None
+
+
+def totp(segredo: str, instante: float | None = None, digitos: int = 6, periodo: int = 30,
+         algoritmo: str = "sha1") -> str:
+    """TOTP (RFC 6238): o HOTP do número de períodos de 30 s desde 1970. É o código dos apps autenticadores."""
+    return hotp(chave_base32(segredo), int((time.time() if instante is None else instante) // periodo), digitos,
+                algoritmo)
+
+
+def ler_otpauth(uri: str) -> dict:
+    """Lê o link otpauth://totp/Emissor:conta?secret=...&issuer=... que fica dentro do QR code dos sites."""
+    partes = urllib.parse.urlsplit(uri.strip())
+    if partes.scheme != "otpauth" or partes.netloc.lower() != "totp":
+        raise LnuxError("Isso não é um link otpauth://totp/... (o que vem no QR code do site).")
+    q = {k.lower(): v[0] for k, v in urllib.parse.parse_qs(partes.query).items()}
+    rotulo = urllib.parse.unquote(partes.path.lstrip("/"))
+    emissor_rotulo, _, conta = rotulo.rpartition(":")
+    if not q.get("secret"):
+        raise LnuxError("O link não tem a chave (secret=...).")
+    chave_base32(q["secret"])  # confere se é Base32
+    return {"emissor": q.get("issuer") or emissor_rotulo or "", "conta": conta or rotulo,
+            "segredo": q["secret"].upper(), "digitos": int(q.get("digits", 6)), "periodo": int(q.get("period", 30)),
+            "algoritmo": q.get("algorithm", "SHA1").lower()}
+
+
+def montar_otpauth(c: dict) -> str:
+    rotulo = urllib.parse.quote(f"{c['emissor']}:{c['conta']}" if c.get("emissor") else c["conta"])
+    consulta = urllib.parse.urlencode({"secret": c["segredo"], "issuer": c.get("emissor", ""), "digits": c["digitos"],
+                                       "period": c["periodo"], "algorithm": c["algoritmo"].upper()})
+    return f"otpauth://totp/{rotulo}?{consulta}"
+
+
+@submenu
+def menu_2fa():
+    estado = {"senha": None}
+
+    def abrir() -> list:
+        if not ARQUIVO_2FA.exists():
+            return []
+        if estado["senha"] is None:
+            estado["senha"] = _senha()
+        try:
+            return json.loads(aes_decifrar_bytes(ARQUIVO_2FA.read_bytes(), estado["senha"]))
+        except LnuxError:
+            estado["senha"] = None
+            raise
+
+    def salvar(contas: list) -> None:
+        if estado["senha"] is None:
+            info("Crie a senha que protege os seus códigos (sem ela não dá para ver nem recuperar).")
+            estado["senha"] = _senha(confirmar_digitando=True)
+        ARQUIVO_2FA.parent.mkdir(parents=True, exist_ok=True)
+        ARQUIVO_2FA.write_bytes(aes_cifrar_bytes(json.dumps(contas).encode(), estado["senha"]))
+        os.chmod(ARQUIVO_2FA, 0o600)
+
+    def ver():
+        contas = abrir()
+        if not contas:
+            info("Nenhuma conta ainda: use 'Adicionar uma conta'.")
+            return
+        if not setas_ativas():
+            for c in contas:
+                print(f"  {totp(c['segredo'], digitos=c['digitos'], periodo=c['periodo'], algoritmo=c['algoritmo'])}  "
+                      f"{c['emissor']} {c['conta']}")
+            return
+        sel = 0
+        with TelaCheia():
+            while True:
+                agora = time.time()
+                linhas = [f"{NEG}🔑 Códigos de verificação{RST}  {DIM}↑↓ escolher · Enter copia · q sai{RST}", ""]
+                for i, c in enumerate(contas):
+                    codigo = totp(c["segredo"], agora, c["digitos"], c["periodo"], c["algoritmo"])
+                    resta = c["periodo"] - int(agora) % c["periodo"]
+                    codigo = f"{codigo[:len(codigo) // 2]} {codigo[len(codigo) // 2:]}"
+                    cor = VERM if resta <= 5 else VERD
+                    texto = f"  {cor}{NEG}{codigo}{RST}  {_barra(resta / c['periodo'], 8)} {resta:>2}s  {c['emissor']} " \
+                            f"{DIM}{c['conta']}{RST}"
+                    linhas.append(f"{DESTAQUE}{_sem_ansi(texto)}{RST}" if i == sel else texto)
+                desenhar(linhas)
+                tecla = tecla_ou_nada(0.5)
+                if tecla in ("q", "esc"):
+                    return
+                if tecla in ("cima", "baixo"):
+                    sel = _mover(tecla, sel, len(contas), len(contas))
+                elif tecla == "enter":
+                    c = contas[sel]
+                    copiar_texto(totp(c["segredo"], digitos=c["digitos"], periodo=c["periodo"],
+                                      algoritmo=c["algoritmo"]), avisar=False)
+
+    def adicionar():
+        contas = abrir()
+        i = escolher("Como adicionar?", ["🖼️ Ler o QR code de uma imagem (print da tela do site)",
+                                         "📷 Tirar uma foto do QR code", "🔗 Colar o link otpauth://...",
+                                         "⌨️ Digitar a chave (o site mostra como 'chave' ou 'código de configuração')"])
+        if i is None:
+            return
+        if i in (0, 1):
+            if not garantir_cmd("zbarimg", "zbar"):
+                return
+            arq = escolher_arquivo("Qual imagem?", EXT_IMAGEM) if i == 0 else foto(DATA_DIR / "tmp" / "qr2fa.jpg")
+            if not arq:
+                return
+            texto = saida(["zbarimg", "--quiet", "--raw", str(arq)], timeout=30)
+            if i == 1:
+                Path(arq).unlink(missing_ok=True)
+            conta = ler_otpauth(next((l for l in texto.splitlines() if l.startswith("otpauth://")), texto))
+        elif i == 2:
+            conta = ler_otpauth(perguntar("Link"))
+        else:
+            segredo = perguntar("Chave").strip()
+            chave_base32(segredo)
+            conta = {"emissor": perguntar("Site ou app (ex.: GitHub)").strip(), "conta": perguntar("Conta (e-mail ou usuário)").strip(),
+                     "segredo": re.sub(r"[\s-]", "", segredo).upper(), "digitos": 6, "periodo": 30, "algoritmo": "sha1"}
+        contas.append(conta)
+        salvar(contas)
+        ok(f"{conta['emissor']} {conta['conta']} adicionada. Código agora: "
+           f"{totp(conta['segredo'], digitos=conta['digitos'], periodo=conta['periodo'], algoritmo=conta['algoritmo'])}")
+        info("Confira digitando esse código no site, como ele pede ao ativar a verificação em duas etapas.")
+
+    def remover():
+        contas = abrir()
+        i = escolher("Remover qual?", [f"{c['emissor']} {c['conta']}" for c in contas]) if contas else None
+        if i is not None and confirmar(f"Remover {contas[i]['emissor']} {contas[i]['conta']}? Sem outro jeito de gerar o "
+                                       "código, você pode perder o acesso à conta.", False):
+            contas.pop(i)
+            salvar(contas)
+            ok("Removida.")
+
+    def exportar():
+        contas = abrir()
+        if not contas:
+            return
+        aviso("Os links e QR codes dão acesso aos seus códigos: mostre só para o seu outro aparelho.")
+        i = escolher("Exportar qual?", [f"{c['emissor']} {c['conta']}" for c in contas] + ["Todas (links num .txt cifrado)"])
+        if i is None:
+            return
+        if i < len(contas):
+            mostrar_qr(montar_otpauth(contas[i]), salvar=False)
+        else:
+            destino = aes_cifrar_arquivo(_arquivo_temporario("\n".join(montar_otpauth(c) for c in contas)),
+                                         _senha(confirmar_digitando=True),
+                                         pasta_saida("2FA") / f"contas-2fa-{datetime.now():%Y%m%d}.txt.lnuxcripto")
+            ok(f"Exportado e cifrado: {destino} (abra em 🕵️ Mensagens secretas → AES → Decifrar um arquivo)")
+
+    menu("🔑 Códigos de verificação (2FA)", [
+        ("👀 Ver os códigos (atualizam sozinhos)", ver),
+        ("➕ Adicionar uma conta (QR code, link ou chave)", adicionar),
+        ("📤 Exportar (QR code para outro app ou aparelho)", exportar),
+        ("🗑️ Remover uma conta", remover),
+    ], cabecalho=lambda: print(f"{DIM}Os códigos de 6 dígitos da verificação em duas etapas (TOTP), como o Google "
+                               f"Authenticator. As chaves ficam cifradas com AES-256 e a sua senha.{RST}"))
+
+
+def _arquivo_temporario(texto: str) -> Path:
+    pasta = Path(tempfile.mkdtemp(prefix="lnux_"))
+    arq = pasta / "dados.txt"
+    arq.write_text(texto, "utf-8")
+    return arq
+
+
+# ── 16. Letra sincronizada da música (LRCLIB, estilo sptlrx) ─────────
+
+PASTA_LETRAS = DATA_DIR / "cache" / "letras"
+
+
+def parse_lrc(texto: str) -> list:
+    """Letra no formato LRC ('[01:23.45] verso') → [(segundos, verso)] em ordem (um verso pode ter vários tempos)."""
+    versos = []
+    for linha in texto.splitlines():
+        tempos = re.findall(r"\[(\d+):(\d+(?:[.:]\d+)?)\]", linha)
+        verso = re.sub(r"\[\d+:\d+(?:[.:]\d+)?\]", "", linha).strip()
+        for minutos, segundos in tempos:
+            versos.append((int(minutos) * 60 + float(segundos.replace(":", ".")), verso))
+    return sorted(versos)
+
+
+def verso_atual(versos: list, tempo: float) -> int:
+    """Índice do verso que está tocando no tempo dado (-1 antes do primeiro)."""
+    atual = -1
+    for i, (inicio, _) in enumerate(versos):
+        if inicio <= tempo:
+            atual = i
+        else:
+            break
+    return atual
+
+
+def buscar_letra(artista: str, musica: str, album: str = "", duracao: float | None = None) -> dict:
+    """{'sincronizada': LRC ou '', 'simples': texto ou ''} do LRCLIB (gratuito, sem chave), com cache no aparelho."""
+    chave = _slug(f"{artista}-{musica}")
+    cache = PASTA_LETRAS / f"{chave}.json"
+    if cache.exists():
+        return ler_json(cache, {})
+    cabecalhos = {"User-Agent": f"LNUX {VERSION} ({REPO_LNUX})"}
+    parametros = {"artist_name": artista, "track_name": musica, **({"album_name": album} if album else {}),
+                  **({"duration": int(duracao)} if duracao else {})}
+    dados = None
+    try:
+        dados = pedir_json(url_com("https://lrclib.net/api/get", **parametros), cabecalhos=cabecalhos)
+    except LnuxError as e:
+        if not str(e).startswith("HTTP 404"):  # sem internet (ou o site fora do ar): não é "letra não encontrada"
+            raise
+    if not dados:  # a busca exata não achou: procura pelo nome, que tolera diferenças de álbum e duração
+        achados = pedir_json(url_com("https://lrclib.net/api/search", q=f"{artista} {musica}"), cabecalhos=cabecalhos)
+        dados = next((a for a in achados if a.get("syncedLyrics")), achados[0] if achados else None)
+    if not dados:
+        raise LnuxError(f"Não achei a letra de '{musica}' ({artista}) no LRCLIB.")
+    letra = {"sincronizada": dados.get("syncedLyrics") or "", "simples": dados.get("plainLyrics") or "",
+             "titulo": dados.get("trackName", musica), "artista": dados.get("artistName", artista)}
+    PASTA_LETRAS.mkdir(parents=True, exist_ok=True)
+    gravar_json(cache, letra)
+    return letra
+
+
+def _artista_e_musica(f: dict) -> tuple:
+    """(artista, música) do que o player está tocando, pelas etiquetas ou pelo nome 'Artista - Música'."""
+    artista = f["subtitulo"].split(" · ")[0].strip()
+    musica = f["titulo"]
+    if not artista and " - " in musica:
+        artista, _, musica = musica.partition(" - ")
+    musica = re.sub(r"\s*[\(\[](?:official|oficial|clipe|video|vídeo|lyric|letra|audio|áudio|hd|4k)[^\)\]]*[\)\]]",
+                    "", musica, flags=re.I).strip()
+    return artista.strip(), musica
+
+
+def letra_da_musica() -> None:
+    """A letra da música que está tocando, verso a verso no tempo certo (←/→ ajustam o atraso)."""
+    try:
+        mpv = Mpv(timeout=2)
+    except OSError:
+        artista, musica = perguntar("Artista").strip(), perguntar("Música").strip()
+        if musica:
+            letra = buscar_letra(artista, musica)
+            ler_texto(f"🎤 {letra['titulo']} — {letra['artista']}",
+                      letra["simples"] or "\n".join(v for _, v in parse_lrc(letra["sincronizada"])))
+        return
+    try:
+        atraso, chave_atual, versos, simples, titulo_l = 0.0, None, [], "", ""
+        with TelaCheia():
+            while True:
+                f = faixa_atual(mpv)
+                artista, musica = _artista_e_musica(f)
+                if (artista, musica) != chave_atual:
+                    chave_atual, versos, simples = (artista, musica), [], ""
+                    desenhar([f"{NEG}🎤 {musica}{RST} {DIM}{artista}{RST}", "", f"{DIM}Procurando a letra...{RST}"])
+                    try:
+                        letra = buscar_letra(artista, musica, duracao=f.get("duracao"))
+                        versos, simples = parse_lrc(letra["sincronizada"]), letra["simples"]
+                        titulo_l = f"{letra['titulo']} — {letra['artista']}"
+                    except LnuxError as e:
+                        simples, titulo_l = str(e), f"{musica} — {artista}"
+                colunas, altura = shutil.get_terminal_size((60, 24))
+                linhas = [f"{NEG}🎤 {titulo_l}{RST}", f"{DIM}←/→ atraso {atraso:+.1f}s · espaço pausa · n próxima · "
+                                                    f"q sai{RST}", ""]
+                if versos:
+                    i = verso_atual(versos, (f.get("tempo") or 0) - atraso)
+                    meio = max(3, (altura - 4) // 2)
+                    for j in range(max(0, i - meio + 1), min(len(versos), i + meio)):
+                        verso = versos[j][1] or "♪"
+                        linhas.append(f"{NEG}{CIANO}▶ {verso}{RST}" if j == i else f"{DIM}  {verso}{RST}")
+                else:
+                    linhas += (simples or "(sem letra)").splitlines()[:altura - 4]
+                desenhar(linhas)
+                tecla = tecla_ou_nada(0.25)
+                if tecla in ("q", "esc"):
+                    return
+                if tecla == "esq":
+                    atraso -= 0.5
+                elif tecla == "dir":
+                    atraso += 0.5
+                elif tecla == " ":
+                    mpv("cycle", "pause")
+                elif tecla == "n":
+                    mpv("playlist-next")
+    except (OSError, ConnectionError):
+        info("A música parou.")
+    finally:
+        mpv.fechar()
+
+
+# ── 17. Teste de digitação (estilo ttyper/Monkeytype) ────────────────
+
+PALAVRAS_DIGITACAO = (
+    "de a o que e do da em um para é com não uma os no se na por mais as dos como mas foi ao ele das tem à seu "
+    "sua ou ser quando muito há nos já está eu também só pelo pela até isso ela entre era depois sem mesmo aos ter "
+    "seus quem nas me esse eles estão você tinha foram essa num nem suas meu às minha têm numa pelos elas havia seja "
+    "qual será nós tenho lhe deles essas esses pelas este fosse dele tu te vocês vos lhes meus minhas teu tua teus "
+    "tuas nosso nossa nossos nossas dela delas esta estes estas aquele aquela aqueles aquelas isto aquilo estou está "
+    "estamos estava estávamos estive esteve estivemos casa tempo dia ano vez coisa homem mulher vida mundo trabalho "
+    "parte pessoa forma caso lugar país grande novo bom primeiro último longo pequeno próprio outro certo agora "
+    "sempre nunca ainda aqui lá hoje ontem amanhã cedo tarde noite manhã cidade rua escola livro água comida amigo "
+    "família criança música filme jogo telefone computador terminal programa código janela tela teclado letra "
+    "palavra frase texto rápido devagar fácil difícil bonito feliz forte verde azul vermelho branco preto"
+).split()
+
+
+def texto_para_digitar(palavras: int, sem_acentos: bool = False, semente: int | None = None) -> str:
+    sorteio = random.Random(semente)
+    texto = " ".join(sorteio.choice(PALAVRAS_DIGITACAO) for _ in range(palavras))
+    return sem_acento(texto) if sem_acentos else texto
+
+
+def resultado_digitacao(alvo: str, digitado: str, segundos: float, teclas: int, erros: int) -> dict:
+    """Palavras por minuto (5 caracteres certos = 1 palavra), a velocidade bruta e a precisão das teclas."""
+    certos = sum(1 for a, b in zip(alvo, digitado) if a == b)
+    minutos = max(segundos, 1e-6) / 60
+    return {"ppm": round(certos / 5 / minutos, 1), "bruto": round(len(digitado) / 5 / minutos, 1),
+            "precisao": round(100 * (teclas - erros) / teclas, 1) if teclas else 0.0,
+            "certos": certos, "segundos": round(segundos, 1)}
+
+
+def quebrar_colorido(alvo: str, pedacos: list, largura: int) -> list:
+    """Quebra o texto em linhas pelos espaços, com um pedaço colorido por letra (as cores não se perdem)."""
+    linhas, inicio = [], 0
+    while inicio < len(alvo):
+        fim = min(len(alvo), inicio + largura)
+        if fim < len(alvo):
+            corte = alvo.rfind(" ", inicio, fim)
+            if corte > inicio:
+                fim = corte + 1
+        linhas.append("".join(pedacos[inicio:fim]))
+        inicio = fim
+    return linhas
+
+
+def teste_de_digitacao() -> None:
+    modos = [("30 segundos", 30, 80), ("60 segundos", 60, 150), ("25 palavras", None, 25), ("50 palavras", None, 50)]
+    i = escolher("Modo", [m for m, _, _ in modos], "2")
+    if i is None:
+        return
+    nome_modo, limite, n_palavras = modos[i]
+    alvo = texto_para_digitar(n_palavras, sem_acentos=confirmar("Sem acentos (ç, ã, é...)?", False))
+    if not setas_ativas():
+        print(f"\n{alvo}\n")
+        inicio = time.time()
+        digitado = input("> ")
+        r = resultado_digitacao(alvo, digitado, time.time() - inicio, len(digitado), 0)
+        ok(f"{r['ppm']} palavras por minuto ({r['certos']} caracteres certos)")
+        return
+    digitado, teclas, erros, inicio = "", 0, 0, None
+    with TelaCheia():
+        while True:
+            agora = time.time()
+            if inicio and limite and agora - inicio >= limite:
+                break
+            if len(digitado) >= len(alvo):
+                break
+            colunas, _ = shutil.get_terminal_size((60, 24))
+            pedacos = []
+            for j, letra in enumerate(alvo):
+                if j < len(digitado):
+                    pedacos.append(f"{VERD}{letra}{RST}" if digitado[j] == letra else
+                                   f"{VERM}\033[4m{letra if letra != ' ' else '·'}{RST}")
+                elif j == len(digitado):
+                    pedacos.append(f"{INV}{letra}{RST}")
+                else:
+                    pedacos.append(f"{DIM}{letra}{RST}")
+            tempo = (f"{max(0, limite - (agora - inicio)):.0f}s" if limite else f"{agora - inicio:.0f}s") if inicio \
+                else "comece a digitar"
+            parcial = resultado_digitacao(alvo, digitado, agora - inicio, teclas, erros) if inicio else None
+            linhas = [f"{NEG}⌨️ Teste de digitação{RST} · {nome_modo} · {tempo}"
+                      + (f" · {parcial['ppm']:.0f} ppm" if parcial and agora - inicio > 2 else ""),
+                      f"{DIM}Esc desiste · Backspace apaga{RST}", ""]
+            linhas += quebrar_colorido(alvo, pedacos, max(20, colunas - 2))
+            desenhar(linhas)
+            tecla = tecla_ou_nada(0.2)
+            if tecla is None:
+                continue
+            if tecla == "esc":
+                return
+            if tecla == "backspace":
+                digitado = digitado[:-1]
+            elif tecla == " " or (len(tecla) == 1 and tecla.isprintable()):
+                inicio = inicio or time.time()
+                teclas += 1
+                if tecla != alvo[len(digitado)]:
+                    erros += 1
+                digitado += tecla
+    r = resultado_digitacao(alvo, digitado, time.time() - inicio if inicio else 0, teclas, erros)
+    recorde_antes = _recorde(f"digitacao-{nome_modo}")
+    _recorde(f"digitacao-{nome_modo}", int(r["ppm"]))
+    print(f"\n{NEG}{r['ppm']} palavras por minuto{RST} · precisão {r['precisao']}% · bruto {r['bruto']} ppm · "
+          f"{r['segundos']} s")
+    if r["ppm"] > recorde_antes:
+        ok(f"🏆 Recorde novo em {nome_modo}! (antes: {recorde_antes} ppm)")
+    else:
+        info(f"Recorde em {nome_modo}: {recorde_antes} ppm")
+
+
+# ── 18. Criptomoedas e bolsa (estilo cointop) ────────────────────────
+
+COINGECKO = "https://api.coingecko.com/api/v3"
+YAHOO_GRAFICO = "https://query1.finance.yahoo.com/v8/finance/chart/"
+BOLSA_PADRAO = ["^BVSP", "PETR4.SA", "VALE3.SA", "ITUB4.SA", "USDBRL=X", "AAPL"]
+
+
+def parse_mercado_cripto(dados: list) -> list:
+    """Resposta do /coins/markets do CoinGecko → [{id, nome, simbolo, preco, variacao_24h, grafico_7d}]."""
+    return [{"id": d.get("id"), "nome": d.get("name"), "simbolo": str(d.get("symbol", "")).upper(),
+             "preco": d.get("current_price"), "variacao_24h": d.get("price_change_percentage_24h") or 0.0,
+             "grafico_7d": (d.get("sparkline_in_7d") or {}).get("price") or []} for d in dados]
+
+
+def parse_yahoo(dados: dict) -> dict:
+    """Resposta do gráfico do Yahoo Finance → {simbolo, nome, preco, anterior, moeda, fechamentos}."""
+    try:
+        resultado = dados["chart"]["result"][0]
+    except (KeyError, IndexError, TypeError):
+        raise LnuxError("O Yahoo Finance não reconheceu esse código.") from None
+    meta = resultado.get("meta", {})
+    fechamentos = [v for v in ((resultado.get("indicators", {}).get("quote") or [{}])[0].get("close") or []) if v is not None]
+    return {"simbolo": meta.get("symbol"), "nome": meta.get("shortName") or meta.get("longName") or meta.get("symbol"),
+            "preco": meta.get("regularMarketPrice"), "anterior": meta.get("chartPreviousClose") or meta.get("previousClose"),
+            "moeda": meta.get("currency", ""), "fechamentos": fechamentos}
+
+
+def _variacao(v: float) -> str:
+    return f"{VERD}▲ {v:+.2f}%{RST}" if v >= 0 else f"{VERM}▼ {v:+.2f}%{RST}"
+
+
+@submenu
+def menu_cotacoes():
+    c = cfg()
+
+    def cripto_principais():
+        dados = pedir_json(url_com(f"{COINGECKO}/coins/markets", vs_currency="brl", order="market_cap_desc",
+                                   per_page=20, page=1, sparkline="true"))
+        moedas = parse_mercado_cripto(dados)
+        favoritas = set(c.get("cripto_favoritas", []))
+        print(f"\n  {DIM}{'':2}{'moeda':<20} {'preço (R$)':>14}  {'24 h':>11}  7 dias{RST}")
+        for m in moedas:
+            estrela = "⭐" if m["id"] in favoritas else "  "
+            print(f"  {estrela}{(m['nome'] + ' ' + m['simbolo'])[:19]:<20} {numero_br(m['preco'] or 0, 2):>14}  "
+                  f"{_variacao(m['variacao_24h'])}  {sparkline(m['grafico_7d'], 24)}")
+        i = escolher("Ver o gráfico de qual? (Esc volta)", [f"{m['nome']} ({m['simbolo']})" for m in moedas])
+        if i is not None:
+            grafico_cripto(moedas[i]["id"], moedas[i]["nome"])
+
+    def grafico_cripto(ident: str, nome: str):
+        dias = [("24 horas", 1), ("7 dias", 7), ("30 dias", 30), ("1 ano", 365)]
+        j = escolher("Período", [d for d, _ in dias], "2")
+        if j is None:
+            return
+        dados = pedir_json(url_com(f"{COINGECKO}/coins/{ident}/market_chart", vs_currency="brl", days=dias[j][1]))
+        precos = [p for _, p in dados.get("prices", [])]
+        if not precos:
+            raise LnuxError("Sem dados para esse período.")
+        colunas, _ = shutil.get_terminal_size((60, 24))
+        print(f"\n  {NEG}{nome}{RST} · {dias[j][0]} · de R$ {numero_br(precos[0], 2)} para R$ {numero_br(precos[-1], 2)} "
+              f"{_variacao((precos[-1] / precos[0] - 1) * 100)}  {DIM}(mín {numero_br(min(precos), 2)} · máx "
+              f"{numero_br(max(precos), 2)}){RST}\n")
+        for linha in grafico_em_colunas(precos, max(20, colunas - 6), 10):
+            print(f"  {CIANO}{linha}{RST}")
+        if confirmar("Guardar nas favoritas?", ident not in c.get("cripto_favoritas", [])):
+            c["cripto_favoritas"] = list(dict.fromkeys([*c.get("cripto_favoritas", []), ident]))
+            salvar_cfg()
+
+    def cripto_buscar():
+        termo = perguntar("Nome ou símbolo (ex.: solana, DOGE)").strip()
+        if not termo:
+            return
+        achadas = pedir_json(url_com(f"{COINGECKO}/search", query=termo)).get("coins", [])[:12]
+        if not achadas:
+            info("Nada encontrado.")
+            return
+        i = escolher("Qual?", [f"{a['name']} ({a['symbol']})" for a in achadas])
+        if i is not None:
+            grafico_cripto(achadas[i]["id"], achadas[i]["name"])
+
+    def bolsa():
+        codigos = c.get("bolsa_favoritas") or BOLSA_PADRAO
+        print(f"\n  {DIM}{'código':<10} {'nome':<26} {'preço':>14}  {'dia':>11}  último mês{RST}")
+        for codigo in codigos:
+            try:
+                a = parse_yahoo(pedir_json(url_com(YAHOO_GRAFICO + urllib.parse.quote(codigo), range="1mo", interval="1d")))
+            except LnuxError as e:
+                print(f"  {codigo:<10} {DIM}{e}{RST}")
+                continue
+            dia = (a["preco"] / a["anterior"] - 1) * 100 if a["preco"] and a["anterior"] else 0
+            print(f"  {codigo:<10} {str(a['nome'])[:25]:<26} {a['moeda']} {numero_br(a['preco'] or 0, 2):>10}  "
+                  f"{_variacao(dia)}  {sparkline(a['fechamentos'], 22)}")
+        print(f"\n{DIM}Dados do Yahoo Finance (com atraso; serviço não oficial, pode mudar).{RST}")
+
+    def bolsa_editar():
+        atual = ", ".join(c.get("bolsa_favoritas") or BOLSA_PADRAO)
+        info("Ações brasileiras terminam em .SA (PETR4.SA); ^BVSP é o Ibovespa; USDBRL=X é o dólar; AAPL, MSFT... "
+             "são dos EUA.")
+        nova = perguntar("Códigos (separados por vírgula)", atual)
+        c["bolsa_favoritas"] = [x.strip().upper() for x in nova.split(",") if x.strip()]
+        salvar_cfg()
+        ok("Lista salva.")
+
+    menu("💹 Criptomoedas e bolsa", [
+        ("🪙 Criptomoedas: as 20 maiores (preço, 24 h e 7 dias)", cripto_principais),
+        ("🔎 Criptomoedas: buscar e ver o gráfico", cripto_buscar),
+        ("📈 Bolsa: a sua lista (Ibovespa, ações, dólar)", bolsa),
+        ("✏️ Bolsa: escolher os códigos da lista", bolsa_editar),
+    ], cabecalho=lambda: print(f"{DIM}Preços do CoinGecko e do Yahoo Finance. Não é recomendação de investimento. "
+                               f"Inspirado no cointop.{RST}"))
+
+
+# ── 19. Telas de descanso (estilo cmatrix, pipes.sh, asciiquarium) ──
+
+class ChuvaMatrix:
+    CARACTERES = "ｱｲｳｴｵｶｷｸｹｺｻｼｽｾｿﾀﾁﾂﾃﾄﾅﾆﾇﾈﾉﾊﾋﾌﾍﾎﾏﾐﾑﾒﾓﾔﾕﾖﾗﾘﾙﾚﾛﾜﾝ0123456789Z:.\"=*+-<>¦|"
+
+    def __init__(self, largura: int, altura: int, semente: int | None = None):
+        self.sorteio = random.Random(semente)
+        self.largura, self.altura = largura, altura
+        self.gotas = [self._nova(inicio=True) for _ in range(largura)]
+
+    def _nova(self, inicio: bool = False) -> list:
+        return [self.sorteio.randint(-self.altura, 0) if inicio else self.sorteio.randint(-self.altura // 2, 0),
+                self.sorteio.randint(4, max(5, self.altura)), self.sorteio.random() < 0.6]
+
+    def passo(self) -> None:
+        for gota in self.gotas:
+            gota[0] += 1
+            if gota[0] - gota[1] > self.altura:
+                gota[:] = self._nova()
+
+    def quadro(self) -> list:
+        linhas = []
+        for y in range(self.altura):
+            partes = []
+            for x, (cabeca, comprimento, ativa) in enumerate(self.gotas):
+                distancia = cabeca - y
+                if not ativa or distancia < 0 or distancia >= comprimento:
+                    partes.append(" ")
+                    continue
+                c = self.sorteio.choice(self.CARACTERES)
+                cor = "\033[1;97m" if distancia == 0 else "\033[1;32m" if distancia < comprimento // 3 else "\033[32m"
+                partes.append(f"{cor}{c}\033[0m" if _COR else c)
+            linhas.append("".join(partes))
+        return linhas
+
+
+class Canos:
+    # (direção em que vinha, direção nova) → o canto que liga as duas (y cresce para baixo)
+    CANTOS = {(1, 0, 0, 1): "┓", (1, 0, 0, -1): "┛", (-1, 0, 0, 1): "┏", (-1, 0, 0, -1): "┗",
+              (0, 1, 1, 0): "┗", (0, 1, -1, 0): "┛", (0, -1, 1, 0): "┏", (0, -1, -1, 0): "┓"}
+
+    def __init__(self, largura: int, altura: int, canos: int = 4, semente: int | None = None):
+        self.sorteio = random.Random(semente)
+        self.largura, self.altura = largura, altura
+        self.tela = [[" "] * largura for _ in range(altura)]
+        self.canos = [self._novo() for _ in range(canos)]
+        self.passos = 0
+
+    def _novo(self) -> list:
+        direcao = self.sorteio.choice([(1, 0), (-1, 0), (0, 1), (0, -1)])
+        return [self.sorteio.randrange(self.largura), self.sorteio.randrange(self.altura), direcao,
+                self.sorteio.choice(["31", "32", "33", "34", "35", "36"])]
+
+    def passo(self) -> None:
+        self.passos += 1
+        if self.passos > self.largura * self.altura // 2:  # tela cheia: começa de novo
+            self.tela = [[" "] * self.largura for _ in range(self.altura)]
+            self.passos = 0
+        for cano in self.canos:
+            x, y, (dx, dy), cor = cano
+            nova = (dx, dy)
+            if self.sorteio.random() < 0.15:
+                nova = self.sorteio.choice([(dy, dx), (-dy, -dx)])  # vira 90°
+            simbolo = ("━" if dx else "┃") if nova == (dx, dy) else self.CANTOS[(dx, dy, *nova)]
+            self.tela[y][x] = f"\033[{cor}m{simbolo}\033[0m" if _COR else simbolo
+            x, y = (x + nova[0]) % self.largura, (y + nova[1]) % self.altura
+            cano[:3] = [x, y, nova]
+
+    def quadro(self) -> list:
+        return ["".join(linha) for linha in self.tela]
+
+
+class Aquario:
+    PEIXES = [("><(((º>", "<º)))><"), ("><>", "<><"), ("><((º>", "<º))><"), ("}-<((((º>", "<º))))>-{")]
+
+    def __init__(self, largura: int, altura: int, peixes: int = 7, semente: int | None = None):
+        self.sorteio = random.Random(semente)
+        self.largura, self.altura = largura, altura
+        self.peixes = [self._novo(espalhado=True) for _ in range(peixes)]
+        self.bolhas: list = []
+
+    def _novo(self, espalhado: bool = False) -> list:
+        indo = self.sorteio.random() < 0.5
+        desenho = self.sorteio.choice(self.PEIXES)[0 if indo else 1]
+        x = self.sorteio.randrange(self.largura) if espalhado else (-len(desenho) if indo else self.largura)
+        return [x, self.sorteio.randrange(1, max(2, self.altura - 3)), 1 if indo else -1, desenho,
+                self.sorteio.choice(["33", "35", "36", "91", "93", "95"])]
+
+    def passo(self) -> None:
+        for i, peixe in enumerate(self.peixes):
+            peixe[0] += peixe[2]
+            if peixe[0] > self.largura + 2 or peixe[0] < -len(peixe[3]) - 2:
+                self.peixes[i] = self._novo()
+            elif self.sorteio.random() < 0.03:
+                self.bolhas.append([peixe[0] + (len(peixe[3]) if peixe[2] > 0 else 0), peixe[1] - 1])
+        self.bolhas = [[x, y - 1] for x, y in self.bolhas if y > 1]
+
+    def quadro(self) -> list:
+        tela = [[" "] * self.largura for _ in range(self.altura)]
+        for x, y in self.bolhas:
+            if 0 <= x < self.largura and 0 <= y < self.altura:
+                tela[y][x] = "o" if y % 3 else "°"
+        for x, y, _, desenho, cor in self.peixes:
+            for k, letra in enumerate(desenho):
+                if 0 <= x + k < self.largura and 0 <= y < self.altura:
+                    tela[y][x + k] = f"\033[{cor}m{letra}\033[0m" if _COR else letra
+        fundo = "".join("ψ" if (i * 7) % 11 == 0 else "~" if i % 3 else "." for i in range(self.largura))
+        tela[-1] = list(f"\033[32m{fundo}\033[0m" if _COR else fundo)
+        linhas = ["".join(linha) for linha in tela]
+        linhas[0] = (f"\033[36m{'~' * self.largura}\033[0m" if _COR else "~" * self.largura)
+        return linhas
+
+
+def tela_de_descanso(classe) -> None:
+    if not setas_ativas():
+        raise LnuxError("As telas de descanso precisam de um terminal interativo.")
+    colunas, altura = shutil.get_terminal_size((80, 24))
+    animacao = classe(colunas, altura - 1)
+    with TelaCheia():
+        while True:
+            animacao.passo()
+            desenhar(animacao.quadro() + [f"{DIM}qualquer tecla sai{RST}"])
+            if tecla_ou_nada(0.07) is not None:
+                return
+
+
+@submenu
+def menu_telas_de_descanso():
+    menu("🌌 Telas de descanso", [
+        ("🟩 Chuva do Matrix", lambda: tela_de_descanso(ChuvaMatrix)),
+        ("🔀 Canos coloridos", lambda: tela_de_descanso(Canos)),
+        ("🐟 Aquário", lambda: tela_de_descanso(Aquario)),
+    ], cabecalho=lambda: print(f"{DIM}Qualquer tecla volta. Inspirado no cmatrix, no pipes.sh e no asciiquarium.{RST}"))
+
+
+# ════════════════════════════════════════════════════════════════════
 #  Configurações e diagnóstico
 # ════════════════════════════════════════════════════════════════════
 
@@ -33992,6 +36071,7 @@ def menu_sistema():
         ("📦 Instalar dependências (essenciais, música, vídeos)", instalar_dependencias),
         (lambda: "🎨 Aparência do terminal (tema, fonte, boas-vindas, banner)" if tem_recurso("tema_termux")
          else "🎨 Aparência (banner do menu; o tema e a fonte ficam no seu programa de terminal)", menu_aparencia),
+        ("🛎️ Serviços e logs do sistema (systemd ou OpenRC)", so_em("servicos_sistema", menu_servicos_sistema)),
         ("⚙️ Configurações e diagnóstico", menu_config),
     ])
 
@@ -34093,6 +36173,31 @@ def _indice_busca() -> list:
                                                            "numero bits", menu_sistemas_numericos),
         ("🔣 Alfabetos próprios", "alfabeto proprio simbolos emoji runas inventar codigo", menu_alfabetos),
         ("📡 Código Morse, Braille e Base64", "morse braille base64 base32 codigo pontos tracos", menu_codigos),
+        ("🖥️ Ficha do sistema", "ficha sistema neofetch fastfetch informacoes aparelho modelo cpu memoria kernel",
+         ficha_do_sistema),
+        ("⚙️ Processos ao vivo", "processos htop btop top tarefas cpu memoria encerrar matar kill programa travado",
+         monitor_processos),
+        ("💽 Explorar o espaço em disco", "espaco disco ncdu gdu dust pasta tamanho ocupa cheio liberar",
+         explorar_espaco),
+        ("🐚 Shell bonito", "shell zsh oh my zsh starship prompt bash tema terminal bonito", menu_shell_bonito),
+        ("🎬 Gravar o terminal", "gravar terminal asciinema gravacao sessao tutorial", menu_gravar_terminal),
+        ("📚 Cola de comandos (tldr)", "tldr cola comando exemplo ajuda man manual como usar cheat", menu_tldr),
+        ("📦 Mandar arquivos com um código (croc)", "croc wormhole mandar enviar receber arquivo codigo outro aparelho",
+         menu_croc),
+        ("📈 Ping com gráfico", "ping grafico gping latencia internet caindo lag conexao", ping_com_grafico),
+        ("📶 Internet usada por cada programa", "nethogs bandwhich banda rede programa consumo quem usa",
+         rede_por_programa),
+        ("🔌 Testar uma API (HTTP)", "api http rest get post httpie curl postman requisicao json", menu_testar_api),
+        ("🔍 Ver JSON e Markdown", "json markdown fx glow jq ver ler formatar arvore readme", menu_ver_dados),
+        ("🐳 Contêineres (Docker ou Podman)", "docker podman conteiner container lazydocker imagem", menu_conteineres),
+        ("🛎️ Serviços e logs do sistema", "servicos systemd systemctl journalctl openrc logs daemon", menu_servicos_sistema),
+        ("🔑 Códigos de verificação 2FA", "2fa totp autenticador google authenticator codigo verificacao duas etapas",
+         menu_2fa),
+        ("🎤 Letra da música", "letra lyrics musica cantar karaoke sincronizada", letra_da_musica),
+        ("⌨️ Teste de digitação", "digitacao digitar teclado velocidade ppm typing", teste_de_digitacao),
+        ("💹 Criptomoedas e bolsa", "cripto bitcoin ethereum bolsa acoes ibovespa cotacao investimento dolar",
+         menu_cotacoes),
+        ("🌌 Telas de descanso", "tela descanso matrix canos pipes aquario peixe screensaver", menu_telas_de_descanso),
         ("📲 Celular e sistema", "celular sistema android adb bateria apps fotos", menu_celular),
         ("🔌 Depuração sem fio (ADB)", "adb depuracao wifi wireless android shell signal 9 pareamento", menu_adb),
         ("📖 Comandos do ADB (com descrição)", "comandos adb lista ajuda pm am dpm shell screencap screenrecord "
@@ -34331,6 +36436,10 @@ def main(argv=None) -> int:
     sub.add_parser("atualizar", help="atualiza Termux, pacotes Python, distros e o LNUX")
     sub.add_parser("limpar", help="otimização rápida: limpa caches e temporários com segurança")
     sub.add_parser("doctor", help="diagnóstico do ambiente")
+    p = sub.add_parser("pasta", help="compartilha uma pasta no navegador (baixar e, se ligado no menu, mandar arquivos)")
+    p.add_argument("pasta")
+    p.add_argument("--porta", type=int, default=8090)
+    sub.add_parser("ficha", help="ficha do sistema (estilo neofetch)")
     p = sub.add_parser("sistema", help="mostra ou troca o sistema (perfil de distro) que o LNUX usa")
     p.add_argument("perfil", nargs="?", help="id do perfil (termux, debian, arch, fedora, alpine, opensuse, outro)")
     p.add_argument("--listar", action="store_true", help="lista os perfis disponíveis")
@@ -34466,6 +36575,10 @@ def main(argv=None) -> int:
             atualizar_tudo()
         elif args.comando == "doctor":
             diagnostico()
+        elif args.comando == "pasta":
+            servir_pasta(args.pasta, args.porta)
+        elif args.comando == "ficha":
+            ficha_do_sistema()
         elif args.comando == "sistema":
             if args.listar:
                 for perfil in perfis().values():

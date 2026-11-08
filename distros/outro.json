@@ -20,12 +20,14 @@
     "nomes": {
       "android-tools": null,
       "aria2": null,
+      "asciinema": null,
       "binutils": null,
       "browsh": null,
       "clang": null,
       "cloudflared": null,
       "cmake": null,
       "code-server": null,
+      "croc": null,
       "cronie": null,
       "curl": null,
       "deno": null,
@@ -41,6 +43,7 @@
       "git": null,
       "golang": null,
       "gopls": null,
+      "iputils": null,
       "jellyfin-server": null,
       "libqrencode": null,
       "libreoffice": null,
@@ -52,6 +55,7 @@
       "nano": null,
       "navidrome": null,
       "neovim": null,
+      "nethogs": null,
       "nmap": null,
       "nmcli": null,
       "nodejs": null,
@@ -83,6 +87,7 @@
       "rust-analyzer": null,
       "samba": null,
       "scrcpy": null,
+      "starship": null,
       "syncthing": null,
       "tcpdump": null,
       "termux-api": null,
@@ -103,7 +108,8 @@
       "xclip": null,
       "xdg-open": null,
       "yt-dlp-ejs": null,
-      "zbar": null
+      "zbar": null,
+      "zsh": null
     },
     "modulos_python": {}
   },

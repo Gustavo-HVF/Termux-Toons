@@ -23,12 +23,14 @@
     "nomes": {
       "android-tools": "android-tools",
       "aria2": "aria2",
+      "asciinema": "asciinema",
       "binutils": "binutils",
       "browsh": null,
       "clang": "clang",
       "cloudflared": "cloudflared",
       "cmake": "cmake",
       "code-server": null,
+      "croc": "croc",
       "cronie": "cronie",
       "curl": "curl",
       "deno": "deno",
@@ -44,6 +46,7 @@
       "git": "git",
       "golang": "go",
       "gopls": "gopls",
+      "iputils": null,
       "jellyfin-server": null,
       "libqrencode": "libqrencode-tools",
       "libreoffice": "libreoffice",
@@ -55,6 +58,7 @@
       "nano": "nano",
       "navidrome": "navidrome",
       "neovim": "neovim",
+      "nethogs": "nethogs",
       "nmap": "nmap",
       "nmcli": "networkmanager-cli",
       "nodejs": "nodejs npm",
@@ -86,6 +90,7 @@
       "rust-analyzer": "rust-analyzer",
       "samba": "samba",
       "scrcpy": null,
+      "starship": "starship",
       "syncthing": "syncthing",
       "tcpdump": "tcpdump",
       "termux-api": null,
@@ -106,7 +111,8 @@
       "xclip": "xclip",
       "xdg-open": "xdg-utils",
       "yt-dlp-ejs": null,
-      "zbar": "zbar"
+      "zbar": "zbar",
+      "zsh": "zsh"
     },
     "modulos_python": {
       "cryptography": "py3-cryptography",

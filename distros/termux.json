@@ -40,7 +40,8 @@
       "nmcli": null,
       "vlc": null,
       "pip": null,
-      "libreoffice": null
+      "libreoffice": null,
+      "iputils": "inetutils"
     },
     "modulos_python": {}
   },
