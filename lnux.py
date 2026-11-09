@@ -36113,12 +36113,22 @@ SERVICO_TUNEL_APPS = "tunel-apps-web"   # o cloudflared
 LNUX_APPS_PORTA_TUNEL = 8096
 
 
+def lnux_apps_tem_tunel() -> bool:
+    """O LNUX-APPs baixado já sabe ficar atrás de um túnel (--permitir-host)? Cópias antigas não sabem."""
+    try:
+        return "--permitir-host" in lnux_apps_servidor().read_text("utf-8")
+    except OSError:
+        return False
+
+
 def apps_web_tunel_link() -> str | None:
-    """O link público dos Apps Web, se o túnel e o servidor dele estão ligados (com a chave, se for com a ponte)."""
+    """O link público dos Apps Web, se o túnel e o servidor dele estão ligados e respondendo (com a chave, se for com a ponte)."""
     if not servico_ativo(SERVICO_APPS_TUNEL):
         return None
     c = cfg()
     porta = int(c.get("apps_porta_tunel", LNUX_APPS_PORTA_TUNEL))
+    if not lnux_apps_estado(porta, lnux_apps_config().get("token", "")):
+        return None  # o serviço existe, mas o servidor não está de pé (ex.: reiniciando sem parar por um erro)
     base = endereco_fixo(porta) or (url_tunel(SERVICO_TUNEL_APPS) if servico_ativo(SERVICO_TUNEL_APPS) else None)
     if not base:
         return None
@@ -36126,17 +36136,44 @@ def apps_web_tunel_link() -> str | None:
     return base.rstrip("/") + "/" + (f"#token={token}" if token else "")
 
 
-def apps_web_tunel_parar() -> None:
-    parar_servico(SERVICO_TUNEL_APPS)
-    parar_servico(SERVICO_APPS_TUNEL)
-    ok("Túnel dos Apps Web desligado: o link não abre mais.")
+def apps_web_tunel_parar(avisar: bool = True) -> None:
+    for nome in (SERVICO_TUNEL_APPS, SERVICO_APPS_TUNEL):
+        if servico_ativo(nome):
+            parar_servico(nome)
+    if avisar:
+        ok("Túnel dos Apps Web desligado: o link não abre mais.")
+
+
+def _falha_do_tunel(msg: str) -> None:
+    """Desliga o que foi ligado (senão o servidor fica reiniciando sem parar) e mostra o fim do log."""
+    try:
+        fim = log_de(SERVICO_APPS_TUNEL).read_text("utf-8", errors="replace").strip().splitlines()[-4:]
+    except OSError:
+        fim = []
+    apps_web_tunel_parar(avisar=False)
+    erro(msg)
+    for linha in fim:
+        print(f"  {DIM}{linha}{RST}")
 
 
 def apps_web_tunel() -> None:
     """Compartilha os Apps Web pela internet: um link https que abre em qualquer lugar (celular, computador, amigo)."""
     if not garantir_lnux_apps():
         return
+    if not lnux_apps_tem_tunel():
+        info("A sua cópia do LNUX-APPs é de antes do túnel; atualizando...")
+        try:
+            lnux_apps_baixar(atualizar=True)
+        except LnuxError as e:
+            erro(str(e))
+        if not lnux_apps_tem_tunel():
+            apps_web_tunel_parar(avisar=False)
+            erro("O LNUX-APPs publicado ainda não tem o túnel (a opção --permitir-host do servidor). "
+                 "Tente '🔄 Atualizar os Apps Web' mais tarde.")
+            return
     link = apps_web_tunel_link()
+    if not link and (servico_ativo(SERVICO_APPS_TUNEL) or servico_ativo(SERVICO_TUNEL_APPS)):
+        apps_web_tunel_parar(avisar=False)  # sobrou de uma tentativa que falhou: começa do zero
     if link:
         ok("O túnel dos Apps Web está ligado:")
         print(f"  {NEG}{link}{RST}")
@@ -36207,8 +36244,9 @@ def apps_web_tunel() -> None:
     if not com_ponte:
         argumentos.append("--sem-ponte")
     comando = "PYTHONUNBUFFERED=1 " + shlex.join([sys.executable, str(lnux_apps_servidor()), *argumentos])
+    log_de(SERVICO_APPS_TUNEL).unlink(missing_ok=True)
     if not iniciar_servico(SERVICO_APPS_TUNEL, comando, reiniciar=True, wake_lock=True):
-        parar_servico(SERVICO_TUNEL_APPS)
+        apps_web_tunel_parar(avisar=False)
         return
     token = lnux_apps_config().get("token", "")
     for _ in range(40):
@@ -36216,7 +36254,7 @@ def apps_web_tunel() -> None:
             break
         time.sleep(0.25)
     else:
-        erro("O servidor do túnel não respondeu. Veja o log: Apps Web › Túnel: status e log.")
+        _falha_do_tunel("O servidor do túnel não respondeu (desliguei o túnel). O fim do log:")
         return
     link = apps_web_tunel_link() or base.rstrip("/") + "/"
     ok("Pronto! Abra de qualquer lugar:")
