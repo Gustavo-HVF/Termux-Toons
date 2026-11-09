@@ -208,6 +208,31 @@ def _():
             setattr(lnux, n, v)
 
 
+@caso("Túnel com um LNUX-APPs antigo (sem --permitir-host): tenta atualizar, avisa e não deixa nada ligado")
+def _():
+    velho = CASA / "lnux-apps-velho"
+    (velho / "servidor").mkdir(parents=True)
+    (velho / "servidor" / "lnux_apps.py").write_text("# versão antiga: sem as opções do túnel\n", "utf-8")
+    atualizou, iniciados, erros = [], [], []
+    nomes = ("garantir_lnux_apps", "LNUX_APPS_DIR", "lnux_apps_baixar", "iniciar_servico", "servico_ativo", "erro")
+    original = {n: getattr(lnux, n) for n in nomes}
+    lnux.garantir_lnux_apps = lambda: True
+    lnux.LNUX_APPS_DIR = velho
+    lnux.lnux_apps_baixar = lambda atualizar=False: atualizou.append(atualizar) or True
+    lnux.iniciar_servico = lambda *a, **k: iniciados.append(a) or True
+    lnux.servico_ativo = lambda nome: False
+    lnux.erro = erros.append
+    try:
+        assert lnux.lnux_apps_tem_tunel() is False
+        lnux.apps_web_tunel()
+        assert atualizou == [True], atualizou
+        assert not iniciados, iniciados
+        assert erros and "--permitir-host" in erros[-1], erros
+    finally:
+        for n, v in original.items():
+            setattr(lnux, n, v)
+
+
 def main() -> int:
     ok = falhou = pulados = 0
     for nome, f in CASOS:
