@@ -36101,6 +36101,135 @@ def apps_web_na_rede() -> None:
     info("Para voltar a ser só deste aparelho: Apps Web › Servidor: parar (e abra um app de novo).")
 
 
+# ── Compartilhar pela internet (túnel) ──────────────────────────────
+# Um segundo servidor, numa porta só dele, atende o túnel: assim o servidor de sempre (só deste aparelho) não
+# muda, e o do túnel pode ir sem a ponte. O cloudflared liga primeiro (o endereço trycloudflare.com só aparece
+# depois); o servidor do túnel então sobe aceitando exatamente esse endereço (--permitir-host) e nunca roda
+# comandos (--sem-comandos). Com um endereço fixo (túnel da Cloudflare com o seu domínio) apontado para a porta
+# do túnel, usa esse endereço no lugar.
+
+SERVICO_APPS_TUNEL = "apps-web-tunel"   # o servidor que o túnel atende
+SERVICO_TUNEL_APPS = "tunel-apps-web"   # o cloudflared
+LNUX_APPS_PORTA_TUNEL = 8096
+
+
+def apps_web_tunel_link() -> str | None:
+    """O link público dos Apps Web, se o túnel e o servidor dele estão ligados (com a chave, se for com a ponte)."""
+    if not servico_ativo(SERVICO_APPS_TUNEL):
+        return None
+    c = cfg()
+    porta = int(c.get("apps_porta_tunel", LNUX_APPS_PORTA_TUNEL))
+    base = endereco_fixo(porta) or (url_tunel(SERVICO_TUNEL_APPS) if servico_ativo(SERVICO_TUNEL_APPS) else None)
+    if not base:
+        return None
+    token = lnux_apps_config().get("token", "") if c.get("apps_tunel_ponte") else ""
+    return base.rstrip("/") + "/" + (f"#token={token}" if token else "")
+
+
+def apps_web_tunel_parar() -> None:
+    parar_servico(SERVICO_TUNEL_APPS)
+    parar_servico(SERVICO_APPS_TUNEL)
+    ok("Túnel dos Apps Web desligado: o link não abre mais.")
+
+
+def apps_web_tunel() -> None:
+    """Compartilha os Apps Web pela internet: um link https que abre em qualquer lugar (celular, computador, amigo)."""
+    if not garantir_lnux_apps():
+        return
+    link = apps_web_tunel_link()
+    if link:
+        ok("O túnel dos Apps Web está ligado:")
+        print(f"  {NEG}{link}{RST}")
+        mostrar_qr(link, "apps-web-tunel", salvar=False)
+        if cfg().get("apps_tunel_ponte"):
+            aviso("Este link leva a chave da ponte: quem tiver o link mexe nas pastas liberadas deste aparelho.")
+        escolha = escolher("E agora?", ["Deixar ligado", "Copiar o link", "Desligar o túnel"], 1)
+        if escolha == 1:
+            copiar_texto(link)
+        elif escolha == 2:
+            apps_web_tunel_parar()
+        return
+    print(textwrap.dedent(f"""
+        Gera um link {NEG}https://...{RST} que abre os Apps Web de qualquer lugar (outro celular, um computador,
+        um amigo), mesmo fora da sua rede Wi-Fi. Usa um túnel da Cloudflare (cloudflared, grátis, sem conta).
+        Este aparelho continua sendo o servidor: precisa ficar ligado e com internet.
+    """).strip("\n"))
+    modo = escolher("O que compartilhar?", [
+        "Só os apps (recomendado): quem abrir usa os apps no navegador dele, sem acesso a este aparelho",
+        "Os apps E a ponte: as pastas liberadas e o ffmpeg deste aparelho (só para você mesmo, em outro lugar)",
+    ], 1)
+    if modo is None:
+        return
+    com_ponte = modo == 1
+    if com_ponte:
+        aviso("Com a ponte, QUEM TIVER O LINK pode ler, gravar e apagar arquivos nas pastas liberadas deste aparelho "
+              "e usar as chaves de IA guardadas aqui. Não poste o link nem mande para outras pessoas. "
+              "(Rodar programas fica sempre desligado pelo túnel.)")
+        if not confirmar("Entendi. Compartilhar com a ponte?", False):
+            return
+    c = cfg()
+    porta = int(c.get("apps_porta_tunel", LNUX_APPS_PORTA_TUNEL))
+    if servico_ativo(SERVICO_APPS_TUNEL):
+        parar_servico(SERVICO_APPS_TUNEL)
+    if not porta_livre(porta, espera=5):  # um servidor recém-desligado leva um instante para soltar a porta
+        aviso(f"A porta {porta} está ocupada por outro programa.")
+        porta = perguntar_int("Outra porta para o túnel dos Apps Web", porta + 1, 1024, 65535)
+    c["apps_porta_tunel"] = porta
+    c["apps_tunel_ponte"] = com_ponte
+    salvar_cfg()
+    # 1) o endereço: o fixo (se houver um apontado para esta porta) ou um túnel rápido novo
+    fixo = endereco_fixo(porta)
+    if fixo:
+        base = fixo
+        info(f"Usando o seu endereço fixo: {fixo}")
+    else:
+        if not garantir_cmd("cloudflared"):
+            return
+        parar_servico(SERVICO_TUNEL_APPS)
+        log_de(SERVICO_TUNEL_APPS).unlink(missing_ok=True)  # para achar o endereço novo no log
+        if not iniciar_servico(SERVICO_TUNEL_APPS, f"cloudflared tunnel --no-autoupdate --url http://localhost:{porta}"):
+            return
+        info("Abrindo o túnel (leva uns segundos)...")
+        base = None
+        for _ in range(45):
+            base = url_tunel(SERVICO_TUNEL_APPS)
+            if base:
+                break
+            time.sleep(1)
+        if not base:
+            parar_servico(SERVICO_TUNEL_APPS)
+            erro("O túnel não deu o endereço. Tem internet? Veja o log: Apps Web › Túnel: status e log.")
+            return
+    # 2) o servidor do túnel, aceitando esse endereço
+    argumentos = ["--porta", str(porta), "--sem-comandos"]
+    for h in {urllib.parse.urlsplit(base).hostname, urllib.parse.urlsplit(host_fixo(porta) or "").hostname} - {None, ""}:
+        argumentos += ["--permitir-host", h]
+    if not com_ponte:
+        argumentos.append("--sem-ponte")
+    comando = "PYTHONUNBUFFERED=1 " + shlex.join([sys.executable, str(lnux_apps_servidor()), *argumentos])
+    if not iniciar_servico(SERVICO_APPS_TUNEL, comando, reiniciar=True, wake_lock=True):
+        parar_servico(SERVICO_TUNEL_APPS)
+        return
+    token = lnux_apps_config().get("token", "")
+    for _ in range(40):
+        if lnux_apps_estado(porta, token):
+            break
+        time.sleep(0.25)
+    else:
+        erro("O servidor do túnel não respondeu. Veja o log: Apps Web › Túnel: status e log.")
+        return
+    link = apps_web_tunel_link() or base.rstrip("/") + "/"
+    ok("Pronto! Abra de qualquer lugar:")
+    print(f"  {NEG}{link}{RST}")
+    mostrar_qr(link, "apps-web-tunel", salvar=False)
+    if com_ponte:
+        aviso("O link leva a chave da ponte: guarde só para você.")
+    if not fixo:
+        info("O endereço muda toda vez que o túnel liga. Para um endereço que não muda, use o túnel fixo "
+             f"(Endereço fixo) e aponte um endereço do seu domínio para a porta {porta}.")
+    info("Para desligar: Apps Web › Compartilhar pela internet (túnel) › Desligar o túnel.")
+
+
 @submenu
 def apps_web_pastas() -> None:
     """Pastas liberadas para a ponte, rodar comandos e a chave."""
@@ -36199,6 +36328,9 @@ def menu_apps_web():
     itens += [
         ("🔄 Atualizar os Apps Web (baixar os apps novos)", lambda: lnux_apps_baixar(atualizar=True)),
         ("📡 Abrir em outro aparelho da rede (QR code)", apps_web_na_rede),
+        ("🌍 Compartilhar pela internet (túnel, link https e QR code)", apps_web_tunel),
+        ("🌍 Túnel: desligar", apps_web_tunel_parar),
+        ("🌍 Túnel: status e log", lambda: (status_servico(SERVICO_TUNEL_APPS), status_servico(SERVICO_APPS_TUNEL))),
         *itens_servico(SERVICO_APPS, "Servidor", lambda: garantir_servidor_apps(cfg().get("apps_ponte", "sempre") == "sempre")),
         ("⚙️ Ponte: pastas liberadas, comandos e chave", apps_web_pastas),
         ("ℹ️ Como funciona", explicar_apps_web),
@@ -36213,6 +36345,9 @@ def menu_apps_web():
             ligado = servico_ativo(SERVICO_APPS)
             print(f"{DIM}{prontos} apps prontos · {planejados} a caminho · servidor {'ligado' if ligado else 'desligado'}"
                   f" · ffmpeg {'sim' if tem('ffmpeg') else 'não (instale para exportar MP4/MP3)'}{RST}")
+            link = apps_web_tunel_link()
+            if link:
+                print(f"{DIM}🌍 Na internet: {link.split('#')[0]}{' (com a ponte)' if cfg().get('apps_tunel_ponte') else ''}{RST}")
 
     menu("🧩 Apps Web", itens, cabecalho=cabecalho)
 
