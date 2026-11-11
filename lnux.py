@@ -36336,6 +36336,312 @@ def apps_web_pastas() -> None:
     ], cabecalho=cabecalho)
 
 
+# ── TNUX (o sistema no estilo do Linux Mint, do mesmo autor) ─────────
+# O TNUX é outro repositório: um sistema com núcleo em C e uma área de trabalho que abre no navegador.
+# Aqui o LNUX baixa o repositório, compila (make), liga o servidor da ponte dele (tnuxd) como um serviço
+# (tmux) e abre a área de trabalho já com a chave. O tnuxd sorteia uma chave a cada vez que liga e grava a
+# porta e a chave em ~/.tnux/ponte.json: é de lá que o LNUX as lê. No modo ponte, o TNUX usa este aparelho de
+# verdade: o terminal dele é o shell daqui e os arquivos são os daqui.
+
+TNUX_REPO = "https://github.com/Gustavo-HVF/TNUX-DistroSystem"
+TNUX_DIR = DATA_DIR / "tnux"
+TNUX_DADOS = HOME / ".tnux"
+TNUX_PORTA = 8097          # a 8096 é do túnel dos Apps Web
+SERVICO_TNUX = "tnux-desktop"
+
+
+def tnux_binario(nome: str) -> Path:
+    return TNUX_DIR / "build" / nome
+
+
+def tnux_baixado() -> bool:
+    return (TNUX_DIR / "Makefile").is_file() and (TNUX_DIR / "web" / "index.html").is_file()
+
+
+def tnux_instalado() -> bool:
+    return all(os.access(tnux_binario(n), os.X_OK) for n in ("tnux", "tnuxd")) and tnux_baixado()
+
+
+def tnux_tem(recurso: str) -> bool:
+    """A cópia baixada do TNUX já tem este recurso? (cópias antigas não têm o túnel, por exemplo)"""
+    try:
+        return recurso in (TNUX_DIR / "ponte" / "tnuxd.c").read_text("utf-8")
+    except OSError:
+        return False
+
+
+def tnux_compilar() -> bool:
+    """Compila o tnux e o tnuxd (make). Precisa de um compilador C e do make."""
+    if not garantir_cmd("make"):
+        return False
+    if not any(tem(c) for c in ("cc", "gcc", "clang")):
+        if not garantir_cmd("clang" if sistema().termux else "gcc"):
+            return False
+    info("Compilando o TNUX (leva menos de um minuto)...")
+    r = rodar(["make", "-C", str(TNUX_DIR)], capturar=True, timeout=900, mostrar=False)
+    if r.returncode != 0 or not tnux_instalado():
+        fim = ((r.stderr or "") + (r.stdout or "")).strip().splitlines()[-6:]
+        raise LnuxError("A compilação do TNUX falhou:\n" + "\n".join(fim))
+    ok("TNUX compilado.")
+    return True
+
+
+def tnux_baixar(atualizar: bool = False) -> bool:
+    """Clona (ou atualiza) o TNUX em ~/.lnux/tnux e compila."""
+    if not garantir_cmd("git"):
+        return False
+    if (TNUX_DIR / ".git").is_dir():
+        if atualizar:
+            info("Atualizando o TNUX...")
+            r = rodar(["git", "-C", str(TNUX_DIR), "pull", "--ff-only"], capturar=True, timeout=300, mostrar=False)
+            if r.returncode != 0:
+                raise LnuxError("Não deu para atualizar o TNUX: " + ((r.stderr or r.stdout or "").strip().splitlines() or ["erro do git"])[-1]
+                                + f"\nSe você mexeu nos arquivos de {TNUX_DIR}, apague a pasta e baixe de novo.")
+            ok("TNUX atualizado." if "Already up to date" not in (r.stdout or "") else "O TNUX já estava na versão mais nova.")
+    else:
+        if TNUX_DIR.exists() and any(TNUX_DIR.iterdir()):
+            raise LnuxError(f"A pasta {TNUX_DIR} já existe e não é um clone do git. Apague ou renomeie e tente de novo.")
+        info(f"Baixando o TNUX ({TNUX_REPO})...")
+        r = rodar(["git", "clone", "--depth", "1", TNUX_REPO, str(TNUX_DIR)], capturar=True, timeout=900, mostrar=False)
+        if r.returncode != 0:
+            raise LnuxError("Não deu para baixar o TNUX: " + ((r.stderr or "").strip().splitlines() or ["sem resposta"])[-1])
+        ok(f"TNUX baixado em {TNUX_DIR}.")
+    if not tnux_baixado():
+        raise LnuxError("O TNUX foi baixado, mas está incompleto (falta a pasta web/). Tente atualizar daqui a pouco.")
+    if atualizar or not tnux_instalado():
+        return tnux_compilar()
+    return True
+
+
+def garantir_tnux() -> bool:
+    """O TNUX baixado e compilado (pergunta antes de baixar)."""
+    if tnux_instalado():
+        return True
+    if not tnux_baixado():
+        info("O TNUX fica num repositório à parte (uns poucos MB) e é compilado aqui (precisa do make e de um compilador C).")
+        if not confirmar("Baixar e compilar agora?", True):
+            return False
+    return tnux_baixar()
+
+
+def tnux_ponte() -> dict | None:
+    """A porta e a chave da ponte do TNUX que está ligada (do ~/.tnux/ponte.json), ou None."""
+    try:
+        dados = json.loads((TNUX_DADOS / "ponte.json").read_text("utf-8"))
+        pid = int(dados.get("pid", 0))
+        if pid <= 0:
+            return None
+        os.kill(pid, 0)
+        return dados if dados.get("porta") and dados.get("token") else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def tnux_api(caminho: str, metodo: str = "GET", ponte: dict | None = None, timeout: float = 5) -> dict | None:
+    """Um pedido à API da ponte do TNUX (com a chave). None se não respondeu."""
+    ponte = ponte or tnux_ponte()
+    if not ponte:
+        return None
+    pedido = urllib.request.Request(f"http://127.0.0.1:{ponte['porta']}{caminho}", method=metodo,
+                                    data=b"" if metodo == "POST" else None, headers={"X-TNUX-Token": ponte["token"]})
+    try:
+        with urllib.request.urlopen(pedido, timeout=timeout) as r:
+            return json.loads(r.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            return {"erro": json.loads(e.read() or b"{}").get("erro", f"erro {e.code}"), "status": e.code}
+        except ValueError:
+            return {"erro": f"erro {e.code}", "status": e.code}
+    except (OSError, ValueError):
+        return None
+
+
+def garantir_tnux_ligado(na_rede: bool = False) -> dict | None:
+    """Liga a área de trabalho do TNUX (se preciso) e devolve {porta, token}. Na rede, para outro aparelho abrir."""
+    if not garantir_tnux():
+        return None
+    c = cfg()
+    ponte = tnux_ponte()
+    if servico_ativo(SERVICO_TNUX) and ponte and tnux_api("/api/info", ponte=ponte) and (c.get("tnux_na_rede_ativo") or not na_rede):
+        return ponte
+    if servico_ativo(SERVICO_TNUX):
+        info("Religando o TNUX" + (" para a rede..." if na_rede else "..."))
+        parar_servico(SERVICO_TNUX)
+        time.sleep(1)
+    porta = int(c.get("tnux_porta", TNUX_PORTA))
+    if not porta_livre(porta, espera=3):
+        aviso(f"A porta {porta} está ocupada; o TNUX usa a próxima livre.")
+    (TNUX_DADOS / "ponte.json").unlink(missing_ok=True)   # para não ler a chave de uma vez anterior
+    c["tnux_na_rede_ativo"] = na_rede
+    salvar_cfg()
+    argumentos = [str(tnux_binario("tnuxd")), "--porta", str(porta)] + (["--rede"] if na_rede else [])
+    # TNUX_RAIZ: onde está a área de trabalho; LNUX_PY: para o TNUX achar este LNUX (programa "LNUX" do menu dele)
+    comando = shlex.join(["env", f"TNUX_RAIZ={TNUX_DIR}", f"LNUX_PY={Path(__file__).resolve()}", *argumentos])
+    if not iniciar_servico(SERVICO_TNUX, comando, wake_lock=True):
+        return None
+    for _ in range(60):
+        ponte = tnux_ponte()
+        if ponte and tnux_api("/api/info", ponte=ponte):
+            return ponte
+        time.sleep(0.25)
+    erro("A área de trabalho do TNUX não respondeu. Veja o log em Apps Web › TNUX › Área de trabalho: status e log.")
+    return None
+
+
+def tnux_abrir() -> None:
+    """Abre a área de trabalho do TNUX no navegador deste aparelho, já com a chave."""
+    ponte = garantir_tnux_ligado()
+    if not ponte:
+        return
+    abrir_link(f"http://127.0.0.1:{ponte['porta']}/#token={ponte['token']}")
+    ok("Abrindo a área de trabalho do TNUX no navegador.")
+    info(f"Endereço: http://127.0.0.1:{ponte['porta']}/  (com a chave; quem tiver a chave controla este aparelho)")
+    if sistema().termux:
+        info("O TNUX fica ligado em segundo plano; para desligar: Apps Web › TNUX › Área de trabalho: parar.")
+
+
+def tnux_na_rede() -> None:
+    """Liga o TNUX para a rede: um computador abre a área de trabalho deste aparelho e empresta o processador."""
+    aviso("Assim, qualquer aparelho na mesma rede Wi-Fi que tiver o link controla este aparelho (terminal, arquivos, "
+          "programas). A conexão não é cifrada: use só em redes suas.")
+    if not confirmar("Ligar o TNUX para a rede?", False):
+        return
+    ponte = garantir_tnux_ligado(na_rede=True)
+    if not ponte:
+        return
+    url = f"http://{ip_local()}:{ponte['porta']}/#token={ponte['token']}"
+    ok("Abra no outro aparelho (mesma rede):")
+    print(f"  {NEG}{url}{RST}")
+    mostrar_qr(url, "tnux-rede", salvar=False)
+    info("Com a área de trabalho aberta no computador, ele faz o serviço pesado para este aparelho: "
+         "Apps Web › TNUX › O computador processa (tnux pc).")
+    info("Para voltar a ser só deste aparelho: Apps Web › TNUX › Área de trabalho: parar (e abra de novo).")
+
+
+def tnux_compartilhar() -> None:
+    """Um link https (túnel da Cloudflare) que abre o TNUX deste aparelho de qualquer lugar."""
+    if not garantir_tnux():
+        return
+    if not tnux_tem("--tunel"):
+        info("A sua cópia do TNUX é de antes do túnel; atualizando...")
+        tnux_baixar(atualizar=True)
+        if not tnux_tem("--tunel"):
+            erro("O TNUX publicado ainda não tem o túnel. Tente 'Atualizar o TNUX' mais tarde.")
+            return
+        if servico_ativo(SERVICO_TNUX):
+            parar_servico(SERVICO_TNUX)     # religa com a versão nova
+    estado = tnux_api("/api/tunel/estado")
+    if not (estado and estado.get("link")):
+        aviso("QUEM TIVER O LINK controla este aparelho como você: terminal, arquivos e programas. "
+              "Mande só para quem você confia (ou use só você, de outro lugar).")
+        if not confirmar("Criar o link pela internet?", False):
+            return
+        if not garantir_cmd("cloudflared"):
+            return
+    ponte = garantir_tnux_ligado(cfg().get("tnux_na_rede_ativo", False))
+    if not ponte:
+        return
+    # o "tnux compartilhar" liga o túnel e mostra o link com o QR code (desenhado por ele, sem o qrencode)
+    r = rodar([tnux_binario("tnux"), "compartilhar"], timeout=120)
+    estado = tnux_api("/api/tunel/estado", ponte=ponte) or {}
+    link = estado.get("link")
+    if r.returncode != 0 or not link:
+        erro("O túnel não ligou. Tem internet? Veja o log em ~/.tnux/tunel.log.")
+        return
+    escolha = escolher("E agora?", ["Deixar ligado", "Copiar o link", "Desligar o link"], 1)
+    if escolha == 1:
+        copiar_texto(link)
+    elif escolha == 2:
+        tnux_compartilhar_parar()
+
+
+def tnux_compartilhar_parar() -> None:
+    r = tnux_api("/api/tunel/parar", "POST")
+    if r is None:
+        info("O TNUX não está ligado: não há link para desligar.")
+    else:
+        ok("Link do TNUX desligado: ele não abre mais.")
+
+
+def tnux_link_internet() -> str | None:
+    estado = tnux_api("/api/tunel/estado", timeout=2) if servico_ativo(SERVICO_TNUX) else None
+    return (estado or {}).get("link") or None
+
+
+def tnux_terminal() -> None:
+    """O shell do TNUX aqui no terminal: prompt, histórico e Tab, com os comandos rodando neste aparelho."""
+    if not garantir_tnux():
+        return
+    info("Para voltar ao LNUX: exit")
+    subprocess.call([str(tnux_binario("tnux"))],
+                    env={**os.environ, "LNUX_PY": str(Path(__file__).resolve()), "TNUX_RAIZ": str(TNUX_DIR)})
+
+
+def tnux_pc() -> None:
+    """Mostra os computadores que estão emprestando o processador e explica o tnux pc."""
+    if not garantir_tnux():
+        return
+    if not tnux_ponte():
+        aviso("O TNUX não está ligado. Use '📡 Abrir num computador da rede' e abra o link no computador.")
+        return
+    subprocess.call([str(tnux_binario("tnux")), "pc"])
+    print(textwrap.dedent(f"""
+        Com a área de trabalho do TNUX aberta no navegador de um computador, este aparelho manda o serviço
+        pesado para lá. No terminal (o shell do TNUX ou aqui mesmo), por exemplo:
+
+          {NEG}{tnux_binario('tnux')} pc imagem --para webp --largura 1600 *.jpg{RST}
+          {NEG}{tnux_binario('tnux')} pc zip fotos.zip Fotos/{RST}
+          {NEG}{tnux_binario('tnux')} pc ajuda{RST}
+    """).rstrip())
+
+
+def explicar_tnux() -> None:
+    print(textwrap.dedent(f"""
+        {NEG}TNUX{RST}: um sistema no estilo do Linux Mint, do mesmo autor do LNUX ({TNUX_REPO}).
+        O núcleo é escrito em C e a área de trabalho (painel, menu, janelas, terminal, arquivos, editor,
+        gerenciador de aplicativos) abre no navegador.
+
+        Aqui ele roda no {NEG}modo ponte{RST}: o terminal da área de trabalho é o shell deste aparelho, o gerenciador
+        de arquivos mostra as pastas daqui e o gerenciador de aplicativos instala programas de verdade
+        (pelo gerenciador de pacotes do sistema). O LNUX também aparece lá dentro, no programa "LNUX".
+
+        A área de trabalho exige uma chave, que vai no endereço quando o LNUX abre o TNUX. Quem tiver a chave
+        controla este aparelho. A chave muda toda vez que o TNUX liga.
+
+        • 📡 Na rede: um computador do Wi-Fi abre a área de trabalho e empresta o processador (tnux pc).
+        • 🌍 Pela internet: um link https da Cloudflare, com chave própria, que para de valer ao desligar.
+    """).strip("\n"))
+
+
+@submenu
+def menu_tnux():
+    itens = [
+        ("🖥️ Abrir a área de trabalho no navegador", tnux_abrir),
+        ("📡 Abrir num computador da rede (QR code)", tnux_na_rede),
+        ("🌍 Compartilhar pela internet (Cloudflare, link https e QR code)", tnux_compartilhar),
+        ("🌍 Link pela internet: desligar", tnux_compartilhar_parar),
+        ("⌨️ O shell do TNUX aqui no terminal", tnux_terminal),
+        ("🧮 O computador processa para o celular (tnux pc)", tnux_pc),
+        *itens_servico(SERVICO_TNUX, "Área de trabalho", garantir_tnux_ligado),
+        ("⬇️ Baixar e compilar o TNUX" if not tnux_baixado() else "🔄 Atualizar o TNUX", lambda: tnux_baixar(atualizar=tnux_baixado())),
+        ("ℹ️ Como funciona", explicar_tnux),
+    ]
+
+    def cabecalho():
+        if not tnux_instalado():
+            print(f"{DIM}O TNUX ainda não foi baixado: escolha 'Abrir' ou 'Baixar e compilar'.{RST}")
+            return
+        ponte = tnux_ponte() if servico_ativo(SERVICO_TNUX) else None
+        rede = " · na rede" if ponte and cfg().get("tnux_na_rede_ativo") else ""
+        print(f"{DIM}Área de trabalho {'ligada na porta ' + str(ponte['porta']) + rede if ponte else 'desligada'}"
+              f" · {TNUX_DIR}{RST}")
+        link = tnux_link_internet()
+        if link:
+            print(f"{DIM}🌍 Na internet: {link.split('#')[0]}{RST}")
+
+    menu("🐧 TNUX: área de trabalho no estilo do Linux Mint", itens, cabecalho=cabecalho)
+
+
 def explicar_apps_web() -> None:
     print(textwrap.dedent(f"""
         {NEG}Apps Web{RST}: editores que abrem no navegador (do celular ou do computador), feitos só com HTML,
@@ -36360,6 +36666,7 @@ def menu_apps_web():
               "arquivo": "📄", "layout": "📊", "tela": "🖥️", "imagem": "🖼️", "estrela": "⭐", "cor": "🎨",
               "particulas": "🎞️", "forma": "📐", "ia": "🤖"}
     itens = [("🏠 Página inicial (todos os apps)", lambda: abrir_app_web(None))]
+    itens.append(("🐧 TNUX: conectar à área de trabalho no estilo do Linux Mint", menu_tnux))
     itens += [(f"{icones.get(a.get('icone'), '🧩')} {a['nome']}: {a.get('descricao', '')}", (lambda app=a: abrir_app_web(app))) for a in apps]
     if not apps:
         itens.append(("⬇️ Baixar o LNUX-APPs (Vídeo, Som, Efeitos...)", lambda: lnux_apps_baixar()))
@@ -36675,6 +36982,8 @@ def _indice_busca() -> list:
         ("🌌 Telas de descanso", "tela descanso matrix canos pipes aquario peixe screensaver", menu_telas_de_descanso),
         ("🧩 Apps Web (vídeo, som e efeitos no navegador)", "apps web navegador editor video filme som audio estudio gravar mixar "
          "efeitos animacao titulo motion lnux-apps ponte filmcraft soundcraft effectcraft", menu_apps_web),
+        ("🐧 TNUX: conectar à área de trabalho no estilo do Linux Mint", "tnux linux mint desktop area de trabalho sistema operacional "
+         "navegador ponte cinnamon janelas cloudflare tunel link computador processar", menu_tnux),
         ("📲 Celular e sistema", "celular sistema android adb bateria apps fotos", menu_celular),
         ("🔌 Depuração sem fio (ADB)", "adb depuracao wifi wireless android shell signal 9 pareamento", menu_adb),
         ("📖 Comandos do ADB (com descrição)", "comandos adb lista ajuda pm am dpm shell screencap screenrecord "
@@ -36920,6 +37229,10 @@ def main(argv=None) -> int:
     sub.add_parser("ficha", help="ficha do sistema (estilo neofetch)")
     p = sub.add_parser("apps", help="abre os Apps Web no navegador (liga o servidor e a ponte)")
     p.add_argument("app", nargs="?", help="id do app (video, som, efeitos...); sem nada, a página inicial")
+    p = sub.add_parser("tnux", help="o TNUX: a área de trabalho no estilo do Linux Mint, ligada a este aparelho")
+    p.add_argument("acao", nargs="?", default="abrir", choices=["abrir", "rede", "compartilhar", "parar-link", "parar", "terminal", "atualizar"],
+                   help="abrir (padrão), rede (outro aparelho do Wi-Fi), compartilhar (link https da Cloudflare), "
+                        "parar-link, parar (desliga a área de trabalho), terminal (o shell do TNUX), atualizar")
     p = sub.add_parser("sistema", help="mostra ou troca o sistema (perfil de distro) que o LNUX usa")
     p.add_argument("perfil", nargs="?", help="id do perfil (termux, debian, arch, fedora, alpine, opensuse, outro)")
     p.add_argument("--listar", action="store_true", help="lista os perfis disponíveis")
@@ -37067,6 +37380,10 @@ def main(argv=None) -> int:
                     raise LnuxError(f"App desconhecido: {args.app}. Os que existem: "
                                     f"{', '.join(a['id'] for a in lnux_apps_catalogo() if a.get('estado') == 'pronto') or '(baixe o LNUX-APPs antes)'}")
             abrir_app_web(app)
+        elif args.comando == "tnux":
+            {"abrir": tnux_abrir, "rede": tnux_na_rede, "compartilhar": tnux_compartilhar, "parar-link": tnux_compartilhar_parar,
+             "parar": lambda: parar_servico(SERVICO_TNUX), "terminal": tnux_terminal,
+             "atualizar": lambda: tnux_baixar(atualizar=tnux_baixado())}[args.acao]()
         elif args.comando == "sistema":
             if args.listar:
                 for perfil in perfis().values():
