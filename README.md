@@ -310,7 +310,10 @@ Para jogar com outras pessoas nas **salas** da Companhia e usar a **loja** (pers
 - A **loja** fica numa pasta própria (`~/.lnux-apps/loja`, com as subpastas `personagens`, `mundos` e `animacoes`),
   a única pasta do aparelho que os visitantes alcançam. Quem entra vê os itens em 3D antes de usar e, se você
   deixar (dentro da loja, na Companhia), publica os seus; arquivos que você põe nas subpastas também aparecem.
-- Você cria as salas abrindo a Companhia **neste aparelho** (o LNUX abre já com a chave) e manda o link da sala.
+- Quem abre o link vê a **lista de salas** (como a lista de servidores de um jogo), entra numa ou **cria a sua**,
+  com as opções: pública ou privada, senha, quantas pessoas, bate-papo e o cenário. Criar não precisa da ponte;
+  se não quiser que os outros criem, desligue na própria lista de salas, abrindo a Companhia **neste aparelho**
+  (o LNUX abre já com a chave).
 - *💬 Companhia publicada: tirar da internet* fecha o link. O endereço muda toda vez que o túnel liga; com o
   *Endereço fixo* apontado para a porta 8105, o LNUX usa esse endereço.
 
