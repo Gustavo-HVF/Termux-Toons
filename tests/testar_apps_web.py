@@ -233,6 +233,115 @@ def _():
             setattr(lnux, n, v)
 
 
+@caso("Companhia publicada sozinha: servidor --so-app com a ponte, link sem a chave; de fora, só a Companhia, as salas e a loja")
+def _():
+    local = copia_local()
+    if not local:
+        return "pulado (sem uma cópia do LNUX-APPs por perto; use LNUX_APPS_LOCAL=pasta)"
+    if "--so-app" not in (local / "servidor" / "lnux_apps.py").read_text("utf-8"):
+        return "pulado (a cópia do LNUX-APPs por perto é de antes do --so-app)"
+    import urllib.request
+    ativos, comandos, abertos = {}, [], []
+
+    def iniciar(nome, comando, reiniciar=False, wake_lock=True, com_log=True):
+        comandos.append((nome, comando))
+        if comando.startswith("cloudflared"):
+            lnux.log_de(nome).parent.mkdir(parents=True, exist_ok=True)
+            lnux.log_de(nome).write_text("INF |  https://abc-teste.trycloudflare.com  |\n", "utf-8")
+            ativos[nome] = None
+        else:
+            ativos[nome] = subprocess.Popen(comando, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+
+    def parar(nome):
+        p = ativos.pop(nome, None)
+        if p:
+            os.killpg(p.pid, 15)
+            p.wait(timeout=10)
+
+    def pedir(porta, caminho, cabecalhos):
+        """(status, Location, corpo) sem seguir redirecionamentos."""
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", porta, timeout=5)
+        c.request("GET", caminho, headers=cabecalhos)
+        r = c.getresponse()
+        dados = r.read()
+        c.close()
+        return r.status, r.getheader("Location"), dados
+
+    nomes = ("garantir_lnux_apps", "LNUX_APPS_DIR", "garantir_cmd", "iniciar_servico", "parar_servico", "servico_ativo", "escolher", "confirmar",
+             "mostrar_qr", "endereco_fixo", "host_fixo", "abrir_link")
+    original = {n: getattr(lnux, n) for n in nomes}
+    respostas = []
+    lnux.garantir_lnux_apps = lambda: True
+    lnux.LNUX_APPS_DIR = local
+    lnux.garantir_cmd = lambda *a, **k: True
+    lnux.iniciar_servico, lnux.parar_servico = iniciar, parar
+    lnux.servico_ativo = lambda nome: nome in ativos
+    lnux.escolher = lambda msg, opcoes, padrao=None: respostas.pop(0)
+    lnux.confirmar = lambda msg, padrao=False: True
+    lnux.mostrar_qr = lambda *a, **k: None
+    lnux.endereco_fixo = lnux.host_fixo = lambda porta: None
+    lnux.abrir_link = abertos.append
+    try:
+        porta = porta_livre()
+        lnux.cfg()["companhia_porta"] = porta
+        token = lnux.lnux_apps_config().get("token", "")
+        lnux.companhia_publicar()
+        cloud = next(c for n, c in comandos if n == lnux.SERVICO_TUNEL_COMPANHIA)
+        serv = next(c for n, c in comandos if n == lnux.SERVICO_COMPANHIA)
+        assert f"--url http://localhost:{porta}" in cloud, cloud
+        assert "--so-app companhia" in serv and "--sem-comandos" in serv and "--permitir-host abc-teste.trycloudflare.com" in serv and "--sem-ponte" not in serv, serv
+        link = lnux.companhia_link()
+        assert link == "https://abc-teste.trycloudflare.com/" and "token" not in link, link
+        # o dono: abriu a Companhia aqui, com a chave, no modo de jogar
+        assert abertos == [f"http://127.0.0.1:{porta}/apps/companhia/#token={token}&modo=jogar"], abertos
+        # de fora (como pelo túnel): só a Companhia; a ponte não abre nem com a chave; a loja e as salas sim
+        fora = {"Host": "abc-teste.trycloudflare.com", "Cf-Connecting-Ip": "203.0.113.9"}
+        assert pedir(porta, "/", fora)[:2] == (302, "/apps/companhia/")
+        assert pedir(porta, "/apps/companhia/", fora)[0] == 200
+        assert pedir(porta, "/apps/video/", fora)[0] == 404
+        assert pedir(porta, "/api/estado", {**fora, "X-Ponte-Token": token})[0] == 403
+        assert pedir(porta, "/api/pastas?caminho=~", {**fora, "X-Ponte-Token": token})[0] == 403
+        assert pedir(porta, "/api/loja", fora)[0] == 200
+        assert json.loads(pedir(porta, "/api/publico", fora)[2])["so_app"] == "companhia"
+        # neste aparelho, com a chave: a ponte funciona (é por aqui que o dono cria as salas)
+        status, _, corpo = pedir(porta, "/api/estado", {"Host": f"127.0.0.1:{porta}", "X-Ponte-Token": token})
+        assert status == 200 and json.loads(corpo)["so_app"] == "companhia"
+        # chamando de novo: mostra o link; "Tirar da internet" desliga tudo
+        respostas[:] = [3]
+        lnux.companhia_publicar()
+        assert not ativos and lnux.companhia_link() is None
+    finally:
+        for n in list(ativos):
+            parar(n)
+        for n, v in original.items():
+            setattr(lnux, n, v)
+
+
+@caso("Companhia publicada com um LNUX-APPs antigo (sem --so-app): tenta atualizar, avisa e não deixa nada ligado")
+def _():
+    velho = CASA / "lnux-apps-velho-2"
+    (velho / "servidor").mkdir(parents=True)
+    (velho / "servidor" / "lnux_apps.py").write_text("# versão antiga: --permitir-host, mas sem publicar um app sozinho\n", "utf-8")
+    atualizou, iniciados, erros = [], [], []
+    nomes = ("garantir_lnux_apps", "LNUX_APPS_DIR", "lnux_apps_baixar", "iniciar_servico", "servico_ativo", "erro")
+    original = {n: getattr(lnux, n) for n in nomes}
+    lnux.garantir_lnux_apps = lambda: True
+    lnux.LNUX_APPS_DIR = velho
+    lnux.lnux_apps_baixar = lambda atualizar=False: atualizou.append(atualizar) or True
+    lnux.iniciar_servico = lambda *a, **k: iniciados.append(a) or True
+    lnux.servico_ativo = lambda nome: False
+    lnux.erro = erros.append
+    try:
+        assert lnux.lnux_apps_tem_so_app() is False
+        lnux.companhia_publicar()
+        assert atualizou == [True] and not iniciados and erros and "--so-app" in erros[-1], (atualizou, iniciados, erros)
+    finally:
+        for n, v in original.items():
+            setattr(lnux, n, v)
+
+
 def main() -> int:
     ok = falhou = pulados = 0
     for nome, f in CASOS:
