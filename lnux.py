@@ -36195,6 +36195,7 @@ def apps_web_tunel() -> None:
         "Só os apps (recomendado): quem abrir usa os apps no navegador dele, sem acesso a este aparelho",
         "Os apps E a ponte: as pastas liberadas e o ffmpeg deste aparelho (só para você mesmo, em outro lugar)",
     ], 1)
+    info("Para jogar com outras pessoas na Companhia, use '💬 Publicar só a Companhia': o link não leva a chave.")
     if modo is None:
         return
     com_ponte = modo == 1
@@ -36266,6 +36267,171 @@ def apps_web_tunel() -> None:
         info("O endereço muda toda vez que o túnel liga. Para um endereço que não muda, use o túnel fixo "
              f"(Endereço fixo) e aponte um endereço do seu domínio para a porta {porta}.")
     info("Para desligar: Apps Web › Compartilhar pela internet (túnel) › Desligar o túnel.")
+
+
+# ── Publicar só a Companhia (salas e loja) ──────────────────────────
+# Para jogar com outras pessoas: um servidor só para isso, numa porta própria, com --so-app companhia. Pelo link
+# (o túnel) abre só a Companhia: a página inicial dos Apps Web e os outros apps não existem nesse endereço, e quem
+# chega por ele nunca usa a ponte, nem com a chave (as pastas, o ffmpeg e as chaves de IA ficam de fora). Os
+# visitantes só alcançam as salas e a loja (uma pasta própria: ~/.lnux-apps/loja). O dono cria as salas abrindo a
+# Companhia NESTE aparelho (127.0.0.1, com a chave), no mesmo servidor, e manda o link, que vai sem a chave.
+
+SERVICO_COMPANHIA = "companhia-site"    # o servidor que publica só a Companhia
+SERVICO_TUNEL_COMPANHIA = "tunel-companhia"
+LNUX_APPS_PORTA_COMPANHIA = 8105  # 8095 Apps Web, 8096 túnel deles, 8097 TNUX e sites, 8098/8099 chat
+
+
+def lnux_apps_tem_so_app() -> bool:
+    """O LNUX-APPs baixado já sabe publicar um app sozinho (--so-app)? Cópias antigas não sabem."""
+    try:
+        return "--so-app" in lnux_apps_servidor().read_text("utf-8")
+    except OSError:
+        return False
+
+
+def companhia_porta() -> int:
+    return int(cfg().get("companhia_porta", LNUX_APPS_PORTA_COMPANHIA))
+
+
+def companhia_link() -> str | None:
+    """O link público da Companhia publicada (nunca leva a chave), se o servidor e o túnel estão de pé."""
+    if not servico_ativo(SERVICO_COMPANHIA):
+        return None
+    porta = companhia_porta()
+    if not lnux_apps_estado(porta, lnux_apps_config().get("token", "")):
+        return None
+    base = endereco_fixo(porta) or (url_tunel(SERVICO_TUNEL_COMPANHIA) if servico_ativo(SERVICO_TUNEL_COMPANHIA) else None)
+    return base.rstrip("/") + "/" if base else None
+
+
+def companhia_local() -> str:
+    """A Companhia publicada, aberta NESTE aparelho com a chave (é por aqui que o dono cria as salas)."""
+    token = lnux_apps_config().get("token", "")
+    return f"http://127.0.0.1:{companhia_porta()}/apps/companhia/#token={token}&modo=jogar"
+
+
+def companhia_loja_pasta() -> Path:
+    return Path(os.path.expanduser(lnux_apps_config().get("loja") or str(LNUX_APPS_DADOS / "loja")))
+
+
+def companhia_parar(avisar: bool = True) -> None:
+    for nome in (SERVICO_TUNEL_COMPANHIA, SERVICO_COMPANHIA):
+        if servico_ativo(nome):
+            parar_servico(nome)
+    if avisar:
+        ok("A Companhia saiu da internet: o link não abre mais.")
+
+
+def companhia_publicar() -> None:
+    """Publica só a Companhia pela internet: um link https para jogar nas salas e usar a loja, sem os outros apps e
+    sem a ponte."""
+    if not garantir_lnux_apps():
+        return
+    if not lnux_apps_tem_so_app():
+        info("A sua cópia do LNUX-APPs é de antes da publicação só da Companhia; atualizando...")
+        try:
+            lnux_apps_baixar(atualizar=True)
+        except LnuxError as e:
+            erro(str(e))
+        if not lnux_apps_tem_so_app():
+            companhia_parar(avisar=False)
+            erro("O LNUX-APPs publicado ainda não sabe publicar só a Companhia (a opção --so-app do servidor). "
+                 "Tente '🔄 Atualizar os Apps Web' mais tarde.")
+            return
+    link = companhia_link()
+    if not link and (servico_ativo(SERVICO_COMPANHIA) or servico_ativo(SERVICO_TUNEL_COMPANHIA)):
+        companhia_parar(avisar=False)  # sobrou de uma tentativa que falhou: começa do zero
+    if link:
+        ok("A Companhia está publicada. O link para as pessoas:")
+        print(f"  {NEG}{link}{RST}")
+        mostrar_qr(link, "companhia", salvar=False)
+        escolha = escolher("E agora?", ["Abrir a Companhia aqui (para criar a sala)", "Copiar o link", "Deixar como está",
+                                        "Tirar da internet"], 0)
+        if escolha == 0:
+            abrir_link(companhia_local())
+        elif escolha == 1:
+            copiar_texto(link)
+        elif escolha == 3:
+            companhia_parar()
+        return
+    print(textwrap.dedent(f"""
+        Publica {NEG}só a Companhia{RST} num link {NEG}https://...{RST} para jogar com outras pessoas: quem abrir
+        entra nas salas e na loja (personagens, mundos e animações), e mais nada.
+          • A página inicial dos Apps Web e os outros apps não abrem por esse link.
+          • A ponte (as pastas, o ffmpeg e as chaves de IA deste aparelho) não abre por ele, nem com a chave.
+          • A loja fica numa pasta própria ({companhia_loja_pasta()}): é a única pasta que os visitantes alcançam.
+        Você cria a sala abrindo a Companhia aqui neste aparelho e manda o link da sala para as pessoas.
+        Este aparelho é o servidor: precisa ficar ligado e com internet. Usa um túnel da Cloudflare (cloudflared).
+    """).strip("\n"))
+    if not confirmar("Publicar a Companhia?", True):
+        return
+    c = cfg()
+    porta = companhia_porta()
+    if servico_ativo(SERVICO_COMPANHIA):
+        parar_servico(SERVICO_COMPANHIA)
+    if not porta_livre(porta, espera=5):
+        aviso(f"A porta {porta} está ocupada por outro programa.")
+        porta = perguntar_int("Outra porta para a Companhia publicada", porta + 1, 1024, 65535)
+    c["companhia_porta"] = porta
+    salvar_cfg()
+    # 1) o endereço: o fixo (se houver um apontado para esta porta) ou um túnel rápido novo
+    fixo = endereco_fixo(porta)
+    if fixo:
+        base = fixo
+        info(f"Usando o seu endereço fixo: {fixo}")
+    else:
+        if not garantir_cmd("cloudflared"):
+            return
+        parar_servico(SERVICO_TUNEL_COMPANHIA)
+        log_de(SERVICO_TUNEL_COMPANHIA).unlink(missing_ok=True)  # para achar o endereço novo no log
+        if not iniciar_servico(SERVICO_TUNEL_COMPANHIA, f"cloudflared tunnel --no-autoupdate --url http://localhost:{porta}"):
+            return
+        info("Abrindo o túnel (leva uns segundos)...")
+        base = None
+        for _ in range(45):
+            base = url_tunel(SERVICO_TUNEL_COMPANHIA)
+            if base:
+                break
+            time.sleep(1)
+        if not base:
+            parar_servico(SERVICO_TUNEL_COMPANHIA)
+            erro("O túnel não deu o endereço. Tem internet? Veja o log: Apps Web › Companhia publicada: status e log.")
+            return
+    # 2) o servidor: só a Companhia, aceitando esse endereço, nunca rodando comandos
+    argumentos = ["--porta", str(porta), "--so-app", "companhia", "--sem-comandos"]
+    for h in sorted({urllib.parse.urlsplit(base).hostname, urllib.parse.urlsplit(host_fixo(porta) or "").hostname} - {None, ""}):
+        argumentos += ["--permitir-host", h]
+    comando = "PYTHONUNBUFFERED=1 " + shlex.join([sys.executable, str(lnux_apps_servidor()), *argumentos])
+    log_de(SERVICO_COMPANHIA).unlink(missing_ok=True)
+    if not iniciar_servico(SERVICO_COMPANHIA, comando, reiniciar=True, wake_lock=True):
+        companhia_parar(avisar=False)
+        return
+    token = lnux_apps_config().get("token", "")
+    for _ in range(40):
+        if lnux_apps_estado(porta, token):
+            break
+        time.sleep(0.25)
+    else:
+        try:
+            fim = log_de(SERVICO_COMPANHIA).read_text("utf-8", errors="replace").strip().splitlines()[-4:]
+        except OSError:
+            fim = []
+        companhia_parar(avisar=False)
+        erro("O servidor da Companhia não respondeu (desliguei o link). O fim do log:")
+        for linha in fim:
+            print(f"  {DIM}{linha}{RST}")
+        return
+    link = base.rstrip("/") + "/"
+    ok("Pronto! O link para as pessoas (sem a chave da ponte):")
+    print(f"  {NEG}{link}{RST}")
+    mostrar_qr(link, "companhia", salvar=False)
+    info("Para jogar: abra a Companhia aqui, em Sala › Criar ou entrar numa sala; o link da sala sai com este endereço.")
+    info(f"A loja fica em {companhia_loja_pasta()} (arquivos postos nas subpastas personagens, mundos e animacoes também aparecem).")
+    if not fixo:
+        info("O endereço muda toda vez que o túnel liga. Para um endereço que não muda, use o túnel fixo (Endereço fixo) "
+             f"e aponte um endereço do seu domínio para a porta {porta}.")
+    if confirmar("Abrir a Companhia aqui para criar a sala?", True):
+        abrir_link(companhia_local())
 
 
 @submenu
@@ -36676,6 +36842,9 @@ def menu_apps_web():
         ("🌍 Compartilhar pela internet (túnel, link https e QR code)", apps_web_tunel),
         ("🌍 Túnel: desligar", apps_web_tunel_parar),
         ("🌍 Túnel: status e log", lambda: (status_servico(SERVICO_TUNEL_APPS), status_servico(SERVICO_APPS_TUNEL))),
+        ("💬 Publicar só a Companhia (salas e loja; sem os outros apps e sem a ponte)", companhia_publicar),
+        ("💬 Companhia publicada: tirar da internet", companhia_parar),
+        ("💬 Companhia publicada: status e log", lambda: (status_servico(SERVICO_TUNEL_COMPANHIA), status_servico(SERVICO_COMPANHIA))),
         *itens_servico(SERVICO_APPS, "Servidor", lambda: garantir_servidor_apps(cfg().get("apps_ponte", "sempre") == "sempre")),
         ("⚙️ Ponte: pastas liberadas, comandos e chave", apps_web_pastas),
         ("ℹ️ Como funciona", explicar_apps_web),
@@ -36693,6 +36862,9 @@ def menu_apps_web():
             link = apps_web_tunel_link()
             if link:
                 print(f"{DIM}🌍 Na internet: {link.split('#')[0]}{' (com a ponte)' if cfg().get('apps_tunel_ponte') else ''}{RST}")
+            publicada = companhia_link()
+            if publicada:
+                print(f"{DIM}💬 Companhia publicada: {publicada}{RST}")
 
     menu("🧩 Apps Web", itens, cabecalho=cabecalho)
 
