@@ -36273,8 +36273,9 @@ def apps_web_tunel() -> None:
 # Para jogar com outras pessoas: um servidor só para isso, numa porta própria, com --so-app companhia. Pelo link
 # (o túnel) abre só a Companhia: a página inicial dos Apps Web e os outros apps não existem nesse endereço, e quem
 # chega por ele nunca usa a ponte, nem com a chave (as pastas, o ffmpeg e as chaves de IA ficam de fora). Os
-# visitantes só alcançam as salas e a loja (uma pasta própria: ~/.lnux-apps/loja). O dono cria as salas abrindo a
-# Companhia NESTE aparelho (127.0.0.1, com a chave), no mesmo servidor, e manda o link, que vai sem a chave.
+# visitantes só alcançam as salas e a loja (uma pasta própria: ~/.lnux-apps/loja). Quem abre o link vê a lista de
+# salas e entra, ou cria a sua (com as opções: pública ou privada, senha, pessoas, bate-papo, cenário), se o dono
+# deixar; o dono também abre a Companhia NESTE aparelho (127.0.0.1, com a chave) e o link vai sem a chave.
 
 SERVICO_COMPANHIA = "companhia-site"    # o servidor que publica só a Companhia
 SERVICO_TUNEL_COMPANHIA = "tunel-companhia"
@@ -36345,7 +36346,7 @@ def companhia_publicar() -> None:
         ok("A Companhia está publicada. O link para as pessoas:")
         print(f"  {NEG}{link}{RST}")
         mostrar_qr(link, "companhia", salvar=False)
-        escolha = escolher("E agora?", ["Abrir a Companhia aqui (para criar a sala)", "Copiar o link", "Deixar como está",
+        escolha = escolher("E agora?", ["Abrir a Companhia aqui (a lista de salas)", "Copiar o link", "Deixar como está",
                                         "Tirar da internet"], 0)
         if escolha == 0:
             abrir_link(companhia_local())
@@ -36356,11 +36357,12 @@ def companhia_publicar() -> None:
         return
     print(textwrap.dedent(f"""
         Publica {NEG}só a Companhia{RST} num link {NEG}https://...{RST} para jogar com outras pessoas: quem abrir
-        entra nas salas e na loja (personagens, mundos e animações), e mais nada.
+        vê a lista de salas, entra ou cria a sua (pública ou privada, com senha, quantas pessoas...), e usa a loja
+        (personagens, mundos e animações). E mais nada.
           • A página inicial dos Apps Web e os outros apps não abrem por esse link.
           • A ponte (as pastas, o ffmpeg e as chaves de IA deste aparelho) não abre por ele, nem com a chave.
           • A loja fica numa pasta própria ({companhia_loja_pasta()}): é a única pasta que os visitantes alcançam.
-        Você cria a sala abrindo a Companhia aqui neste aparelho e manda o link da sala para as pessoas.
+        Você também joga: abra a Companhia aqui neste aparelho; na lista de salas dá para não deixar os outros criarem.
         Este aparelho é o servidor: precisa ficar ligado e com internet. Usa um túnel da Cloudflare (cloudflared).
     """).strip("\n"))
     if not confirmar("Publicar a Companhia?", True):
@@ -36425,12 +36427,12 @@ def companhia_publicar() -> None:
     ok("Pronto! O link para as pessoas (sem a chave da ponte):")
     print(f"  {NEG}{link}{RST}")
     mostrar_qr(link, "companhia", salvar=False)
-    info("Para jogar: abra a Companhia aqui, em Sala › Criar ou entrar numa sala; o link da sala sai com este endereço.")
+    info("Quem abrir o link vê a lista de salas e entra ou cria a sua; o link de cada sala sai com este endereço.")
     info(f"A loja fica em {companhia_loja_pasta()} (arquivos postos nas subpastas personagens, mundos e animacoes também aparecem).")
     if not fixo:
         info("O endereço muda toda vez que o túnel liga. Para um endereço que não muda, use o túnel fixo (Endereço fixo) "
              f"e aponte um endereço do seu domínio para a porta {porta}.")
-    if confirmar("Abrir a Companhia aqui para criar a sala?", True):
+    if confirmar("Abrir a Companhia aqui (a lista de salas)?", True):
         abrir_link(companhia_local())
 
 
