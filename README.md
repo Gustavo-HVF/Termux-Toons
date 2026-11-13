@@ -314,6 +314,10 @@ Para jogar com outras pessoas nas **salas** da Companhia e usar a **loja** (pers
   com as opções: pública ou privada, senha, quantas pessoas, bate-papo e o cenário. Criar não precisa da ponte;
   se não quiser que os outros criem, desligue na própria lista de salas, abrindo a Companhia **neste aparelho**
   (o LNUX abre já com a chave).
+- Quem entra também pode **criar uma conta** (nome, e-mail, senha e idade, com um código de 6 dígitos por e-mail) e
+  montar o **perfil** (foto, capa, bio...). Tudo fica neste aparelho (`~/.lnux-apps/contas/`). O código sai pela sua
+  conta de e-mail: configure em *Contas e e-mail*, na lista de salas da Companhia aberta neste aparelho (no Gmail,
+  use uma "senha de app"). Lá também ficam a idade mínima e "só entra quem tem conta".
 - *💬 Companhia publicada: tirar da internet* fecha o link. O endereço muda toda vez que o túnel liga; com o
   *Endereço fixo* apontado para a porta 8105, o LNUX usa esse endereço.
 
