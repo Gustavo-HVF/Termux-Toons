@@ -36429,6 +36429,8 @@ def companhia_publicar() -> None:
     mostrar_qr(link, "companhia", salvar=False)
     info("Quem abrir o link vê a lista de salas e entra ou cria a sua; o link de cada sala sai com este endereço.")
     info(f"A loja fica em {companhia_loja_pasta()} (arquivos postos nas subpastas personagens, mundos e animacoes também aparecem).")
+    info("Contas: para quem entra criar conta (o código vai por e-mail), configure o seu e-mail em Contas e e-mail, "
+         "na lista de salas da Companhia aberta aqui (no Gmail, use uma senha de app).")
     if not fixo:
         info("O endereço muda toda vez que o túnel liga. Para um endereço que não muda, use o túnel fixo (Endereço fixo) "
              f"e aponte um endereço do seu domínio para a porta {porta}.")
