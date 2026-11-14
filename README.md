@@ -317,7 +317,9 @@ Para jogar com outras pessoas nas **salas** do WEBC e usar a **loja** (personage
 - Quem entra também pode **criar uma conta** (nome, e-mail, senha e idade, com um código de 6 dígitos por e-mail) e
   montar o **perfil** (foto, capa, bio...). Tudo fica neste aparelho (`~/.lnux-apps/contas/`). O código sai pela sua
   conta de e-mail: configure em *Contas e e-mail*, na página Sala do WEBC aberto neste aparelho (no Gmail,
-  use uma "senha de app"). Lá também ficam a idade mínima e "só entra quem tem conta".
+  servidor `smtp.gmail.com`, porta 465, e uma "senha de app" de myaccount.google.com/apppasswords; o
+  `imap.gmail.com` do app de e-mail do celular é o de receber e não serve). Lá também ficam a idade mínima e "só
+  entra quem tem conta".
 - *💬 WEBC publicado: tirar da internet* fecha o link. O endereço muda toda vez que o túnel liga; com o
   *Endereço fixo* apontado para a porta 8105, o LNUX usa esse endereço.
 - **🔑 Chaves das APIs**: a chave do **Sketchfab** fica em `~/.lnux-apps/chaves.json` (permissão 600). Com ela, na loja
