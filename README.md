@@ -320,6 +320,10 @@ Para jogar com outras pessoas nas **salas** do WEBC e usar a **loja** (personage
   use uma "senha de app"). Lá também ficam a idade mínima e "só entra quem tem conta".
 - *💬 WEBC publicado: tirar da internet* fecha o link. O endereço muda toda vez que o túnel liga; com o
   *Endereço fixo* apontado para a porta 8105, o LNUX usa esse endereço.
+- **🔑 Chaves das APIs**: a chave do **Sketchfab** fica em `~/.lnux-apps/chaves.json` (permissão 600). Com ela, na loja
+  do WEBC aberta neste aparelho, o botão **Sketchfab** busca modelos e traz mapas para a loja: o servidor baixa, converte
+  para `.glb` e põe o crédito de quem fez. Só entram os de licença Creative Commons que deixa redistribuir (CC0, BY, BY-SA,
+  BY-NC, BY-NC-SA); os comprados (licença Standard) não. A chave nunca vai para o navegador nem para o link das pessoas.
 
 Tema e layout ficam no botão ◐ de cada app; o projeto fica
 guardado no navegador. Na linha de comando: `python lnux.py apps` (página inicial) ou `python lnux.py apps som`.

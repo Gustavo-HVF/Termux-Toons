@@ -52,6 +52,31 @@ def copia_local() -> Path | None:
     return None
 
 
+@caso("Chaves das APIs: a do Sketchfab vai para ~/.lnux-apps/chaves.json (600), que o servidor do WEBC lê; apagar tira")
+def _():
+    import getpass as gp
+    import tempfile as tf
+    antes = (lnux.LNUX_APPS_DADOS, lnux.LNUX_APPS_CHAVES, lnux.escolher, gp.getpass)
+    with tf.TemporaryDirectory() as tmp:
+        lnux.LNUX_APPS_DADOS = Path(tmp) / ".lnux-apps"
+        lnux.LNUX_APPS_CHAVES = lnux.LNUX_APPS_DADOS / "chaves.json"
+        respostas = [0, 0, 3]
+        senhas = ["isso nao!", "chave-de-teste-123"]
+        lnux.escolher = lambda msg, opcoes, padrao=None: respostas.pop(0)
+        gp.getpass = lambda msg="": senhas.pop(0)
+        try:
+            lnux.apps_web_chaves()
+            dados = json.loads(lnux.LNUX_APPS_CHAVES.read_text())
+            assert dados == {"sketchfab": {"token": "chave-de-teste-123"}}, dados  # a primeira (com espaço e !) foi recusada
+            assert (lnux.LNUX_APPS_CHAVES.stat().st_mode & 0o777) == 0o600
+            assert lnux.chave_sketchfab_guardada() == "chave-de-teste-123"
+            respostas[:] = [1, 3]
+            lnux.apps_web_chaves()
+            assert json.loads(lnux.LNUX_APPS_CHAVES.read_text()) == {} and not lnux.chave_sketchfab_guardada()
+        finally:
+            lnux.LNUX_APPS_DADOS, lnux.LNUX_APPS_CHAVES, lnux.escolher, gp.getpass = antes
+
+
 @caso("Catálogo: lê o apps.json e ignora entradas sem id ou sem caminho")
 def _():
     pasta = CASA / "falso-lnux-apps"
