@@ -36195,7 +36195,7 @@ def apps_web_tunel() -> None:
         "Só os apps (recomendado): quem abrir usa os apps no navegador dele, sem acesso a este aparelho",
         "Os apps E a ponte: as pastas liberadas e o ffmpeg deste aparelho (só para você mesmo, em outro lugar)",
     ], 1)
-    info("Para jogar com outras pessoas na Companhia, use '💬 Publicar só a Companhia': o link não leva a chave.")
+    info("Para jogar com outras pessoas no WEBC, use '💬 Publicar só o WEBC': o link não leva a chave.")
     if modo is None:
         return
     com_ponte = modo == 1
@@ -36269,15 +36269,15 @@ def apps_web_tunel() -> None:
     info("Para desligar: Apps Web › Compartilhar pela internet (túnel) › Desligar o túnel.")
 
 
-# ── Publicar só a Companhia (salas e loja) ──────────────────────────
+# ── Publicar só o WEBC (salas e loja) ──────────────────────────
 # Para jogar com outras pessoas: um servidor só para isso, numa porta própria, com --so-app companhia. Pelo link
-# (o túnel) abre só a Companhia: a página inicial dos Apps Web e os outros apps não existem nesse endereço, e quem
+# (o túnel) abre só o WEBC: a página inicial dos Apps Web e os outros apps não existem nesse endereço, e quem
 # chega por ele nunca usa a ponte, nem com a chave (as pastas, o ffmpeg e as chaves de IA ficam de fora). Os
 # visitantes só alcançam as salas e a loja (uma pasta própria: ~/.lnux-apps/loja). Quem abre o link vê a lista de
 # salas e entra, ou cria a sua (com as opções: pública ou privada, senha, pessoas, bate-papo, cenário), se o dono
-# deixar; o dono também abre a Companhia NESTE aparelho (127.0.0.1, com a chave) e o link vai sem a chave.
+# deixar; o dono também abre o WEBC NESTE aparelho (127.0.0.1, com a chave) e o link vai sem a chave.
 
-SERVICO_COMPANHIA = "companhia-site"    # o servidor que publica só a Companhia
+SERVICO_COMPANHIA = "companhia-site"    # o servidor que publica só o WEBC
 SERVICO_TUNEL_COMPANHIA = "tunel-companhia"
 LNUX_APPS_PORTA_COMPANHIA = 8105  # 8095 Apps Web, 8096 túnel deles, 8097 TNUX e sites, 8098/8099 chat
 
@@ -36295,7 +36295,7 @@ def companhia_porta() -> int:
 
 
 def companhia_link() -> str | None:
-    """O link público da Companhia publicada (nunca leva a chave), se o servidor e o túnel estão de pé."""
+    """O link público do WEBC publicado (nunca leva a chave), se o servidor e o túnel estão de pé."""
     if not servico_ativo(SERVICO_COMPANHIA):
         return None
     porta = companhia_porta()
@@ -36306,7 +36306,7 @@ def companhia_link() -> str | None:
 
 
 def companhia_local() -> str:
-    """A Companhia publicada, aberta NESTE aparelho com a chave (é por aqui que o dono cria as salas)."""
+    """O WEBC publicado, aberto NESTE aparelho com a chave (é por aqui que o dono cria as salas)."""
     token = lnux_apps_config().get("token", "")
     return f"http://127.0.0.1:{companhia_porta()}/apps/companhia/#token={token}&modo=jogar"
 
@@ -36320,33 +36320,33 @@ def companhia_parar(avisar: bool = True) -> None:
         if servico_ativo(nome):
             parar_servico(nome)
     if avisar:
-        ok("A Companhia saiu da internet: o link não abre mais.")
+        ok("O WEBC saiu da internet: o link não abre mais.")
 
 
 def companhia_publicar() -> None:
-    """Publica só a Companhia pela internet: um link https para jogar nas salas e usar a loja, sem os outros apps e
+    """Publica só o WEBC pela internet: um link https para jogar nas salas e usar a loja, sem os outros apps e
     sem a ponte."""
     if not garantir_lnux_apps():
         return
     if not lnux_apps_tem_so_app():
-        info("A sua cópia do LNUX-APPs é de antes da publicação só da Companhia; atualizando...")
+        info("A sua cópia do LNUX-APPs é de antes da publicação só do WEBC; atualizando...")
         try:
             lnux_apps_baixar(atualizar=True)
         except LnuxError as e:
             erro(str(e))
         if not lnux_apps_tem_so_app():
             companhia_parar(avisar=False)
-            erro("O LNUX-APPs publicado ainda não sabe publicar só a Companhia (a opção --so-app do servidor). "
+            erro("O LNUX-APPs publicado ainda não sabe publicar só o WEBC (a opção --so-app do servidor). "
                  "Tente '🔄 Atualizar os Apps Web' mais tarde.")
             return
     link = companhia_link()
     if not link and (servico_ativo(SERVICO_COMPANHIA) or servico_ativo(SERVICO_TUNEL_COMPANHIA)):
         companhia_parar(avisar=False)  # sobrou de uma tentativa que falhou: começa do zero
     if link:
-        ok("A Companhia está publicada. O link para as pessoas:")
+        ok("O WEBC está publicado. O link para as pessoas:")
         print(f"  {NEG}{link}{RST}")
         mostrar_qr(link, "companhia", salvar=False)
-        escolha = escolher("E agora?", ["Abrir a Companhia aqui (a lista de salas)", "Copiar o link", "Deixar como está",
+        escolha = escolher("E agora?", ["Abrir o WEBC aqui", "Copiar o link", "Deixar como está",
                                         "Tirar da internet"], 0)
         if escolha == 0:
             abrir_link(companhia_local())
@@ -36356,16 +36356,16 @@ def companhia_publicar() -> None:
             companhia_parar()
         return
     print(textwrap.dedent(f"""
-        Publica {NEG}só a Companhia{RST} num link {NEG}https://...{RST} para jogar com outras pessoas: quem abrir
+        Publica {NEG}só o WEBC{RST} num link {NEG}https://...{RST} para jogar com outras pessoas: quem abrir
         vê a lista de salas, entra ou cria a sua (pública ou privada, com senha, quantas pessoas...), e usa a loja
         (personagens, mundos e animações). E mais nada.
           • A página inicial dos Apps Web e os outros apps não abrem por esse link.
           • A ponte (as pastas, o ffmpeg e as chaves de IA deste aparelho) não abre por ele, nem com a chave.
           • A loja fica numa pasta própria ({companhia_loja_pasta()}): é a única pasta que os visitantes alcançam.
-        Você também joga: abra a Companhia aqui neste aparelho; na lista de salas dá para não deixar os outros criarem.
+        Você também joga: abra o WEBC aqui neste aparelho; na lista de salas dá para não deixar os outros criarem.
         Este aparelho é o servidor: precisa ficar ligado e com internet. Usa um túnel da Cloudflare (cloudflared).
     """).strip("\n"))
-    if not confirmar("Publicar a Companhia?", True):
+    if not confirmar("Publicar o WEBC?", True):
         return
     c = cfg()
     porta = companhia_porta()
@@ -36373,7 +36373,7 @@ def companhia_publicar() -> None:
         parar_servico(SERVICO_COMPANHIA)
     if not porta_livre(porta, espera=5):
         aviso(f"A porta {porta} está ocupada por outro programa.")
-        porta = perguntar_int("Outra porta para a Companhia publicada", porta + 1, 1024, 65535)
+        porta = perguntar_int("Outra porta para o WEBC publicado", porta + 1, 1024, 65535)
     c["companhia_porta"] = porta
     salvar_cfg()
     # 1) o endereço: o fixo (se houver um apontado para esta porta) ou um túnel rápido novo
@@ -36397,9 +36397,9 @@ def companhia_publicar() -> None:
             time.sleep(1)
         if not base:
             parar_servico(SERVICO_TUNEL_COMPANHIA)
-            erro("O túnel não deu o endereço. Tem internet? Veja o log: Apps Web › Companhia publicada: status e log.")
+            erro("O túnel não deu o endereço. Tem internet? Veja o log: Apps Web › WEBC publicado: status e log.")
             return
-    # 2) o servidor: só a Companhia, aceitando esse endereço, nunca rodando comandos
+    # 2) o servidor: só o WEBC, aceitando esse endereço, nunca rodando comandos
     argumentos = ["--porta", str(porta), "--so-app", "companhia", "--sem-comandos"]
     for h in sorted({urllib.parse.urlsplit(base).hostname, urllib.parse.urlsplit(host_fixo(porta) or "").hostname} - {None, ""}):
         argumentos += ["--permitir-host", h]
@@ -36419,7 +36419,7 @@ def companhia_publicar() -> None:
         except OSError:
             fim = []
         companhia_parar(avisar=False)
-        erro("O servidor da Companhia não respondeu (desliguei o link). O fim do log:")
+        erro("O servidor do WEBC não respondeu (desliguei o link). O fim do log:")
         for linha in fim:
             print(f"  {DIM}{linha}{RST}")
         return
@@ -36430,11 +36430,11 @@ def companhia_publicar() -> None:
     info("Quem abrir o link vê a lista de salas e entra ou cria a sua; o link de cada sala sai com este endereço.")
     info(f"A loja fica em {companhia_loja_pasta()} (arquivos postos nas subpastas personagens, mundos e animacoes também aparecem).")
     info("Contas: para quem entra criar conta (o código vai por e-mail), configure o seu e-mail em Contas e e-mail, "
-         "na lista de salas da Companhia aberta aqui (no Gmail, use uma senha de app).")
+         "na página Sala do WEBC aberto aqui (no Gmail, use uma senha de app).")
     if not fixo:
         info("O endereço muda toda vez que o túnel liga. Para um endereço que não muda, use o túnel fixo (Endereço fixo) "
              f"e aponte um endereço do seu domínio para a porta {porta}.")
-    if confirmar("Abrir a Companhia aqui (a lista de salas)?", True):
+    if confirmar("Abrir o WEBC aqui?", True):
         abrir_link(companhia_local())
 
 
@@ -36846,9 +36846,9 @@ def menu_apps_web():
         ("🌍 Compartilhar pela internet (túnel, link https e QR code)", apps_web_tunel),
         ("🌍 Túnel: desligar", apps_web_tunel_parar),
         ("🌍 Túnel: status e log", lambda: (status_servico(SERVICO_TUNEL_APPS), status_servico(SERVICO_APPS_TUNEL))),
-        ("💬 Publicar só a Companhia (salas e loja; sem os outros apps e sem a ponte)", companhia_publicar),
-        ("💬 Companhia publicada: tirar da internet", companhia_parar),
-        ("💬 Companhia publicada: status e log", lambda: (status_servico(SERVICO_TUNEL_COMPANHIA), status_servico(SERVICO_COMPANHIA))),
+        ("💬 Publicar só o WEBC (salas e loja; sem os outros apps e sem a ponte)", companhia_publicar),
+        ("💬 WEBC publicado: tirar da internet", companhia_parar),
+        ("💬 WEBC publicado: status e log", lambda: (status_servico(SERVICO_TUNEL_COMPANHIA), status_servico(SERVICO_COMPANHIA))),
         *itens_servico(SERVICO_APPS, "Servidor", lambda: garantir_servidor_apps(cfg().get("apps_ponte", "sempre") == "sempre")),
         ("⚙️ Ponte: pastas liberadas, comandos e chave", apps_web_pastas),
         ("ℹ️ Como funciona", explicar_apps_web),
@@ -36868,7 +36868,7 @@ def menu_apps_web():
                 print(f"{DIM}🌍 Na internet: {link.split('#')[0]}{' (com a ponte)' if cfg().get('apps_tunel_ponte') else ''}{RST}")
             publicada = companhia_link()
             if publicada:
-                print(f"{DIM}💬 Companhia publicada: {publicada}{RST}")
+                print(f"{DIM}💬 WEBC publicado: {publicada}{RST}")
 
     menu("🧩 Apps Web", itens, cabecalho=cabecalho)
 

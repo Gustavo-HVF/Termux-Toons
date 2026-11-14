@@ -185,7 +185,7 @@ def _():
         status, r = estado(porta, "abc-teste.trycloudflare.com")
         assert status == 200 and r["ponte"] is False, (status, r)
         with urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{porta}/apps/companhia/", headers={"Host": "abc-teste.trycloudflare.com"}), timeout=3) as rr:
-            assert rr.status == 200 and b"Companhia" in rr.read()
+            assert rr.status == 200 and b"WEBC" in rr.read()
         # chamando de novo com o túnel ligado: mostra o link e desliga quando pede
         respostas[:] = [2]
         lnux.apps_web_tunel()
@@ -233,7 +233,7 @@ def _():
             setattr(lnux, n, v)
 
 
-@caso("Companhia publicada sozinha: servidor --so-app com a ponte, link sem a chave; de fora, só a Companhia, as salas e a loja")
+@caso("WEBC publicado sozinho: servidor --so-app com a ponte, link sem a chave; de fora, só o WEBC, as salas e a loja")
 def _():
     local = copia_local()
     if not local:
@@ -294,9 +294,9 @@ def _():
         assert "--so-app companhia" in serv and "--sem-comandos" in serv and "--permitir-host abc-teste.trycloudflare.com" in serv and "--sem-ponte" not in serv, serv
         link = lnux.companhia_link()
         assert link == "https://abc-teste.trycloudflare.com/" and "token" not in link, link
-        # o dono: abriu a Companhia aqui, com a chave, no modo de jogar
+        # o dono: abriu o WEBC aqui, com a chave, no modo de jogar
         assert abertos == [f"http://127.0.0.1:{porta}/apps/companhia/#token={token}&modo=jogar"], abertos
-        # de fora (como pelo túnel): só a Companhia; a ponte não abre nem com a chave; a loja e as salas sim
+        # de fora (como pelo túnel): só o WEBC; a ponte não abre nem com a chave; a loja e as salas sim
         fora = {"Host": "abc-teste.trycloudflare.com", "Cf-Connecting-Ip": "203.0.113.9"}
         assert pedir(porta, "/", fora)[:2] == (302, "/apps/companhia/")
         assert pedir(porta, "/apps/companhia/", fora)[0] == 200
@@ -319,7 +319,7 @@ def _():
             setattr(lnux, n, v)
 
 
-@caso("Companhia publicada com um LNUX-APPs antigo (sem --so-app): tenta atualizar, avisa e não deixa nada ligado")
+@caso("WEBC publicado com um LNUX-APPs antigo (sem --so-app): tenta atualizar, avisa e não deixa nada ligado")
 def _():
     velho = CASA / "lnux-apps-velho-2"
     (velho / "servidor").mkdir(parents=True)
