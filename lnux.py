@@ -36315,6 +36315,63 @@ def companhia_loja_pasta() -> Path:
     return Path(os.path.expanduser(lnux_apps_config().get("loja") or str(LNUX_APPS_DADOS / "loja")))
 
 
+# ── As chaves das APIs que o WEBC usa (Sketchfab...) ─────────────────
+# Ficam em ~/.lnux-apps/chaves.json (permissão 600), que o servidor do LNUX-APPs lê: é ele que fala com as APIs (busca e
+# baixa os mapas do Sketchfab para a loja). A chave nunca vai para o navegador nem para o link das pessoas.
+LNUX_APPS_CHAVES = LNUX_APPS_DADOS / "chaves.json"
+
+
+def lnux_apps_chaves() -> dict:
+    try:
+        d = json.loads(LNUX_APPS_CHAVES.read_text("utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def gravar_lnux_apps_chaves(d: dict) -> None:
+    LNUX_APPS_DADOS.mkdir(parents=True, exist_ok=True)
+    temporario = LNUX_APPS_CHAVES.with_suffix(".tmp")
+    temporario.write_text(json.dumps(d, ensure_ascii=False, indent=2), "utf-8")
+    os.chmod(temporario, 0o600)
+    os.replace(temporario, LNUX_APPS_CHAVES)
+
+
+def chave_sketchfab_guardada() -> str:
+    c = lnux_apps_chaves().get("sketchfab")
+    return str((c.get("token") if isinstance(c, dict) else c) or "")
+
+
+def apps_web_chaves() -> None:
+    """🔑 As chaves das APIs do WEBC: a do Sketchfab (para trazer mapas para a loja)."""
+    while True:
+        sk = chave_sketchfab_guardada()
+        print(f"{DIM}Sketchfab: {'guardada (' + sk[:4] + '…)' if sk else 'não guardada'} · arquivo: {LNUX_APPS_CHAVES}{RST}")
+        i = escolher("Chaves das APIs", ["Sketchfab: guardar ou trocar a chave", "Sketchfab: apagar a chave", "Como pegar a chave do Sketchfab", "Voltar"])
+        if i is None or i == 3:
+            return
+        if i == 0:
+            token = getpass.getpass("Chave da API do Sketchfab (não aparece ao digitar; Enter = cancelar): ").strip()
+            if not token:
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9_\-.]{8,200}", token):
+                erro("Essa chave não parece certa (só letras, números, - _ e .).")
+                continue
+            c = lnux_apps_chaves()
+            c["sketchfab"] = {"token": token}
+            gravar_lnux_apps_chaves(c)
+            ok("Chave do Sketchfab guardada. Na loja do WEBC (aberta neste aparelho), o botão Sketchfab já busca e traz mapas.")
+        elif i == 1:
+            c = lnux_apps_chaves()
+            if c.pop("sketchfab", None) is not None:
+                gravar_lnux_apps_chaves(c)
+                ok("Chave do Sketchfab apagada.")
+        else:
+            info("No site do Sketchfab: entre na sua conta › Configurações (Settings) › Senha e API (Password & API) › API token. "
+                 "Copie e cole aqui. Só entram na loja os modelos com licença Creative Commons que deixa redistribuir (CC0, BY, BY-SA, "
+                 "BY-NC, BY-NC-SA), com o crédito de quem fez; os comprados (licença Standard) não.")
+
+
 def companhia_parar(avisar: bool = True) -> None:
     for nome in (SERVICO_TUNEL_COMPANHIA, SERVICO_COMPANHIA):
         if servico_ativo(nome):
@@ -36850,6 +36907,7 @@ def menu_apps_web():
         ("💬 WEBC publicado: tirar da internet", companhia_parar),
         ("💬 WEBC publicado: status e log", lambda: (status_servico(SERVICO_TUNEL_COMPANHIA), status_servico(SERVICO_COMPANHIA))),
         *itens_servico(SERVICO_APPS, "Servidor", lambda: garantir_servidor_apps(cfg().get("apps_ponte", "sempre") == "sempre")),
+        ("🔑 Chaves das APIs (Sketchfab, para trazer mapas para a loja do WEBC)", apps_web_chaves),
         ("⚙️ Ponte: pastas liberadas, comandos e chave", apps_web_pastas),
         ("ℹ️ Como funciona", explicar_apps_web),
     ]
