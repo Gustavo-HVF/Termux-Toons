@@ -36360,8 +36360,9 @@ def apps_web_chaves() -> None:
             c = lnux_apps_chaves()
             c["sketchfab"] = {"token": token}
             gravar_lnux_apps_chaves(c)
-            ok("Chave do Sketchfab guardada. Na loja do WEBC, o botão Sketchfab já busca e traz mapas: para você e para quem pode "
-               "publicar na loja (eles usam a sua chave pelo servidor, sem nunca vê-la nem trocá-la).")
+            ok("Chave do Sketchfab guardada. Na loja do WEBC, o botão Sketchfab já busca, baixa e carrega mapas (escolhendo o formato "
+               "e as texturas em 1K, 2K, 4K...) para todos; quem pode publicar também traz para a loja. Eles usam a sua chave pelo "
+               "servidor, sem nunca vê-la nem trocá-la.")
         elif i == 1:
             c = lnux_apps_chaves()
             if c.pop("sketchfab", None) is not None:

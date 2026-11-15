@@ -324,8 +324,9 @@ Para jogar com outras pessoas nas **salas** do WEBC e usar a **loja** (personage
   *Endereço fixo* apontado para a porta 8105, o LNUX usa esse endereço.
 - **🔑 Chaves das APIs**: a chave do **Sketchfab** fica em `~/.lnux-apps/chaves.json` (permissão 600). Com ela, na loja
   do WEBC, o botão **Sketchfab** busca modelos e traz mapas para a loja: o servidor baixa, converte para `.glb` e põe o
-  crédito de quem fez. **Todos que podem publicar na loja usam a sua chave**, pelo servidor, sem nunca vê-la nem
-  trocá-la (só você, neste aparelho, troca); há um limite de pedidos para quem não é você. Só entram os de licença
+  crédito de quem fez. **Todos usam a sua chave** para buscar, baixar e carregar mapas (escolhendo o formato e as
+  texturas em 1K, 2K, 4K...), e quem pode publicar também traz para a loja; tudo pelo servidor, sem nunca vê-la nem
+  trocá-la (só você, neste aparelho, troca). Há um limite de pedidos para quem não é você. Só entram os de licença
   Creative Commons que deixa redistribuir (CC0, BY, BY-SA, BY-NC, BY-NC-SA); os comprados (licença Standard) não. A
   chave nunca vai para o navegador nem para o link das pessoas.
 
