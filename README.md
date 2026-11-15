@@ -308,8 +308,9 @@ Para jogar com outras pessoas nas **salas** do WEBC e usar a **loja** (personage
 - **A ponte não abre por esse link, nem com a chave**: as pastas, o ffmpeg e as chaves de IA deste aparelho ficam
   de fora. Quem entra pelo link só alcança as salas e a loja. O link nunca leva a chave.
 - A **loja** fica numa pasta própria (`~/.lnux-apps/loja`, com as subpastas `personagens`, `mundos` e `animacoes`),
-  a única pasta do aparelho que os visitantes alcançam. Quem entra vê os itens em 3D antes de usar e, se você
-  deixar (dentro da loja, no WEBC), publica os seus; arquivos que você põe nas subpastas também aparecem.
+  a única pasta do aparelho que os visitantes alcançam. Quem entra vê os itens em 3D antes de usar; **só quem tem
+  conta publica** os seus, se você deixar (dentro da loja, no WEBC); arquivos que você põe nas subpastas também
+  aparecem.
 - Quem abre o link vê a **lista de salas** (como a lista de servidores de um jogo), entra numa ou **cria a sua**,
   com as opções: pública ou privada, senha, quantas pessoas, bate-papo e o cenário. Criar não precisa da ponte;
   se não quiser que os outros criem, desligue na própria lista de salas, abrindo o WEBC **neste aparelho**
@@ -325,7 +326,7 @@ Para jogar com outras pessoas nas **salas** do WEBC e usar a **loja** (personage
 - **🔑 Chaves das APIs**: a chave do **Sketchfab** fica em `~/.lnux-apps/chaves.json` (permissão 600). Com ela, na loja
   do WEBC, o botão **Sketchfab** busca modelos e traz mapas para a loja: o servidor baixa, converte para `.glb` e põe o
   crédito de quem fez. **Todos usam a sua chave** para buscar, baixar e carregar mapas (escolhendo o formato e as
-  texturas em 1K, 2K, 4K...), e quem pode publicar também traz para a loja; tudo pelo servidor, sem nunca vê-la nem
+  texturas em 1K, 2K, 4K...), e quem tem conta também traz para a loja; tudo pelo servidor, sem nunca vê-la nem
   trocá-la (só você, neste aparelho, troca). Há um limite de pedidos para quem não é você. Só entram os de licença
   Creative Commons que deixa redistribuir (CC0, BY, BY-SA, BY-NC, BY-NC-SA); os comprados (licença Standard) não. A
   chave nunca vai para o navegador nem para o link das pessoas.

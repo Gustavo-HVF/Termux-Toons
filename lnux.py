@@ -36361,7 +36361,7 @@ def apps_web_chaves() -> None:
             c["sketchfab"] = {"token": token}
             gravar_lnux_apps_chaves(c)
             ok("Chave do Sketchfab guardada. Na loja do WEBC, o botão Sketchfab já busca, baixa e carrega mapas (escolhendo o formato "
-               "e as texturas em 1K, 2K, 4K...) para todos; quem pode publicar também traz para a loja. Eles usam a sua chave pelo "
+               "e as texturas em 1K, 2K, 4K...) para todos; quem tem conta também traz para a loja. Eles usam a sua chave pelo "
                "servidor, sem nunca vê-la nem trocá-la.")
         elif i == 1:
             c = lnux_apps_chaves()
@@ -36421,6 +36421,7 @@ def companhia_publicar() -> None:
           • A página inicial dos Apps Web e os outros apps não abrem por esse link.
           • A ponte (as pastas, o ffmpeg e as chaves de IA deste aparelho) não abre por ele, nem com a chave.
           • A loja fica numa pasta própria ({companhia_loja_pasta()}): é a única pasta que os visitantes alcançam.
+            Todos veem e baixam; só quem tem conta publica (as contas precisam do e-mail do servidor configurado).
         Você também joga: abra o WEBC aqui neste aparelho; na lista de salas dá para não deixar os outros criarem.
         Este aparelho é o servidor: precisa ficar ligado e com internet. Usa um túnel da Cloudflare (cloudflared).
     """).strip("\n"))
